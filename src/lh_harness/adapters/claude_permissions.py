@@ -102,6 +102,14 @@ class WorkspaceSnapshot:
     errors: tuple[str, ...] = ()
 
 
+# Git metadata that read-only commands rewrite despite GIT_OPTIONAL_LOCKS=0
+# (e.g. `git diff` refreshing the stat cache on filesystems with unstable
+# stat info, like WSL DrvFS mounts). Tracking these makes every honest
+# audit self-invalidate. History-bearing paths (.git/HEAD, refs, objects)
+# stay fully tracked.
+_GIT_METADATA_NOISE = frozenset({".git", ".git/index", ".git/FETCH_HEAD"})
+
+
 def snapshot_workspace(
     workspace_path: str,
     hidden_paths: tuple[str, ...] | list[str] = (),
@@ -131,6 +139,12 @@ def snapshot_workspace(
                 continue
             try:
                 relative = path.relative_to(root).as_posix()
+                if relative in _GIT_METADATA_NOISE or (
+                    relative.startswith(".git/") and relative.endswith(".lock")
+                ):
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(path)
+                    continue
                 stat = entry.stat(follow_symlinks=False)
                 if entry.is_symlink():
                     records[relative] = (

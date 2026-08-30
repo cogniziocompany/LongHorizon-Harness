@@ -39,6 +39,9 @@ from .events import EventTailer
 # process environment rather than a per-workspace file.
 _WEB_DEFAULT_AGENT = os.environ.get("LH_HARNESS_WEB_DEFAULT_AGENT") or "codex"
 _WEB_DEFAULT_MODEL = os.environ.get("LH_HARNESS_WEB_DEFAULT_MODEL") or DEFAULT_CODEX_MODEL
+_WEB_DEFAULT_MANAGER_MODEL = (
+    os.environ.get("LH_HARNESS_WEB_DEFAULT_MANAGER_MODEL") or _WEB_DEFAULT_MODEL
+)
 _WEB_DEFAULT_AUDITOR_MODEL = (
     os.environ.get("LH_HARNESS_WEB_DEFAULT_AUDITOR_MODEL") or _WEB_DEFAULT_MODEL
 )
@@ -752,7 +755,7 @@ def create_app(
                 "agent": _WEB_DEFAULT_AGENT,
                 "model": _WEB_DEFAULT_MODEL,
                 "roles": {
-                    "manager": {"agent": _WEB_DEFAULT_AGENT, "model": _WEB_DEFAULT_MODEL},
+                    "manager": {"agent": _WEB_DEFAULT_AGENT, "model": _WEB_DEFAULT_MANAGER_MODEL},
                     "executor": {"agent": _WEB_DEFAULT_AGENT, "model": _WEB_DEFAULT_MODEL},
                     "auditor": {"agent": _WEB_DEFAULT_AGENT, "model": _WEB_DEFAULT_AUDITOR_MODEL},
                 },
