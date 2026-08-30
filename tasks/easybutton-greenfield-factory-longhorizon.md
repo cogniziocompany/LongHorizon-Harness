@@ -164,3 +164,20 @@ This task is intentionally shaped for LongHorizon-Harness:
 - Claims 365 Control Center module (the reference UX)
 - TRMS repo (the reference build discipline + flakiness shape)
 
+
+---
+
+## LiteLLM gateway capabilities this task uses
+
+The reference LiteLLM gateway admin UI shows the relevant sections we'll use: Virtual Keys, Playground, Models + Endpoints, Agentic → MCP Servers, Agentic → Guardrails, Policies, Tools → Search Tools + Vector Stores + Tool Policies, plus Observability (Usage, Logs, Guardrails Monitor) and Access Control (Teams, Internal Users, Organizations, Access Groups, Budgets).
+
+This task uses them as follows:
+
+1. **Playground (chat model + tools)** — the LongHorizon Manager/Executor/Auditor roles and our own factory worker steps can use the same LiteLLM `/v1/chat/completions` endpoint with tool calling. The model is our local `qwen3.6` for vision-heavy work and `glm-5.2:cloud` for longer reasoning; both are served by the gateway.
+2. **Tools → Vector Stores** — the RAG layer should create a vector store in the gateway UI with the Microsoft Learn Dynamics/Dataverse docs chunked corpus (plus our own design/handoff docs), keyed by section path. We can then use the gateway's retrieval tool surface instead of building a separate `rag-docs-mcp` if we want to reuse the gateway's own retrieval plumbing.
+3. **Tools → Search Tools / Tool Policies** — the agentic tool calls into the gateway can be constrained by tool policies per role, which lines up with the per-role MCP access groups we already defined (`dataverse-write` vs `dataverse-read` vs `xrm-*` etc.).
+4. **Guardrails** — the guardrail policy surface exists and we should use it to catch common agent failure modes (e.g. hallucinated tool names, out-of-scope writes, missing evidence artifacts) before they land in a run's evidence rows.
+5. **Observability → Usage / Logs / Guardrails Monitor** — the gateway's own observability surfaces already show per-key usage and logs. Where possible we should wire our factory runs to tag spans with `run_id` + `phase` so the gateway's usage logs become an additional trace surface alongside Langfuse.
+
+This is additive to the design doc — it doesn't replace the factory's Postgres state or the existing Langfuse tracing.
+
