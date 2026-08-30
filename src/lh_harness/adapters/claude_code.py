@@ -98,6 +98,12 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             "stream-json",
             "--verbose",
             "--dangerously-skip-permissions",
+            # Honor the role-isolation contract described above: without this
+            # flag Claude Code auto-loads the workspace's .mcp.json, and large
+            # MCP tool inventories can push built-in tool schemas out of the
+            # context window on local models. Only an explicit mcp_config
+            # (--mcp-config below) is ever loaded.
+            "--strict-mcp-config",
         ]
         deny_tools = [*policy.disallowed_tools, *path_deny_rules(hidden_paths)]
         if deny_tools:
