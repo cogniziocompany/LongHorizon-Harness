@@ -1768,6 +1768,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 hidden_paths=hidden_paths,
                 guard_exclude_paths=guard_exclude_paths,
                 reasoning_effort=effort,
+                run_id=run_id,
             )
         return agent_cache[key]
 
@@ -2214,6 +2215,7 @@ def _build_agent(
     hidden_paths: tuple[str, ...] = (),
     guard_exclude_paths: tuple[str, ...] = (),
     reasoning_effort: str | None = None,
+    run_id: str | None = None,
 ):
     if name == "codex":
         from .adapters.codex import CodexAdapter
@@ -2247,6 +2249,8 @@ def _build_agent(
             # exclusions are a Claude-Code-only concern for now.
             guard_exclude_paths=guard_exclude_paths,
             reasoning_effort=reasoning_effort,
+            # Tags proxied requests with run/round/role for observability.
+            run_id=run_id,
         )
         if model is not None:
             kwargs["model"] = model

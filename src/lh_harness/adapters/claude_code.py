@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from pathlib import Path
 
@@ -41,6 +42,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         hidden_paths: tuple[str, ...] = (),
         guard_exclude_paths: tuple[str, ...] = (),
         reasoning_effort: str | None = None,
+        run_id: str | None = None,
     ) -> None:
         policy = policy_for_role(role)
         effort = normalise_reasoning_effort(reasoning_effort)
@@ -121,6 +123,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         self.role = role
         self.policy = policy
         self.reasoning_effort = effort
+        self.run_id = run_id
         # Snapshot-only exclusions: unlike hidden_paths these are not denied
         # to the agent — the guard just refrains from walking directories that
         # legitimately churn (build outputs) during an audit window.
@@ -132,6 +135,18 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             visible_output_parser=extract_claude_visible_output,
             hidden_paths=hidden_paths,
         )
+
+    def episode_env(self, label: str) -> dict[str, str]:
+        # Stamp run/round/role onto every proxied request as LiteLLM tags so
+        # proxy-side observability (Langfuse per-key logging) can group traces
+        # by harness run. Claude Code forwards ANTHROPIC_CUSTOM_HEADERS
+        # ("Name: value") on each API call; the tag values carry no secrets.
+        if not self.run_id:
+            return {}
+        match = re.match(r"round_\d+", label)
+        round_tag = match.group(0) if match else "round_unknown"
+        tags = f"lh-run/{self.run_id},{round_tag},{self.role}"
+        return {"ANTHROPIC_CUSTOM_HEADERS": f"x-litellm-tags: {tags}"}
 
     async def run_episode(
         self,

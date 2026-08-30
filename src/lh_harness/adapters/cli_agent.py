@@ -44,6 +44,14 @@ class CommandAgentAdapter:
         self.visible_output_parser = visible_output_parser
         self.hidden_paths = tuple(hidden_paths)
 
+    def episode_env(self, label: str) -> dict[str, str]:
+        """Extra env for one episode's agent process, keyed off the round/role label.
+
+        Adapters override this to stamp per-episode metadata (e.g. request tags
+        for proxy-side observability). Values are shell-quoted by the caller.
+        """
+        return {}
+
     async def run_episode(
         self,
         prompt: str,
@@ -56,9 +64,10 @@ class CommandAgentAdapter:
         # every role episode gets a distinct filename, so concurrent harnesses
         # (and future concurrent roles within one harness) cannot overwrite the
         # input while an agent CLI is still reading it.
+        label = _episode_prompt_label(live_trajectory_path)
         prompt_path = posixpath.join(
             self.prompt_dir,
-            f"{_episode_prompt_label(live_trajectory_path)}_{uuid.uuid4().hex[:12]}.md",
+            f"{label}_{uuid.uuid4().hex[:12]}.md",
         )
         await write_remote_text(env, prompt_path, prompt + _hidden_paths_notice(self.hidden_paths))
         # Substituted by explicit replace, not str.format: templates embed literal
@@ -70,7 +79,13 @@ class CommandAgentAdapter:
             ("{timeout}", str(budget.max_duration_seconds)),
         ):
             command_body = command_body.replace(placeholder, value)
-        command = f"cd {shlex.quote(self.workspace_path)} && {command_body}"
+        # Per-episode env assignments compose with the template's own inline
+        # `VAR=val` prefix; both sit before the executable in the same simple
+        # command, which POSIX sh accepts.
+        env_assigns = "".join(
+            f"{key}={shlex.quote(value)} " for key, value in self.episode_env(label).items()
+        )
+        command = f"cd {shlex.quote(self.workspace_path)} && {env_assigns}{command_body}"
         # When a live path is given (local runs), the environment mirrors stdout
         # to that file line-by-line so the dashboard shows the trajectory live.
         result = await env.exec(
