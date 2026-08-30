@@ -29,6 +29,19 @@ from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 from .events import EventTailer
+
+# The standalone workbench has no project ``config.toml`` of its own (one
+# server can host runs across many workspaces), so the New Task form's
+# starting agent/model has always been a hardcoded "codex" literal here,
+# ignoring whatever the deployment actually wants to route to. Let an
+# operator set the workbench-wide default via environment instead, same way
+# --base-url/--api-key already reach the spawned agent CLI through the
+# process environment rather than a per-workspace file.
+_WEB_DEFAULT_AGENT = os.environ.get("LH_HARNESS_WEB_DEFAULT_AGENT") or "codex"
+_WEB_DEFAULT_MODEL = os.environ.get("LH_HARNESS_WEB_DEFAULT_MODEL") or DEFAULT_CODEX_MODEL
+_WEB_DEFAULT_AUDITOR_MODEL = (
+    os.environ.get("LH_HARNESS_WEB_DEFAULT_AUDITOR_MODEL") or _WEB_DEFAULT_MODEL
+)
 from .protocol import build_meta
 from .snapshot import _provenance, build_run_summary, build_snapshot
 
@@ -736,11 +749,12 @@ def create_app(
             agents=catalogue["agents"],
             models=catalogue["models"],
             defaults={
-                "agent": "codex",
-                "model": DEFAULT_CODEX_MODEL,
+                "agent": _WEB_DEFAULT_AGENT,
+                "model": _WEB_DEFAULT_MODEL,
                 "roles": {
-                    role: {"agent": "codex", "model": DEFAULT_CODEX_MODEL}
-                    for role in ("manager", "executor", "auditor")
+                    "manager": {"agent": _WEB_DEFAULT_AGENT, "model": _WEB_DEFAULT_MODEL},
+                    "executor": {"agent": _WEB_DEFAULT_AGENT, "model": _WEB_DEFAULT_MODEL},
+                    "auditor": {"agent": _WEB_DEFAULT_AGENT, "model": _WEB_DEFAULT_AUDITOR_MODEL},
                 },
             },
             model_discovery=catalogue["model_discovery"],

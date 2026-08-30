@@ -2004,7 +2004,7 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
   const [modelRefreshError, setModelRefreshError] = useState('');
   const [workspace, setWorkspace] = useState('');
   const [maxRounds, setMaxRounds] = useState('25');
-  const [promptLanguage, setPromptLanguage] = useState<'en' | 'zh'>('zh');
+  const [promptLanguage, setPromptLanguage] = useState<'en' | 'zh'>('en');
   const [roundLimit, setRoundLimit] = useState(MAX_TRAJECTORY_ROUNDS);
   useEffect(() => {
     if (!meta || rolesInitialised.current) return;

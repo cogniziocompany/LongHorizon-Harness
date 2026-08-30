@@ -17,6 +17,7 @@ import selectors
 import shutil
 import subprocess
 import time
+import urllib.request
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -208,7 +209,72 @@ def _discover_codex_models(
         }
 
 
+_LITELLM_MODELS_TIMEOUT_SECONDS = 3.0
+
+
+def _discover_litellm_models(
+    binary: str | None,
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
+    """Ask a configured Anthropic-compatible proxy (e.g. LiteLLM) for its real
+    model list, so the workbench offers the models actually routable through
+    it instead of only Anthropic's own aliases.
+
+    Returns ``(None, {})`` when no proxy is configured, or when the request
+    fails for any reason -- the caller then falls back to the hardcoded
+    Claude alias list unchanged.  This never raises.
+    """
+
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip().rstrip("/")
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if not base_url or not api_key:
+        return None, {}
+    request = urllib.request.Request(
+        f"{base_url}/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_LITELLM_MODELS_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read())
+    except (OSError, ValueError) as exc:
+        return None, {
+            "status": "unavailable",
+            "source": "litellm_models_endpoint",
+            "account_scoped": False,
+            "refreshed_at": None,
+            "warning": f"Could not reach the configured proxy ({base_url}) for its model list: {_compact_error(exc)}",
+        }
+    raw_models = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(raw_models, list):
+        return None, {}
+    default_ids = {
+        os.environ.get("LH_HARNESS_WEB_DEFAULT_MODEL", "").strip(),
+        os.environ.get("LH_HARNESS_WEB_DEFAULT_AUDITOR_MODEL", "").strip(),
+    }
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_models:
+        model_id = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
+        if not _valid_model_id(model_id) or model_id in seen:
+            continue
+        seen.add(model_id)
+        suffix = " · default" if model_id in default_ids and model_id else ""
+        entries.append(_model_entry(model_id, f"{model_id}{suffix}", "detected"))
+    if not entries:
+        return None, {}
+    return entries, {
+        "status": "detected",
+        "source": "litellm_models_endpoint",
+        "account_scoped": False,
+        "refreshed_at": time.time(),
+        "warning": f"Model list fetched live from the configured proxy ({base_url}).",
+    }
+
+
 def _discover_claude_models(binary: str | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    proxy_models, proxy_discovery = _discover_litellm_models(binary)
+    if proxy_models:
+        return proxy_models, proxy_discovery
+
     recent = _recent_claude_models()
     ids = [DEFAULT_CLAUDE_MODEL, "opus", "sonnet", "haiku", *recent]
     models: list[dict[str, Any]] = []
