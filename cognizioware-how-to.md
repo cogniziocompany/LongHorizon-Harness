@@ -149,3 +149,11 @@ auditor = 600
 - **CT110 repo access**: account-wide GitHub deploy key (acts as prax211 — read AND write
   everywhere; upgrade to a machine user if autonomous pushes start). New project =
   `git clone` into `/home/harness/work/<name>`, then select it as the run's Workspace.
+- **CT110 API auth**: the bearer the dashboard/API expects is read from the env field
+  **`LH_HARNESS_WEB_TOKEN`** (equivalently `--auth-token`), set in the `lh-harness.service`
+  environment on CT110; current value starts `f8b…`. Send it as
+  `Authorization: Bearer <token>` — never `?token=`, which leaks into access logs. Workers
+  never inherit it (`LH_HARNESS_WEB_TOKEN` is stripped from child env, see
+  `environment/local.py` / `supervisor/service.py`). Full value stays out of git: read it
+  with `systemctl show lh-harness -p Environment` on CT110 (other secrets live in the unit's
+  `EnvironmentFile`, `/home/harness/.lh-harness-secrets.env`).
