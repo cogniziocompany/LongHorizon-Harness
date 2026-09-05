@@ -13,7 +13,14 @@ web API or `lh-run`.
 | Auditor | `kimi-k3:cloud` | Only family verified to emit the strict 3-line control header reliably; malformed headers fail rounds |
 
 **Never seat `minimax-m3:cloud` as executor** — it cannot see tool results through LiteLLM and
-confabulates "environment broken" reports.
+confabulates "environment broken" reports. **Nor as manager** (2026-08-30): it ignores operator
+gate resolves — repeats the same ask through consumed answers.
+
+**Cloud-executor standard (updated 2026-08-31):** manager `glm-5.3:cloud`; executor
+`kimi-k2.7-code:cloud`. glm-5.3-flash:cloud (multi-account pooled, 3x max-key weighting) is the
+router-level fallback/chat model but cannot hold the executor seat -- its reasoning blocks break
+the Anthropic adapter ("Content block is not a thinking block"). deepseek-v4-flash does not
+exist upstream; the flash chain falls back to kimi-k2.7-code:cloud.
 
 ## Non-negotiable plumbing (or qwen3.8 silently breaks)
 

@@ -73,7 +73,12 @@ repo; I monitor you.
   netns/tunnel couplings, routers, runner services) into announced windows; list blast radius
   per host. Never let any tier reboot the host that carries the overseer/workbench.
 - **Capacity routing**: local-GPU executors (qwen3.8) for the runs that justify it; cloud
-  executors (kimi-k2.7-code) for backfill/overflow so runs don't starve each other.
+  executors for backfill/overflow so runs don't starve each other.
+- **Standard trio (2026-08-30, Paxton)**: manager `glm-5.3:cloud`; executor
+  `kimi-k2.7-code:cloud`; auditor `kimi-k3:cloud`. glm-5.3-flash:cloud is live in the router
+  as the pooled fallback/chat workhorse but CANNOT hold the Claude Code executor seat --
+  deterministic "Content block is not a thinking block" (2026-08-31). minimax-m3 is retired from the manager seat: it repeatedly ignored
+  operator gate resolves (asked the same question 4x through 4 consumed answers).
 - **Session audits**: periodically resume each repo session for a status-vs-tasking report
   (per-item, with commit evidence); reconcile against the repo (`git log`, gap-list docs)
   rather than trusting prose; honest gaps get new runs, not blame.
@@ -168,6 +173,11 @@ Arrive with evidence and a recommendation, not a question.
   `*status=failed*` — substring globs match `rolestatus=failed`); pipe snapshots via stdin
   (argv breaks past ~128KB); treat `waiting_approval` as non-terminal.
 - Every intervention gets one line in memory immediately: what, why, evidence, undo path.
+- **Human-in-the-loop check before ANY stop or gate-resolve**: read `operator_messages` and ask
+  whether the latest round was human-initiated. A gate raised while a human is conversing with
+  the run in the workbench is THAT HUMAN'S gate — a repeated "completion ask" and a human
+  conversation look identical from the status line (live incident: 32a50753 stopped mid-chat
+  with the operator; recover with `/resume {"mode":"continue"}` — the ledger survives).
 
 ### Addendum — the deploy ask-loop (learned on run 009f6396)
 If a task's authoritative spec includes a deploy step but the run's constraints gate it, write
