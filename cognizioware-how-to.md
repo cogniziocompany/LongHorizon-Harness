@@ -175,3 +175,17 @@ auditor = 600
   `environment/local.py` / `supervisor/service.py`). Full value stays out of git: read it
   with `systemctl show lh-harness -p Environment` on CT110 (other secrets live in the unit's
   `EnvironmentFile`, `/home/harness/.lh-harness-secrets.env`).
+- **Hydra fleet plane (live 2026-09-05)**: CT110 is registered in the Hydra orchestrator
+  (corsairai300, `/opt/cognizioware-hydra/.env` → `HARNESS_NODES_JSON`) as the `external`
+  primary + fallback node by **direct IP** `http://192.168.21.168:8799` — corsairai300
+  cannot resolve `harness.lan.easybutt0n.ai`. Overseers use the gateway alias
+  `hydrafleet` (`/fleet-mcp`, group `fleet-runners`) or REST `/fleet/*`; e2e suites 29/31
+  in cognizioware-mcp-tools cover it. `lh-harness-node:latest` (this repo's `docker/`) is
+  built on corsairai300 for managed nodes; device agents still need the `harness_*`
+  handlers rolled out before a managed install can be placed.
+- **Hivemind capture**: a cron on corsairai300 (`hivemind-ingest.sh`, every 5 min) writes
+  every CT110 run snapshot + fleet intervention into `hivemind_sessions.session_memories`
+  (CT103 agent-db, pgvector) via memory-mcp; recall with the gateway alias `memory`.
+- **Gotcha**: Hydra `auth.js` reads `RUNNER_API_KEY || HYDRA_API_KEY`; a user-level
+  `RUNNER_API_KEY` on a dev box overrides `HYDRA_API_KEY` when booting the orchestrator
+  locally (smoke tests return 401 until you override it).
