@@ -16,10 +16,10 @@ manager `glm-5.3:cloud` · executor `kimi-k2.7-code:cloud` · auditor `kimi-k3:c
 ```json
 {"model":"kimi-k2.7-code:cloud","agent":"claude_code",
  "workspace":"/mnt/c/Users/PaxtonTait/source/cognizioware-mcp-tools-pac",
- "role_configs":{"manager":{"agent":"claude_code","model":"glm-5.3:cloud"},
+ "roles":{"manager":{"agent":"claude_code","model":"glm-5.3:cloud"},
                  "executor":{"agent":"claude_code","model":"kimi-k2.7-code:cloud"},
                  "auditor":{"agent":"claude_code","model":"kimi-k3:cloud"}},
- "rounds":20,"task":"<task text below>"}
+ "max_rounds":20,"task":"<task text below>"}
 ```
 POST to the WSL workbench `http://127.0.0.1:8799/api/runs` (pipe JSON via stdin `--data-binary @-`).
 

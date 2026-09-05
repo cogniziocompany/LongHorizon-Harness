@@ -219,3 +219,17 @@ an operator stop with a rationale marking it complete-at-boundary (not a failure
   HEAD = `ref: refs/heads/<branch>`), then `git reset -q` inside the worktree from WSL to rebuild the index (files untouched), re-commit the
   stray commit on the right branch by explicit path, `git reset --mixed` the main checkout back, and send the run an instruction naming the fix.
 - Task text for every run: "never cd into or run git against <main checkout>; plain git commands only (never --git-dir/--work-tree)".
+
+## Launch payload keys (verified against src/lh_harness/webapi/server.py, 2026-09-05)
+- POST /api/runs reads `roles` (per-role `{agent, model}`) and `max_rounds`. Unknown keys such as `role_configs` or `rounds` are SILENTLY
+  ignored: the run then executes every role on the top-level `model` with the default 25 rounds. After every launch, confirm with
+  `pgrep -af 'lh_harness run'` that `--manager-model/--auditor-model/--max-rounds` are present. (Run 2ff4e39d ran all-kimi for this reason.)
+- Resume (`POST /api/runs/{id}/resume`) takes only `mode` (continue|retry) and `extra_rounds`; it cannot change models. To change a role model,
+  launch a NEW run on the same worktree with a CONTINUATION paragraph naming the commits already on the branch.
+
+## glm-5.3:cloud as manager — known failure (2026-09-05, broker run 2a38855a rounds 7-8)
+- Symptom: the manager phase fails with `API Error: Content block is not a thinking block` once its prompt grows past ~43 KB; LiteLLM logs 200 OK
+  (relay 192.168.21.110:11438, no fallback fired), so it is the streamed thinking/signature deltas of glm-5.3 that Claude Code rejects, the same
+  mechanism that disqualified glm-5.3-flash for the executor seat. Resume re-fails immediately (same prompt).
+- Mitigation used: manager `kimi-k2.7-code:cloud` (executor model; handles far larger prompts through the same relay), auditor `kimi-k3:cloud`.
+  Paxton set the glm-5.3 manager standard; report the deviation and let him confirm or pick another thinking-free manager.

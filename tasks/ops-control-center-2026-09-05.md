@@ -3,7 +3,7 @@
 **Owner session:** Claude Code `6803faad-e27d-43c0-8150-328e549e1fb1` (cwd `c:\Users\PaxtonTait\source\cognizioware-mcp-tools`).
 The overseer (LongHorizon-Harness session) is the MANAGER for this task: it created the worktree, launched and monitors the harness run,
 and schedules the owner's post-processes. The owner session applies its plan's post-run steps (PRs, cross-link PR) when the overseer says go.
-**Harness run:** `20260905T090033Z_2ff4e39d` (WSL workbench, launched 2026-09-05 09:00 PT).
+**Harness run:** `20260905T091620Z_4a316bf3` (WSL workbench, relaunched 2026-09-05 09:16 PT; first attempt 2ff4e39d was launched with the wrong payload keys and stopped at round 2). Manager is `kimi-k2.7-code:cloud` for this run (see template: glm-5.3 manager thinking-block failure).
 **Authoritative spec (read FIRST, follow exactly):** `C:\Users\PaxtonTait\.claude\plans\c-users-paxtontait-source-claims365-lab-snoopy-rossum.md`
 (WSL `/mnt/c/Users/PaxtonTait/.claude/plans/c-users-paxtontait-source-claims365-lab-snoopy-rossum.md`).
 **Harness workspace (dedicated worktree, WSL-created and LOCKED):** `/mnt/c/Users/PaxtonTait/source/cognizioware-mcp-tools-ops`
@@ -21,10 +21,10 @@ manager `glm-5.3:cloud` · executor `kimi-k2.7-code:cloud` · auditor `kimi-k3:c
 ```json
 {"model":"kimi-k2.7-code:cloud","agent":"claude_code",
  "workspace":"/mnt/c/Users/PaxtonTait/source/cognizioware-mcp-tools-ops",
- "role_configs":{"manager":{"agent":"claude_code","model":"glm-5.3:cloud"},
+ "roles":{"manager":{"agent":"claude_code","model":"glm-5.3:cloud"},
                  "executor":{"agent":"claude_code","model":"kimi-k2.7-code:cloud"},
                  "auditor":{"agent":"claude_code","model":"kimi-k3:cloud"}},
- "rounds":22,"task":"<task text below>"}
+ "max_rounds":22,"task":"<task text below>"}
 ```
 POST to `http://127.0.0.1:8799/api/runs` (WSL workbench), JSON via stdin `--data-binary @-`.
 
