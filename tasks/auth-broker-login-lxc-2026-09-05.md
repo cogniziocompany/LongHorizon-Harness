@@ -47,3 +47,5 @@ Runs: 2a38855a (failed r7-8, glm-5.3 manager thinking-block) → 50a5c48c (died:
 c42b824 (2) · 1139e5b (3) · 46a39dd (4) · aa7e651 441b825 (5) · b6e8091 (6, suite 31) · 465f9eb (7) · f0e6ab3 (8) · 11faf4b kb-hook (overseer).
 Review: 31 files, no `.github` changes, YAML parses, placeholders only. Owner d33948bb given GO to push + PR stacked on pac #61.
 Operator steps (CT208 create, auth-broker.env, DNS/Caddy route, CT202 env fills) wait for Paxton's go.
+
+PR: mcp-tools **#65** `feat/auth-broker-login-lxc` → `feat/pac-dataverse-mcp` (stacked on #61; retarget to main after #61 merges).

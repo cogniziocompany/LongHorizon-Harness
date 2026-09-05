@@ -72,3 +72,5 @@ Branch `feat/ops-control-center`: 375326a PR-A · de005b5 PR-B · 236e653 e2e su
 validated a host path inside the caddy container, `mv` on a single-file bind mount → old inode); replaced with pct push → docker cp + validate
 in-container → overwrite in place with `cat >` → reload. Overseer review: workflow diff limited to the allowed additions, strict YAML clean,
 both live Caddyfile hunks retained, no secret values. Owner 6803faad given GO to push + PR (no merge: merge = prod deploy, needs Paxton).
+
+PRs: mcp-tools **#64** `feat/ops-control-center` → main (do-not-merge note); mcp-cognizioware **#65** `chore/admin-infra-link` → develop (toolbar Infra link).
