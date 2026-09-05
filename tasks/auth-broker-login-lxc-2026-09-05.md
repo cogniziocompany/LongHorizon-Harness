@@ -60,3 +60,6 @@ PR: mcp-tools **#65** `feat/auth-broker-login-lxc` → `feat/pac-dataverse-mcp` 
 - Pi-hole `192.168.21.161 auth-broker.lan.easybutt0n.ai`; Caddy route on the branch (8dbb9d1) → 192.168.21.166:3125; CT202 mcp-tools.env
   got AUTH_BROKER_TOKEN, AUTH_BROKER_MCP_URL, PAC_DEV_* (username/password fallback; SPN ids still blank).
 - Gaps left on PR #65: `lh-harness` service has no Dockerfile; `playwright-login` Dockerfile patch no longer matches playwright/mcp:latest.
+- Deployed: #65 merged (5b995dd), lane 33988761927 green. Caddy route works (https://auth-broker.lan.easybutt0n.ai/mcp → 401 without token).
+  LiteLLM could not reach it: compose `extra_hosts` hardcodes `auth-broker.lan.easybutt0n.ai:127.0.0.1` (fail-fast) → parametrized as
+  `${AUTH_BROKER_HOST_IP:-127.0.0.1}` (#69) with AUTH_BROKER_HOST_IP=192.168.21.161 in mcp-tools.env; lane 21073a0 applies it.
