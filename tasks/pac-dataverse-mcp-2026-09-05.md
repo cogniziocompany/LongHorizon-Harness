@@ -47,3 +47,8 @@ Auditor: no git fetch.
 4. **cognizioware-qa full e2e** (`qa-gate.yml` target=litellm, env=prod after deploy; plus the repo's own suites
    29/30/17/20/22 with `RUN_LIVE_REGRESSION=1`). If QA has no compatible suite for a piece, notify Paxton.
 5. Commit 2 (matrix `'live'`, baseline, mustHave) → gate hard-fails on regression. County bootstrap last.
+
+## Deployed (2026-09-05 ~20:55 PT)
+#61 merged (74d278f). Its lane was "green" on 2026-09-05 17:5x but never deployed (deploy job defect, see ops task / mcp-tools #66-#68);
+lane bded802 actually deployed pac-mcp, dataverse-data-mcp and monday-mcp to CT202 (all healthy). Note: suite numbers 29/30 were already
+used by hydra-fleet/memory suites (the repo has other duplicate suite numbers too).

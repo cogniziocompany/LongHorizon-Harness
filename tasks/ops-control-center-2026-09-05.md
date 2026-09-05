@@ -74,3 +74,12 @@ in-container → overwrite in place with `cat >` → reload. Overseer review: wo
 both live Caddyfile hunks retained, no secret values. Owner 6803faad given GO to push + PR (no merge: merge = prod deploy, needs Paxton).
 
 PRs: mcp-tools **#64** `feat/ops-control-center` → main (do-not-merge note); mcp-cognizioware **#65** `chore/admin-infra-link` → develop (toolbar Infra link).
+
+## Deployed (2026-09-05 ~20:55 PT)
+mcp-tools #64 merged (98ba424). The first lane was "green" but deployed nothing (deploy job bug: ssh inside `while read` synced only the
+first build context; `| tail -25` masked the failed compose up) — fixed in #66; #67 (xrm build needs a cross-repo token: secret
+XRM_BUILD_GH_TOKEN) and #68 (dataverse-data-mcp has no lockfile → npm install) were the next latent failures. Lane bded802 (run
+33987710207) is the first honest full deploy: ops-control-center, ops-oauth2-proxy, ops-docker-socket-proxy up; `/ping` 200; `/` → 302
+to login.microsoftonline.com with client 2562701c; `/healthz` 200; `/api/doctor` 401 without key; socket-proxy POST → 403; LE cert valid
+to 2026-12-04. Leftover: ops-oauth2-proxy healthcheck uses wget (distroless image has none) → shows "unhealthy" while serving correctly.
+Waiting on Paxton's sign-in proof (footer email, seven pages, Run doctor).
