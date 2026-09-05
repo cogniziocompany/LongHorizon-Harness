@@ -29,6 +29,20 @@ Paxton (human)
 | Repo session | Creates runs in ITS repo, polls their snapshots, injects pacing, resolves routine/loop-protection gates with rationale, reports completions with audit evidence | Resolve deploy/rollout gates (escalate); build large features by hand when a harness run was directed; touch another session's reserved paths |
 | Harness run | One contract, one workspace, audited rounds | Deploy, reboot hosts, push, touch reserved paths |
 
+## Addressing runs via the Hydra fleet plane (preferred since 2026-09-05)
+
+Run creation/monitoring/intervention now has a single API instead of per-node
+base URLs: Hydra's `/fleet/*` REST and the `hydrafleet` MCP alias
+(`/fleet-mcp`, access group `fleet-runners`). It encodes this template's rules
+as invariants: top-level `model` required, one run per working tree (409),
+`cancelReasonAck` before resuming a cancelled run, a `rationale` on every
+mutation (logged to the per-run activity feed the web UI shows), migrate =
+the Step-6 successor pattern (stop-before-create, CONTINUATION task text),
+device power = 501. MCP prompts `overseer-briefing`,
+`run-management-playbook`, and `assign-repo-session` serve this doctrine at
+call time. `claude --resume` (below) remains the channel for talking to
+*sessions*; the fleet plane is the channel for runs.
+
 ## Addressing agents (hard-won)
 
 - **`claude --resume <UUID> -p "<directive>"` from the repo's own directory is the reliable

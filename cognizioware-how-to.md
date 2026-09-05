@@ -36,6 +36,21 @@ the `billingservice` knowledge base (ids noted inline; process: `kb-article/kb-a
 Never run task execution on native Windows: `LocalEnvironment.exec` uses
 `os.killpg`/`SIGHUP` (108 test failures on win32; 405 pass on Linux).
 
+### 2b. Third deployment shape: `lh-harness-node` Docker (Hydra-managed, 2026-09-05)
+
+`docker/` in this repo builds **lh-harness-node** — this exact build in a
+container (py3.12 + node22 + claude CLI), entrypoint-seeded with the CT110
+config values, web API on `127.0.0.1:8799` only. The **cognizioware-hydra**
+device agent installs/restarts it on fleet devices (`harness_install` /
+`harness_restart`) and proxies `/api/*` over its outbound WS (`harness_http`)
+— no harness port is ever exposed on the network. Windows devices run it via
+Docker Desktop/WSL2, which is what makes Windows a supported placement.
+Fleet orchestration (placement, migration, offload, aggregated monitoring)
+lives in Hydra's `/fleet/*` REST + `/fleet-mcp` MCP (alias `hydrafleet`,
+access group `fleet-runners`); CT110 stays registered as the `external`
+primary + fallback node. See `docker/README.md` and
+`tasks/TEMPLATE-overseer-hierarchy.md` §Addressing.
+
 ## 3. Our modifications on top of upstream
 
 | Commit | What | Why |
