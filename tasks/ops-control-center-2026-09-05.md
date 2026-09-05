@@ -3,7 +3,7 @@
 **Owner session:** Claude Code `6803faad-e27d-43c0-8150-328e549e1fb1` (cwd `c:\Users\PaxtonTait\source\cognizioware-mcp-tools`).
 The overseer (LongHorizon-Harness session) is the MANAGER for this task: it created the worktree, launched and monitors the harness run,
 and schedules the owner's post-processes. The owner session applies its plan's post-run steps (PRs, cross-link PR) when the overseer says go.
-**Harness run:** `20260905T091620Z_4a316bf3` (WSL workbench, relaunched 2026-09-05 09:16 PT; first attempt 2ff4e39d was launched with the wrong payload keys and stopped at round 2). Manager is `kimi-k2.7-code:cloud` for this run (see template: glm-5.3 manager thinking-block failure).
+**Harness run:** `20260905T101715Z_c80b1224` (attempt 3, 2026-09-05 10:17 PT, manager/executor `kimi-k2.7-code:pool`, auditor `kimi-k3:pool`). Earlier: 2ff4e39d (wrong payload keys), 4a316bf3 (died on Ollama quota: prax211 session limit; PR-A committed as 375326a).
 **Authoritative spec (read FIRST, follow exactly):** `C:\Users\PaxtonTait\.claude\plans\c-users-paxtontait-source-claims365-lab-snoopy-rossum.md`
 (WSL `/mnt/c/Users/PaxtonTait/.claude/plans/c-users-paxtontait-source-claims365-lab-snoopy-rossum.md`).
 **Harness workspace (dedicated worktree, WSL-created and LOCKED):** `/mnt/c/Users/PaxtonTait/source/cognizioware-mcp-tools-ops`

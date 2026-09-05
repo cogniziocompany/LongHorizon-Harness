@@ -244,3 +244,18 @@ an operator stop with a rationale marking it complete-at-boundary (not a failure
 - Before launching on a repo: `grep -n hooks .claude/settings.json` in the workspace; any hook that writes inside the repo must be guarded the
   same way (the powerplatform repo also has a graphify post-commit hook writing `graphify-out/.hook.log`).
 - When a run audits `blocked/violation` for 3+ consecutive rounds with commits landing, read the auditor's integrity reason before spending rounds.
+
+## Ollama Cloud pool: why it never engaged, and the `:pool` model groups (2026-09-05)
+- Prod LiteLLM (CT202) had `routing_strategy: least-busy` in the DB `router_settings` (DB overrides YAML). A lane that fails instantly
+  (quota 429 → APIConnectionError, which never triggered cooldown: `Cooldown Deployments=[]` all day) always looks least busy, so 99.9% of
+  Claude Code traffic pinned to the ptait01 relay (identity prax211) until prax211 hit its session usage limit; the direct `openai/`
+  deployments (KEY_1/2/3) got 2 of ~5,200 selections. Switched the DB setting to `simple-shuffle`.
+- Direct lanes that the anthropic `/v1/messages` bridge actually uses: `ollama_chat/<model>` with `api_base: https://ollama.com` and
+  `api_key: os.environ/OLLAMA_CLOUD_KEY_n` (ollama_chat sends the bearer). Added DB model groups `kimi-k2.7-code:pool`, `kimi-k3:pool`,
+  `glm-5.3:pool` (KEY_2 ai-dev01 + KEY_3 ai-dev02, rpm 40 each; KEY_1 prax211 to be added when its window resets), plus a KEY_2 lane in
+  `kimi-k2.7-code:cloud`. Virtual keys have model allow-lists: `lh-harness`, `hive-mind-contact-memory`, `hive-eval-run-20260818` were
+  extended with the `:pool` names (3 keys under the missing `librechat` team could not be updated).
+- Harness standard until Paxton says otherwise: manager `kimi-k2.7-code:pool` · executor `kimi-k2.7-code:pool` · auditor `kimi-k3:pool`.
+  These live only in the LiteLLM DB — port them into `infrastructure/litellm-config.yaml` (repo) so a deploy does not lose them.
+- Diagnosis commands: `/model/info` (deployments per group), router log `get_available_deployment ... api_base` counts, `/v1/messages` probe
+  with the master key, direct `https://ollama.com/v1/chat/completions` per key for quota.
