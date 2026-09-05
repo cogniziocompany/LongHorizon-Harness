@@ -51,3 +51,16 @@ HARD RULES: no secrets or real key values anywhere (placeholders only); no host/
 5. Merge → normal lane (E2E gate → UAT litellm → QA gate → CT202 deploy → QA verify → smoke). Watch the first run: the .NET SDK image pull is ~800 MB
    against the 30-min job timeout. Then verification per spec: `docker compose ps` healthy ×3, `/ping` 200, unauth `/` → 302 to login.microsoftonline.com,
    Global.Admin sign-in shows the footer email (Paxton), Caddy log shows the `ops.` cert, next `main` push ingests e2e (202) and the E2E page shows it.
+
+## Operator log (2026-09-05)
+- Entra: Paxton created a DEDICATED app `ops.easybutt0n.ai`, client `2562701c-211c-44cf-bb2c-25c605ad875e`, tenant `d647920c-…`; secret `control-panel-ops`
+  expires **2028-09-04** (spec §3 fallback path — App Roles `Global.Admin`/`Billing.Admin` must be defined on THIS app and assigned; Web redirect
+  URI `https://ops.easybutt0n.ai/oauth2/callback`; optional `email` claim). Not the 240a59df admin app.
+- CT202 `mcp-tools.env` (backup `mcp-tools.env.bak-<ts>` beside it): OPS_PUBLIC_URL, OPS_AZURE_CLIENT_ID, OPS_AZURE_CLIENT_SECRET, OPS_COOKIE_SECRET,
+  OPS_INGEST_KEY, OPS_ALLOWED_ROLES, OPS_GITHUB_REPO, OPS_LITELLM_KEY (virtual key alias `ops-control-center`, all 22 MCP access groups, no budget). Done.
+- GitHub secret `OPS_INGEST_KEY` on cogniziocompany/cognizioware-mcp-tools. Done.
+- Pi-hole (LXC 105, snapshot `pre-ops-record-20260905`): `192.168.21.161 ops.easybutt0n.ai` added; resolves. Done.
+- Cloudflare: CNAME `ops` → `litellm.easybutt0n.ai`, grey cloud (Paxton, via dashboard).
+- Side fix while here: the CT202 LiteLLM DB `litellm_settings` had `mcp_semantic_tool_filter` re-enabled with `text-embedding-3-small` (no deployment →
+  ~8k "no healthy deployments" errors/24h since 06:39). Removed the key from `LiteLLM_Config` (same surgical recipe as 2026-04-05). Container restart
+  pending a quiet window if the errors persist.
