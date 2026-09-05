@@ -1,0 +1,45 @@
+# lh-harness-node — one harness fleet node, managed by the Hydra device agent.
+#
+#   LH_HARNESS_WEB_TOKEN=<token> docker compose -f docker/compose.node.yml up -d
+#
+# The web API is published on loopback ONLY; the Hydra device agent proxies
+# /api/* over its outbound WS (harness_http). Never publish 8799 on 0.0.0.0.
+services:
+  lh-harness-node:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: lh-harness-node:latest
+    container_name: lh-harness-node
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LH_NODE_HOST_PORT:-8799}:8799"
+    environment:
+      LH_HARNESS_WEB_TOKEN: ${LH_HARNESS_WEB_TOKEN:?required}
+      # LiteLLM routing for the claude_code adapter + model discovery.
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://litellm.easybutt0n.ai}
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+      # Fleet-default config seeds (see docker/entrypoint.sh).
+      LH_NODE_AGENT: ${LH_NODE_AGENT:-claude_code}
+      LH_NODE_MODEL: ${LH_NODE_MODEL:-kimi-k2.7-code:cloud}
+      LH_NODE_MANAGER_MODEL: ${LH_NODE_MANAGER_MODEL:-}
+      LH_NODE_EXECUTOR_MODEL: ${LH_NODE_EXECUTOR_MODEL:-}
+      LH_NODE_AUDITOR_MODEL: ${LH_NODE_AUDITOR_MODEL:-kimi-k3:cloud}
+      LH_NODE_MAX_ROUNDS: ${LH_NODE_MAX_ROUNDS:-25}
+      LH_NODE_GUARD_EXCLUDE_PATHS: ${LH_NODE_GUARD_EXCLUDE_PATHS:-node_modules,graphify-out,logs}
+      LH_NODE_TIMEOUT_MANAGER: ${LH_NODE_TIMEOUT_MANAGER:-300}
+      LH_NODE_TIMEOUT_GUI_EXECUTOR: ${LH_NODE_TIMEOUT_GUI_EXECUTOR:-5400}
+      LH_NODE_TIMEOUT_CLI_EXECUTOR: ${LH_NODE_TIMEOUT_CLI_EXECUTOR:-5400}
+      LH_NODE_TIMEOUT_AUDITOR: ${LH_NODE_TIMEOUT_AUDITOR:-600}
+      # Web workbench defaults surfaced in /api/meta.
+      LH_HARNESS_WEB_DEFAULT_AGENT: ${LH_NODE_AGENT:-claude_code}
+      LH_HARNESS_WEB_DEFAULT_MODEL: ${LH_NODE_MODEL:-kimi-k2.7-code:cloud}
+    volumes:
+      - lh-harness-work:/home/harness/work
+      - lh-harness-runs:/home/harness/runs
+      # Read-only deploy key for repo checkouts (optional).
+      - ${LH_NODE_SSH_DIR:-./.node-ssh}:/home/harness/.ssh:ro
+
+volumes:
+  lh-harness-work:
+  lh-harness-runs:
