@@ -49,3 +49,8 @@ Branch from `origin/main` (worktree from WSL, locked); put this file's absolute 
   or a forwarded header Kestrel refuses. Probe matrix (direct+Host, direct+X-Forwarded-*, via oauth2-proxy) results are in the overseer log.
 - The lane's ingest step masks this with `curl -sf` → only `::warning::Ops control center E2E ingest failed`. Add `-w '%{http_code}'`
   and print the body on failure in the workflow step (one line, allowed).
+- Probe matrix result: direct 202; direct + `Host: ops.easybutt0n.ai` 202; direct + X-Forwarded-Proto/For 202; direct + X-Forwarded-Host 202;
+  **via ops-oauth2-proxy:4180 → 400** (oauth2-proxy access log: `POST "/api/ingest/e2e" 400 0 0.001`). So the proxy alters/drops the POST body
+  on its skip-auth route. Overseer fix shipped: mcp-tools **#71** — Caddy routes `/api/ingest/*`, `/api/doctor`, `/healthz` straight to the app
+  (bearer-key gated, no forwarded identity). Item 8 for the owner is now: confirm ingest lands after the next main push, and optionally find
+  the oauth2-proxy cause (version/flag) for the record.
