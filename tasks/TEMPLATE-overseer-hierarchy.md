@@ -259,3 +259,7 @@ an operator stop with a rationale marking it complete-at-boundary (not a failure
   These live only in the LiteLLM DB — port them into `infrastructure/litellm-config.yaml` (repo) so a deploy does not lose them.
 - Diagnosis commands: `/model/info` (deployments per group), router log `get_available_deployment ... api_base` counts, `/v1/messages` probe
   with the master key, direct `https://ollama.com/v1/chat/completions` per key for quota.
+
+## Deploy authority (revised 2026-09-05)
+Paxton: prod deploys/flips through the repo pipelines are auto-approved — no per-deploy "go". Gates still decide (stop on red), rollbacks
+stay documented, and the hard constraints remain (no ptait09 reboots, no bare `docker compose up`, no `git add -A`, no secrets in docs).
