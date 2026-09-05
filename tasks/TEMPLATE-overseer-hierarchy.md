@@ -263,3 +263,11 @@ an operator stop with a rationale marking it complete-at-boundary (not a failure
 ## Deploy authority (revised 2026-09-05)
 Paxton: prod deploys/flips through the repo pipelines are auto-approved — no per-deploy "go". Gates still decide (stop on red), rollbacks
 stay documented, and the hard constraints remain (no ptait09 reboots, no bare `docker compose up`, no `git add -A`, no secrets in docs).
+
+## "Green" lanes that deploy nothing (learned 2026-09-05, mcp-tools run 33983953419)
+- A step that loops `while read … < file` and calls `ssh`/`scp` inside consumes the rest of the file on the first iteration: only the
+  first build context was ever synced/built. Always `ssh -n` / `scp … < /dev/null` inside read loops.
+- `cmd 2>&1 | tail -N` returns tail's status: without `set -o pipefail` a failed `docker compose up` still exits 0 and the job goes green.
+- Verify a deploy on the box, not from the job colour: `docker ps` for the new services, `docker images` for the new tag, public `/ping`.
+  The ops lane was green while Caddy returned 502 (`lookup ops-oauth2-proxy: no such host`). Fixed in mcp-tools #66.
+- Shell hygiene for the overseer itself: background/tool commands reset cwd; use absolute paths or `git -C <repo>` for every git command.
