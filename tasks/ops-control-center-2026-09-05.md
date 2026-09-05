@@ -64,3 +64,11 @@ HARD RULES: no secrets or real key values anywhere (placeholders only); no host/
 - Side fix while here: the CT202 LiteLLM DB `litellm_settings` had `mcp_semantic_tool_filter` re-enabled with `text-embedding-3-small` (no deployment →
   ~8k "no healthy deployments" errors/24h since 06:39). Removed the key from `LiteLLM_Config` (same surgical recipe as 2026-04-05). Container restart
   pending a quiet window if the errors persist.
+
+## Completion (2026-09-05 ~11:15 PT)
+Run `20260905T101715Z_c80b1224` completed (8 rounds, final audit complete/clean/aligned) and was ended at its completion gate.
+Branch `feat/ops-control-center`: 375326a PR-A · de005b5 PR-B · 236e653 e2e suite **32** (29-31 taken) + suite 26 · 1945dad/f740635 handoff ·
+51c6b36 kb-hook fix (overseer) · **ea19a1f (overseer)**: the run's Caddyfile sync step would have failed on deploy (copied PVE /tmp inside pct exec,
+validated a host path inside the caddy container, `mv` on a single-file bind mount → old inode); replaced with pct push → docker cp + validate
+in-container → overwrite in place with `cat >` → reload. Overseer review: workflow diff limited to the allowed additions, strict YAML clean,
+both live Caddyfile hunks retained, no secret values. Owner 6803faad given GO to push + PR (no merge: merge = prod deploy, needs Paxton).

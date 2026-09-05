@@ -181,3 +181,9 @@ This task uses them as follows:
 
 This is additive to the design doc — it doesn't replace the factory's Postgres state or the existing Langfuse tracing.
 
+
+## Promotion pipeline (2026-09-05)
+Run 7dc4b478 (died on Ollama quota at r16) → `20260905T101725Z_bd00534f` (`:pool` trio) verified completion at r3. Branch `ci/env-promotion`
+(6b41a4a promote.yml + eval-gate.yml dual-eval, scripts/promotion/README.md, actionlint; aac0d46 kb-hook fix) stacks on the never-pushed
+factory lineage, so both were pushed and opened as stacked PRs: **#39** `feat/factory-environments` → develop, **#40** `ci/env-promotion` → #39.
+First real promote run needs the `production` environment approval. Login-MRU: **#38** (owner 2e684a91) — also removed tracked `kb-article/.env`.

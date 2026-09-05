@@ -40,3 +40,10 @@ Completion = commits + hashes per deliverable, test output quoted, operator-step
 1. PR feat/auth-broker-login-lxc -> main (stacked on the pac PR #61; merge order pac -> broker).
 2. Operator: create CT208 with create-lxc.sh (ptait01 pct), install Docker, place auth-broker.env, compose up; DNS + Caddy; run the login-and-prove episode inside the LXC; collect PNG proof + auth_status.
 3. cognizioware-qa gate before any CT202 deploy (target=litellm on UAT) + npm run test:auth-broker, suites 17/20/23/29 from the LAN runner; then merge -> CI lane (QA gate sits between UAT and prod) -> CT202 env fills -> pac-mcp restart -> verification per the plan. If QA lacks a compatible check, notify Paxton.
+
+## Completion (2026-09-05 ~11:45 PT)
+Runs: 2a38855a (failed r7-8, glm-5.3 manager thinking-block) → 50a5c48c (died: prax211 Ollama quota) → `20260905T101725Z_2b308880` on the
+`:pool` trio completed all eight deliverables (12 rounds, clean audits). Branch `feat/auth-broker-login-lxc`: 23f4f05 c6f29ad f8bc0ff (1) ·
+c42b824 (2) · 1139e5b (3) · 46a39dd (4) · aa7e651 441b825 (5) · b6e8091 (6, suite 31) · 465f9eb (7) · f0e6ab3 (8) · 11faf4b kb-hook (overseer).
+Review: 31 files, no `.github` changes, YAML parses, placeholders only. Owner d33948bb given GO to push + PR stacked on pac #61.
+Operator steps (CT208 create, auth-broker.env, DNS/Caddy route, CT202 env fills) wait for Paxton's go.
