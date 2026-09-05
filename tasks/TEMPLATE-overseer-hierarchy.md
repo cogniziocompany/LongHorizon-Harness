@@ -233,3 +233,14 @@ an operator stop with a rationale marking it complete-at-boundary (not a failure
   mechanism that disqualified glm-5.3-flash for the executor seat. Resume re-fails immediately (same prompt).
 - Mitigation used: manager `kimi-k2.7-code:cloud` (executor model; handles far larger prompts through the same relay), auditor `kimi-k3:cloud`.
   Paxton set the glm-5.3 manager standard; report the deviation and let him confirm or pick another thinking-free manager.
+
+## Repo-level Claude hooks poison harness audits (learned 2026-09-05, run 13ccf895)
+- cognizioware-powerplatform and cognizioware-mcp-tools commit `.claude/settings.json` hooks that run `kb-article/kb-hook.py` on PostToolUse/Stop.
+  Inside a harness run every manager/executor/auditor `claude --print` phase fires them: the hook wrote `kb-article/kb-hook.log` into the
+  workspace (the auditor's integrity check then voids EVERY audit as "workspace mutated") and filed a `[session-end]` KB article per phase.
+  Run 13ccf895 burned all 25 rounds on `blocked/violation` with finished code on the branch.
+- Fix shipped (harness 375778c; worktrees 51c6b36 ops, 11faf4b broker, 19e9072 mru, aac0d46 ci/env-promotion): kb-hook.py exits when
+  `LH_HARNESS_CLAUDE_ROLE` (set by the harness on every phase) or `KB_HOOK_DISABLE` is present and logs to `~/.claude/kb-hook.log`.
+- Before launching on a repo: `grep -n hooks .claude/settings.json` in the workspace; any hook that writes inside the repo must be guarded the
+  same way (the powerplatform repo also has a graphify post-commit hook writing `graphify-out/.hook.log`).
+- When a run audits `blocked/violation` for 3+ consecutive rounds with commits landing, read the auditor's integrity reason before spending rounds.
