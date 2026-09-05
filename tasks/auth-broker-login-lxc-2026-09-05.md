@@ -49,3 +49,14 @@ Review: 31 files, no `.github` changes, YAML parses, placeholders only. Owner d3
 Operator steps (CT208 create, auth-broker.env, DNS/Caddy route, CT202 env fills) wait for Paxton's go.
 
 PR: mcp-tools **#65** `feat/auth-broker-login-lxc` → `feat/pac-dataverse-mcp` (stacked on #61; retarget to main after #61 merges).
+
+## Operator log (2026-09-05, overseer)
+- CT208 `cognizioware-auth-broker` on ptait01 at **192.168.21.166** (`.163` is the pp dev host). Needed: Pi-hole resolver via `pct set --nameserver`
+  + restart (template inherits the host's Tailscale DNS), and `firewall=1` removed from net0 (blocked all traffic; CT202 runs without it).
+  create-lxc.sh fixed on the branch (3ed462e). Docker 29.8 / compose v5.5.
+- `/opt/auth-broker/auth-broker.env` (600 root) with tenant, public client, ai-dev01 ROPC account, dataverse URL, broker token, cache key.
+  Repo contexts under `/opt/auth-broker/repo/infrastructure/`. `msal-broker` healthy on :3125/:3126; real ROPC token for dataverse acquired;
+  token store persists after `chown node:node /data` (EACCES before).
+- Pi-hole `192.168.21.161 auth-broker.lan.easybutt0n.ai`; Caddy route on the branch (8dbb9d1) → 192.168.21.166:3125; CT202 mcp-tools.env
+  got AUTH_BROKER_TOKEN, AUTH_BROKER_MCP_URL, PAC_DEV_* (username/password fallback; SPN ids still blank).
+- Gaps left on PR #65: `lh-harness` service has no Dockerfile; `playwright-login` Dockerfile patch no longer matches playwright/mcp:latest.
