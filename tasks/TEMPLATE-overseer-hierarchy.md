@@ -77,6 +77,12 @@ repo; I monitor you.
    batched deploy window. Acknowledge with your monitoring plan.
 ```
 
+## Task-text rule (learned twice on 2026-09-05)
+The harness worker sees ONLY the `task` string — never the task file's header, tables, or
+"spec at the path above". Put the authoritative spec's absolute path (WSL form for WSL runs)
+INSIDE the task text as its first sentence, plus the workspace path and branch. A run that
+cannot find its spec will gate on "spec not found" and burn a round.
+
 ## Overseer duties that stay central
 
 - **One run per working tree.** Two runs sharing a checkout collide on the git index; a
