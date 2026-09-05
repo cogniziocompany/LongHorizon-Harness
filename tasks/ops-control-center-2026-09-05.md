@@ -83,3 +83,7 @@ XRM_BUILD_GH_TOKEN) and #68 (dataverse-data-mcp has no lockfile → npm install)
 to login.microsoftonline.com with client 2562701c; `/healthz` 200; `/api/doctor` 401 without key; socket-proxy POST → 403; LE cert valid
 to 2026-12-04. Leftover: ops-oauth2-proxy healthcheck uses wget (distroless image has none) → shows "unhealthy" while serving correctly.
 Waiting on Paxton's sign-in proof (footer email, seven pages, Run doctor).
+- 23:41 PT: Paxton signed in (Entra gate + pages + doctor run) — ops sign-in proof DONE. Doctor exposed graphify-mcp restart loop (mcp 2.x
+  removed AnyUrl; #70 pins mcp<2) and six app-side probe bugs (task ops-control-center-fixes-2026-09-05.md, owner 6803faad).
+- 23:26-23:44 PT prod billing restart loop: autoheal restarted mcp-billing-service every ~3 min because the new build's /api/health takes 15 s
+  (secondary-DB probe) vs the 10 s healthcheck timeout; healthcheck now hits /api/v1/admin/auth-config (a4c1dff on the prod branch).
