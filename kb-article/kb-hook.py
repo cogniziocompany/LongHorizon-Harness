@@ -90,7 +90,9 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-LOG_FILE = SCRIPT_DIR / "kb-hook.log"
+# Log OUTSIDE the repo: writing inside the workspace mutates it during lh-harness audits
+# (every audit of run 13ccf895 was voided by kb-article/kb-hook.log changing). Override with KB_HOOK_LOG.
+LOG_FILE = Path(os.environ.get("KB_HOOK_LOG") or (Path.home() / ".claude" / "kb-hook.log"))
 ENV_FILE = PROJECT_ROOT / ".claude" / "kb-hook.env"
 
 DEFAULT_WEBHOOK = "http://192.168.21.161:3114/api/kb/articles"
@@ -515,6 +517,10 @@ def _handle_stop(session_id: str) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # lh-harness worker phases (manager/executor/auditor) run claude --print with this env set;
+    # they must not file KB articles per phase nor touch the workspace. Exit before reading stdin.
+    if os.environ.get("LH_HARNESS_CLAUDE_ROLE") or os.environ.get("KB_HOOK_DISABLE"):
+        return
     try:
         raw = sys.stdin.read()
         if not raw.strip():

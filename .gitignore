@@ -49,3 +49,6 @@ env.local.sh
 
 # Hook/runtime logs
 *.log
+
+# kb hook log now lives in ~/.claude; ignore any legacy in-repo copy
+kb-article/kb-hook.log
