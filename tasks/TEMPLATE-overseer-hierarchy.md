@@ -206,3 +206,16 @@ branch with green tests; the deploy is explicitly OUT OF SCOPE and operator-exec
 Otherwise the manager can never satisfy its completion rule and will raise the same
 "authorize the next step" ask every round regardless of your answers — the only clean close is
 an operator stop with a rationale marking it complete-at-boundary (not a failure).
+
+## WSL worktrees for harness runs (learned 2026-09-05, broker run 2a38855a)
+- Create the run worktree FROM WSL (`git worktree add -b <branch> /mnt/c/... origin/<base>`) so the worker's git works, then IMMEDIATELY
+  `git worktree lock /mnt/c/... --reason "lh-harness run <id> (WSL paths; do not prune from Windows)"`.
+- Windows git cannot resolve the `/mnt/c/...` gitdir pointer, lists the worktree as `prunable`, and `git worktree prune` / `git worktree remove`
+  run from Windows DELETES the live worktree's admin entry. The worker then sees "not a git repository", and a resourceful executor falls back
+  to committing through the main checkout with `--git-dir/--work-tree` — its commit lands on whatever branch the main checkout has out
+  (this put msal-broker work on `ci/qa-gate-uat-prod`). Locked worktrees are exempt from prune.
+- Never run `git worktree prune`/`remove` from Windows git in a repo that has WSL worktrees. Clean up finished worktrees from WSL only.
+- Repair if it happens: recreate `.git/worktrees/<name>/{gitdir,commondir,HEAD}` (gitdir = `/mnt/c/.../<wt>/.git`, commondir = `../..`,
+  HEAD = `ref: refs/heads/<branch>`), then `git reset -q` inside the worktree from WSL to rebuild the index (files untouched), re-commit the
+  stray commit on the right branch by explicit path, `git reset --mixed` the main checkout back, and send the run an instruction naming the fix.
+- Task text for every run: "never cd into or run git against <main checkout>; plain git commands only (never --git-dir/--work-tree)".
