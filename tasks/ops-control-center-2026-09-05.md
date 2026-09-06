@@ -87,3 +87,6 @@ Waiting on Paxton's sign-in proof (footer email, seven pages, Run doctor).
   removed AnyUrl; #70 pins mcp<2) and six app-side probe bugs (task ops-control-center-fixes-2026-09-05.md, owner 6803faad).
 - 23:26-23:44 PT prod billing restart loop: autoheal restarted mcp-billing-service every ~3 min because the new build's /api/health takes 15 s
   (secondary-DB probe) vs the 10 s healthcheck timeout; healthcheck now hits /api/v1/admin/auth-config (a4c1dff on the prod branch).
+- 2026-09-06 01:00 PT: #70 (graphify pin), #71 (Caddy key-gated bypass), #72 (owner's v1 follow-ups) all deployed via green lanes. Doctor: 64
+  checks, 0 failures, 5 warnings (3 tailnet not-probed, e2e ingest pending next main push, OPS_GITHUB_TOKEN now set + container recreated).
+  Certs parse with real CN/issuer/days. No-key ingest → 401 JSON. Ops Control Center task COMPLETE.
