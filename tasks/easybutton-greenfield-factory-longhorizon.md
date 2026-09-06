@@ -187,3 +187,6 @@ Run 7dc4b478 (died on Ollama quota at r16) → `20260905T101725Z_bd00534f` (`:po
 (6b41a4a promote.yml + eval-gate.yml dual-eval, scripts/promotion/README.md, actionlint; aac0d46 kb-hook fix) stacks on the never-pushed
 factory lineage, so both were pushed and opened as stacked PRs: **#39** `feat/factory-environments` → develop, **#40** `ci/env-promotion` → #39.
 First real promote run needs the `production` environment approval. Login-MRU: **#38** (owner 2e684a91) — also removed tracked `kb-article/.env`.
+
+## Promotion pipeline first runs (2026-09-06)
+- #41 #42 admin-merged 02:12 on Paxton delegation (workflow-only). promote.yml registered on main. Run 34005196138 failed all Secondary CE QA gates: dispatch used ref main but cognizioware-qa default branch is master (422). Fixed in #44 (main, admin-merged) + #45 (develop). Run cancelled; run 2 = 34005319604 (develop build, is_production=true, production gate approved by overseer per pre-approval).

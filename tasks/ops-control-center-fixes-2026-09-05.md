@@ -70,3 +70,4 @@ probe paths, 403 pass, billing /admin/, token presence, Read-me identity). Overs
 - Open: why v7.8.0 with `OAUTH2_PROXY_PASS_USER_HEADERS=true` / `PREFER_EMAIL_TO_USER=true` does not inject `X-Forwarded-Email` upstream.
   Startup log also warns the session exceeds 4 KB (multiple cookies) — consider `OAUTH2_PROXY_SESSION_STORE_TYPE=redis` or trimming scopes.
   This also explains why the footer never showed the email before #72.
+- 2026-09-06 02:30 PT: #73 (accept identity from any forwarded header) deployed via green lane; OPS_REQUIRE_FORWARDED_IDENTITY override removed and ops-control-center recreated: no header 403, X-Forwarded-User-only 200, anonymous public 302 to login. Regression CLOSED.
