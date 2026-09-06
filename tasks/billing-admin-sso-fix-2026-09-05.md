@@ -55,3 +55,5 @@ rollback line. Auditor: no git fetch.
    ghcr…billing-service:sha-44c4ccc → mcp-billing-service:latest + compose up + remove the two env lines.
 4. Verify per spec: auth-config JSON, container logs show `/api/v1/admin/config/me - 200` after Paxton signs in as paxton@cognizio.company (Global
    Admin badge), no new JWT audience/issuer failures, API-key paths unchanged. Then update memory `billing-service-deploy-path.md`.
+
+- 2026-09-06 01:45 PT: Paxton signed in to prod /admin/ — Global Admin badge + Infra link confirmed. SSO task COMPLETE (prod branch reconciliation #66 remains for the owner).
