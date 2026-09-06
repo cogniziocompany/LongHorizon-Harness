@@ -38,3 +38,6 @@ secrets; flag tracked `cloudflare/credentials.json`; no push; no PR #66 actions;
 3. Overseer Fix 1c: close PR #66 with the measured reasons and links to the replacement PRs; keep the branch.
 4. Overseer Fix 2: after 1a merges → release fast-forward (uat), then prod rebuild from develop on CT100 with `PARTNER_API_KEY` set; verify; then
    the QA billing gates (uat, prod) must stay 100.
+
+## Completed (2026-09-06 03:00 PT)
+Run 1eeb4daf done in 4 rounds (one early audit violation, then clean): fix/prod-compose-env @ a54d29dd (compose + cloudflare/prod.config.yaml + docs/handoffs/pr66-reconciliation-2026-09-06.md; src/ diff empty) and fix/admin-loading-states @ 54632ed1 (index.html only). Owner cec370bb given GO (push, two PRs, Slow-3G check). Fix 1c DONE: #66 closed with measured reasons. Fix 2 pending the compose PR merge → prod rebuild from develop with PARTNER_API_KEY.

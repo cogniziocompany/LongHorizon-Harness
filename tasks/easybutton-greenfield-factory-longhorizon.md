@@ -190,3 +190,4 @@ First real promote run needs the `production` environment approval. Login-MRU: *
 
 ## Promotion pipeline first runs (2026-09-06)
 - #41 #42 admin-merged 02:12 on Paxton delegation (workflow-only). promote.yml registered on main. Run 34005196138 failed all Secondary CE QA gates: dispatch used ref main but cognizioware-qa default branch is master (422). Fixed in #44 (main, admin-merged) + #45 (develop). Run cancelled; run 2 = 34005319604 (develop build, is_production=true, production gate approved by overseer per pre-approval).
+- promote runs 2-4 (2026-09-06 02:3x): poll step unauthenticated (#46 Authorization header, #48 GITHUB_TOKEN env), then image race (develop head not yet built). Run 5 waits for develop CI then dispatches.
