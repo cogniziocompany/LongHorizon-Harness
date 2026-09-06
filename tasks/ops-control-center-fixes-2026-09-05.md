@@ -54,3 +54,10 @@ Branch from `origin/main` (worktree from WSL, locked); put this file's absolute 
   on its skip-auth route. Overseer fix shipped: mcp-tools **#71** — Caddy routes `/api/ingest/*`, `/api/doctor`, `/healthz` straight to the app
   (bearer-key gated, no forwarded identity). Item 8 for the owner is now: confirm ingest lands after the next main push, and optionally find
   the oauth2-proxy cause (version/flag) for the record.
+
+## Resolved by owner (2026-09-06 00:30 PT) — mcp-tools **#72** merged (24a4c8b)
+Owner's root cause for item 8 (three stacked): ops-oauth2-proxy strips `Authorization` on skip-auth routes (PASS_AUTHORIZATION_HEADER) →
+body-less 401 → status-code-pages re-executed it into the Blazor not-found page → antiforgery turned it into an empty 400 → `curl -sf` hid it.
+Fixes: key also in `X-Ops-Ingest-Key`; JSON bodies on all API errors; status-code pages no longer wrap `/api`; PASS_AUTHORIZATION_HEADER off;
+lane prints `ops ingest -> HTTP <code>`; `skips: []` fallback. Items 1-7 fixed in the same PR (real cert CN/days on all nine rows, /mcp/ path,
+probe paths, 403 pass, billing /admin/, token presence, Read-me identity). Overseer's #71 (Caddy bypass for the key-gated paths) is also in.
