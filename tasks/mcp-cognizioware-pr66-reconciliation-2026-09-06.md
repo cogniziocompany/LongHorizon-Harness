@@ -45,3 +45,4 @@ Run 1eeb4daf done in 4 rounds (one early audit violation, then clean): fix/prod-
 ## Fix 2 DONE (2026-09-06 03:55 PT)
 #68 + #69 merged (2f939e39, 880f3d9f); #62 (stale July overlap) closed as superseded; release fast-forwarded → uat lane on sha-880f3d9. CT100 prod rebuilt from origin/develop source (src + infra prod compose + cloudflare prod config) with root compose Partner__ApiKey=${PARTNER_API_KEY} and a fresh PARTNER_API_KEY in .env; healthy; auth-config 5651b092 GUID scope; partner endpoint 401 bad key / 400 "customerId is required" with the real key (was 503); Infra button + loading states live; postgres untouched. Billing QA gates dispatched for uat + prod on 880f3d9.
 - 04:10 PT: billing QA gates on 880f3d9: uat 100, prod 100. #66 reconciliation task COMPLETE.
+- Owner note (recorded once, per the dev-lab rotation stance): #62 branch history contains a plaintext partner API key value; closing the PR does not unexpose it.
