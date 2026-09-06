@@ -271,3 +271,110 @@ stay documented, and the hard constraints remain (no ptait09 reboots, no bare `d
 - Verify a deploy on the box, not from the job colour: `docker ps` for the new services, `docker images` for the new tag, public `/ping`.
   The ops lane was green while Caddy returned 502 (`lookup ops-oauth2-proxy: no such host`). Fixed in mcp-tools #66.
 - Shell hygiene for the overseer itself: background/tool commands reset cwd; use absolute paths or `git -C <repo>` for every git command.
+
+## Promotion-pipeline gate lessons (pp promote.yml, runs 6-9, 2026-09-05 evening)
+- **A job-level `permissions:` grant does not reach jobs that have no block.** Run 6's secondary gate polled commit statuses and got 403 "Resource not accessible by integration"; adding `statuses: read` to the three deploy jobs (#51) fixed nothing because the poll runs in the secondary-gate jobs, which inherited the restricted default. Fix = workflow-level `permissions:` (#53): contents/packages/actions/statuses read.
+- **A CE QA dispatch needs `env_id` and the right profile.** `vars.QA_ENV_ID_DEV/UAT/PROD` were unset → the QA run failed validation in 1 s and posted `score=0 suites=0/0`. The ids live in the cognizioware-qa README "CE environment ids" table (set 2026-09-05). The default `trms` profile scores ~26 on the bare powerplatform orgs purely from drift; gate them with `profile=greenfield` (#55). The ce job only fails when the checkpoint-suite step itself fails, and the suite exits 0 on failed checks, so greenfield can pass.
+- **The QA backend for `[self-hosted, qa-host]` is Docker on ptait09** (`cognizioware-qa-backend-1` :8400 + `cognizioware-qa-postgres-1`). Both were `Exited (255)` after a Docker Desktop restart with no restart policy → every CE gate would time out. Restart policy set to `unless-stopped`; check `curl localhost:8400/health` before dispatching a gate.
+- **Image race is a real state, not a flake.** A merge to develop changes the sha the promotion deploys; `Deploy to dev` fails with "no matching manifest … sha-<new>" until the develop CI image build finishes. Wait for the CI run on that sha, then dispatch (promo9-chain.sh pattern).
+
+## Owner-session pings need the FULL session UUID
+`claude --resume 6803faad -p` fails ("not a UUID and does not match any session title"). Resolve it first: `ls ~/.claude/projects/*/6803faad*.jsonl`. ListAgents names never map to these UUIDs.
+
+## Answering a manager question through the API (learned 2026-09-05, run d96ca9e6)
+`POST /api/runs/<id>/approvals/<approval_id>/resolve` with `{"action":"continue","user_input":"<answer>"}`. The answer field is **`user_input`** — `answer` is silently ignored and the manager re-asks the same question next round. Verify with the snapshot: the approval's `user_input` must show your text. Also: files copied into a WSL worktree from Windows are visible immediately, but tell the manager the exact `git status` line so it stops searching.
+
+## Promote by sha, not by branch name (learned 2026-09-05, run 13 + pp #59)
+promote.yml checks out `inputs.ref` in EVERY env job and tags the image `sha-<HEAD>`; dispatching with `ref=develop` means uat/prod can deploy a NEWER
+develop sha than dev tested if anything merges mid-run (a docs-only merge still moves the sha and needs its CI image). Dispatch with the full sha
+(`-f ref=<40-hex>`), and never merge to develop while a promotion is between dev and prod. Pipeline fix pending: resolve the sha once in a first job.
+
+## Commit-status polls must be freshness-bound (learned 2026-09-06, pp promotion run 13)
+Run 13 passed both dev gates, yet the score gate read `score=0`: the poll took the NEWEST `cognizioware-qa/ce-dev` status on `github.sha` (the workflow
+ref, main) with no regard to when this run dispatched, so it matched a stale status from an earlier attempt while its own gate posted 100 a minute
+later. Fix (#60/#61): `caller_sha` and the poll both use the deployed HEAD (`git rev-parse HEAD`), statuses older than the poll start (−3 min) are
+ignored, newest match wins. General rule: any "dispatch then poll a shared status" step needs a dispatch timestamp or a run-specific correlation id.
+
+## Promotion approval watcher must outlive the eval gates (learned 2026-09-06, run 16)
+A full dev+uat pass takes ~3.5 h (two 150-min-capped eval gates); promo7-watch.sh's 400×30 s loop expired before the production gate appeared and
+printed "timeout". Size the watcher loop for ≥ 6 h, or watch `pending_deployments` with a long fallback. Approve with
+`gh api -X POST repos/<r>/actions/runs/<id>/pending_deployments --input <file.json>` (process substitution does not work from git-bash on Windows);
+the response is a list of strings, so don't pipe it through an object jq. Do not merge to develop while a promotion is between dev and prod unless
+the run is pinned to a sha AND its dev stage is already done (a dev-lane redeploy mid-eval disturbs the gate).
+
+## Shared concurrency groups cancel pending promotion gates (learned 2026-09-06, run 16)
+eval-gate.yml used one `concurrency.group: eval-gate` for its schedules AND for the promotion's workflow_call gates. GitHub keeps ONE pending run per
+group: when the 08:00 PT prod schedule queued behind the in-progress 07:00 uat schedule, it evicted promotion run 16's pending prod gate ("cancelled",
+no actor). Fix #68/#69: group per run + tier. Recovery: cancel the queued schedule, `gh run rerun <id> --failed` (re-runs the cancelled job and the
+skipped downstream jobs on the ORIGINAL workflow files). Avoid promotions whose prod stage lands in the 06:00–09:00 PT schedule window until then.
+
+## Zombie-process storm on ptait01 (incident 2026-09-06 ~08:30–09:15 PT)
+Symptom: SSH MCP gateway, LiteLLM and billing all timing out; ptait01 load 334 with no hot process; `ps -eo comm | sort | uniq -c` showed 3,092
+`timeout` entries, all `<defunct>`, parented by the litellm processes in CT204 (1,574) and CT202. LiteLLM spawns `timeout` helpers for MCP/health
+probes and, with no init as PID 1, never reaps them. Restarting the CT204 litellm container took the load from 334 to 51 within 20 s.
+Fix: cognizioware-mcp-tools #75 — `init: true` on litellm-router, doctor row "Compose stack zombie processes" (socket proxy `/containers/{id}/top`,
+warn >5 / fail >50), e2e suite 33 asserting the row is green. Diagnose with a DIRECT `ssh root@<pve>` from Windows (BatchMode works for
+ptait01/ptait07/corsairai300) — the MCP gateway path is itself a casualty when LiteLLM is sick.
+- Follow-up (2026-09-06 09:55 PT): the mcp-tools lane's "Apply LiteLLM config to UAT CT204" job pushes only litellm-config.yaml; CT204 keeps its OWN
+  docker-compose.yml under /opt/cognizioware-mcp-tools, so compose-level fixes (like `init: true`) must be applied there by hand (done; backup
+  docker-compose.yml.bak-init-*). Zombie counts after the fix: CT202 ~0, CT204 recreating. Doctor row live: "Compose stack zombie processes ok=True".
+
+## CI runners live on CT210 (ptait07), not the dev PC (2026-09-06 09:10–11:20 PT)
+Paxton's rule: dev boxes run only active local dev tests and explicit exceptions; every scheduled/PR/promotion/e2e/eval/QA job runs on PVE runners.
+CT210 `ci-runners` (192.168.21.170; Debian 12, Docker, Node 22, pwsh 7.5; user `runner`) hosts `ct210-pp` (self-hosted,Linux,X64,lan-deploy) and
+`ct210-qa` (self-hosted,Linux,X64,qa-host) as systemd services, plus the QA backend compose (/opt/cognizioware-qa/repo, override 8400→4000, data
+migrated from ptait09). Needed on the runner: `/home/runner/.ssh/id_ed25519_proxmox` (deployments/ssh/config), Playwright `--with-deps`, QA health at
+`/api/health`. Proof: the pp prod eval gate ran end-to-end on ct210-pp (15/16; the one failure is the product's multi-webhook-crud QA verdict in
+n8n, not the runner). Remaining Windows-ism in pp workflows: the deploy step's `"C:\Program Files\Git\bin\bash.exe" scripts/deploy/rollout.sh` —
+replace with `bash scripts/deploy/rollout.sh` before the next promotion. New LXCs on any PVE host inherit the host's Tailscale resolver: write
+/etc/resolv.conf (Pi-hole 192.168.21.3 + 1.1.1.1) before apt. `pct set --nameserver` does not change a running container.
+
+## Ollama Cloud quota exhaustion kills every run at once (2026-09-06 17:51–17:57Z)
+Five parallel CT110 runs on the `kimi-k2.7-code:pool` trio drained all three Ollama Cloud accounts (prax211, ai-dev01, ai-dev02: "reached your session
+usage limit"); the :pool groups have no non-Ollama fallback, so all runs failed with `litellm.APIConnectionError … No fallback model group`. Rules: at
+most TWO concurrent :pool runs; before launching, probe quota with a 4-token chat per key (ollama.com/api/chat); when a run fails with this message,
+do NOT relaunch — wait for the session window to reset (probe hourly) then `POST /api/runs/<id>/resume {"mode":"continue"}` on the failed runs two at
+a time. Ask Paxton before buying extra usage.
+
+## Local qwen3.8 executor: use Ollama's OpenAI-compatible endpoint (learned 2026-09-06, run 86cd5320)
+With `ollama_chat/qwen3.8:27b` behind LiteLLM, Claude Code's tool-result turns came back 500 "no user query found in messages" from Ollama and the
+executor looped on api_retry until the episode failed (no LLM traffic, GPUs idle — looks like a hang). Direct `/v1/chat/completions` with tool
+messages worked, so the qwen3.8 deployment is now `openai/qwen3.8:27b` at `http://192.168.21.110:11442/v1`, and the 64k context is pinned with
+`OLLAMA_CONTEXT_LENGTH=65536` on the ptait01 `cognizioware-ollama-span` container (both RTX 3090s, `OLLAMA_SCHED_SPREAD=1`, 12.3 GB each) because
+`/v1` cannot pass num_ctx. Verify a run is alive by `curl :11442/api/ps` (model + ctx 65536 + VRAM) and `nvidia-smi` utilization, not by the run's
+status. Langfuse: the per-key public/secret pair stored in LiteLLM returned 401 on the public API — the read keys need re-issuing before a Langfuse
+review is possible; LiteLLM spend logs by date window are the fallback evidence.
+- Addendum (15:15 PT): the qwen3.8 executor also fails through the OpenAI-compatible route once Qwen3 *thinking* output is present — LiteLLM's
+  Anthropic adapter raises "Content block is not a thinking block" (same bug that killed the glm-5.3 manager). Manager rounds survive (they are
+  single-shot); executor rounds die on the first tool turn. A `/no_think` model variant (`qwen3.8-nothink`, Modelfile SYSTEM "/no_think") was created
+  on the span server but could not be loaded next to the resident 27b model (GPU1 20 GB, host RAM 37/43 GB) within 8 minutes. Verdict: local qwen3.8
+  is usable for MANAGER/AUDITOR roles with a 900 s auditor budget (workspace `.lh-harness/config.toml` `[run.timeouts]`), not for the executor until
+  LiteLLM's thinking-block handling is fixed or a non-thinking local coder model is loaded. The per-workspace config path is what web-launched runs read.
+
+## Local model policy (Paxton, 2026-09-06 16:00 PT)
+Locally we use **qwen3.8 and newer only**, unless an explicit exception is granted. `qwen3-coder:30b` was pulled as a one-off diagnostic and is not a
+lane. Consequence: the local lane needs the LiteLLM thinking-block/tool-turn normalizer (task litellm-thinking-fix-2026-09-06.md) before qwen3.8 can be
+an executor; until then qwen3.8 is manager/auditor only (600/900 s budgets) and executors run on the kimi cloud pool (two concurrent runs max).
+Capacity decision: renting GPU compute is 15–150x the cost of the Ollama subscriptions for our volume (8×H100 ≈ $11.5k/mo; GLM-5.3-Flash is a 320B MoE
+needing ~306 GiB FP8); Paxton is adding Ollama capacity instead (Max or a 4th Pro).
+- 16:30 PT: Paxton added a 4th Ollama Cloud key (alias `litellm-cognizioware`) → stored as `OLLAMA_CLOUD_KEY_4` in CT202 `mcp-tools.env` (effective at the
+  next router recreate) AND added immediately as a 4th DB deployment on `kimi-k2.7-code:pool`, `kimi-k3:pool`, `glm-5.3:pool` via `/model/new` (no
+  restart). Concurrency cap raised to THREE `:pool` runs; the quota probe now checks 4 keys and resumes when ≥3 answer. The :pool groups remain
+  DB-only (todo: port into infrastructure/litellm-config.yaml with `os.environ/OLLAMA_CLOUD_KEY_1..4`).
+
+### Lesson (2026-09-06 16:45 PT): every repo with a `lan-deploy` job needs its own runner registration
+GitHub self-hosted runners are per-repo (no org-level runner group here). Deregistering the PC runners left mcp-cognizioware's deploy job queued
+forever (`self-hosted,lan-deploy`, no runner) — the earlier note "mcp-cognizioware needs no self-hosted runner" was wrong; only its build/image jobs
+are ubuntu-latest. Fix recipe (CT210, user `runner`): registration token via `gh api -X POST repos/<org>/<repo>/actions/runners/registration-token`,
+`tar xzf ../actions-runner-linux-x64-2.337.0.tar.gz` into /home/runner/<name>, `./config.sh --unattended --url … --token … --name ct210-<name>
+--labels lan-deploy --replace`, `./svc.sh install runner && ./svc.sh start`. Then grep the repo's deploy step for pwsh syntax ($LASTEXITCODE, $env:,
+.Substring, bash.exe) and convert to `shell: bash` before the first run. Runners today: ct210-pp, ct210-qa, ct210-billing.
+
+### Incident (2026-09-06 16:52 PT): mcp-tools #77 rewrote 562 files with CRLF — reverted by #78 within 3 minutes
+Cause: `gh repo clone` on Windows with global autocrlf=true, then `git config core.autocrlf false` WITHOUT `git reset --hard` → every
+checked-out file (CRLF) now differed from the index (LF) and `commit -a` swept them all in. I only saw the 563-file stat in the merge output
+because `pr create` and `pr merge` were chained in one command. Rules from now on: (1) clone with `git -c core.autocrlf=false clone …` (or
+config + `reset --hard` BEFORE touching files); (2) never chain `pr create` + `pr merge` — print `git diff --stat origin/<base>` and require the
+expected file count first; (3) prefer editing on CT110/WSL for repos that auto-deploy on main (mcp-tools "Deploy MCP Tools Stack" runs on every
+main push: E2E gate → CT204 config apply + LiteLLM restart → QA gate → CT202 deploy). The CRLF run was cancelled mid QA-gate (CT204 had already
+taken the CRLF config, harmless; the fix run re-applies LF). Main is now pre-#77 + the intended single-file change (verified `git diff --stat`).

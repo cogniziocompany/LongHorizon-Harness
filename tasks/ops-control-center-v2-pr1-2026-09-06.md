@@ -23,3 +23,15 @@ bump + suite 34 · PR 5 docs. Manual runbook items listed in plan §8.
 1. Overseer review (no action endpoints; /api/status has no secret-looking strings; discovery rows match live containers) → merge → lane → verify
    `curl -H "X-Ops-Ingest-Key: $K" https://ops.easybutt0n.ai/api/status` live and the role chip in the footer.
 2. Owner 6803faad: nothing until PR 2 is scheduled; report any deviation from the plan.
+
+## Completed (2026-09-05 19:55 PT)
+Run d2fd4759 finished in 3 rounds (round 1 audit blocked/suspect, then clean): c148083 role tiering + ActionGuard · b4606c2 discovery-driven targets · ef530d0 GET /api/status (+ suite 32 cases, Caddy @keyed + oauth2 skip-auth extended by /api/status* only) · ad23bc4 handoff addendum; 25 files +1118/-19; docker build Release 0 errors, compose smoke, doctor discovery rows quoted. Overseer review passed (ActionGuard order, no action endpoints, no secrets). Completion gate resolved "stop". Owner 6803faad given GO to push + PR → main; overseer merges, watches the ops lane, verifies /api/status on CT202. Next: PR 2 (cloud + langfuse sections) after PR 1 is live.
+
+## Live (2026-09-05 20:15 PT)
+mcp-tools #74 merged; lane 34007673806 all green and honestly deployed (ops-control-center + oauth2-proxy recreated on CT202; LiteLLM and Caddy were
+also recreated — that restart coincided with pp promotion run 9's eval gate and turned its three multistep builds into n8n "Connection error"
+failures; run 10 re-dispatched after the lane). Verified: `/api/status` 401 without key, 200 with X-Ops-Ingest-Key, no secret-looking strings,
+`/data/targets.generated.json` written, Caddyfile mounted read-only. Doctor 90 ok / 24 warn / 4 fail — the 4 fails are discovery false positives for
+PR 2's overrides map: `Service ops-control-center` probes `/mcp` and gets 403 (identity middleware), `playwright-qa1/2/3-mcp` refuse on the first
+private port (should be `skip: true` or the right port). Catalog captured at 03:10 UTC during the LiteLLM restart shows aggregate 0 / "refresh failed";
+expected to recover on the next refresh — check before PR 2.
