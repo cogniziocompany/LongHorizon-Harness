@@ -41,3 +41,6 @@ secrets; flag tracked `cloudflare/credentials.json`; no push; no PR #66 actions;
 
 ## Completed (2026-09-06 03:00 PT)
 Run 1eeb4daf done in 4 rounds (one early audit violation, then clean): fix/prod-compose-env @ a54d29dd (compose + cloudflare/prod.config.yaml + docs/handoffs/pr66-reconciliation-2026-09-06.md; src/ diff empty) and fix/admin-loading-states @ 54632ed1 (index.html only). Owner cec370bb given GO (push, two PRs, Slow-3G check). Fix 1c DONE: #66 closed with measured reasons. Fix 2 pending the compose PR merge → prod rebuild from develop with PARTNER_API_KEY.
+
+## Fix 2 DONE (2026-09-06 03:55 PT)
+#68 + #69 merged (2f939e39, 880f3d9f); #62 (stale July overlap) closed as superseded; release fast-forwarded → uat lane on sha-880f3d9. CT100 prod rebuilt from origin/develop source (src + infra prod compose + cloudflare prod config) with root compose Partner__ApiKey=${PARTNER_API_KEY} and a fresh PARTNER_API_KEY in .env; healthy; auth-config 5651b092 GUID scope; partner endpoint 401 bad key / 400 "customerId is required" with the real key (was 503); Infra button + loading states live; postgres untouched. Billing QA gates dispatched for uat + prod on 880f3d9.
