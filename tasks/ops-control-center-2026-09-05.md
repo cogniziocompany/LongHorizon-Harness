@@ -90,3 +90,4 @@ Waiting on Paxton's sign-in proof (footer email, seven pages, Run doctor).
 - 2026-09-06 01:00 PT: #70 (graphify pin), #71 (Caddy key-gated bypass), #72 (owner's v1 follow-ups) all deployed via green lanes. Doctor: 64
   checks, 0 failures, 5 warnings (3 tailnet not-probed, e2e ingest pending next main push, OPS_GITHUB_TOKEN now set + container recreated).
   Certs parse with real CN/issuer/days. No-key ingest → 401 JSON. Ops Control Center task COMPLETE.
+- 2026-09-06 02:10 PT: Paxton confirmed ops footer shows his email and billing admin badge + Infra link — both sign-in proofs DONE. Enforcement re-enable pending lane d55d6df (#73).
