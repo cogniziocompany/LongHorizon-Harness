@@ -61,3 +61,12 @@ body-less 401 → status-code-pages re-executed it into the Blazor not-found pag
 Fixes: key also in `X-Ops-Ingest-Key`; JSON bodies on all API errors; status-code pages no longer wrap `/api`; PASS_AUTHORIZATION_HEADER off;
 lane prints `ops ingest -> HTTP <code>`; `skips: []` fallback. Items 1-7 fixed in the same PR (real cert CN/days on all nine rows, /mcp/ path,
 probe paths, 403 pass, billing /admin/, token presence, Read-me identity). Overseer's #71 (Caddy bypass for the key-gated paths) is also in.
+
+## Regression after #72 (2026-09-06 01:28 PT) — UI 403 "no forwarded identity" for signed-in users
+- oauth2-proxy (v7.8.0 pinned) logs AuthSuccess with the email and proxies `/`, yet the app's new enforcement returned 403 → `X-Forwarded-Email`
+  is not arriving at the app. Direct test inside the container: `GET /` with `X-Forwarded-Email` → 200, without → 403, so the app logic is right.
+- Mitigation (live): `OPS_REQUIRE_FORWARDED_IDENTITY=0` in CT202 mcp-tools.env + recreate ops-control-center. UI remains reachable only via
+  oauth2-proxy (Caddy routes everything but the key-gated API paths to it), so this only drops the in-app defence-in-depth until fixed.
+- Open: why v7.8.0 with `OAUTH2_PROXY_PASS_USER_HEADERS=true` / `PREFER_EMAIL_TO_USER=true` does not inject `X-Forwarded-Email` upstream.
+  Startup log also warns the session exceeds 4 KB (multiple cookies) — consider `OAUTH2_PROXY_SESSION_STORE_TYPE=redis` or trimming scopes.
+  This also explains why the footer never showed the email before #72.
