@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from lh_harness.adapters.claude_permissions import _AUDITOR_ROLES
+from lh_harness.adapters.claude_code import ClaudeCodeAdapter
 from lh_harness.mcp_profiles import (
     MCP_LAN_GATEWAY_URL,
     MCP_PROD_GATEWAY_URL,
@@ -21,6 +22,7 @@ from lh_harness.mcp_profiles import (
     render_mcp_config,
     resolve_profile,
 )
+from lh_harness.webapi.snapshot import _safe_mcp_profile_resolution, build_snapshot
 
 
 @pytest.fixture
@@ -322,3 +324,77 @@ def test_gateway_configured_reflects_env(clear_mcp_gateway_env, monkeypatch) -> 
     assert gateway_configured() is False
     monkeypatch.setenv("LH_HARNESS_MCP_GATEWAY_KEY", "x")
     assert gateway_configured() is True
+
+
+def test_adapter_honors_allow_auditor_write_mcp(clear_mcp_gateway_env, fake_key, tmp_path) -> None:
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    with pytest.raises(ValueError, match="auditor roles require a read-only profile"):
+        ClaudeCodeAdapter(
+            role="cli_auditor",
+            mcp_profile="ops",
+            run_id="r1",
+            run_dir=str(run_dir),
+            allow_auditor_write_mcp=False,
+        )
+    adapter = ClaudeCodeAdapter(
+        role="cli_auditor",
+        mcp_profile="ops",
+        run_id="r1",
+        run_dir=str(run_dir),
+        allow_auditor_write_mcp=True,
+    )
+    assert adapter.mcp_profile_resolved["name"] == "ops"
+    assert adapter.mcp_profile_resolved["read_only"] is False
+
+
+def test_adapter_writes_profile_resolution_record(clear_mcp_gateway_env, fake_key, tmp_path) -> None:
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    adapter = ClaudeCodeAdapter(
+        role="cli_executor",
+        mcp_profile="default",
+        run_id="r1",
+        run_dir=str(run_dir),
+    )
+    assert adapter.mcp_profile_resolved["name"] == "default"
+    resolution_path = run_dir / "harness" / "mcp_profile_resolution.json"
+    assert resolution_path.is_file()
+    data = json.loads(resolution_path.read_text(encoding="utf-8"))
+    assert data["cli_executor"]["name"] == "default"
+    assert "reason" in data["cli_executor"]
+    assert "source" in data["cli_executor"]
+
+
+def test_safe_mcp_profile_resolution_ignores_malformed_values() -> None:
+    assert _safe_mcp_profile_resolution({"manager": {"name": "ops"}}) == {
+        "manager": {"name": "ops", "reason": "", "source": "", "read_only": None}
+    }
+    assert _safe_mcp_profile_resolution({"manager": {"bad": 1}}) == {}
+
+
+def test_snapshot_includes_mcp_profile_resolution_from_adapter_file(clear_mcp_gateway_env, fake_key, tmp_path, monkeypatch) -> None:
+    from lh_harness.dashboard.state import DashboardState
+
+    root = tmp_path / "runs"
+    run = root / "run-1"
+    logs = run / "logs"
+    logs.mkdir(parents=True)
+    (logs / "role_management").mkdir(parents=True)
+    (logs / "role_management" / "events.jsonl").write_text(
+        json.dumps({"event": "role_harness_start"}) + "\n", encoding="utf-8"
+    )
+    run_dir = run
+    run_dir.mkdir(exist_ok=True)
+    adapter = ClaudeCodeAdapter(
+        role="cli_executor",
+        mcp_profile="ops",
+        run_id="run-1",
+        run_dir=str(run_dir),
+    )
+    assert adapter.mcp_profile_resolved["name"] == "ops"
+    state = DashboardState(logs, runs_root=root, control_enabled=False)
+    snapshot = build_snapshot(state, run_id="run-1")
+    resolution = snapshot["run"].get("mcp_profile_resolution", {})
+    assert resolution.get("cli_executor", {}).get("name") == "ops"
+    assert "reason" in resolution.get("cli_executor", {})

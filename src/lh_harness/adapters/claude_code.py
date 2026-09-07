@@ -51,6 +51,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         reasoning_effort: str | None = None,
         run_id: str | None = None,
         run_dir: str | None = None,
+        allow_auditor_write_mcp: bool = False,
     ) -> None:
         policy = policy_for_role(role)
         effort = normalise_reasoning_effort(reasoning_effort)
@@ -85,6 +86,8 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             if candidate.is_file():
                 mcp_config = str(candidate.resolve())
         generated_mcp_path: str | None = None
+        self.mcp_profile_resolved = {}
+        self.mcp_profile_reason = ""
         if run_id and run_dir and mcp_profile:
             # Resolve and render a harness-owned per-role MCP config.  This
             # happens at adapter construction time because the role does not
@@ -95,6 +98,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                     role,
                     role_profile=mcp_profile,
                     run_profile=mcp_profile,
+                    allow_auditor_write_mcp=allow_auditor_write_mcp,
                 )
                 rendered = render_mcp_config(
                     profile,
@@ -105,6 +109,14 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 )
                 if rendered is not None:
                     generated_mcp_path = str(rendered)
+                self.mcp_profile_resolved = {
+                    "name": profile.name,
+                    "reason": profile.reason,
+                    "read_only": profile.read_only,
+                    "source": profile.source,
+                }
+                self.mcp_profile_reason = profile.reason
+                _record_profile_resolution(run_dir, role, profile)
             except ValueError as exc:
                 # An auditor assigned a non-read-only profile is a configuration
                 # error; fail fast so the operator sees a clear message.
@@ -114,6 +126,8 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 # MCP config; the run proceeds with whatever was explicitly
                 # supplied or none at all.
                 generated_mcp_path = None
+                self.mcp_profile_resolved = {}
+                self.mcp_profile_reason = ""
         resolved_add_dirs = list(add_dirs or [])
         env_add_dirs = os.getenv("LH_HARNESS_CLAUDECODE_ADD_DIRS") or os.getenv(
             "LH_HARNESS_MCP_ADD_DIRS"
@@ -227,6 +241,9 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             if is_auditor_role(self.role)
             else None
         )
+        self.mcp_profile_resolved = {}
+        self.mcp_profile_reason = ""
+
         # Carry per-episode env into the subprocess, removing auditor-unset keys.
         label = _episode_prompt_label(live_trajectory_path)
         if self._env_unset_keys:
@@ -251,6 +268,8 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 "claude_workspace_read_only": self.policy.workspace_read_only,
                 "claude_reasoning_effort": self.reasoning_effort,
                 "lh_session_id": episode_session_id(self.run_id, label, self.role),
+                "mcp_profile": self.mcp_profile_name,
+                "mcp_profile_resolved": self.mcp_profile_resolved,
             }
         )
         _inject_session_header_into_mcp_config(
@@ -329,6 +348,41 @@ def episode_session_id(run_id: str | None, label: str, role: str) -> str:
 def _extract_round_tag(label: str) -> str:
     match = re.match(r"round_\d+", label)
     return match.group(0) if match else "round_unknown"
+
+
+def _record_profile_resolution(
+    run_dir: str | None,
+    role: str,
+    profile: "McpProfile",
+) -> None:
+    """Write a durable record of the resolved MCP profile for snapshot provenance."""
+
+    if not run_dir:
+        return
+    target_dir = Path(run_dir) / "harness"
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    target = target_dir / "mcp_profile_resolution.json"
+    data: dict[str, Any] = {}
+    try:
+        if target.is_file():
+            data = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[role] = {
+        "name": profile.name,
+        "reason": profile.reason,
+        "read_only": profile.read_only,
+        "source": profile.source,
+    }
+    try:
+        target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _inject_session_header_into_mcp_config(

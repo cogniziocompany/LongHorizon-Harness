@@ -92,6 +92,7 @@ def _normalise_role_configs(
     model: str | None,
     reasoning_effort: str | None = None,
     mcp_profile: str | None = None,
+    allow_auditor_write_mcp: bool = False,
 ) -> dict[str, dict[str, str]]:
     """Validate and resolve the three public role bindings.
 
@@ -168,6 +169,7 @@ def _normalise_role_configs(
             role,
             role_profile=result[role].get("mcp_profile"),
             gateway_key="validation-only",
+            allow_auditor_write_mcp=allow_auditor_write_mcp,
         )
         if resolved_mcp.read_only is False and role in {"auditor"}:
             raise ValueError(
@@ -1394,6 +1396,7 @@ class RunSupervisor:
         run_id: str | None = None,
         reasoning_effort: str | None = None,
         mcp_profile: str | None = None,
+        allow_auditor_write_mcp: bool = False,
         _recover_reservation: bool = False,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -1412,6 +1415,7 @@ class RunSupervisor:
                 run_id=run_id,
                 reasoning_effort=reasoning_effort,
                 mcp_profile=mcp_profile,
+                allow_auditor_write_mcp=allow_auditor_write_mcp,
             )
         request = {
             "task": task,
@@ -1424,6 +1428,7 @@ class RunSupervisor:
             "run_id": run_id,
             "reasoning_effort": reasoning_effort,
             "mcp_profile": mcp_profile,
+            "allow_auditor_write_mcp": allow_auditor_write_mcp,
         }
         fingerprint = hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         path = self._idempotency_path("create", key)
@@ -1530,6 +1535,7 @@ class RunSupervisor:
         run_id: str | None = None,
         reasoning_effort: str | None = None,
         mcp_profile: str | None = None,
+        allow_auditor_write_mcp: bool = False,
         _recover_reservation: bool = False,
         _idempotency_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -1561,6 +1567,7 @@ class RunSupervisor:
             model=model,
             reasoning_effort=reasoning_effort,
             mcp_profile=mcp_profile,
+            allow_auditor_write_mcp=allow_auditor_write_mcp,
         )
         run_id = run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
         run_dir = self._run_dir(run_id)

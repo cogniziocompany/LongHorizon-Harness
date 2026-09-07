@@ -711,6 +711,11 @@ def main(argv: list[str] | None = None) -> int:
         if config_error is not None:
             parser.error(str(config_error))
         _apply_repeatable_defaults(args, run_defaults)
+        # Boolean config fields need an explicit attribute because argparse
+        # did not create a flag for them, but downstream agent construction
+        # expects a value on `args`.
+        if not hasattr(args, "allow_auditor_write_mcp"):
+            args.allow_auditor_write_mcp = bool(run_defaults.get("allow_auditor_write_mcp", False))
         if PROJECT_CONFIG_PATH.is_file():
             print(f"Using config: {PROJECT_CONFIG_PATH.resolve()}")
         return _run_command(args)
@@ -1783,6 +1788,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 reasoning_effort=effort,
                 run_id=run_id,
                 run_dir=run_dir,
+                allow_auditor_write_mcp=getattr(args, "allow_auditor_write_mcp", False),
             )
         return agent_cache[key]
 
@@ -2232,6 +2238,7 @@ def _build_agent(
     reasoning_effort: str | None = None,
     run_id: str | None = None,
     run_dir: str | Path | None = None,
+    allow_auditor_write_mcp: bool = False,
 ):
     if name == "codex":
         from .adapters.codex import CodexAdapter
@@ -2269,6 +2276,7 @@ def _build_agent(
             # Tags proxied requests with run/round/role for observability.
             run_id=run_id,
             run_dir=run_dir,
+            allow_auditor_write_mcp=allow_auditor_write_mcp,
         )
         if model is not None:
             kwargs["model"] = model
