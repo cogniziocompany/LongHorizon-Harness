@@ -1,0 +1,7 @@
+# LiteLLM Skill Hub alongside the MCP-prompt catalog — 2026-09-07
+
+**Source:** Paxton's planning session 9db55f21 (`C:\Users\PaxtonTait\.claude\plans\adaptive-inventing-stonebraker.md`). Finding: nothing regressed - the Skills registry is new in v1.100.0 and has never been written; our four skills (audio-qa, gateway-skill-authoring, litellm-gateway-quickstart, remote-pc) are live as MCP prompts via gateway-skills-mcp (skills-skill-<name>). Decision: both channels, no migration; MCP prompts stay the source of truth.
+**Harness task:** 15-litellm-skill-hub (ptait09-easybutt0n-ai workspace, kimi, 6 rounds): idempotent publish script from SKILL.md frontmatter, `skill:hub` drift row, public-skills export script, docs + patch for the mcp-tools authoring skill. No live calls in the run.
+**Overseer after the run:** baseline checks on CT202 (pct exec), run the publish script live, verify /ui/skills/ + marketplace.json + prompts/get regression, fleet e2e rows.
+**Decision for Paxton:** the Hub stores only a git-subdir pointer and Claude Code clones it, so the source must be clonable by consumers: recommended a dedicated PUBLIC skills-only repo (content is already secret-free by gate) vs distributing a PAT/deploy key. Name for the public repo needed (e.g. cogniziocompany/cognizioware-skills).
+**Note from the plan:** `.env.bak-relay` in the ptait09-easybutt0n-ai working tree on PTAIT09 holds a plaintext master key (untracked); delete the file.
