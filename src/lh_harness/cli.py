@@ -526,6 +526,18 @@ def main(argv: list[str] | None = None) -> int:
         "the installed computer-use plugin, which is loaded automatically otherwise.",
     )
     run_parser.add_argument(
+        "--mcp-profile",
+        default=run_default("mcp_profile"),
+        help="MCP profile for every role; overrides config and web defaults.",
+    )
+    for role, _, scope in _ROLE_OPTIONS:
+        run_parser.add_argument(
+            _flag(role, "mcp-profile"),
+            dest=f"{role}_mcp_profile",
+            default=run_default(f"{role}_mcp_profile"),
+            help=f"MCP profile for {scope}; defaults to {_fallback_hint(role, 'mcp-profile')}.",
+        )
+    run_parser.add_argument(
         "--mcp-add-dir",
         action="append",
         default=None,
@@ -1764,11 +1776,13 @@ def _run_command(args: argparse.Namespace) -> int:
                 workspace_path=workspace,
                 prompt_dir=prompt_dir,
                 mcp_config=resolve_mcp_config(name),
+                mcp_profile=_resolve_role_option(args, effective_permission_role, "mcp_profile"),
                 mcp_add_dirs=args.mcp_add_dir,
                 hidden_paths=hidden_paths,
                 guard_exclude_paths=guard_exclude_paths,
                 reasoning_effort=effort,
                 run_id=run_id,
+                run_dir=run_dir,
             )
         return agent_cache[key]
 
@@ -2211,11 +2225,13 @@ def _build_agent(
     workspace_path: str,
     prompt_dir: str,
     mcp_config: str | None = None,
+    mcp_profile: str | None = None,
     mcp_add_dirs: list[str] | None = None,
     hidden_paths: tuple[str, ...] = (),
     guard_exclude_paths: tuple[str, ...] = (),
     reasoning_effort: str | None = None,
     run_id: str | None = None,
+    run_dir: str | Path | None = None,
 ):
     if name == "codex":
         from .adapters.codex import CodexAdapter
@@ -2242,6 +2258,7 @@ def _build_agent(
             workspace_path=workspace_path,
             prompt_dir=prompt_dir,
             mcp_config=mcp_config,
+            mcp_profile=mcp_profile,
             add_dirs=mcp_add_dirs,
             role=role,
             hidden_paths=hidden_paths,
@@ -2251,6 +2268,7 @@ def _build_agent(
             reasoning_effort=reasoning_effort,
             # Tags proxied requests with run/round/role for observability.
             run_id=run_id,
+            run_dir=run_dir,
         )
         if model is not None:
             kwargs["model"] = model

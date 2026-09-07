@@ -10,7 +10,7 @@ from ..supervisor.lifecycle import canonical_lifecycle_status
 from .events import EventTailer
 
 
-_PROVENANCE_FIELDS = ("agent", "model", "role_configs", "workspace", "max_rounds", "prompt_language")
+_PROVENANCE_FIELDS = ("agent", "model", "role_configs", "workspace", "max_rounds", "prompt_language", "mcp_profile")
 _MAX_FINAL_RESPONSE_CHARS = 512 * 1024
 # Mirrors agent_registry's rule; owner records are untrusted input here.
 _REASONING_EFFORT_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")

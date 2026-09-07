@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from ..dashboard.state import DashboardState
+from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
@@ -517,6 +518,7 @@ def _public_owner(owner: dict[str, Any]) -> dict[str, Any]:
         "resumed_from",
         "resume_kind",
         "resume_epoch",
+        "mcp_profile",
     }
     result = {key: owner[key] for key in allowed if key in owner}
     if isinstance(owner.get("task"), str):
@@ -755,11 +757,25 @@ def create_app(
                 "agent": _WEB_DEFAULT_AGENT,
                 "model": _WEB_DEFAULT_MODEL,
                 "roles": {
-                    "manager": {"agent": _WEB_DEFAULT_AGENT, "model": _WEB_DEFAULT_MANAGER_MODEL},
-                    "executor": {"agent": _WEB_DEFAULT_AGENT, "model": _WEB_DEFAULT_MODEL},
-                    "auditor": {"agent": _WEB_DEFAULT_AGENT, "model": _WEB_DEFAULT_AUDITOR_MODEL},
+                    "manager": {
+                        "agent": _WEB_DEFAULT_AGENT,
+                        "model": _WEB_DEFAULT_MANAGER_MODEL,
+                        "mcp_profile": _default_profile_for_role("manager"),
+                    },
+                    "executor": {
+                        "agent": _WEB_DEFAULT_AGENT,
+                        "model": _WEB_DEFAULT_MODEL,
+                        "mcp_profile": _default_profile_for_role("executor"),
+                    },
+                    "auditor": {
+                        "agent": _WEB_DEFAULT_AGENT,
+                        "model": _WEB_DEFAULT_AUDITOR_MODEL,
+                        "mcp_profile": _default_profile_for_role("auditor"),
+                    },
                 },
             },
+            mcp_profiles=list_available_profiles(),
+            mcp_gateway_configured=gateway_configured(),
             model_discovery=catalogue["model_discovery"],
         )
 
@@ -808,6 +824,7 @@ def create_app(
             )
             if prompt_language not in {"en", "zh"}:
                 raise ValueError("prompt_language must be en or zh")
+            mcp_profile = _body_text(body.get("mcp_profile"), field="mcp_profile", max_chars=64) or None
             created = supervisor.create_run(
                 task=task,
                 agent=agent,
@@ -818,6 +835,7 @@ def create_app(
                 prompt_language=prompt_language,
                 run_id=run_id_value,
                 reasoning_effort=reasoning_effort,
+                mcp_profile=mcp_profile,
                 idempotency_key=_bounded_command_id(request.headers.get("Idempotency-Key")),
             )
         except IdempotencyConflict as exc:
