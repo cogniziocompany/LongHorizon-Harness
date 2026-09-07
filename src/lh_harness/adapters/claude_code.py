@@ -167,18 +167,15 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         # proxy-side observability (Langfuse per-key logging) can group traces
         # by harness run. Claude Code forwards ANTHROPIC_CUSTOM_HEADERS
         # ("Name: value") on each API call; the tag values carry no secrets.
-        if not self.run_id:
+        session_id = episode_session_id(self.run_id, label, self.role)
+        if not session_id or session_id == "unknown":
             return {}
-        round_tag = _extract_round_tag(label)
-        tags = f"lh-run/{self.run_id},{round_tag},{self.role},lh-session/{self.episode_session_id(label)}"
+        tags = f"lh-run/{self.run_id},{_extract_round_tag(label)},{self.role},lh-session/{session_id}"
         return {"ANTHROPIC_CUSTOM_HEADERS": f"x-litellm-tags: {tags}"}
 
     def episode_session_id(self, label: str) -> str:
         """Derived session id used to join a run's episodes in the proxy logs."""
-        if not self.run_id:
-            return "unknown"
-        round_tag = _extract_round_tag(label)
-        return f"{self.run_id}.{round_tag}.{self.role}"
+        return episode_session_id(self.run_id, label, self.role)
 
     async def run_episode(
         self,
@@ -218,10 +215,10 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 "claude_computer_mcp_loaded": self.computer_mcp_configured,
                 "claude_workspace_read_only": self.policy.workspace_read_only,
                 "claude_reasoning_effort": self.reasoning_effort,
-                "lh_session_id": self.episode_session_id(label),
+                "lh_session_id": episode_session_id(self.run_id, label, self.role),
             }
         )
-        _inject_session_header_into_mcp_config(self, label)
+        _inject_session_header_into_mcp_config(self.run_id, label, self.role, self.run_dir)
         if before is not None:
             after = snapshot_workspace(
                 self.workspace_path,
@@ -251,6 +248,11 @@ class _EnvUnsetWrapper:
         self._env = env
         self._keys = keys
 
+    def __getattr__(self, name: str) -> Any:
+        # Delegate all other Environment attributes (upload, download,
+        # staging_dir, etc.) to the wrapped environment unchanged.
+        return getattr(self._env, name)
+
     async def exec(
         self,
         command: str,
@@ -275,24 +277,38 @@ class _EnvUnsetWrapper:
                     _os.environ[key] = value
 
 
+def episode_session_id(run_id: str | None, label: str, role: str) -> str:
+    """Derived session id used to join a run's episodes in the proxy logs."""
+    if not run_id:
+        return "unknown"
+    round_tag = _extract_round_tag(label)
+    return f"{run_id}.{round_tag}.{role}"
+
+
 def _extract_round_tag(label: str) -> str:
     match = re.match(r"round_\d+", label)
     return match.group(0) if match else "round_unknown"
 
 
-def _inject_session_header_into_mcp_config(adapter: ClaudeCodeAdapter, label: str) -> None:
+def _inject_session_header_into_mcp_config(
+    run_id: str | None,
+    label: str,
+    role: str,
+    run_dir: str | None,
+) -> None:
     """If a generated MCP config exists for this role, inject the session header."""
-    if not adapter.run_dir or not adapter.mcp_profile_name:
+    if not run_dir:
         return
-    config_path = Path(adapter.run_dir) / "harness" / "mcp" / f"{adapter.role}.mcp.json"
+    config_path = Path(run_dir) / "harness" / "mcp" / f"{role}.mcp.json"
     if not config_path.is_file():
         return
     try:
         data = json.loads(config_path.read_text())
         servers = data.get("mcpServers", {})
+        session_id = episode_session_id(run_id, label, role)
         for server in servers.values():
             headers = server.setdefault("headers", {})
-            headers["X-LH-Session"] = adapter.episode_session_id(label)
+            headers["X-LH-Session"] = session_id
         config_path.write_text(json.dumps(data, indent=2))
     except Exception:
         pass
