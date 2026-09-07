@@ -38,11 +38,14 @@ _RUN_KEYS = {
     "prompt_language",
     "claude_mcp_config",
     "codex_mcp_config",
+    "mcp_profile",
+    "mcp_profiles",
     "mcp_add_dirs",
     "guard_exclude_paths",
     "max_rounds",
     "dashboard",
     "dashboard_port",
+    "allow_auditor_write_mcp",
     "roles",
     "timeouts",
 }
@@ -55,6 +58,7 @@ _STRING_KEYS = {
     "base_url",
     "claude_mcp_config",
     "codex_mcp_config",
+    "mcp_profile",
 }
 
 CONFIG_TEMPLATE = """# LongHorizon-Harness project defaults.
@@ -217,6 +221,12 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
             raise ProjectConfigError("run.guard_exclude_paths must be an array of non-empty strings")
         defaults["guard_exclude_path"] = list(value)
+    if "mcp_profile" in run:
+        defaults["mcp_profile"] = _string(run["mcp_profile"], "run.mcp_profile")
+    if "allow_auditor_write_mcp" in run:
+        defaults["allow_auditor_write_mcp"] = _boolean(
+            run["allow_auditor_write_mcp"], "run.allow_auditor_write_mcp"
+        )
 
     roles = run.get("roles", {})
     if not isinstance(roles, dict):
@@ -227,7 +237,7 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
     for role, values in roles.items():
         if not isinstance(values, dict):
             raise ProjectConfigError(f"[run.roles.{role}] must be a TOML table")
-        unknown_role_keys = set(values) - {"agent", "model", "reasoning_effort"}
+        unknown_role_keys = set(values) - {"agent", "model", "reasoning_effort", "mcp_profile"}
         if unknown_role_keys:
             raise ProjectConfigError(
                 f"unknown [run.roles.{role}] key(s): {_names(unknown_role_keys)}"
@@ -243,6 +253,10 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         if "reasoning_effort" in values:
             defaults[f"{role}_reasoning_effort"] = _reasoning_effort(
                 values["reasoning_effort"], f"run.roles.{role}.reasoning_effort"
+            )
+        if "mcp_profile" in values:
+            defaults[f"{role}_mcp_profile"] = _string(
+                values["mcp_profile"], f"run.roles.{role}.mcp_profile"
             )
 
     timeouts = run.get("timeouts", {})

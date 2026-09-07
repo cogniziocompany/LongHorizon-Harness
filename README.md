@@ -30,6 +30,8 @@
 
 > **The model determines what an agent can do in one round. LongHorizon-Harness engineers the loop around it: what to do next, how to verify the result in the real computer, what progress to preserve, and how to continue after failure or context refresh.**
 
+> **Auditor git lock:** auditor roles are forbidden from network git operations (`git fetch`, `pull`, `push`, `remote`, `clone`, `submodule`, `lfs`, `gh`, and `git -C` / `git --git-dir` variants). The harness removes `SSH_AUTH_SOCK` from the auditor subprocess environment and sets `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=/bin/false`, and a fast-fail git config override so these operations cannot complete. A workspace-guard violation confined to `.git/**` is tagged with hint `network_git_op` so the failure reason is clear.
+
 **A Loop Engineering system for Claude Code, Codex, OpenCode, and DeepSeek Harness. One-command install, ready to run.**
 
 LongHorizon-Harness turns existing agents into long-running computer-use systems. Across desktop apps and the terminal CLI, it continuously recovers the goal and verified state, selects the next bounded step, executes it with a fresh context, checks the actual result, and then checkpoints accepted progress or feeds failure evidence into the next round. It does not train a new model or replace an existing agent; it provides the durable execution loop around one.
@@ -466,6 +468,55 @@ lh-harness run --task @task.md --agent codex \
 Both flags can be given together when roles use different backends, and `--mcp-add-dir` may be repeated. The equivalent environment variables are `LH_HARNESS_CLAUDECODE_MCP_CONFIG`, `LH_HARNESS_CODEX_MCP_CONFIG`, and `LH_HARNESS_MCP_ADD_DIRS`, the last separated by `:` on macOS/Linux and `;` on Windows.
 
 Prefer letting the server read API keys from its environment over writing them into the config file.
+
+#### MCP profiles and session ids
+
+LongHorizon-Harness can generate per-role MCP configs for the cognizioware LiteLLM MCP gateway instead of hand-writing a `.mcp.json` per role. A **profile** is a named allow-list of gateway server aliases; the harness renders a separate `cognizioware` MCP server under `<run_dir>/harness/mcp/<role>.mcp.json` for each role and passes it to Claude Code with `--strict-mcp-config`.
+
+Profiles live in three layers:
+
+1. **Built-in profiles** — always available.
+2. **User profiles** — `~/.lh-harness/mcp_profiles.json` (or `$LH_HARNESS_STATE_ROOT/mcp_profiles.json`).
+3. **Project profiles** — `[run.mcp_profiles.<name>]` in `.lh-harness/config.toml`.
+
+Selection precedence for a role (highest first):
+
+1. API/CLI per-role override (`--manager-mcp-profile`, `--executor-mcp-profile`, `--auditor-mcp-profile`, or `POST /api/runs` `roles.<role>.mcp_profile`)
+2. API/CLI run-level override (`--mcp-profile` or `POST /api/runs` `mcp_profile`)
+3. Config `[run.roles.<role>] mcp_profile`
+4. Config `[run] mcp_profile`
+5. Web-default envs: `LH_HARNESS_WEB_DEFAULT_MCP_PROFILE` and `LH_HARNESS_WEB_DEFAULT_{MANAGER,EXECUTOR,AUDITOR}_MCP_PROFILE`
+6. Built-in defaults — manager/executor: `default`, auditor roles: `audit`
+
+Built-in profiles:
+
+| Profile | Read-only | Servers / allow-list | Use for |
+|---|---|---|---|
+| `none` | yes | no MCP config rendered | Runs that should not use the gateway at all |
+| `audit` | yes | ssh list/read, kb, docs, langfuse read | Auditor roles and read-only verification |
+| `default` | no | audit + github-read, youtrack-read, ssh-exec | Manager/executor general development |
+| `ops` | no | default + docker-control, pct-control | Operations that need container/VM control |
+| `full` | no | no allow-list header; all configured servers | Unrestricted access to every gateway server |
+
+Auditor roles may only use `read_only=true` profiles unless you set `allow_auditor_write_mcp = true` in `.lh-harness/config.toml`. The gateway key is **never** logged or used as a fallback for the LLM token.
+
+Gateway settings come from the environment only:
+
+```ini
+LH_HARNESS_MCP_GATEWAY_KEY=...                # required for any non-none profile
+LH_HARNESS_MCP_GATEWAY_URL=lan                # "lan" -> 192.168.21.161:4000/mcp/, omit for prod
+LH_HARNESS_MCP_GATEWAY_HEADERS_JSON={"X-Custom":"yes"}  # optional extra headers
+```
+
+Every episode carries a **derived session id** `lh_session_id` that joins the run's episodes in the proxy logs and appears in `claude_stream.jsonl` / run events:
+
+```
+<run_id>.<round_tag>.<role>
+```
+
+For example `20250907T120000Z_abcd1234.round_001.cli_executor`. The same value is sent as `x-litellm-tags: ...,lh-session/<session_id>` and as `X-LH-Session` in the generated MCP config headers.
+
+Deploy note for node operators: place the gateway key in `/home/harness/.lh-harness-secrets.env` on the node host (CT110/WSL), not in project files. After the harness node reads it, `GET /api/meta` will report `mcp_gateway_configured: true` and the available profiles. If you proxy through LiteLLM, add `X-LH-Session` to a server's `extra_headers` so the gateway forwards it to the upstream.
 
 ### Dashboard commands
 

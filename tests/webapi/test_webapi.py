@@ -484,6 +484,77 @@ def test_websocket_publishes_operator_messages_without_role_events(tmp_path: Pat
         }]
 
 
+def test_api_meta_includes_mcp_profiles_and_gateway_configured(tmp_path: Path) -> None:
+    root, state = _fixture(tmp_path)
+    app = create_app(state=state, runs_root=root, run_id="run-1")
+    response = TestClient(app).get("/api/meta")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mcp_gateway_configured"] is False
+    profiles = {p["name"]: p for p in data["mcp_profiles"]}
+    assert "none" in profiles
+    assert "audit" in profiles
+    assert "default" in profiles
+    assert profiles["audit"]["read_only"] is True
+    assert "Authorization" not in str(data["mcp_profiles"])
+    defaults = data["defaults"]["roles"]
+    assert defaults["manager"]["mcp_profile"] == "default"
+    assert defaults["executor"]["mcp_profile"] == "default"
+    assert defaults["auditor"]["mcp_profile"] == "audit"
+
+
+def test_api_create_run_accepts_mcp_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from lh_harness.supervisor.service import RunSupervisor
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    supervisor = RunSupervisor(str(root), workspace_root=str(tmp_path / "workspace"))
+    monkeypatch.setattr(
+        RunSupervisor,
+        "_launch_worker",
+        lambda self, **kwargs: {
+            "run_id": kwargs["run_id"],
+            "owner": kwargs["reservation"],
+        },
+    )
+    app = create_app(supervisor=supervisor, runs_root=root)
+    client = TestClient(app)
+    response = client.post(
+        "/api/runs",
+        json={
+            "task": "test mcp profile round trip",
+            "agent": "claude_code",
+            "mcp_profile": "ops",
+            "roles": {"auditor": {"mcp_profile": "audit", "agent": "claude_code"}},
+        },
+    )
+    assert response.status_code == 200
+    run = response.json()["run"]
+    assert run["owner"]["mcp_profile"] == "ops"
+    assert run["owner"]["role_configs"]["auditor"]["mcp_profile"] == "audit"
+    assert run["owner"]["role_configs"]["manager"]["mcp_profile"] == "ops"
+
+
+def test_api_create_run_rejects_non_read_only_auditor_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from lh_harness.supervisor.service import RunSupervisor
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    supervisor = RunSupervisor(str(root), workspace_root=str(tmp_path / "workspace"))
+    app = create_app(supervisor=supervisor, runs_root=root)
+    client = TestClient(app)
+    response = client.post(
+        "/api/runs",
+        json={
+            "task": "test auditor mcp refusal",
+            "agent": "claude_code",
+            "roles": {"auditor": {"mcp_profile": "ops", "agent": "claude_code"}},
+        },
+    )
+    assert response.status_code == 400
+    assert "read-only" in response.json()["detail"].lower()
+
+
 def test_websocket_publishes_resolved_approval_answer_without_role_events(tmp_path: Path) -> None:
     root, state = _fixture(tmp_path)
     approval = state.create_approval(title="Choose an account", message="A or B?")

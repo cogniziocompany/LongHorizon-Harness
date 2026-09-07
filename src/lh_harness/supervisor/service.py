@@ -91,6 +91,8 @@ def _normalise_role_configs(
     agent: str,
     model: str | None,
     reasoning_effort: str | None = None,
+    mcp_profile: str | None = None,
+    allow_auditor_write_mcp: bool = False,
 ) -> dict[str, dict[str, str]]:
     """Validate and resolve the three public role bindings.
 
@@ -98,6 +100,11 @@ def _normalise_role_configs(
     caller supplies any role configuration, every public role is resolved to
     an explicit backend and model so switching one role to Claude can never
     inherit a Codex model id (or vice versa).
+
+    ``mcp_profile`` is accepted and resolved just enough to enforce the
+    auditor read-only invariant at the API boundary.  The worker command still
+    carries the explicit overrides so the CLI can perform the full precedence
+    resolution against the deployment's gateway key and project config.
     """
 
     if value is None:
@@ -114,7 +121,7 @@ def _normalise_role_configs(
             raw = {}
         if not isinstance(raw, dict):
             raise ValueError(f"roles.{role} must be an object")
-        extra = set(raw) - {"agent", "model", "reasoning_effort"}
+        extra = set(raw) - {"agent", "model", "reasoning_effort", "mcp_profile"}
         if extra:
             raise ValueError(f"unknown roles.{role} field: {sorted(extra)[0]}")
         role_agent = str(raw.get("agent") or agent).strip()
@@ -147,6 +154,28 @@ def _normalise_role_configs(
                     f"roles.{role}.agent {role_agent} does not accept a reasoning effort"
                 )
             result[role]["reasoning_effort"] = role_effort
+        raw_mcp_profile = raw.get("mcp_profile")
+        if raw_mcp_profile is None and mcp_profile:
+            raw_mcp_profile = mcp_profile
+        if raw_mcp_profile is not None:
+            if not isinstance(raw_mcp_profile, str) or not raw_mcp_profile.strip():
+                raise ValueError(f"roles.{role}.mcp_profile must be a non-empty string")
+            result[role]["mcp_profile"] = raw_mcp_profile.strip()
+        # Resolve just enough to enforce the auditor read-only rule.  A dummy
+        # gateway key keeps non-none profiles from being coerced to "none".
+        from ..mcp_profiles import resolve_profile
+
+        resolved_mcp = resolve_profile(
+            role,
+            role_profile=result[role].get("mcp_profile"),
+            gateway_key="validation-only",
+            allow_auditor_write_mcp=allow_auditor_write_mcp,
+        )
+        if resolved_mcp.read_only is False and role in {"auditor"}:
+            raise ValueError(
+                f"roles.{role}.mcp_profile {resolved_mcp.name!r} is not read-only; "
+                "auditor roles require a read-only MCP profile"
+            )
     return result
 
 
@@ -1305,6 +1334,7 @@ class RunSupervisor:
         max_rounds: int,
         prompt_language: str,
         reasoning_effort: str | None = None,
+        mcp_profile: str | None = None,
         resume: bool = False,
     ) -> list[str]:
         # Always launch through the interpreter that owns this supervisor.
@@ -1335,6 +1365,8 @@ class RunSupervisor:
             command.append(f"--model={model}")
         if reasoning_effort and not role_configs:
             command.append(f"--reasoning-effort={reasoning_effort}")
+        if mcp_profile:
+            command.append(f"--mcp-profile={mcp_profile}")
         for role in _ROLE_KEYS:
             spec = (role_configs or {}).get(role)
             if not spec:
@@ -1347,6 +1379,8 @@ class RunSupervisor:
             )
             if spec.get("reasoning_effort"):
                 command.append(f"--{role}-reasoning-effort={spec['reasoning_effort']}")
+            if spec.get("mcp_profile"):
+                command.append(f"--{role}-mcp-profile={spec['mcp_profile']}")
         return command
 
     def create_run(
@@ -1361,6 +1395,8 @@ class RunSupervisor:
         prompt_language: str = "en",
         run_id: str | None = None,
         reasoning_effort: str | None = None,
+        mcp_profile: str | None = None,
+        allow_auditor_write_mcp: bool = False,
         _recover_reservation: bool = False,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -1378,6 +1414,8 @@ class RunSupervisor:
                 prompt_language=prompt_language,
                 run_id=run_id,
                 reasoning_effort=reasoning_effort,
+                mcp_profile=mcp_profile,
+                allow_auditor_write_mcp=allow_auditor_write_mcp,
             )
         request = {
             "task": task,
@@ -1389,6 +1427,8 @@ class RunSupervisor:
             "prompt_language": prompt_language,
             "run_id": run_id,
             "reasoning_effort": reasoning_effort,
+            "mcp_profile": mcp_profile,
+            "allow_auditor_write_mcp": allow_auditor_write_mcp,
         }
         fingerprint = hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         path = self._idempotency_path("create", key)
@@ -1494,6 +1534,8 @@ class RunSupervisor:
         prompt_language: str = "en",
         run_id: str | None = None,
         reasoning_effort: str | None = None,
+        mcp_profile: str | None = None,
+        allow_auditor_write_mcp: bool = False,
         _recover_reservation: bool = False,
         _idempotency_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -1524,6 +1566,8 @@ class RunSupervisor:
             agent=agent,
             model=model,
             reasoning_effort=reasoning_effort,
+            mcp_profile=mcp_profile,
+            allow_auditor_write_mcp=allow_auditor_write_mcp,
         )
         run_id = run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
         run_dir = self._run_dir(run_id)
@@ -1576,6 +1620,7 @@ class RunSupervisor:
             max_rounds=max_rounds,
             prompt_language=prompt_language,
             reasoning_effort=reasoning_effort,
+            mcp_profile=mcp_profile,
         )
         started_at = time.time()
         # Reserve the run before launching a process.  This closes the orphan
@@ -1596,6 +1641,9 @@ class RunSupervisor:
         }
         if reasoning_effort:
             reservation["reasoning_effort"] = reasoning_effort
+        # Always record mcp_profile (even None) so provenance and worker argv are
+        # stable across requests with and without an explicit profile.
+        reservation["mcp_profile"] = mcp_profile
         if _idempotency_fingerprint:
             reservation["idempotency_fingerprint"] = _idempotency_fingerprint
         return self._launch_worker(

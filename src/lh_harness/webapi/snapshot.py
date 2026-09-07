@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 from ..dashboard.state import DashboardState
@@ -10,7 +12,16 @@ from ..supervisor.lifecycle import canonical_lifecycle_status
 from .events import EventTailer
 
 
-_PROVENANCE_FIELDS = ("agent", "model", "role_configs", "workspace", "max_rounds", "prompt_language")
+_PROVENANCE_FIELDS = (
+    "agent",
+    "model",
+    "role_configs",
+    "workspace",
+    "max_rounds",
+    "prompt_language",
+    "mcp_profile",
+    "mcp_profile_resolution",
+)
 _MAX_FINAL_RESPONSE_CHARS = 512 * 1024
 # Mirrors agent_registry's rule; owner records are untrusted input here.
 _REASONING_EFFORT_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
@@ -54,6 +65,12 @@ def _provenance(*sources: dict[str, Any] | None) -> dict[str, Any]:
             value = source.get(field)
             if field == "role_configs":
                 cleaned = _safe_role_configs(value)
+                if cleaned:
+                    result[field] = cleaned
+                    break
+                continue
+            if field == "mcp_profile_resolution":
+                cleaned = _safe_mcp_profile_resolution(value)
                 if cleaned:
                     result[field] = cleaned
                     break
@@ -111,6 +128,52 @@ def _safe_role_configs(value: object) -> dict[str, dict[str, str]]:
         if isinstance(effort, str) and _REASONING_EFFORT_RE.match(effort.strip()):
             result[role]["reasoning_effort"] = effort.strip()
     return result if len(result) == 3 else {}
+
+
+_VALID_MCP_RESOLUTION_ROLES = frozenset(
+    {
+        "manager",
+        "executor",
+        "gui_executor",
+        "cli_executor",
+        "auditor",
+        "gui_auditor",
+        "cli_auditor",
+        "final_response",
+    }
+)
+
+
+def _safe_mcp_profile_resolution(value: object) -> dict[str, dict[str, Any]]:
+    """Sanitize the per-role resolved MCP profile provenance record."""
+
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for role, raw in value.items():
+        if role not in _VALID_MCP_RESOLUTION_ROLES:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        reason = raw.get("reason")
+        if not isinstance(reason, str):
+            reason = ""
+        source = raw.get("source")
+        if not isinstance(source, str):
+            source = ""
+        read_only = raw.get("read_only")
+        if not isinstance(read_only, bool):
+            read_only = None
+        result[role] = {
+            "name": name.strip(),
+            "reason": reason.strip(),
+            "source": source.strip(),
+            "read_only": read_only,
+        }
+    return result
 
 
 def _status(raw: dict[str, Any], events: list[dict[str, Any]], approvals: list[dict[str, Any]]) -> str:
@@ -209,6 +272,19 @@ def build_snapshot(state: DashboardState, *, run_id: str | None = None) -> dict[
             start_payload = {**start_payload, "workspace": start_payload.get("workspace_path")}
         break
     provenance = _provenance(owner, report, start_payload)
+    # The worker/adapter writes the authoritative resolved profile record after
+    # it resolves against the gateway key and project config.  Merge it into
+    # snapshot provenance when the file exists.
+    if getattr(state, "runs_root", None) is not None:
+        try:
+            resolution_path = Path(state.runs_root) / effective_run_id / "harness" / "mcp_profile_resolution.json"
+            if resolution_path.is_file():
+                resolution = json.loads(resolution_path.read_text(encoding="utf-8"))
+                cleaned = _safe_mcp_profile_resolution(resolution)
+                if cleaned:
+                    provenance["mcp_profile_resolution"] = cleaned
+        except (OSError, ValueError, RuntimeError):
+            pass
     # ``active_*`` means work that can still change, never merely the newest
     # durable round.  A final Manager-only round is often appended after the
     # Auditor has already satisfied the task; falling back to that round made

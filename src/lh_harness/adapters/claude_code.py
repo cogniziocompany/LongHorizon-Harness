@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 from pathlib import Path
+from typing import Any
 
 from ..agent_logs import visible_output as extract_claude_visible_output
 from ..agent_registry import normalise_reasoning_effort
+from ..mcp_profiles import (
+    render_mcp_config,
+    resolve_profile,
+)
 from .claude_permissions import (
     ClaudeRole,
     is_auditor_role,
@@ -15,6 +21,7 @@ from .claude_permissions import (
     snapshot_workspace,
     workspace_snapshot_diff,
 )
+from .cli_agent import CommandAgentAdapter, _episode_prompt_label
 from ..environment.base import Environment
 from ..provider_errors import GUARD_REJECTION_MESSAGE
 from ..types import (
@@ -24,7 +31,6 @@ from ..types import (
     EpisodeBudget,
     EpisodeResult,
 )
-from .cli_agent import CommandAgentAdapter
 
 
 class ClaudeCodeAdapter(CommandAgentAdapter):
@@ -37,12 +43,15 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         workspace_path: str = DEFAULT_WORKSPACE_PATH,
         prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
         mcp_config: str | None = None,
+        mcp_profile: str | None = None,
         add_dirs: list[str] | None = None,
         role: ClaudeRole = "cli_executor",
         hidden_paths: tuple[str, ...] = (),
         guard_exclude_paths: tuple[str, ...] = (),
         reasoning_effort: str | None = None,
         run_id: str | None = None,
+        run_dir: str | None = None,
+        allow_auditor_write_mcp: bool = False,
     ) -> None:
         policy = policy_for_role(role)
         effort = normalise_reasoning_effort(reasoning_effort)
@@ -65,12 +74,60 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         )
 
         # MCP support remains opt-in. --strict-mcp-config keeps unrelated
-        # user/project MCP servers out of every role.
+        # user/project MCP servers out of every role. Per-episode generated
+        # configs live under the harness-owned run directory, outside the agent
+        # workspace, so they cannot be read by the agent but are picked up by
+        # the adapter's --mcp-config path below.
+        self.mcp_profile_name = mcp_profile
+        self.run_dir = run_dir
         mcp_config = mcp_config or os.getenv("LH_HARNESS_CLAUDECODE_MCP_CONFIG")
         if mcp_config:
             candidate = Path(mcp_config).expanduser()
             if candidate.is_file():
                 mcp_config = str(candidate.resolve())
+        generated_mcp_path: str | None = None
+        self.mcp_profile_resolved = {}
+        self.mcp_profile_reason = ""
+        if run_id and run_dir and mcp_profile:
+            # Resolve and render a harness-owned per-role MCP config.  This
+            # happens at adapter construction time because the role does not
+            # change within a run.  The actual session header is injected per
+            # episode in run_episode below.
+            try:
+                profile = resolve_profile(
+                    role,
+                    role_profile=mcp_profile,
+                    run_profile=mcp_profile,
+                    allow_auditor_write_mcp=allow_auditor_write_mcp,
+                )
+                rendered = render_mcp_config(
+                    profile,
+                    run_id=run_id,
+                    role=role,
+                    run_dir=run_dir,
+                    session_id=episode_session_id(run_id, "round_unknown", role),
+                )
+                if rendered is not None:
+                    generated_mcp_path = str(rendered)
+                self.mcp_profile_resolved = {
+                    "name": profile.name,
+                    "reason": profile.reason,
+                    "read_only": profile.read_only,
+                    "source": profile.source,
+                }
+                self.mcp_profile_reason = profile.reason
+                _record_profile_resolution(run_dir, role, profile)
+            except ValueError as exc:
+                # An auditor assigned a non-read-only profile is a configuration
+                # error; fail fast so the operator sees a clear message.
+                raise
+            except Exception:
+                # Other rendering failures leave the adapter without generated
+                # MCP config; the run proceeds with whatever was explicitly
+                # supplied or none at all.
+                generated_mcp_path = None
+                self.mcp_profile_resolved = {}
+                self.mcp_profile_reason = ""
         resolved_add_dirs = list(add_dirs or [])
         env_add_dirs = os.getenv("LH_HARNESS_CLAUDECODE_ADD_DIRS") or os.getenv(
             "LH_HARNESS_MCP_ADD_DIRS"
@@ -91,6 +148,23 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                     "PAGER=cat",
                 ]
             )
+            for key, value in policy.env_overrides.items():
+                if value is not None:
+                    env_parts.append(f"{key}={shlex.quote(value)}")
+
+        # Variables that must be removed from the subprocess environment are
+        # deleted from the env dict passed to Popen (see run_episode); they must
+        # never be rendered as shell arguments such as --unsetenvvar=..., which
+        # /bin/sh treats as a command name and fails with "not found".
+        self._env_unset_keys = (
+            tuple(
+                key
+                for key, value in policy.env_overrides.items()
+                if value is None
+            )
+            if is_auditor_role(role)
+            else ()
+        )
 
         env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
         command_parts = [
@@ -111,9 +185,10 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         if deny_tools:
             command_parts.append("--disallowedTools")
             command_parts.extend(shlex.quote(tool) for tool in deny_tools)
-        self.computer_mcp_configured = bool(policy.load_computer_mcp and mcp_config)
-        if self.computer_mcp_configured:
-            command_parts.extend(["--mcp-config", shlex.quote(mcp_config)])
+        self.computer_mcp_configured = bool(policy.load_computer_mcp and (mcp_config or generated_mcp_path))
+        effective_mcp_config = generated_mcp_path or mcp_config
+        if self.computer_mcp_configured and effective_mcp_config:
+            command_parts.extend(["--mcp-config", shlex.quote(effective_mcp_config)])
         command_parts.extend(["--model", shlex.quote(model)])
         # Claude Code warns and continues at its default when the value is not
         # one it knows, so an unusable effort will not fail the run here.
@@ -141,12 +216,15 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         # proxy-side observability (Langfuse per-key logging) can group traces
         # by harness run. Claude Code forwards ANTHROPIC_CUSTOM_HEADERS
         # ("Name: value") on each API call; the tag values carry no secrets.
-        if not self.run_id:
+        session_id = episode_session_id(self.run_id, label, self.role)
+        if not session_id or session_id == "unknown":
             return {}
-        match = re.match(r"round_\d+", label)
-        round_tag = match.group(0) if match else "round_unknown"
-        tags = f"lh-run/{self.run_id},{round_tag},{self.role}"
+        tags = f"lh-run/{self.run_id},{_extract_round_tag(label)},{self.role},lh-session/{session_id}"
         return {"ANTHROPIC_CUSTOM_HEADERS": f"x-litellm-tags: {tags}"}
+
+    def episode_session_id(self, label: str) -> str:
+        """Derived session id used to join a run's episodes in the proxy logs."""
+        return episode_session_id(self.run_id, label, self.role)
 
     async def run_episode(
         self,
@@ -163,12 +241,20 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             if is_auditor_role(self.role)
             else None
         )
+        self.mcp_profile_resolved = {}
+        self.mcp_profile_reason = ""
+
+        # Carry per-episode env into the subprocess, removing auditor-unset keys.
+        label = _episode_prompt_label(live_trajectory_path)
+        if self._env_unset_keys:
+            env = _EnvUnsetWrapper(env, self._env_unset_keys)
         result = await super().run_episode(
             prompt,
             env,
             budget,
             live_trajectory_path=live_trajectory_path,
         )
+        label = _episode_prompt_label(live_trajectory_path)
         result.metadata.update(
             {
                 "claude_role": self.role,
@@ -181,7 +267,17 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 "claude_computer_mcp_loaded": self.computer_mcp_configured,
                 "claude_workspace_read_only": self.policy.workspace_read_only,
                 "claude_reasoning_effort": self.reasoning_effort,
+                "lh_session_id": episode_session_id(self.run_id, label, self.role),
+                "mcp_profile": self.mcp_profile_name,
+                "mcp_profile_resolved": self.mcp_profile_resolved,
             }
+        )
+        _inject_session_header_into_mcp_config(
+            self.run_id,
+            label,
+            self.role,
+            self.run_dir,
+            mcp_profile_name=self.mcp_profile_name,
         )
         if before is not None:
             after = snapshot_workspace(
@@ -196,10 +292,123 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             snapshot_errors = diff.get("verifier_workspace_snapshot_errors")
             if snapshot_errors:
                 # Escalate only a successful status: a real timeout (or
-                # cancellation) is stronger evidence and must stay visible to
-                # the runtime-failure classifier.
+                # cancellation) is stronger evidence and must stay visible to the
+                # runtime-failure classifier.
                 if result.status == "done":
                     result.status = "error"
                 guard_error = GUARD_REJECTION_MESSAGE
                 result.error = f"{result.error}\n{guard_error}".strip() if result.error else guard_error
         return result
+
+
+class _EnvUnsetWrapper:
+    """Wrap an Environment so that exec() drops named keys from the child env."""
+
+    def __init__(self, env: Environment, keys: tuple[str, ...]) -> None:
+        self._env = env
+        self._keys = keys
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate all other Environment attributes (upload, download,
+        # staging_dir, etc.) to the wrapped environment unchanged.
+        return getattr(self._env, name)
+
+    async def exec(
+        self,
+        command: str,
+        timeout: int = 30,
+        tee_path: str | None = None,
+    ) -> Any:
+        # LocalEnvironment copies os.environ in the child process. We cannot
+        # pass a custom env dict through the Environment protocol, so we curate
+        # the parent process's os.environ in place for the duration of the call.
+        # This is safe here because the wrapper is only used for single-threaded
+        # local agent runs and the keys are restored immediately after exec.
+        import os as _os
+
+        saved: dict[str, str | None] = {}
+        for key in self._keys:
+            saved[key] = _os.environ.pop(key, None)
+        try:
+            return await self._env.exec(command, timeout=timeout, tee_path=tee_path)
+        finally:
+            for key, value in saved.items():
+                if value is not None:
+                    _os.environ[key] = value
+
+
+def episode_session_id(run_id: str | None, label: str, role: str) -> str:
+    """Derived session id used to join a run's episodes in the proxy logs."""
+    if not run_id:
+        return "unknown"
+    round_tag = _extract_round_tag(label)
+    return f"{run_id}.{round_tag}.{role}"
+
+
+def _extract_round_tag(label: str) -> str:
+    match = re.match(r"round_\d+", label)
+    return match.group(0) if match else "round_unknown"
+
+
+def _record_profile_resolution(
+    run_dir: str | None,
+    role: str,
+    profile: "McpProfile",
+) -> None:
+    """Write a durable record of the resolved MCP profile for snapshot provenance."""
+
+    if not run_dir:
+        return
+    target_dir = Path(run_dir) / "harness"
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    target = target_dir / "mcp_profile_resolution.json"
+    data: dict[str, Any] = {}
+    try:
+        if target.is_file():
+            data = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[role] = {
+        "name": profile.name,
+        "reason": profile.reason,
+        "read_only": profile.read_only,
+        "source": profile.source,
+    }
+    try:
+        target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _inject_session_header_into_mcp_config(
+    run_id: str | None,
+    label: str,
+    role: str,
+    run_dir: str | None,
+    mcp_profile_name: str | None = None,
+) -> None:
+    """If a generated MCP config exists for this role, inject the session header.
+
+    When mcp_profile_name is "none", no config was generated and injection is
+    skipped.  This keeps the adapter usable for deployments without a gateway.
+    """
+    if not run_dir or mcp_profile_name == "none":
+        return
+    config_path = Path(run_dir) / "harness" / "mcp" / f"{role}.mcp.json"
+    if not config_path.is_file():
+        return
+    try:
+        data = json.loads(config_path.read_text())
+        servers = data.get("mcpServers", {})
+        session_id = episode_session_id(run_id, label, role)
+        for server in servers.values():
+            headers = server.setdefault("headers", {})
+            headers["X-LH-Session"] = session_id
+        config_path.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass

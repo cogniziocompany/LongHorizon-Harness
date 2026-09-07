@@ -217,6 +217,16 @@ def audit_report_from_episode_result(
         paths = _mutation_paths(result.metadata.get("verifier_workspace_mutations"))
         restore_on_mutation = bool(result.metadata.get("verifier_workspace_restore_on_mutation", True))
         restored = bool(result.metadata.get("verifier_workspace_restored"))
+        if paths and all(path.startswith(".git/") for path in paths):
+            integrity_findings.append(
+                {
+                    "type": "network_git_op",
+                    "severity": "violation",
+                    "evidence": "Auditor workspace mutation is confined to .git/; likely a forbidden network git operation (fetch/pull/push/remote/clone/submodule/lfs).",
+                    "paths": paths,
+                    "restored": restored,
+                }
+            )
         allowed_delete_paths = _allowed_auditor_delete_paths(
             result.metadata,
             integrity_status=integrity_status,
