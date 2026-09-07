@@ -32,6 +32,9 @@ def test_auditor_env_contains_network_git_overrides(role: str) -> None:
     assert policy.env_overrides["GIT_TERMINAL_PROMPT"] == "0"
     assert policy.env_overrides["GIT_ASKPASS"] == "/bin/false"
     assert policy.env_overrides["SSH_AUTH_SOCK"] is None
+    assert policy.env_overrides["GIT_CONFIG_COUNT"] == "4"
+    assert policy.env_overrides["GIT_CONFIG_KEY_0"] == "credential.helper"
+    assert policy.env_overrides["GIT_CONFIG_VALUE_0"] == ""
 
 
 @pytest.mark.parametrize("role", _AUDITOR_ROLES)
@@ -53,6 +56,15 @@ def test_executor_command_template_does_not_inject_git_overrides(role: str) -> N
     assert "GIT_TERMINAL_PROMPT=0" not in template
     assert "GIT_ASKPASS=/bin/false" not in template
     assert "--unsetenvvar=SSH_AUTH_SOCK" not in template
+    assert "GIT_CONFIG_COUNT=4" not in template
+
+
+@pytest.mark.parametrize("role", ["manager", "final_response"])
+def test_manager_and_final_response_no_network_git_rules(role: str) -> None:
+    policy = policy_for_role(role)
+    for rule in AUDITOR_NETWORK_GIT_DENY:
+        assert rule not in policy.disallowed_tools
+    assert "GIT_TERMINAL_PROMPT" not in policy.env_overrides
 
 
 def _episode_result(status: str, mutations: dict[str, list[str]]) -> object:
@@ -86,6 +98,22 @@ def test_mixed_guard_mutation_does_not_add_network_git_op_hint() -> None:
         "done",
         {"added": [".git/objects/abc", "src/file.py"], "changed": [], "deleted": [], "type_changed": []},
     )
+    report = audit_report_from_episode_result(result, 1, language="en")
+    types = [f["type"] for f in report.integrity_findings]
+    assert "network_git_op" not in types
+
+
+def test_git_only_mutation_also_changes_status_to_blocked() -> None:
+    result = _episode_result(
+        "done",
+        {"added": [".git/objects/abc"], "changed": [], "deleted": [], "type_changed": []},
+    )
+    report = audit_report_from_episode_result(result, 1, language="en")
+    assert report.status == "blocked"
+
+
+def test_empty_mutation_does_not_add_network_git_op_hint() -> None:
+    result = _episode_result("done", {"added": [], "changed": [], "deleted": [], "type_changed": []})
     report = audit_report_from_episode_result(result, 1, language="en")
     types = [f["type"] for f in report.integrity_findings]
     assert "network_git_op" not in types

@@ -57,6 +57,15 @@ AUDITOR_NETWORK_GIT_ENV: dict[str, str | None] = {
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_ASKPASS": "/bin/false",
     "SSH_AUTH_SOCK": None,
+    "GIT_CONFIG_COUNT": "4",
+    "GIT_CONFIG_KEY_0": "credential.helper",
+    "GIT_CONFIG_VALUE_0": "",
+    "GIT_CONFIG_KEY_1": "credential.helper",
+    "GIT_CONFIG_VALUE_1": "",
+    "GIT_CONFIG_KEY_2": "url.https://.insteadOf",
+    "GIT_CONFIG_VALUE_2": "",
+    "GIT_CONFIG_KEY_3": "url.ssh://.insteadOf",
+    "GIT_CONFIG_VALUE_3": "",
 }
 
 
