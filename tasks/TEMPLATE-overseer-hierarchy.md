@@ -378,3 +378,59 @@ config + `reset --hard` BEFORE touching files); (2) never chain `pr create` + `p
 expected file count first; (3) prefer editing on CT110/WSL for repos that auto-deploy on main (mcp-tools "Deploy MCP Tools Stack" runs on every
 main push: E2E gate → CT204 config apply + LiteLLM restart → QA gate → CT202 deploy). The CRLF run was cancelled mid QA-gate (CT204 had already
 taken the CRLF config, harmless; the fix run re-applies LF). Main is now pre-#77 + the intended single-file change (verified `git diff --stat`).
+
+### Lesson (2026-09-06 17:35 PT): CT110 workspaces must use SSH remotes
+Six of the CT110 clones had `https://github.com/...` remotes; as user `harness` there are no https credentials, so `git fetch`/`push` fail with
+"could not read Username" — and a `checkout -B <branch> origin/develop` after a failed fetch silently builds on a STALE base (RP-14 would have
+started from d26ccc5 instead of b9b06b7). All remotes switched to `git@github.com:` (deploy key `lh-harness@ct110`, authenticates as prax211).
+Rule: before launching a run, `git fetch` must print nothing on stderr and `git log -1 origin/<base>` must match GitHub's tip.
+
+### Lesson (2026-09-06 17:44 PT): new workspace → budgets file FIRST
+Web-launched runs take `[run.timeouts]` from the WORKSPACE `.lh-harness/config.toml`; a fresh clone has none, so every role gets the 300 s default
+and a qwen3.8 manager times out three rounds in a row (loop-protection gate → run lost, ~20 min). Checklist for a new CT110 workspace: SSH remote,
+`git fetch` clean, branch from the verified base, venv/deps, `.lh-harness/config.toml` (manager 900 / auditor 900 / cli_executor 1800) added to
+`.git/info/exclude`, THEN launch.
+
+### Incident (2026-09-06 18:15 PT): a run whose workspace IS the harness repo poisoned every run on the node
+`/home/harness/venv` still had `_editable_impl_lh_harness.pth` → `/home/harness/work/LongHorizon-Harness/src` from the first install. The path did not
+exist, so imports silently fell through to site-packages — until the MCP-profiles task cloned the harness repo to exactly that path. From then on
+every worker/episode subprocess on CT110 imported the workspace's half-built code; the run's own slice-A commit crashed its auditor AND RP-14's.
+Fixed: `.pth` moved to `/home/harness/venv/_editable_impl_lh_harness.pth.disabled-20260906`, released package reinstalled non-editably from a clone
+of origin/main at `/home/harness/release-src`. Rules: (1) harness-dev runs use a workspace path that no `.pth`/PYTHONPATH references — check
+`python -c "import lh_harness; print(lh_harness.__file__)"` from the workspace before launch; (2) deploys are `pip install <clone>` (never `-e`)
+into the service venv; (3) when several runs die with the same odd spawn error within minutes, suspect the node, not the models.
+
+### Lesson (2026-09-06 19:45 PT): a "cancelled" CI job with no canceller = look at the runner host
+mcp-tools' E2E gate showed `cancelled` at the upload step; nobody cancelled it — the self-hosted runner service in CT203 was OOM-killed by systemd
+(`Failed with result 'oom-kill'`) and stayed down, so the deploy lane silently queued for 1.5 h. Check `gh api repos/<r>/actions/runners` (status
+offline) first, then the unit's journal in the CT. Runner hosts today: gh-runner-lan = CT203 (ptait01, mcp-tools), ct210-{pp,qa,billing} = CT210
+(ptait07), corsairai300 host unit (cognizioware-hydra).
+- Addendum 19:55 PT: the same run's executor then `pip install -e .`'d the workspace into the service venv (service venv first on PATH),
+  killing every new run at round 0. `/home/harness/venv` is now root-owned; deploys run as root. Harness-dev task texts must name the workspace
+  `.venv` explicitly and forbid touching `/home/harness/venv`.
+- 20:10 PT: `gh api --input <(printf …)` does NOT work from Git Bash on Windows (`open /proc/<pid>/fd/63: cannot find the path`) — the
+  approval watcher silently failed every 2 min while prod sat waiting. Always write the JSON to a temp file and pass `--input <file>`.
+- 21:15 PT: never edit a bash watcher script while it is running — bash reads the file incrementally, so the running loop hit `break: only
+  meaningful in a loop` / `syntax error near done` and exited (the promotion had already completed; no harm). Copy to a new filename for the next run.
+
+### Lesson (2026-09-07 00:25 PT): local lane rules after the LiteLLM normalizer
+`qwen3.8` (local, $0) now works for manager, executor AND auditor through CT202 (thinking-block/tool-turn normalizer, mcp-tools #79/#80/#81).
+Use it for one run at a time — the dual-3090 span serves NUM_PARALLEL=2, so a second or third qwen3.8 planner queues and blows the 900 s budget.
+Keep the kimi pool for parallel throughput; when the pool hits the 5-hour quota wall, move ONE run to all-qwen3.8 instead of waiting. Budgets
+file (900/900/1800) is mandatory in every workspace. If `Content block is not a thinking block` ever reappears, check that CT202's
+litellm-config still carries `hooks.thinking_normalizer.thinking_normalizer_instance` and the /app/hooks mount.
+- 00:30 PT Sep 7: `POST …/approvals/{id}/resolve` returns "error parsing the body" when `user_input` contains non-ASCII (an em dash) sent through curl from Git Bash — keep resolve notes ASCII-only, or send the body from a file.
+- 00:40 PT Sep 7: `glm-5.3:cloud` passes the 4-step round-trip on prod → allowed again as MANAGER (it was banned after the 09-05 F1 kill).
+  Standard trios now: throughput = kimi-k2.7-code:pool / kimi-k2.7-code:pool / kimi-k3:pool; planner-heavy = glm-5.3:cloud manager + kimi pool
+  executor + kimi-k3:pool auditor; off-quota = qwen3.8 / qwen3.8 / qwen3.8 (one run at a time).
+
+### Rule (2026-09-07): fleet devices get a fourth, infrastructure-free path — Claude Remote Control
+Task `tasks/claude-rc-fallback-2026-09-07.md`. Once a device runs the `<id>-claude-rc` easysvc service, the overseer's escalation order for a
+device that stops answering is: runner REST/MCP via the tunnel → LiteLLM gateway `ptait09-*` tools → Hydra device agent → **the `<id>-rc`
+session at claude.ai/code** (find it with `GET /rc` on the runner or `host_info.claudeRc`) → only then a human at the console. Nothing about this
+path is operated from ptait09 interactively; installs go through the runner's `/exec` as SYSTEM, service restarts from an elevated console (Paxton).
+- 05:45 PT Sep 7: "OOM-killed runner unit" on CT203 was HOST OOM on ptait01 (cgroup peak 0.5 GB of 12 GB; 28 host kills; the kernel also killed the
+  Ollama span's llama-server). Lesson: when a CT process dies of OOM below its cgroup limit, read the HOST's `dmesg`/`journalctl -k` first. The
+  mcp-tools LAN runner now lives on CT210 (ptait07) as `ct210-lan`.
+- LESSON (2026-09-07): LiteLLM `GET /health` (authenticated) is NOT a cheap probe - it runs a real completion against every deployment (~50 models: paid Perplexity, Ollama Cloud quota, and it loads glm-ocr onto the ptait01 GPU). Spend log showed 120-490 health-check rows per hour and ~$0.1-0.2/h. Pollers and gates must use `/health/liveliness` (process up), `/health/readiness` (db + version) or `/health?model=<one>`; never bare `/health` in a loop. Public `/health` through Cloudflare returns 401 and is harmless.
+- LESSON (2026-09-07): "Content block is not a thinking block" is raised by Claude Code's stream accumulator, not by the router; routers log nothing. Reproduce with a streamed `/v1/messages` call and print block/delta indexes. Harness lane answer: reasoning off (`qwen3.8-nothink`, extra_body reasoning_effort=none).

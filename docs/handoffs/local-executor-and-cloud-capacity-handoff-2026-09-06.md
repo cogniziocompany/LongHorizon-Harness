@@ -107,3 +107,49 @@ Turn 2 — append the turn-1 answer verbatim (including its `thinking` block wit
 - 16:30 PT — Paxton chose option D: a 4th Ollama Cloud key (alias `litellm-cognizioware`, probed OK) is in the gateway env as `OLLAMA_CLOUD_KEY_4`
   and live as a 4th deployment on every `:pool` group (DB-stored, no restart). Cap raised to three concurrent `:pool` runs. Option B (normalizer) is
   in progress as run bf5e2f69. Option C (non-Ollama fallbacks) still needs his go because it spends per-token on Anthropic/OpenRouter accounts.
+
+### Progress 2026-09-06 17:58 PT — F1 reproduced on the qwen3.8 AUDITOR
+Run 20260907T005013Z_adf11963 (RP-14, mcp-cognizioware): auditor `qwen3.8` (openai/… @ :11442/v1, 900 s budget) failed after 732 s with
+`Content block is not a thinking block` — the auditor echoes its own earlier thinking block on a later tool turn exactly like the executor did.
+So F1 hits every role that runs more than one tool turn; only truly single-shot episodes are safe. Consequence: until the normalizer
+(cognizioware-mcp-tools run bf5e2f69) is deployed on CT202, qwen3.8 is limited to roles that finish in one turn, and the harness lanes stay on the
+kimi pool. The bf5e2f69 run itself (qwen3.8 manager + auditor, r6+) has survived so far — luck of short audits, not evidence of a fix.
+
+### Progress 2026-09-06 20:05 PT — second quota wall of the day
+Keys 1–3 (prax211, ai-dev01, ai-dev02) all 429 "session usage limit" again at 20:05 PT; only key 4 (litellm-cognizioware, added 16:30) answers.
+Casualty: the MCP-profiles harness run da3cdef7 (round 4, `No fallback model group found for kimi-k2.7-code:pool`). Two runs (RP-16 ac894162,
+webhook fix 084159ae) are riding key 4 alone. Practical ceiling today: four Pro accounts sustain roughly three concurrent kimi runs for ~3 h before
+the rolling 5-hour windows close; the pool has no non-Ollama rung (paid providers need Paxton's go). The local qwen3.8 lane cannot absorb
+the load until the normalizer (mcp-tools #79, deploying) is live and re-validated.
+- 20:10 PT: quota watcher v2 running (probes 4 keys every 20 min; resumes ids listed in C:\tmp\pending_runs.txt when ≥2 keys OK, cap 2 running).
+
+### Progress 2026-09-06 21:30 PT — span hang + uat gate blocked by quota, not by the hook
+- The uat LiteLLM QA gate (`cognizioware-qa/litellm-uat`) has been FAILING since 21:08Z, i.e. BEFORE the normalizer: every failed subtest is a
+  500 "session usage limit" from the Ollama relay (glm-5.3-flash:cloud, kimi-k2.7-code:cloud chat + /v1/messages). It passed at 16:42Z. So the
+  CT202 deploy of #79 waits for the quota windows, then `gh run rerun --failed` on 34072999745 (or the next main push).
+- The qwen3.8 span (cognizioware-ollama-span on ptait01) was HUNG: `/api/ps` listed the model but direct `/v1/chat/completions` timed out at 120 s,
+  GPU util 0 %, GPU0 12.5 GB / GPU1 0.3 GB (runner dead). `docker restart cognizioware-ollama-span` fixed it: first answer in 51 s (cold load),
+  now GPU0 20.4 GB + GPU1 14.4 GB (spread + 64k KV). Host RAM: 42 GB total, 4 GB available — that is the real ceiling for a second local model.
+  This also explains the matrix run stalling at step [a] for qwen3.8. Add the span to the ops doctor as an inference probe (not just container health).
+- 22:05 PT: normalizer (mcp-tools #79 + #80) live on uat; the Claude-Code-shaped round-trip matrix PASSES 4/4 for qwen3.8 on CT204. Prod (CT202)
+  waits for the pipeline's uat QA gate, which is failing only on Ollama quota. §6.1 acceptance (harness run, 3 tool rounds, clean audit) runs after CT202.
+- 23:10 PT: normalizer live on CT202 (prod) through the pipeline; qwen3.8 Anthropic-route smoke 200. §6.1 acceptance run launching (all-qwen3.8 trio).
+- 00:25 PT Sep 7: **§6.1 ACCEPTED.** All-qwen3.8 harness run (9a864a8f) through prod: 3 tool-using rounds, clean audits, no F1/F2/F3. Local lane
+  restored for every role. Remaining from §3: option A (Ollama capacity) done with key #4; option C (normalizer) done; B/D/E/F not needed today.
+- 00:40 PT Sep 7: glm-5.3:cloud matrix 4/4 on prod; kimi pool 3/4 with the miss being a per-account 429 that the router retried on the same deployment. Routing gap noted (pool fallback chain + cooldown) as the next capacity item.
+
+### Progress 2026-09-07 02:35 PT — span hang #2
+The qwen3.8 span hung again ~5 h after the first restart: model listed as loaded (19 GB on GPU0 only, GPU1 empty, 0 % util), direct
+/v1/chat/completions timed out at 150 s, the uat router's qwen3.8 route timed out at 7 min. Restarted the container again. Pattern: the hang
+follows heavy sequential use (the all-qwen3.8 RC run) and the model ends up on a single GPU with no spread — investigate OLLAMA_SCHED_SPREAD on
+reload and an idle-unload/reload cycle (KEEP_ALIVE 30m) as the trigger. The doctor "span inference" row (mcp-tools resilience task) is the
+detection fix; the cure needs a probe-and-restart loop or a fix upstream. Until then: one local run at a time, and expect a restart every ~5 h.
+- 02:45 PT Sep 7: auto-heal installed on ptait01: /etc/cron.d/ollama-span-probe runs /usr/local/sbin/ollama-span-probe.sh every 10 min (1-token generate with a 120 s timeout; on failure docker restart cognizioware-ollama-span; log /var/log/ollama-span-probe.log). Removes the manual restart from the loop until the root cause (single-GPU reload + KV growth) is fixed.
+
+### ROOT CAUSE 2026-09-07 05:45 PT — ptait01 host is out of RAM; that is both the "span hangs" and the runner kills
+Kernel log on ptait01: `Out of memory: Killed process (llama-server) anon-rss 6.6 GB … global_oom` at 01:40 — the qwen3.8 span's runner was
+killed by the HOST (42 GB: span + CT202 stack + CT204 stack + CT100 + CT203 + page cache), which is exactly the "model listed but no inference"
+state seen twice. CT203's cgroup: memory.max 12 GB, peak 0.5 GB, `oom_kill 28` — the LAN runner was never near its limit; the host killed it.
+Consequences: (1) the mcp-tools LAN runner moves to CT210 on ptait07 (`ct210-lan`, label lan-cognizioware); CT203's unit is stopped;
+(2) the span probe-and-restart cron stays as a safety net; (3) real fix = RAM for ptait01 or moving the uat stack (CT204) / the span off it —
+Paxton's call. Until then, expect the span to be killed whenever CT202+CT204+E2E coincide.

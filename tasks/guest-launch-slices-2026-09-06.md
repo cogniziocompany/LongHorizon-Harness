@@ -63,3 +63,11 @@ uat via release fast-forward after the pp promotion settles. pp promotion for 47
 - 16:49 PT: billing QA gate (target=billing, env=dev, base_url http://192.168.21.153:20252, caller sha b9b06b7) on ct210-qa: score 100, 8/8 admin
   acceptance tests, status `cognizioware-qa/billing-dev` success (qa run 34067904053). Next for billing: mirror the Stripe__Guest*/Billing__*/YouTrack__*
   keys into the uat lane env, then release fast-forward → uat lane; prod stays closed until seven successful test-mode nightly closes (plan invariant).
+- 20:10 PT: promotion 34067791009 (pinned 476811f): dev AND uat fully green (deploy, CE QA gate, primary eval gate, eval score gate). Prod deploy
+  approved by the overseer at 20:08 PT per Paxton's standing rule (the watcher's own approve call failed on Windows process substitution — fixed in
+  promo-guest.sh; approved by hand with a JSON file). Prod deploying now; prod CE gate + prod eval gate follow (expect 15/16 again until the
+  webhook-crud fix lands — that gate result is informational for this run, the deploy itself is done once the rollout step passes).
+- 21:10 PT: promotion 34067791009 COMPLETED SUCCESS — dev, uat AND prod: deploy + CE QA gate + primary eval gate + eval score gate all green.
+  Guest slice 1 (pp #73), the web nav-archive (#67) and the runner/deploy fixes (#71–#76) are in PROD at sha 476811f. Prod eval score gate passed
+  (the multi-webhook-crud case that scored 15/16 in run 16 did not block this run — see the webhook task file; the fix run stays queued as
+  hardening). Slice 2 candidates (P03 provisioning, U02 LiteLLM-first capture, B06 dunning, A03/A04 admin telemetry) can be planned.

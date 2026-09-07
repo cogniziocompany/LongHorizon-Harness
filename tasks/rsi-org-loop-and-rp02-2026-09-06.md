@@ -60,3 +60,64 @@ functions + apply script) launched as run 00c95986 in the rsi clone.
   slice 1 + RP-13 at 15:16; guest slice 1 relaunched on kimi (84bec9d9) after the local qwen3.8 executor attempts failed on LiteLLM translation bugs
   (see docs/handoffs/local-executor-and-cloud-capacity-handoff-2026-09-06.md). RP-15 (f94faabb) and the webhook-crud fix (cccbef69) remain queued
   behind the two-run cap.
+- 2026-09-06 16:57 PT: RP-15 (f94faabb) had died at round 1 on the ai-dev01 session limit ("No fallback model group"). With keys 1 and 4
+  (litellm-cognizioware) healthy and only one other :pool run active, resumed via `POST /api/runs/{id}/resume {"mode":"continue"}` →
+  status starting, resume_epoch 1. The ≥3-keys quota watcher was stopped (manual resume supersedes it); state-change watcher now covers RP-15 + bf5e2f69.
+- 17:35 PT: RP-15 (f94faabb) completed at round 7 after the resume: one explicit-path commit 2c53b36 on feat/rsi-hydra-trigger (worktree
+  cognizioware-hydra-rsi) — POST /fleet/rsi/runs (RSI_TRIGGER_ENABLED default off, RSI_ALLOW_LIST, 11-field validation, rsi-loop actor logging),
+  orchestrator/src/rsi-poller.js write-back poller with injectable sink + pendingEvents fallback, 22/22 node tests, design §4.4/§6 updated.
+  Overseer review: no secrets, kill switch verified in code. Run closed via approval f31a05fcdadd (stop). PR opened → main.
+- 17:34 PT: RP-15 merged as hydra #14 (main ebe0153). Orchestrator deploy on corsairai300 still batched (RP-02 #12 + RP-15 #14 + RP-13 apply);
+  RSI_TRIGGER_ENABLED stays unset (off) until Paxton starts using the loop.
+- 17:35 PT: RP-14 (YouTrack approval-trigger receiver, mcp-cognizioware `feat/rsi-approval-trigger` from develop b9b06b7 = billing slice 1 + #72)
+  launched as `20260907T003459Z_81e6ed65`, 8 rounds, qwen3.8 / kimi-k2.7-code:pool / qwen3.8. All four Ollama keys answered 200 at 17:33, so three
+  pool runs are in flight (bf5e2f69, 2785e057, 81e6ed65). RP-16 (surfacing adapters) waits for the mcp-tools workspace (bf5e2f69) to finish.
+- 17:52 PT: RP-14 81e6ed65 stopped at round 3 — same cause as the harness run: no workspace `.lh-harness/config.toml`, qwen3.8 manager timed out
+  twice at 300 s, round 3 emitted an invalid route. Budgets file added to the mcp-cognizioware workspace (untracked). Relaunched with a kimi manager
+  (three qwen3.8 planners on one span with NUM_PARALLEL=2 queue behind each other); auditor stays qwen3.8. New id on the next line.
+- 17:53 PT: RP-14 relaunched as `20260907T005013Z_adf11963` (kimi manager+executor, qwen3.8 auditor, 8 rounds, budgets 900/900/1800).
+- 17:58 PT: RP-14 adf11963 FAILED in round 1 on the qwen3.8 AUDITOR: `API Error: Content block is not a thinking block` (F1, LiteLLM thinking-block
+  echo) after a 732 s tool-using audit episode. Executor (kimi) had completed the round. Relaunched with the standard all-kimi trio
+  (kimi-k2.7-code:pool / kimi-k2.7-code:pool / kimi-k3:pool); qwen3.8 stays out of tool-using roles until bf5e2f69's normalizer is deployed.
+- 18:05 PT: RP-14 relaunched as `20260907T010509Z_060e4809` (all-kimi trio, 8 rounds).
+- 18:15 PT: RP-14 060e4809 FAILED at round 1 with `/bin/sh: 1: --unsetenvvar=SSH_AUTH_SOCK: not found` — collateral of the CT110 editable-install
+  hazard (see tasks/mcp-profiles-auditor-lock-2026-09-06.md 18:15). Released package restored; relaunched (id on the next line).
+- 18:22 PT: RP-14 relaunched as `20260907T011226Z_c471fab5` (all-kimi, 8 rounds), on the restored released package.
+- 19:05 PT: RP-14 (c471fab5, all-kimi) COMPLETE at round 5: d915bf3 (slices 1–2: RsiApprovalController/handler, validation incl. service-account
+  approver guard `ai-dev01@cognizio.company`, harness_trigger_request builder) + a64bee0 (slices 3–4: Postgres `rsi_approvals` idempotency store,
+  409 active-run guard, continuation branches `feat/rsi-<type>-<issue>-continue-<n>`, `pending_youtrack_events` fallback, DI, tests). 22 files
+  +2697, all inside src/McpCognizioware.BillingService{,.tests}; kill switches `Rsi:LoopEnabled`/`Rsi:TriggerEnabled` (legacy env
+  RSI_LOOP_ENABLED/RSI_TRIGGER_ENABLED) default false; simulation trace: 202 / 400 / 409 / 202-continuation. No secrets. The run also edited the
+  design doc in the hydra-rsi worktree (outside its workspace) — committed separately as hydra #15 (doc-only). Run closed via approval
+  51c2958ed596. Next: dotnet test → PR → develop (dev billing lane deploy; the receiver is inert with the switches off).
+- 19:45 PT: RP-14 verification — hermetic suite 285/289: four PostgresPendingEventQueueTests failed because enqueue set NextAttemptAtUtc = now+5 min
+  (fresh write-backs invisible to GetPendingAsync). Overseer fix (2 lines): due immediately, RetryDelay only after a failed attempt → 289/289.
+  PR → develop opened (deploys to the dev billing lane via ct210-billing; receiver inert with switches off).
+- 19:50 PT: RP-16 (surfacing-catalog adapters ops-status + qa-run, mcp-tools `feat/rsi-surfacing-adapters` from main b407ddc) launched as `20260907T014548Z_d2cdac30` (all-kimi, 8 rounds). RP-14 merged as mcp-cognizioware #73 → dev billing lane deploy in progress.
+- 20:00 PT: RP-14 live on the dev billing lane (develop CI 34074020118 green from ct210-billing; app sha-1a82ca5 healthy, /api/health 200, guest route 401). Receiver inert (switches off).
+- 20:20 PT: RP-16 ac894162 died in round 1 on the ai-dev01 session limit (no commits yet). Queued for automatic resume with the webhook fix; the MCP-profiles relaunch (new task text) follows by hand once the quota watcher reports ≥2 healthy keys. Nothing else runs on the pool tonight until the windows roll.
+- 22:45 PT: RP-16 (ac894162, resumed after quota) COMPLETE at round 4: f51a8d8 — services/ops-status-mcp (7 read-only ops_status_* tools),
+  services/qa-run-mcp (qa_run_summary, qa_service_run_status), litellm-config.yaml `rsi-loop` access group (separate from fleet-runners/billing/
+  repo-tools), self-check scripts; 9 files +3421; no secrets; no mutating HTTP verbs. GAP: no Dockerfiles/compose services for the two adapters, so
+  the config would reference unresolvable hosts → opened as a DRAFT PR; follow-up RP-16b (compose + env + e2e) before merge. Design-doc §4.2 edit
+  committed separately (hydra docs PR). Run closed via approval 5e3110b43b8a.
+- 22:50 PT: hydra #16 (RP-16 doc deviations) merged. RP-16b launched as `20260907T033030Z_63fa3d04` (same branch feat/rsi-surfacing-adapters; Dockerfiles + compose services + e2e 35; all-kimi, 6 rounds). Pool now: webhook fix 084159ae, MCP-profiles 716506b3, RP-16b — three runs on four healthy keys.
+- 23:30 PT: RP-16b (63fa3d04) COMPLETE at round 6: d0482a5 Dockerfiles (node:22-alpine, non-root, HEALTHCHECK /health), dedf223 compose services
+  ops-status-mcp :3130 / qa-run-mcp :3131 (env by NAME from mcp-tools.env, init: true), 313593c e2e suite 35 + docs + .env.example names,
+  4d568b7 env-name alignment. Branch total 16 files +3711, compose/config diffs are pure additions (CRLF preserved). No secrets. Run closed via
+  approval 8f6bf01b451b. Overseer: compose validated on CT204 with the real env → PR #81 marked ready → merge → pipeline builds the two images
+  and deploys (E2E gate, CT204, QA gate, CT202). Operator env to set on CT202/CT204 (names only): OPS_CONTROL_CENTER_URL, OPS_INGEST_KEY, QA_BACKEND_URL, QA_READ_TOKEN, QA_REPORTS_DIR
+  (MCP_API_KEY already exists). Overseer trimmed `env_file` from both services (6bebefa) so they receive only these; validated on CT204.
+- 23:45 PT: PR #81 (RP-16 + RP-16b + env trim) MERGED (main 541d7aa) → pipeline builds ops-status-mcp / qa-run-mcp images and deploys CT204 → CT202. Adapter env not yet set on either router host (CT204 has none; CT202 has OPS_INGEST_KEY only) — adapters will start but answer errors until OPS_CONTROL_CENTER_URL / QA_BACKEND_URL / QA_READ_TOKEN / QA_REPORTS_DIR are added; overseer wiring next.
+- 23:55 PT: adapter env wired by NAME on CT202 + CT204 mcp-tools.env: QA_BACKEND_URL (CT210 QA backend :8400) and QA_READ_TOKEN (CT210's QA API key, copied host-to-host, never in docs). OPS_CONTROL_CENTER_URL uses the compose default (ops-control-center:8080; OPS_INGEST_KEY already on CT202). QA_REPORTS_DIR left at default (no report mount on the router hosts; the adapter falls back to the API). The pipeline's CT202 full deploy creates the two adapter containers with this env; CT204's apply step only touches LiteLLM, so uat has no adapters (by design of the lane).
+- 00:50 PT Sep 7: adapters pipeline (541d7aa): E2E + CT204 + uat QA gate green, **CT202 deploy failed at 'Build local images'** — the lane derives build contexts from compose and syncs only infrastructure/<ctx>; RP-16 placed the services at repo-root services/, so CT202 had an empty context (no Dockerfile). Prod router untouched (failed before compose up; health 200). Fix: move both adapters to infrastructure/docker/<name> and point the compose contexts there (branch fix/rsi-adapters-build-context).
+- 02:20 PT Sep 7: **RP-16 LIVE on prod** — build-context fix merged; pipeline fully green (E2E, CT204, uat QA gate, CT202 deploy, smoke, prod QA
+  verify). CT202: ops-status-mcp and qa-run-mcp containers healthy, /health OK (ops sections doctor/catalog/e2e/ci/cloud/langfuse/actions;
+  qa reports_dir /app/qa-reports). The CT202 deploy restarted LiteLLM (~6 min ago) — pool runs may have lost one episode. Next: gateway tools/list
+  check for the rsi-loop group and a virtual key with access group rsi-loop for the Open WebUI reporting agent (RP-13 apply, later).
+- 02:35 PT Sep 7: gateway verification — JSON-RPC `tools/list` on CT202 `/mcp/` with `x-mcp-servers: ops_status_mcp,qa_run_mcp` returns exactly the
+  nine rsi-loop tools (`ops_status_mcp-ops_status_{doctor,catalog,e2e,ci,cloud,langfuse,actions}`, `qa_run_mcp-qa_run_summary`,
+  `qa_run_mcp-qa_service_run_status`). Gotcha for callers: the `/mcp/tools` and `/mcp/tools/list` GET/POST shortcuts answer "Client must accept
+  text/event-stream" — use a real MCP JSON-RPC POST with `Accept: application/json, text/event-stream` (the e2e suite's POST shape soft-skips).
+  Optional polish: add dash-free aliases (`opsstatus`, `qarun`) in mcp_aliases to shorten tool names for the Open WebUI agent.
+- 02:37 PT Sep 7: aggregate gateway tools/list = 954 (no collapse; the plan's ~695 baseline was older).

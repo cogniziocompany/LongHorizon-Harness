@@ -43,3 +43,13 @@ on CT210; disable the PC's three runner services (needs an elevated shell — Pa
   steps to bash; WRONG on first pass: #75 left `if ($LASTEXITCODE …)` + `$env:GITHUB_OUTPUT` inside the bash steps → still `syntax error near
   unexpected token '{'` (runs 34066670957, 34066962672); pp #76 finishes the conversion. Lesson: after a shell conversion grep the whole step for
   pwsh syntax ($LASTEXITCODE, $env:, .Trim(), Write-Host) — not just the failing line. The dev PC now runs nothing for CI.
+- 17:03 PT (Paxton: "this device docker still shows the qa and hydra"): the PC's Docker still held the STOPPED hydra compose project
+  (orchestrator + redis, exited 7–21 h) and ~13 GB of hydra/qa images. Removed: `docker compose -p hydra down`, images hydra-orchestrator,
+  hydra-terminal-host, hydra-ocr-service (x2 tags), cognizioware-hydra-orchestrator, cognizioware-qa-backend. Kept: volume `cognizioware-qa_pgdata`
+  (the pre-migration QA database; CT210 holds the live copy — delete only with Paxton's go) and Paxton's own ptait09-easybutt0n-ai stack
+  (openwebui/mcpo exited, cloudflared tunnel running). No hydra/qa containers or images remain; QA runs on CT210, Hydra on corsairai300.
+- 22:30 PT (Paxton): the three PC runner services (pp ptait09, qa ptait09-qa, mcp ptait09-mcp) set to start=disabled. CI offload complete: nothing on the dev PC starts at boot for CI/QA/Hydra.
+- 23:20 PT (Paxton, elevated): all three PC runner services now START_TYPE DISABLED (verified with sc.exe qc). CI offload item closed.
+- 23:45 PT Sep 6: main's CI deploy job was still failing on the pwsh remnant (#76 fixed develop only; run 34066957143) → cherry-picked as pp #79 to main. Note for the record: pp #41/#42 merged 2026-09-06 01:56Z; #43 was superseded by #62 (main) + #63 (develop), both merged — nothing is blocked on that thread.
+- 00:20 PT Sep 7: 'disable the three PC runner services' item REMOVED from the ship plan — Paxton completed it (verified DISABLED 23:20 PT).
+- 05:50 PT: ci-offload note — mcp-tools' lan-cognizioware runner is now ct210-lan on CT210 too (ptait01 host OOM); runners on CT210: ct210-pp, ct210-qa, ct210-billing, ct210-lan.

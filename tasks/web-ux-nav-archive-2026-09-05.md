@@ -39,3 +39,10 @@ sessions + subheader **including W3 archive/restore** (single slice; "Delete" ap
 committed 36 untracked backend dist artifacts were dropped by the overseer (reset to c29decb) — `packages/backend/dist` is not tracked on develop.
 PR → develop: pp #67, held unmerged until promotion run 16 clears its dev stage (a dev-lane redeploy mid-eval would disturb the gate). G2 deferred.
 - 07:15 PT: #67 merged; dev lane CI build/image/deploy green; pp-dev-app-1 on sha-286fecb healthy; log shows `028_environment_status.sql Migration applied`; root 200 (title "Cognizioware - Power Platform Builder"); API 401 unauthenticated as expected. Browser check of the shell/crumb/archive round-trip is Paxton's (needs MSAL sign-in) at http://192.168.21.163:3000.
+
+## Follow-up (2026-09-07 01:35 PT): Env → Session flow redesign review (Claude Design, Modernist)
+Paxton's design expert delivered `design/ux/modernist/` in cognizioware-powerplatform (Env-to-Session-Spec.md, "Env to Session Flow.dc.html",
+five screenshots): 6-step process strip, 3-step wizard (Solution → Specs → Review & start), processing lockout, CGZ-Exxx coded failures,
+approval-gate-only doc editing, auto-titled workspace. Overseer copied the spec to docs/handoff/ and is running the powerplatform Claude Code
+session (f2b53435) headlessly to produce docs/handoff/Env-to-Session-Spec-REVIEW.md (gaps, conflicts, ordered slices, answers to the designer's
+four open questions). Paxton relays the review to the designer; the build itself becomes a harness task after the designer's revision.

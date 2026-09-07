@@ -1,0 +1,24 @@
+# TASKS — one harness task per open repo problem on the Ship Plan (2026-09-07), with the solution each run implements
+
+**Asked by Paxton 2026-09-07 00:25 PT:** "create an lh-harness task for each of the repo problems [from the ship plan artifact] and come up with
+solutions to resolve." Source: ship-plan artifact https://claude.ai/code/artifact/66bed19d-14a9-4bbf-8c9a-15f77a7fc290 (updated 23:05 PT) plus the
+problems found tonight while running its lanes. Follows `TEMPLATE-overseer-hierarchy.md`; overseer manages all four; launches go through the
+capacity-aware queue `C:\tmp\launch_queue.py` (queue dir `C:\tmp\queue\`, cap 2 kimi runs on ≥2 healthy keys, one qwen run; busy workspaces skipped).
+
+| # | Repo · problem (from the plan) | Root cause | Solution the run delivers | Run |
+|---|---|---|---|---|
+| 1 | **cognizioware-powerplatform** — multistep evals fail intermittently (`multi-webhook-crud@prod` 15/16 on run 16; d2e3784 proof promotion red on 3 multistep cases at dev while the same code was green at 476811f) | Provider quota/timeouts inside a multistep case are reported as product "REGRESSION"; the n8n QA agent runs out of iterations on the long verification path | `infra-error` outcome class with retry/backoff and a distinct gate exit code 3 ("blocked by infrastructure"), QA-agent iteration budget + schema-tool checklists for the other two multistep prompts, gate summary that never lies about the product | `fix/multistep-eval-flakiness` in the evalfix workspace, task `C:\tmp\pp-eval-flakiness-task.txt`, kimi trio, 8 rounds |
+| 2 | **mcp-cognizioware** — prod was built on the box from a drifted source tree (six CS0246 errors, the #66 "reconciliation trap"); prod has no lane | No prod instance in `deployments/instances.json`, no promotion workflow; hand builds on CT100 | `prod` instance + `ROLLOUT_APPROVED` guard, `promote-billing.yml` dev → uat → prod (pinned sha, QA `billing-*` statuses, `production` environment approval), prod startup guards (live-mode only in prod, APP_VERSION required), lanes runbook | `feat/billing-prod-lane`, task `C:\tmp\billing-prod-lane-task.txt`, kimi, 8 rounds |
+| 3 | **cognizioware-mcp-tools** — (a) `:pool` groups 500 on one exhausted account while others answer; (b) doctor missed the OOM-killed runner unit and the hung Ollama span (container "healthy", inference dead 2 h); (c) ops-oauth2-proxy healthcheck uses wget on a distroless image (cosmetic red); (d) RSI adapter tool names long / suite 35B queries a shortcut endpoint that cannot answer | Router retries the same deployment (no per-group fallback, long cooldown); doctor probes container state not inference; wrong healthcheck binary; missing dash-free aliases + wrong query shape | Pool fallbacks + short cooldown (Ollama-family only), three doctor rows (runner units via GitHub API, span inference call, cloud-key quota), healthcheck fix, `opsstatus`/`qarun` aliases + JSON-RPC query in suite 35 | `fix/ops-resilience-2026-09-07`, task `C:\tmp\mcp-tools-resilience-task.txt`, kimi, 8 rounds (waits for the audio QA run to free the workspace) |
+| 4 | **cognizioware-qa** — the `litellm-uat` gate went red three times on provider quota errors and blocked the mcp-tools lane ~3 h; every target has the same exposure | Suites treat router 500/429 as product failures; status posted as `failure` | Shared infra-error classifier, retry/backoff, `skipped:infra` subtests, commit status `error` ("blocked by infrastructure") when failed == 0, exit-code 3 contract + `scripts/gate-status.mjs` for callers, env-driven litellm model matrix | `fix/gate-infra-aware`, task `C:\tmp\qa-gate-quota-task.txt`, kimi, 6 rounds |
+
+Already resolved, not re-tasked: "#41 blocked" (merged; #43 → #62/#63), main CI deploy step (pp #79 auto-merge armed), deploy-lane `while read` + ssh
+defects (#66–#68), GITHUB_TOKEN cross-repo build (#67), oauth2-proxy identity header (#73), runner OOM (CT203 drop-in), adapters build context (#82).
+
+## Overseer follow-through (each)
+Review → PR to the repo's integration branch → the repo's lane (pp: dev lane + CE gate → pinned promotion; billing: develop → dev lane → billing gate;
+mcp-tools: main lane E2E → CT204 → QA gate → CT202; qa: master + the callers' promote/deploy workflows updated for the `error` state).
+Caller updates after #4 lands: pp promote.yml and mcp-tools deploy-mcp-tools.yml poll steps treat `error` as "retry later".
+
+## Progress
+- 00:30 PT: four task texts written; queue entries created; launch queue started (workspaces: qa + mcp-cognizioware + evalfix free; mcp-tools busy until the audio QA run ends).
