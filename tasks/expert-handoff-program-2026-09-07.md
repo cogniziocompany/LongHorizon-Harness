@@ -1,0 +1,10 @@
+# Expert handoff program: Hydra control plane + product evaluation catalog — 2026-09-07
+
+**Source:** docs/handoffs/based-on-this-tasks-template-overseer-hi-fancy-fountain.md (committed 3743866). Paxton: "one task encompassing our entire infra and the revenue repo powerplatform; apply everything from the other expert." The handoff itself assigns the work to the owner queues, so it is queued as five harness tasks, each carrying the handoff verbatim:
+- 14a pp product eval catalog (cases #1-#N, full-build driver, strict >90 promotion, ownership/retention/cleanup, EvalsPanel feed, acceptance scenarios) - 12 rounds, pp-evalfix workspace.
+- 14b qa full-case contract v2 + scoring + evidence + Mission Control reuse - 8 rounds.
+- 14c hydra control plane: reconcile items 2-6 then build gaps (external CT110 node + links [absorbs 13b], fleet runs + queue panel, doctrine invariants, MCP tools + prompts, UX parity/activity feed, placement/migrate/offload) - 10 rounds.
+- 14d harness infra hardening + docker node image + disposable infra acceptance (after task 12) - 8 rounds.
+- 14e hivemind memory MCP + ingest + chat outlet filter + gateway registration - 8 rounds.
+**Namespace question (Paxton 16:20 PT):** append the created solution's GUID to schema names so attempts never overlap - or a better existing mechanism. Overseer recommendation pending his answer: per-attempt publisher customization prefix (Dataverse-native namespace, 2-8 chars, e.g. ev + 6 hex of the attempt id) with the solution GUID kept in the ownership ledger; GUID suffixes on every schema name hit the 64-char logical-name limit and hurt readability. The OVERSEER NOTE goes into the 14a task text once decided.
+**Sequencing:** 12 -> 14d; 14c after 12's contract; 14a/14b/14e independent. Deploys: harness release at idle, Hydra on corsairai300, lanes for pp/qa/mcp-tools.
