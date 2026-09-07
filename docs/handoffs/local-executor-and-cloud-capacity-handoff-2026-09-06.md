@@ -153,3 +153,6 @@ state seen twice. CT203's cgroup: memory.max 12 GB, peak 0.5 GB, `oom_kill 28` â
 Consequences: (1) the mcp-tools LAN runner moves to CT210 on ptait07 (`ct210-lan`, label lan-cognizioware); CT203's unit is stopped;
 (2) the span probe-and-restart cron stays as a safety net; (3) real fix = RAM for ptait01 or moving the uat stack (CT204) / the span off it â€”
 Paxton's call. Until then, expect the span to be killed whenever CT202+CT204+E2E coincide.
+
+### 8.x ptait01 memory (2026-09-07 03:10 PT)
+Paxton chose the no-hands fix. Host had NO swap; ARC already capped at 2.7 GB; standing users: CT202 6.8 GB, CT204 6.2 GB, ollama-cloud 5.4 GB (glm-ocr + embeddings kept loaded by /health sweeps), speaches 3.3 GB, CT100 2.5 GB. Added a 16 GB ZFS swap zvol (`rpool/swap`, fstab, `vm.swappiness=10` in /etc/sysctl.d/99-swap.conf) so spikes page instead of OOM-killing llama-server/CT processes. Second lever already landed: the /health sweep fix (mcp-tools #87) stops re-loading glm-ocr/whisper. Still open: CT204 cgroup limit (16 GB) killed node at 02:02 PT - raise or trim the QA lane heap if it recurs.
