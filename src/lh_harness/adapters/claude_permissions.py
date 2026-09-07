@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -21,6 +21,45 @@ _WRITE_TOOLS = ("Write", "Edit", "NotebookEdit")
 _AUDITOR_ROLES = {"gui_auditor", "cli_auditor", "auditor_format_repair"}
 
 
+# Deny rules for auditor network git operations. These prevent an auditor from
+# running commands that rewrite .git/objects or fetch refs over the network,
+# which would cause the workspace guard to flag an integrity violation.
+AUDITOR_NETWORK_GIT_DENY: tuple[str, ...] = (
+    "Bash(git fetch*)",
+    "Bash(git pull*)",
+    "Bash(git push*)",
+    "Bash(git remote*)",
+    "Bash(git clone*)",
+    "Bash(git submodule*)",
+    "Bash(git lfs*)",
+    "Bash(gh *)",
+    # Variants that point git at a different directory via -C or --git-dir.
+    "Bash(git -C * fetch*)",
+    "Bash(git -C * pull*)",
+    "Bash(git -C * push*)",
+    "Bash(git -C * remote*)",
+    "Bash(git -C * clone*)",
+    "Bash(git -C * submodule*)",
+    "Bash(git -C * lfs*)",
+    "Bash(git --git-dir* fetch*)",
+    "Bash(git --git-dir* pull*)",
+    "Bash(git --git-dir* push*)",
+    "Bash(git --git-dir* remote*)",
+    "Bash(git --git-dir* clone*)",
+    "Bash(git --git-dir* submodule*)",
+    "Bash(git --git-dir* lfs*)",
+)
+
+# Environment variables that make any network git operation fail fast for the
+# auditor role. GIT_CONFIG_COUNT overrides are injected via the env and cause git
+# to reject credential helpers and redirect helpers, preventing any network op.
+AUDITOR_NETWORK_GIT_ENV: dict[str, str | None] = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "/bin/false",
+    "SSH_AUTH_SOCK": None,
+}
+
+
 @dataclass(frozen=True)
 class ClaudeRolePolicy:
     role: ClaudeRole
@@ -28,6 +67,7 @@ class ClaudeRolePolicy:
     disallowed_tools: tuple[str, ...]
     load_computer_mcp: bool = False
     workspace_read_only: bool = False
+    env_overrides: dict[str, str | None] = field(default_factory=dict)
 
 
 def policy_for_role(role: str) -> ClaudeRolePolicy:
@@ -65,9 +105,11 @@ def policy_for_role(role: str) -> ClaudeRolePolicy:
             disallowed_tools=(
                 *_WRITE_TOOLS,
                 "Agent",
+                *AUDITOR_NETWORK_GIT_DENY,
             ),
             load_computer_mcp=True,
             workspace_read_only=True,
+            env_overrides=AUDITOR_NETWORK_GIT_ENV,
         )
     raise ValueError(f"Unknown Claude Code role: {role}")
 

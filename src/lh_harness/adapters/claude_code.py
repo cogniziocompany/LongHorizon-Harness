@@ -91,6 +91,28 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                     "PAGER=cat",
                 ]
             )
+            for key, value in policy.env_overrides.items():
+                if value is None:
+                    # Remove the variable from the subprocess environment.
+                    env_parts.append(f"--unsetenvvar={shlex.quote(key)}")
+                else:
+                    env_parts.append(f"{key}={shlex.quote(value)}")
+            # GIT_CONFIG_COUNT overrides must be appended after the dict because
+            # they are numbered. They disable credential helpers and URL
+            # redirects so that any accidental network git operation fails fast.
+            env_parts.extend(
+                [
+                    "GIT_CONFIG_COUNT=4",
+                    "GIT_CONFIG_KEY_0=credential.helper",
+                    "GIT_CONFIG_VALUE_0=",
+                    "GIT_CONFIG_KEY_1=credential.helper",
+                    "GIT_CONFIG_VALUE_1=",
+                    "GIT_CONFIG_KEY_2=url.https://.insteadOf",
+                    "GIT_CONFIG_VALUE_2=",
+                    "GIT_CONFIG_KEY_3=url.ssh://.insteadOf",
+                    "GIT_CONFIG_VALUE_3=",
+                ]
+            )
 
         env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
         command_parts = [
