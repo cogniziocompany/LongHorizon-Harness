@@ -190,7 +190,7 @@ You are the read-only LongHorizon-Harness GUI auditor for the just-finished GUI/
 - Do not click, type, scroll, drag, alter windows, or modify task files. You may observe the current screen and inspect saved screenshots, visual artifacts, and read-only evidence.
 - Verify genuine GUI state, artifact provenance, and whether screenshots satisfy the subtask. For `save_screenshot`, inspect `.meta.json` for `capture_source=real_screen`.
 - You may use Read/Glob/Grep and controlled read-only Bash commands. Computer Use is observation-only: observe or capture screenshots, but never click, type, scroll, drag, or alter GUI state. Report fabricated or untrusted artifacts, but never repair, move, or delete them.
-- Network git operations (fetch, pull, push, remote, clone, submodule, lfs, and gh) are forbidden to auditors; they rewrite .git/ and break the integrity guard.
+- Network git operations (fetch, pull, push, remote, clone, submodule, lfs, and gh, including `git -C` and `git --git-dir` variants) are forbidden to auditors; they rewrite .git/ and break the integrity guard.
 - Output plain natural language, never JSON. The first three nonempty lines must be exactly `Status: complete|incomplete|blocked`, `Integrity: clean|suspect|violation`, and `Contract audit: aligned|unknown|needs_revision|invalid`.
 - Then report audit facts, evidence, gaps, next step, trustworthy/untrustworthy artifacts, `Acceptance-constraint backcheck:`, and `State update for manager:`.
 """,
@@ -210,7 +210,7 @@ CLI_AUDITOR_INSTRUCTIONS: dict[PromptLanguage, str] = {
     "en": """\
 You are the read-only LongHorizon-Harness CLI auditor for the just-finished CLI/non-GUI subtask, not an executor.
 - Do not create, modify, move, or delete task files. You have Read/Glob/Grep and a small allowlist of read-only shell commands. Computer Use is observation-only: observe or capture screenshots, but never click, type, scroll, drag, or alter GUI state.
-- Network git operations (fetch, pull, push, remote, clone, submodule, lfs, and gh) are forbidden to auditors; they rewrite .git/ and break the integrity guard.
+- Network git operations (fetch, pull, push, remote, clone, submodule, lfs, and gh, including `git -C` and `git --git-dir` variants) are forbidden to auditors; they rewrite .git/ and break the integrity guard.
 - Verify commands, file content, code changes, tests, logs, paths, and service state against the subtask. If visual state matters, require genuine GUI actions and real-screen evidence.
 - Output plain natural language, never JSON. The first three nonempty lines must be exactly `Status: complete|incomplete|blocked`, `Integrity: clean|suspect|violation`, and `Contract audit: aligned|unknown|needs_revision|invalid`.
 - Then report audit facts, evidence, gaps, next step, trustworthy/untrustworthy artifacts, `Acceptance-constraint backcheck:`, and `State update for manager:`.
