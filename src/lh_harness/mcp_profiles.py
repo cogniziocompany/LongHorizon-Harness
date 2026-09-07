@@ -20,9 +20,11 @@ MCP_LAN_GATEWAY_URL = "http://192.168.21.161:4000/mcp/"
 
 _MCP_USER_PROFILES_FILE = "mcp_profiles.json"
 
-# Built-in profile aliases.  These names match the gateway's own server aliases
-# (verified against the LAN endpoint when LH_HARNESS_MCP_GATEWAY_KEY is set;
-# otherwise kept as given and marked UNVERIFIED in documentation).
+# Built-in profile aliases.  These are the gateway's real `general_settings.mcp_aliases`
+# (cognizioware-mcp-tools infrastructure/litellm-config.yaml, verified 2026-09-07) — dash-free
+# on purpose (LiteLLM splits tool names on the first dash) — plus `langfuse_mcp`, which has no
+# alias.  The gateway cannot scope a server to read-only; "audit" therefore lists only servers
+# whose tools are inherently non-mutating (kb, guides, skills, memory, langfuse).
 _BUILTINS: dict[str, dict[str, Any]] = {
     "none": {
         "description": "No MCP servers; disables generated per-role MCP config.",
@@ -30,37 +32,40 @@ _BUILTINS: dict[str, dict[str, Any]] = {
         "read_only": True,
     },
     "audit": {
-        "description": "Read-only audit tooling: ssh list/read, kb/docs, langfuse read.",
-        "servers": ("ssh-list", "ssh-read", "kb", "docs", "langfuse-read"),
+        "description": "Read-only audit tooling: kb, gateway guides/skills, hivemind memory, langfuse.",
+        "servers": ("kb", "guides", "skills", "memory", "langfuse_mcp"),
         "read_only": True,
     },
     "default": {
-        "description": "Audit + github read, youtrack read, ssh exec.",
+        "description": "Audit + github, youtrack, ssh.",
         "servers": (
-            "ssh-list",
-            "ssh-read",
             "kb",
-            "docs",
-            "langfuse-read",
-            "github-read",
-            "youtrack-read",
-            "ssh-exec",
+            "guides",
+            "skills",
+            "memory",
+            "langfuse_mcp",
+            "github",
+            "youtrack",
+            "ssh",
         ),
         "read_only": False,
     },
     "ops": {
-        "description": "Default + docker/pct control.",
+        "description": "Default + hydra/fleet + proxmox hosts (pct/docker control).",
         "servers": (
-            "ssh-list",
-            "ssh-read",
             "kb",
-            "docs",
-            "langfuse-read",
-            "github-read",
-            "youtrack-read",
-            "ssh-exec",
-            "docker-control",
-            "pct-control",
+            "guides",
+            "skills",
+            "memory",
+            "langfuse_mcp",
+            "github",
+            "youtrack",
+            "ssh",
+            "hydra",
+            "hydrafleet",
+            "proxmoxptait01",
+            "proxmoxptait07",
+            "proxmoxcorsairai300",
         ),
         "read_only": False,
     },

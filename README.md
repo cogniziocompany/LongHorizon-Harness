@@ -494,8 +494,8 @@ Built-in profiles:
 |---|---|---|---|
 | `none` | yes | no MCP config rendered | Runs that should not use the gateway at all |
 | `audit` | yes | ssh list/read, kb, docs, langfuse read | Auditor roles and read-only verification |
-| `default` | no | audit + github-read, youtrack-read, ssh-exec | Manager/executor general development |
-| `ops` | no | default + docker-control, pct-control | Operations that need container/VM control |
+| `default` | no | audit + github, youtrack, ssh | Manager/executor general development |
+| `ops` | no | default + hydra, hydrafleet, proxmoxptait01, proxmoxptait07, proxmoxcorsairai300 | Operations that need container/VM control |
 | `full` | no | no allow-list header; all configured servers | Unrestricted access to every gateway server |
 
 Auditor roles may only use `read_only=true` profiles unless you set `allow_auditor_write_mcp = true` in `.lh-harness/config.toml`. The gateway key is **never** logged or used as a fallback for the LLM token.
