@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 from pathlib import Path
+from typing import Any
 
 from ..agent_logs import visible_output as extract_claude_visible_output
 from ..agent_registry import normalise_reasoning_effort
@@ -15,6 +17,7 @@ from .claude_permissions import (
     snapshot_workspace,
     workspace_snapshot_diff,
 )
+from .cli_agent import CommandAgentAdapter, _episode_prompt_label
 from ..environment.base import Environment
 from ..provider_errors import GUARD_REJECTION_MESSAGE
 from ..types import (
@@ -24,7 +27,6 @@ from ..types import (
     EpisodeBudget,
     EpisodeResult,
 )
-from .cli_agent import CommandAgentAdapter
 
 
 class ClaudeCodeAdapter(CommandAgentAdapter):
@@ -37,12 +39,14 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         workspace_path: str = DEFAULT_WORKSPACE_PATH,
         prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
         mcp_config: str | None = None,
+        mcp_profile: str | None = None,
         add_dirs: list[str] | None = None,
         role: ClaudeRole = "cli_executor",
         hidden_paths: tuple[str, ...] = (),
         guard_exclude_paths: tuple[str, ...] = (),
         reasoning_effort: str | None = None,
         run_id: str | None = None,
+        run_dir: str | None = None,
     ) -> None:
         policy = policy_for_role(role)
         effort = normalise_reasoning_effort(reasoning_effort)
@@ -65,7 +69,12 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         )
 
         # MCP support remains opt-in. --strict-mcp-config keeps unrelated
-        # user/project MCP servers out of every role.
+        # user/project MCP servers out of every role. Per-episode generated
+        # configs live under the harness-owned run directory, outside the agent
+        # workspace, so they cannot be read by the agent but are picked up by
+        # the adapter's --mcp-config path below.
+        self.mcp_profile_name = mcp_profile
+        self.run_dir = run_dir
         mcp_config = mcp_config or os.getenv("LH_HARNESS_CLAUDECODE_MCP_CONFIG")
         if mcp_config:
             candidate = Path(mcp_config).expanduser()
@@ -92,11 +101,22 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 ]
             )
             for key, value in policy.env_overrides.items():
-                if value is None:
-                    # Remove the variable from the subprocess environment.
-                    env_parts.append(f"--unsetenvvar={shlex.quote(key)}")
-                else:
+                if value is not None:
                     env_parts.append(f"{key}={shlex.quote(value)}")
+
+        # Variables that must be removed from the subprocess environment are
+        # deleted from the env dict passed to Popen (see run_episode); they must
+        # never be rendered as shell arguments such as --unsetenvvar=..., which
+        # /bin/sh treats as a command name and fails with "not found".
+        self._env_unset_keys = (
+            tuple(
+                key
+                for key, value in policy.env_overrides.items()
+                if value is None
+            )
+            if is_auditor_role(role)
+            else ()
+        )
 
         env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
         command_parts = [
@@ -149,10 +169,16 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         # ("Name: value") on each API call; the tag values carry no secrets.
         if not self.run_id:
             return {}
-        match = re.match(r"round_\d+", label)
-        round_tag = match.group(0) if match else "round_unknown"
-        tags = f"lh-run/{self.run_id},{round_tag},{self.role}"
+        round_tag = _extract_round_tag(label)
+        tags = f"lh-run/{self.run_id},{round_tag},{self.role},lh-session/{self.episode_session_id(label)}"
         return {"ANTHROPIC_CUSTOM_HEADERS": f"x-litellm-tags: {tags}"}
+
+    def episode_session_id(self, label: str) -> str:
+        """Derived session id used to join a run's episodes in the proxy logs."""
+        if not self.run_id:
+            return "unknown"
+        round_tag = _extract_round_tag(label)
+        return f"{self.run_id}.{round_tag}.{self.role}"
 
     async def run_episode(
         self,
@@ -169,12 +195,17 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             if is_auditor_role(self.role)
             else None
         )
+        # Carry per-episode env into the subprocess, removing auditor-unset keys.
+        label = _episode_prompt_label(live_trajectory_path)
+        if self._env_unset_keys:
+            env = _EnvUnsetWrapper(env, self._env_unset_keys)
         result = await super().run_episode(
             prompt,
             env,
             budget,
             live_trajectory_path=live_trajectory_path,
         )
+        label = _episode_prompt_label(live_trajectory_path)
         result.metadata.update(
             {
                 "claude_role": self.role,
@@ -187,8 +218,10 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 "claude_computer_mcp_loaded": self.computer_mcp_configured,
                 "claude_workspace_read_only": self.policy.workspace_read_only,
                 "claude_reasoning_effort": self.reasoning_effort,
+                "lh_session_id": self.episode_session_id(label),
             }
         )
+        _inject_session_header_into_mcp_config(self, label)
         if before is not None:
             after = snapshot_workspace(
                 self.workspace_path,
@@ -202,10 +235,64 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             snapshot_errors = diff.get("verifier_workspace_snapshot_errors")
             if snapshot_errors:
                 # Escalate only a successful status: a real timeout (or
-                # cancellation) is stronger evidence and must stay visible to
-                # the runtime-failure classifier.
+                # cancellation) is stronger evidence and must stay visible to the
+                # runtime-failure classifier.
                 if result.status == "done":
                     result.status = "error"
                 guard_error = GUARD_REJECTION_MESSAGE
                 result.error = f"{result.error}\n{guard_error}".strip() if result.error else guard_error
         return result
+
+
+class _EnvUnsetWrapper:
+    """Wrap an Environment so that exec() drops named keys from the child env."""
+
+    def __init__(self, env: Environment, keys: tuple[str, ...]) -> None:
+        self._env = env
+        self._keys = keys
+
+    async def exec(
+        self,
+        command: str,
+        timeout: int = 30,
+        tee_path: str | None = None,
+    ) -> Any:
+        # LocalEnvironment copies os.environ in the child process. We cannot
+        # pass a custom env dict through the Environment protocol, so we curate
+        # the parent process's os.environ in place for the duration of the call.
+        # This is safe here because the wrapper is only used for single-threaded
+        # local agent runs and the keys are restored immediately after exec.
+        import os as _os
+
+        saved: dict[str, str | None] = {}
+        for key in self._keys:
+            saved[key] = _os.environ.pop(key, None)
+        try:
+            return await self._env.exec(command, timeout=timeout, tee_path=tee_path)
+        finally:
+            for key, value in saved.items():
+                if value is not None:
+                    _os.environ[key] = value
+
+
+def _extract_round_tag(label: str) -> str:
+    match = re.match(r"round_\d+", label)
+    return match.group(0) if match else "round_unknown"
+
+
+def _inject_session_header_into_mcp_config(adapter: ClaudeCodeAdapter, label: str) -> None:
+    """If a generated MCP config exists for this role, inject the session header."""
+    if not adapter.run_dir or not adapter.mcp_profile_name:
+        return
+    config_path = Path(adapter.run_dir) / "harness" / "mcp" / f"{adapter.role}.mcp.json"
+    if not config_path.is_file():
+        return
+    try:
+        data = json.loads(config_path.read_text())
+        servers = data.get("mcpServers", {})
+        for server in servers.values():
+            headers = server.setdefault("headers", {})
+            headers["X-LH-Session"] = adapter.episode_session_id(label)
+        config_path.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass

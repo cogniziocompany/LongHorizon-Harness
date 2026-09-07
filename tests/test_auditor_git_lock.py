@@ -43,7 +43,10 @@ def test_auditor_command_template_injects_git_overrides(role: str) -> None:
     template = adapter.command_template
     assert "GIT_TERMINAL_PROMPT=0" in template
     assert "GIT_ASKPASS=/bin/false" in template
-    assert "--unsetenvvar=SSH_AUTH_SOCK" in template
+    # SSH_AUTH_SOCK must be removed from the subprocess env, never rendered as a
+    # shell argument such as --unsetenvvar=... which /bin/sh treats as a command.
+    assert "--unsetenvvar" not in template
+    assert "SSH_AUTH_SOCK" not in template
     assert "GIT_CONFIG_COUNT=4" in template
     assert "GIT_CONFIG_KEY_0=credential.helper" in template
     assert "GIT_CONFIG_VALUE_0=" in template
@@ -55,8 +58,33 @@ def test_executor_command_template_does_not_inject_git_overrides(role: str) -> N
     template = adapter.command_template
     assert "GIT_TERMINAL_PROMPT=0" not in template
     assert "GIT_ASKPASS=/bin/false" not in template
-    assert "--unsetenvvar=SSH_AUTH_SOCK" not in template
+    assert "--unsetenvvar" not in template
     assert "GIT_CONFIG_COUNT=4" not in template
+
+
+def test_auditor_env_unsets_ssh_auth_sock() -> None:
+    """SSH_AUTH_SOCK is removed from the auditor subprocess env via the wrapper."""
+    import os
+
+    role = "cli_auditor"
+    assert policy_for_role(role).env_overrides.get("SSH_AUTH_SOCK") is None
+    saved = os.environ.get("SSH_AUTH_SOCK")
+    try:
+        if saved is None:
+            os.environ["SSH_AUTH_SOCK"] = "/tmp/fake-ssh-agent"
+        adapter = ClaudeCodeAdapter(role=role, run_id="r")
+        assert adapter._env_unset_keys == ("SSH_AUTH_SOCK",)
+    finally:
+        if saved is None:
+            os.environ.pop("SSH_AUTH_SOCK", None)
+        else:
+            os.environ["SSH_AUTH_SOCK"] = saved
+
+
+def test_executor_env_keeps_ssh_auth_sock() -> None:
+    """SSH_AUTH_SOCK is not in the executor's env-unset list."""
+    adapter = ClaudeCodeAdapter(role="cli_executor", run_id="r")
+    assert adapter._env_unset_keys == ()
 
 
 @pytest.mark.parametrize("role", ["manager", "final_response"])
