@@ -9,6 +9,10 @@ from typing import Any
 
 from ..agent_logs import visible_output as extract_claude_visible_output
 from ..agent_registry import normalise_reasoning_effort
+from ..mcp_profiles import (
+    render_mcp_config,
+    resolve_profile,
+)
 from .claude_permissions import (
     ClaudeRole,
     is_auditor_role,
@@ -80,6 +84,36 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             candidate = Path(mcp_config).expanduser()
             if candidate.is_file():
                 mcp_config = str(candidate.resolve())
+        generated_mcp_path: str | None = None
+        if run_id and run_dir and mcp_profile:
+            # Resolve and render a harness-owned per-role MCP config.  This
+            # happens at adapter construction time because the role does not
+            # change within a run.  The actual session header is injected per
+            # episode in run_episode below.
+            try:
+                profile = resolve_profile(
+                    role,
+                    role_profile=mcp_profile,
+                    run_profile=mcp_profile,
+                )
+                rendered = render_mcp_config(
+                    profile,
+                    run_id=run_id,
+                    role=role,
+                    run_dir=run_dir,
+                    session_id=episode_session_id(run_id, "round_unknown", role),
+                )
+                if rendered is not None:
+                    generated_mcp_path = str(rendered)
+            except ValueError as exc:
+                # An auditor assigned a non-read-only profile is a configuration
+                # error; fail fast so the operator sees a clear message.
+                raise
+            except Exception:
+                # Other rendering failures leave the adapter without generated
+                # MCP config; the run proceeds with whatever was explicitly
+                # supplied or none at all.
+                generated_mcp_path = None
         resolved_add_dirs = list(add_dirs or [])
         env_add_dirs = os.getenv("LH_HARNESS_CLAUDECODE_ADD_DIRS") or os.getenv(
             "LH_HARNESS_MCP_ADD_DIRS"
@@ -137,9 +171,10 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         if deny_tools:
             command_parts.append("--disallowedTools")
             command_parts.extend(shlex.quote(tool) for tool in deny_tools)
-        self.computer_mcp_configured = bool(policy.load_computer_mcp and mcp_config)
-        if self.computer_mcp_configured:
-            command_parts.extend(["--mcp-config", shlex.quote(mcp_config)])
+        self.computer_mcp_configured = bool(policy.load_computer_mcp and (mcp_config or generated_mcp_path))
+        effective_mcp_config = generated_mcp_path or mcp_config
+        if self.computer_mcp_configured and effective_mcp_config:
+            command_parts.extend(["--mcp-config", shlex.quote(effective_mcp_config)])
         command_parts.extend(["--model", shlex.quote(model)])
         # Claude Code warns and continues at its default when the value is not
         # one it knows, so an unusable effort will not fail the run here.
@@ -218,7 +253,13 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 "lh_session_id": episode_session_id(self.run_id, label, self.role),
             }
         )
-        _inject_session_header_into_mcp_config(self.run_id, label, self.role, self.run_dir)
+        _inject_session_header_into_mcp_config(
+            self.run_id,
+            label,
+            self.role,
+            self.run_dir,
+            mcp_profile_name=self.mcp_profile_name,
+        )
         if before is not None:
             after = snapshot_workspace(
                 self.workspace_path,
@@ -295,9 +336,14 @@ def _inject_session_header_into_mcp_config(
     label: str,
     role: str,
     run_dir: str | None,
+    mcp_profile_name: str | None = None,
 ) -> None:
-    """If a generated MCP config exists for this role, inject the session header."""
-    if not run_dir:
+    """If a generated MCP config exists for this role, inject the session header.
+
+    When mcp_profile_name is "none", no config was generated and injection is
+    skipped.  This keeps the adapter usable for deployments without a gateway.
+    """
+    if not run_dir or mcp_profile_name == "none":
         return
     config_path = Path(run_dir) / "harness" / "mcp" / f"{role}.mcp.json"
     if not config_path.is_file():
