@@ -1335,6 +1335,7 @@ class RunSupervisor:
         prompt_language: str,
         reasoning_effort: str | None = None,
         mcp_profile: str | None = None,
+        base_check: str | None = None,
         resume: bool = False,
     ) -> list[str]:
         # Always launch through the interpreter that owns this supervisor.
@@ -1367,6 +1368,8 @@ class RunSupervisor:
             command.append(f"--reasoning-effort={reasoning_effort}")
         if mcp_profile:
             command.append(f"--mcp-profile={mcp_profile}")
+        if base_check:
+            command.append(f"--base-check={base_check}")
         for role in _ROLE_KEYS:
             spec = (role_configs or {}).get(role)
             if not spec:
@@ -1397,6 +1400,7 @@ class RunSupervisor:
         reasoning_effort: str | None = None,
         mcp_profile: str | None = None,
         allow_auditor_write_mcp: bool = False,
+        base_check: str | None = None,
         _recover_reservation: bool = False,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -1416,6 +1420,7 @@ class RunSupervisor:
                 reasoning_effort=reasoning_effort,
                 mcp_profile=mcp_profile,
                 allow_auditor_write_mcp=allow_auditor_write_mcp,
+                base_check=base_check,
             )
         request = {
             "task": task,
@@ -1429,6 +1434,7 @@ class RunSupervisor:
             "reasoning_effort": reasoning_effort,
             "mcp_profile": mcp_profile,
             "allow_auditor_write_mcp": allow_auditor_write_mcp,
+            "base_check": base_check,
         }
         fingerprint = hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         path = self._idempotency_path("create", key)
@@ -1503,6 +1509,7 @@ class RunSupervisor:
                 prompt_language=prompt_language,
                 run_id=reserved_run_id,
                 reasoning_effort=reasoning_effort,
+                base_check=base_check,
                 _recover_reservation=bool(existing),
                 _idempotency_fingerprint=fingerprint,
             )
@@ -1536,6 +1543,7 @@ class RunSupervisor:
         reasoning_effort: str | None = None,
         mcp_profile: str | None = None,
         allow_auditor_write_mcp: bool = False,
+        base_check: str | None = None,
         _recover_reservation: bool = False,
         _idempotency_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -1621,6 +1629,7 @@ class RunSupervisor:
             prompt_language=prompt_language,
             reasoning_effort=reasoning_effort,
             mcp_profile=mcp_profile,
+            base_check=base_check,
         )
         started_at = time.time()
         # Reserve the run before launching a process.  This closes the orphan
@@ -1644,6 +1653,8 @@ class RunSupervisor:
         # Always record mcp_profile (even None) so provenance and worker argv are
         # stable across requests with and without an explicit profile.
         reservation["mcp_profile"] = mcp_profile
+        if base_check:
+            reservation["base_check"] = base_check
         if _idempotency_fingerprint:
             reservation["idempotency_fingerprint"] = _idempotency_fingerprint
         return self._launch_worker(
