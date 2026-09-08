@@ -1050,6 +1050,63 @@ class DashboardState:
         self._persist_approval(snapshot)
         return True
 
+    def _overlay_pending_resolutions(self, merged: dict[str, dict[str, Any]]) -> None:
+        """Project pending control-bus resolves into read-only approval records.
+
+        The worker's blocking wait is the only path that may consume (receipt)
+        a command.  Read APIs must still reflect an operator decision that has
+        been accepted onto the control bus, so we overlay the resolved fields
+        without mutating the durable command state.
+        """
+        pending_resolves: dict[str, dict[str, Any]] = {}
+        for command in self.control_bus.pending():
+            if command.get("kind") != "resolve_approval":
+                continue
+            payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+            approval_id = str(payload.get("approval_id", ""))
+            if approval_id:
+                pending_resolves[approval_id] = command
+        if not pending_resolves:
+            return
+        for approval_id, record in merged.items():
+            if str(record.get("status")) != "pending":
+                continue
+            command = pending_resolves.get(approval_id)
+            if command is None:
+                continue
+            payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+            action = str(payload.get("action", "")).strip()
+            allowed: set[str] = set()
+            for option in record.get("options", []):
+                if isinstance(option, dict):
+                    value = str(option.get("value", "")).strip()
+                elif hasattr(option, "value"):
+                    value = str(option.value).strip()
+                else:
+                    value = str(option).strip()
+                if value:
+                    allowed.add(value)
+            if not allowed:
+                allowed = {"continue", "stop"}
+            user_input = str(payload.get("user_input", "")).strip()
+            extra_rounds = _normalise_extra_rounds(payload.get("extra_rounds"))
+            allow_input = bool(record.get("allow_input", True))
+            allow_extra_rounds = bool(record.get("allow_extra_rounds", False))
+            if (
+                action not in allowed
+                or (not allow_input and user_input)
+                or (not allow_extra_rounds and extra_rounds)
+            ):
+                continue
+            resolved = dict(record)
+            resolved["status"] = "resolved"
+            resolved["action"] = action
+            resolved["reason"] = str(payload.get("reason", "")).strip()
+            resolved["user_input"] = user_input
+            resolved["extra_rounds"] = extra_rounds
+            resolved["resolved_at"] = float(command.get("created_at") or time.time())
+            merged[approval_id] = resolved
+
     def list_approvals(self) -> list[dict[str, Any]]:
         # Merge on-disk records (so past/other-process interactions still show)
         # with in-memory records only when the latter is newer.  Reading a
@@ -1066,6 +1123,9 @@ class DashboardState:
                 existing = merged.get(approval_id)
                 if existing is None or _approval_record_newer(candidate, existing):
                     merged[approval_id] = candidate
+        # Pending control-bus resolutions are accepted but not yet consumed by
+        # the worker.  Show them as resolved in the dashboard/API immediately.
+        self._overlay_pending_resolutions(merged)
         items = list(merged.values())
         items.sort(key=lambda item: item.get("created_at") or 0.0)
         return items
