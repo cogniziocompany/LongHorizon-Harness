@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from lh_harness.dashboard.state import ApprovalOption, DashboardState
 from lh_harness.fleet.reporter import (
     FleetReporter,
     _parse_labels,
@@ -23,6 +24,7 @@ from lh_harness.fleet.reporter import (
     wrap_event_sink,
     wrap_status_writer,
 )
+from lh_harness.supervisor.control_bus import ControlBus
 
 
 class _StubHandler(BaseHTTPRequestHandler):
@@ -310,6 +312,131 @@ def test_status_writer_emits_run_status(_isolate_reporter):
     assert ev["status"] == "running"
     assert ev["round"] == 5
     assert ev["role"] == "manager"
+
+
+def test_heartbeat_scheduling(http_server, _isolate_reporter):
+    """Heartbeat callback is invoked on the reporter thread every interval."""
+    _setenv(http_server, "hb-node", "hb-key", "kind=local")
+    reporter = get_reporter(version="0.2.0", capacity=2, reset=True)
+    reporter._heartbeat_interval = 0.3
+
+    calls: list[tuple[list[dict[str, Any]], int, int, int]] = []
+
+    def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int]:
+        calls.append(([], 1, 2, 0))
+        return [], 1, 2, 0
+
+    reporter.register_heartbeat(_heartbeat)
+    time.sleep(1.0)
+    reporter.stop(timeout=5.0)
+
+    heartbeat_requests = [r for r in _StubHandler.requests if r["path"] == "/harness/heartbeat"]
+    assert len(heartbeat_requests) >= 2
+    body = heartbeat_requests[0]["body"]
+    assert body["node"]["name"] == "hb-node"
+    assert body["node"]["version"] == "0.2.0"
+    assert body["capacity"] == {"active": 1, "cap": 2}
+    assert body["queueLen"] == 0
+    assert len(calls) >= 2
+
+
+def test_manager_append_event_reaches_fleet(http_server, _isolate_reporter, tmp_path):
+    """Calling manager._append_event sends a public EventEnvelope to fleet."""
+    _setenv(http_server, "mgr-node", "mgr-key", None)
+    get_reporter(version="0.3.0", capacity=1, reset=True)
+
+    from lh_harness.manager import _append_event
+
+    role_dir = tmp_path / "run-mgr" / "lh_harness" / "role_orchestration"
+    role_dir.mkdir(parents=True)
+    events_path = role_dir / "events.jsonl"
+    _append_event(
+        events_path,
+        "manager_round_start",
+        {"round": 7, "role": "manager", "prompt_chars": 120},
+    )
+    reporter = get_reporter()
+    reporter.stop(timeout=5.0)
+
+    event_requests = [r for r in _StubHandler.requests if r["path"] == "/harness/events"]
+    assert len(event_requests) == 1
+    body = event_requests[0]["body"]
+    assert len(body) == 1
+    ev = body[0]
+    assert ev["run_id"] == "run-mgr"
+    assert ev["type"] == "manager_round_start"
+    assert ev["round"] == 7
+    assert ev["role"] == "manager"
+    assert ev["status"] == "running"
+    assert ev["payload"].get("prompt_chars") == 120
+
+
+def test_control_bus_status_event(_isolate_reporter):
+    """ControlBus.write_status emits a run.status event when fleet is enabled."""
+    _setenv("http://127.0.0.1:1", "bus-node", "bus-key", None)
+    reporter = get_reporter(reset=True)
+    captured: list[dict[str, Any]] = []
+
+    def _capture(endpoint: str, payload: Any, *, gzip_body: bool = True) -> None:
+        captured.append({"endpoint": endpoint, "payload": payload})
+
+    reporter._post = _capture  # type: ignore[method-assign]
+
+    bus = ControlBus("/tmp/fleet-test-control-bus")
+    bus.write_status({"run_id": "run-bus", "status": "stopping", "round": 3, "active_role": "auditor"})
+
+    status_events = [c for c in captured if c["endpoint"] == "/harness/events"]
+    assert len(status_events) == 1
+    ev = status_events[0]["payload"][0]
+    assert ev["type"] == "run.status"
+    assert ev["run_id"] == "run-bus"
+    assert ev["status"] == "stopping"
+    assert ev["round"] == 3
+    assert ev["role"] == "auditor"
+
+
+def test_gate_approval_events(tmp_path, _isolate_reporter):
+    """Creating and resolving an approval emits approval_created/resolved events."""
+    _setenv("http://127.0.0.1:1", "gate-node", "gate-key", None)
+    reporter = get_reporter(reset=True)
+    captured: list[dict[str, Any]] = []
+
+    def _capture(endpoint: str, payload: Any, *, gzip_body: bool = True) -> None:
+        captured.append({"endpoint": endpoint, "payload": payload})
+
+    reporter._post = _capture  # type: ignore[method-assign]
+
+    run_dir = tmp_path / "run-gate"
+    log_dir = run_dir / "lh_harness"
+    role_dir = log_dir / "role_orchestration"
+    role_dir.mkdir(parents=True)
+    state = DashboardState(str(log_dir), control_enabled=True)
+    approval = state.create_approval(
+        title="Continue?",
+        options=[ApprovalOption(value="continue", label="Continue")],
+        context={"trigger": "end_of_round", "round_index": 4},
+    )
+    state.resolve_approval(
+        approval.approval_id,
+        action="continue",
+        reason="proceed",
+    )
+    # The command is written synchronously; the worker loop applies it via
+    # _apply_pending_resolutions.  Trigger that here so the resolved event
+    # is emitted in this test.
+    state._apply_pending_resolutions()
+
+    events = [c for c in captured if c["endpoint"] == "/harness/events"]
+    assert len(events) == 2
+    created = events[0]["payload"][0]
+    assert created["type"] == "approval_created"
+    assert created["run_id"] == "run-gate"
+    assert created["round"] == 4
+    assert created["payload"].get("trigger") == "end_of_round"
+    assert created["payload"].get("approval_id") == approval.approval_id
+    resolved = events[1]["payload"][0]
+    assert resolved["type"] == "approval_resolved"
+    assert resolved["payload"].get("action") == "continue"
 
 
 def test_parse_labels():

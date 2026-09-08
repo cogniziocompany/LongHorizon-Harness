@@ -2457,6 +2457,15 @@ def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
                         flock.flock(fh.fileno(), flock.LOCK_UN)
                     except OSError:
                         pass
+        # Push the same public event to fleet-admin when configured.  The local
+        # ledger is already durable; any fleet failure must remain a side-car
+        # concern and never propagate into the run.
+        try:
+            from .fleet.reporter import post_event_record
+
+            post_event_record(record)
+        except Exception:
+            logger.exception("fleet event hook failed; dropping telemetry")
     finally:
         if raw_fd is not None:
             try:

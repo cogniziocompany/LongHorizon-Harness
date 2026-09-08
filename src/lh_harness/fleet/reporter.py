@@ -105,6 +105,7 @@ class FleetReporter:
             self._thread: threading.Thread | None = None
             self._queue: queue.Queue[_PendingItem | None] | None = None
             self._stop_event: threading.Event | None = None
+            self._heartbeat_callback: Callable[[], tuple[list[dict[str, Any]], int, int, int]] | None = None
             return
 
         self._enabled = True
@@ -120,6 +121,9 @@ class FleetReporter:
         self._stop_event = threading.Event()
         self._last_warned: float = 0.0
         self._warned_lock = threading.Lock()
+        self._heartbeat_callback: Callable[[], tuple[list[dict[str, Any]], int, int, int]] | None = None
+        self._heartbeat_interval = _HEARTBEAT_INTERVAL_SECONDS
+        self._last_heartbeat = 0.0
         self._thread = threading.Thread(target=self._worker, name="fleet-reporter", daemon=True)
         self._thread.start()
 
@@ -202,6 +206,19 @@ class FleetReporter:
             body["report"] = report
         self._post("/harness/rounds", body, gzip_body=True)
 
+    def register_heartbeat(
+        self,
+        callback: Callable[[], tuple[list[dict[str, Any]], int, int, int]],
+    ) -> None:
+        """Register a callback that produces heartbeat data every 30 s.
+
+        The callback must return ``(runs, active, cap, queue_len)``.  It is
+        invoked on the reporter daemon thread; keep it fast and exception-free.
+        """
+        if not self._enabled:
+            return
+        self._heartbeat_callback = callback
+
     def stop(self, timeout: float = 5.0) -> None:
         """Signal the worker to stop and drain the queue."""
         if not self._enabled or self._queue is None or self._stop_event is None:
@@ -230,11 +247,14 @@ class FleetReporter:
 
         Every code path inside the worker is guarded so an unexpected failure
         in the reporter cannot propagate into the run's own worker thread.
+        Heartbeats share the same thread so the reporter never spawns more
+        than one daemon.
         """
         assert self._queue is not None
         assert self._stop_event is not None
         pending: list[_PendingItem] = []
         last_flush = time.monotonic()
+        self._last_heartbeat = time.monotonic()
         try:
             while not self._stop_event.is_set():
                 try:
@@ -244,13 +264,26 @@ class FleetReporter:
                 if item is not None:
                     pending.append(item)
                 now = time.monotonic()
-                if pending and (now - last_flush >= _BATCH_INTERVAL_SECONDS or item is None and self._stop_event.is_set()):
+                if pending and (
+                    now - last_flush >= _BATCH_INTERVAL_SECONDS
+                    or (item is None and self._stop_event.is_set())
+                ):
                     try:
                         self._flush(pending)
                     except Exception:
                         logger.exception("fleet reporter flush failed; dropping batch")
                     pending = []
                     last_flush = now
+                if (
+                    self._heartbeat_callback is not None
+                    and now - self._last_heartbeat >= self._heartbeat_interval
+                ):
+                    try:
+                        runs, active, cap, queue_len = self._heartbeat_callback()
+                        self.queue_heartbeat(runs, active, cap, queue_len)
+                    except Exception:
+                        logger.exception("fleet reporter heartbeat callback failed")
+                    self._last_heartbeat = now
             # Drain any remaining work on stop without blocking callers.
             while True:
                 try:
@@ -465,6 +498,114 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+_RESERVED_EVENT_KEYS = frozenset(
+    {
+        "schema_version",
+        "event_id",
+        "event",
+        "type",
+        "ts",
+        "timestamp",
+        "run_id",
+        "round",
+        "round_index",
+        "round_no",
+        "round_number",
+        "role",
+        "role_name",
+        "agent_role",
+        "status",
+    }
+)
+
+
+def _record_to_envelope(record: dict[str, Any]) -> EventEnvelope:
+    """Convert a manager events.jsonl record into a public EventEnvelope."""
+    if not isinstance(record, dict):
+        record = {}
+    event_id = str(record.get("event_id") or "")
+    run_id = str(record.get("run_id") or _run_id_from_event_id(event_id))
+    raw_type = str(record.get("event") or record.get("type") or "unknown")
+    ts_raw = record.get("ts", record.get("timestamp", 0.0))
+    try:
+        ts = float(ts_raw)
+    except (TypeError, ValueError):
+        ts = 0.0
+    round_number = next(
+        (
+            _optional_int(record.get(key))
+            for key in ("round", "round_index", "round_no", "round_number")
+            if record.get(key) is not None
+        ),
+        None,
+    )
+    role = (
+        record.get("role")
+        or record.get("role_name")
+        or record.get("agent_role")
+        or _infer_role(raw_type)
+    )
+    status = record.get("status") or _infer_status(raw_type)
+    payload = {k: v for k, v in record.items() if k not in _RESERVED_EVENT_KEYS}
+    return EventEnvelope(
+        run_id=run_id,
+        type=raw_type,
+        ts=ts,
+        round=round_number,
+        role=role,
+        status=status,
+        payload=_trim_payload(payload),
+    )
+
+
+def _run_id_from_event_id(event_id: str) -> str:
+    if ":" in event_id:
+        return event_id.split(":", 1)[0]
+    return "local"
+
+
+def _infer_role(event_name: str) -> str | None:
+    dotted = f".{event_name}."
+    for role in (
+        "manager",
+        "auditor_format_repair",
+        "auditor",
+        "executor",
+        "final_response",
+    ):
+        if f".{role}." in dotted or event_name.startswith(f"{role}."):
+            return role
+    return None
+
+
+def _infer_status(event_name: str) -> str | None:
+    if event_name.endswith("_start"):
+        return "running"
+    if event_name.endswith("_done"):
+        return "completed"
+    if event_name.endswith("_cancelled"):
+        return "cancelled"
+    if event_name.endswith("_failed"):
+        return "failed"
+    if event_name.endswith("_created"):
+        return "pending"
+    if event_name.endswith("_resolved"):
+        return "completed"
+    return None
+
+
+def post_event_record(record: dict[str, Any]) -> None:
+    """Queue one manager events.jsonl record to fleet-admin as a public envelope.
+
+    Safe to call from any thread; no-ops when fleet reporting is disabled.
+    """
+    reporter = get_reporter()
+    if reporter is None or not reporter.enabled:
+        return
+    event = _record_to_envelope(record)
+    _safe_call(reporter.queue_event, event)
 
 
 def _trim_payload(payload: Any) -> dict[str, Any]:

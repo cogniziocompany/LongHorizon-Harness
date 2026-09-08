@@ -32,6 +32,7 @@ from ..supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical
 from ..utils.run_boundary import safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
 from ..agent_logs import parse_trajectory as parse_agent_trajectory
+from ..manager import _append_event
 from ..role_prompts import parse_role_manager_next_step
 
 # Roles whose raw trajectory a round directory can hold.
@@ -797,6 +798,24 @@ class DashboardState:
         # Persist to the run's log dir so every human interaction is saved and
         # visible on the web even after the run ends or from a browsing session.
         self._persist_approval(approval.to_dict())
+        # Also emit to the event ledger so the public event stream and fleet
+        # reporter observe the gate the same way as role lifecycle events.
+        events_path = self._role_dir / "events.jsonl"
+        try:
+            _append_event(
+                events_path,
+                "approval_created",
+                {
+                    "approval_id": approval.approval_id,
+                    "round_index": approval.round_index,
+                    "trigger": approval.context.get("trigger", ""),
+                    "status": "pending",
+                },
+            )
+        except (ImportError, OSError):
+            # Event persistence is diagnostic; a read-only or unusual log
+            # layout must not block the approval checkpoint.
+            pass
         return approval
 
     def resolve_approval(
@@ -1013,6 +1032,21 @@ class DashboardState:
                 approval.resolved_at = time.time()
                 snapshot = approval.to_dict()
             self._persist_approval(snapshot)
+            events_path = self._role_dir / "events.jsonl"
+            try:
+                _append_event(
+                    events_path,
+                    "approval_resolved",
+                    {
+                        "approval_id": approval_id,
+                        "round_index": approval.round_index,
+                        "trigger": approval.context.get("trigger", ""),
+                        "status": "resolved",
+                        "action": action,
+                    },
+                )
+            except (ImportError, OSError):
+                pass
             if action == "stop":
                 # Resolving an end-of-round gate with "stop" is an explicit
                 # operator cancellation, not a worker crash.  Persist that
