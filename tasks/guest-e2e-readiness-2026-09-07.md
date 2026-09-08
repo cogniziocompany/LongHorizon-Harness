@@ -129,3 +129,15 @@ Also found: the powerplatform dev lane's `STRIPE_TEST_CUSTOMER_ID=cus_TPFW7YS21t
 **Actions:** stopgap applied to the dev and uat lane env (`Stripe__GuestMeterId=cognizioware_guest_tokens`, backups `.env.bak-guestmeter-*`)
 so events flow as soon as the switches flip; task 05h5b queued at the front to do it properly (a real `GuestMeterEventName` setting, the usage
 kind carried in the payload, a startup guard that refuses an `mtr_`-shaped value, tests, docs).
+
+### 2026-09-08 08:50 PT — guest usage PROVEN end to end on dev (and a lane trap found)
+After the meter-name stopgap and turning `Billing__GuestExecutionEnabled=true` (charging deliberately left false), a guest-channel usage event
+posted to `/api/v1/usage/events` produced the expected writer line — *"Recording observation-only guest meter event: meter=cognizioware_guest_tokens
+price=price_1UCpYb… product=prod_VDG4R7… customer=cus_Utwk… quantity=2000"* — and the Stripe guest meter moved to **2001** (1 manual probe + 2000 from
+the service) while `task_tokens` stayed at 1000. The observation path is correct once the event name is right.
+**Trap found (I caused it, then fixed it):** a plain `docker compose up -d --no-deps app` on a lane silently rolled the dev billing lane back to an
+image from 2026-07-14 (44c4ccc, 42 commits behind develop, predating the guest meter code). `deployments/tier/docker-compose.yml` resolves
+`APP_IMAGE_TAG` from the lane `.env`, which still pinned the July tag, while `rollout.sh` passes the tag inline and never persists it. Prod's compose
+requires the tag explicitly; dev and uat do not. Fixed on the box by pinning `sha-32a365e` and recreating; slice 6 of task 05h5b makes it structural.
+**Usage contract for the afternoon session:** correlation_id, attempt_id, tenant_id, customer_id and a positive total_tokens are all required
+(snake_case), Authorization carries the Lindy webhook secret, and principal_id/channel/source_event_id mark it as guest.
