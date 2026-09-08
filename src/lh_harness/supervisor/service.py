@@ -28,6 +28,7 @@ from .control_bus import (
     ControlBus,
     RevisionConflict,
     _atomic_bytes_write,
+    _atomic_exclusive_write,
     _ensure_dir_fd_nofollow,
     _ensure_dir_nofollow,
     _open_nofollow,
@@ -586,6 +587,15 @@ def _merge_lifecycle_status(
 
 
 RESUME_MODES = ("continue", "retry")
+
+# Per-workspace launch reservation. A reservation is a lightweight file that
+# proves this supervisor process is about to create a run in a workspace. It is
+# deliberately outside the run directory so queue launcher and POST /api/runs
+# can race-check a workspace without knowing a run id yet. The file is keyed by
+# the supervisor PID and a monotonic timestamp; stale files from crashed
+# supervisors are ignored by callers that also verify process liveness.
+_WORKSPACE_RESERVATION_DIR = ".workspace-reservations"
+_WORKSPACE_RESERVATION_STALE_SECONDS = 60.0
 
 # A reopened run keeps its identity and history but must not inherit the
 # previous generation's outcome, live process identity, or one-shot idempotency
@@ -1579,7 +1589,44 @@ class RunSupervisor:
         )
         run_id = run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
         run_dir = self._run_dir(run_id)
-        workspace_path = self._resolve_workspace(workspace)
+        with self.reserve_workspace(workspace) as workspace_path:
+            return self._create_run_once_reserved(
+                task=task,
+                agent=agent,
+                model=model,
+                role_configs=role_configs,
+                resolved_role_configs=resolved_role_configs,
+                workspace_path=workspace_path,
+                max_rounds=max_rounds,
+                prompt_language=prompt_language,
+                run_id=run_id,
+                run_dir=run_dir,
+                reasoning_effort=reasoning_effort,
+                mcp_profile=mcp_profile,
+                base_check=base_check,
+                _recover_reservation=_recover_reservation,
+                _idempotency_fingerprint=_idempotency_fingerprint,
+            )
+
+    def _create_run_once_reserved(
+        self,
+        *,
+        task: str,
+        agent: str,
+        model: str | None,
+        role_configs: dict[str, dict[str, str | None]] | None,
+        resolved_role_configs: dict[str, dict[str, str]],
+        workspace_path: Path,
+        max_rounds: int,
+        prompt_language: str,
+        run_id: str,
+        run_dir: Path,
+        reasoning_effort: str | None,
+        mcp_profile: str | None,
+        base_check: str | None,
+        _recover_reservation: bool,
+        _idempotency_fingerprint: str | None,
+    ) -> dict[str, Any]:
         workspace_path.mkdir(parents=True, exist_ok=True)
         # Re-resolve after mkdir: a pre-existing symlink or a concurrently
         # introduced symlink must not redirect the worker outside the boundary.
@@ -1973,6 +2020,113 @@ class RunSupervisor:
         except ValueError:
             raise ValueError(f"workspace must be inside configured workspace root: {root}") from None
         return resolved
+
+    def _workspace_reservation_path(self, workspace_path: Path) -> Path:
+        """Return the per-workspace reservation marker path under the runs root."""
+
+        workspace_path = Path(workspace_path)
+        # Reservations are stored under the runs root. The workspace itself lives
+        # under workspace_root, which may be a sibling of runs_root. Hash the
+        # absolute workspace path so the marker is unique and stable regardless of
+        # whether workspace_root overlaps runs_root.
+        try:
+            relative = workspace_path.resolve(strict=False).relative_to(self.workspace_root)
+        except (OSError, RuntimeError, ValueError):
+            relative = workspace_path.resolve(strict=False)
+        workspace_hash = hashlib.sha256(str(relative).encode("utf-8")).hexdigest()[:32]
+        return self.runs_root / _WORKSPACE_RESERVATION_DIR / f"{workspace_hash}.reservation.json"
+
+    @contextmanager
+    def reserve_workspace(self, workspace: str | Path | None = None):
+        """Atomically reserve a workspace for a single launch transaction.
+
+        The reservation file is written with an exclusive tempfile/rename under
+        the anchored no-follow helpers used by the control bus. It records the
+        supervisor PID and a timestamp. Callers (queue launcher eligibility,
+        POST /api/runs) must hold this reservation before launching a worker so
+        two launch paths cannot claim the same workspace.
+
+        Raises ValueError if the workspace is already reserved by a live process.
+        """
+
+        workspace_path = self._resolve_workspace(workspace)
+        reservation_path = self._workspace_reservation_path(workspace_path)
+        _ensure_dir_nofollow(reservation_path.parent)
+        now = time.time()
+        self_pid = os.getpid()
+
+        def _is_stale(payload: dict[str, Any]) -> bool:
+            try:
+                pid = int(payload.get("pid", 0) or 0)
+                ts = float(payload.get("ts", 0) or 0)
+            except (TypeError, ValueError):
+                return True
+            if pid <= 0 or pid == self_pid:
+                return True
+            if now - ts > _WORKSPACE_RESERVATION_STALE_SECONDS:
+                return True
+            # A crashed supervisor's PID may be reused; the start identity makes
+            # the reservation durable enough for launch races without requiring
+            # a cross-process lease.
+            identity = str(payload.get("pid_start_identity") or "")
+            current_identity = _pid_start_identity(pid)
+            if current_identity and identity and current_identity != identity:
+                return True
+            return False
+
+        # Create the reservation exclusively.  We first attempt an atomic
+        # exclusive-create; if another live supervisor holds the reservation we
+        # fail closed.  A stale reservation is overwritten so crashed launchers
+        # do not block a workspace forever.
+        payload = {
+            "pid": self_pid,
+            "ts": now,
+            "workspace": str(workspace_path),
+            "pid_start_identity": _pid_start_identity(self_pid),
+        }
+        data = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        try:
+            _atomic_exclusive_write(reservation_path, data)
+        except FileExistsError:
+            existing = _read_json(reservation_path)
+            if not _is_stale(existing):
+                other_pid = int(existing.get("pid", 0) or 0)
+                raise ValueError(f"workspace is reserved by another launch: {workspace_path} (pid {other_pid})")
+            # Stale reservation: overwrite it. We still use atomic write to
+            # avoid tearing the file for concurrent readers of this supervisor.
+            _atomic_bytes_write(reservation_path, data)
+        try:
+            yield workspace_path
+        finally:
+            try:
+                reservation_path.unlink()
+            except (OSError, FileNotFoundError):
+                pass
+
+    def workspace_is_reserved(self, workspace: str | Path | None = None) -> bool:
+        """Return True if the workspace is currently reserved by another live supervisor."""
+
+        workspace_path = self._resolve_workspace(workspace)
+        reservation_path = self._workspace_reservation_path(workspace_path)
+        try:
+            payload = _read_json(reservation_path)
+        except (OSError, ValueError):
+            return False
+        self_pid = os.getpid()
+        try:
+            pid = int(payload.get("pid", 0) or 0)
+            ts = float(payload.get("ts", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0 or pid == self_pid:
+            return False
+        if time.time() - ts > _WORKSPACE_RESERVATION_STALE_SECONDS:
+            return False
+        identity = str(payload.get("pid_start_identity") or "")
+        current_identity = _pid_start_identity(pid)
+        if current_identity and identity and current_identity != identity:
+            return False
+        return True
 
     def _signal(self, run_id: str, sig: signal.Signals, *, kind: str) -> dict[str, Any]:
         if self.attached_only and run_id != self.attached_run_id:
@@ -2461,15 +2615,20 @@ class RunSupervisor:
         )
         max_rounds = _resume_round_budget(owner, extra_rounds)
         workspace_path = self._resolve_workspace(workspace)
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        workspace_path = self._resolve_workspace(str(workspace_path))
-        if (
-            safe_run_logs(self.runs_root, run_dir, allow_missing=True) is None
-            or safe_run_control(self.runs_root, run_dir, allow_missing=True) is None
-        ):
-            raise ValueError("run reservation path is outside its run boundary")
-        self._run_logs_dir(run_id)
-        task_path = run_dir / "tmp" / "task.md"
+        # In-place resume reuses the same workspace; another launch cannot be
+        # using it because the run is terminal. Still take a brief reservation
+        # so the launcher does not race to create a successor in the same
+        # directory before this resume transaction completes.
+        with self.reserve_workspace(workspace_path):
+            workspace_path.mkdir(parents=True, exist_ok=True)
+            workspace_path = self._resolve_workspace(str(workspace_path))
+            if (
+                safe_run_logs(self.runs_root, run_dir, allow_missing=True) is None
+                or safe_run_control(self.runs_root, run_dir, allow_missing=True) is None
+            ):
+                raise ValueError("run reservation path is outside its run boundary")
+            self._run_logs_dir(run_id)
+            task_path = run_dir / "tmp" / "task.md"
         self._write_task_file(task_path, task)
         bus = ControlBus(run_dir)
         command = self._worker_command(

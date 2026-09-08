@@ -183,6 +183,8 @@ def _status(raw: dict[str, Any], events: list[dict[str, Any]], approvals: list[d
     if any(item.get("status") == "pending" for item in approvals):
         return "waiting_approval"
     names = {str(item.get("event")) for item in events}
+    if "role_harness_failed" in names:
+        return "failed"
     if "role_harness_cancelled" in names:
         return "cancelled"
     if "role_harness_done" in names:

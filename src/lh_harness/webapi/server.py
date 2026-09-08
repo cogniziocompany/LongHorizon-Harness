@@ -1131,7 +1131,10 @@ def create_app(
         except IdempotencyConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (TypeError, ValueError, OSError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            detail = str(exc)
+            if isinstance(exc, ValueError) and "reserved by another launch" in detail:
+                raise HTTPException(status_code=409, detail=detail) from exc
+            raise HTTPException(status_code=400, detail=detail) from exc
         if isinstance(created.get("owner"), dict):
             created = {**created, "owner": _public_owner(created["owner"])}
         return {"ok": True, "run": created}
