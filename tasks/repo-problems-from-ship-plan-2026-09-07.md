@@ -55,3 +55,6 @@ Paxton asked for a hybrid approach to relieve the eval-gate delay (restore promo
 ### 2026-09-08 03:20 PT — 10c done (pp #92)
 - Run 1e9a9c30: promote.yml secondary gate polls → `scripts/ci/qa-gate-poll.sh` (success 0 / failure 1 / infra-blocked error 3 after 2 re-dispatches 10 min apart), stubbed test (5 cases), docs/ci/qa-gate-statuses.md. PR #92 → develop.
 - Lesson (second occurrence tonight, mcp-tools #108 was the first): a workflow that moves inline `run:` logic into a repo script must add a checkout to every ubuntu job that calls it. Overseer added sparse checkouts (scripts/ci) to secondary-dev/uat/prod before opening the PR. Added to the review checklist: grep the diff for `bash scripts/` / `source .../*.sh` and confirm each calling job has actions/checkout.
+
+### 2026-09-08 04:20 PT — prod promotion 34207730525: dev eval gate PASSED, then a permission bug
+- The dev primary eval gate passed at 10:49 UTC (first pass since the 05h0a fix). The run then failed in "Eval score gate (dev)" at the new "Record dev primary-eval status" step (pp #91): POST /statuses returned 404 because gate-dev/gate-uat have no `statuses: write`. pp #93 adds the permission; chain merges it and re-dispatches the pinned promotion of the develop head (-r develop) with the approver loop. Full eval reruns (~2 h).
