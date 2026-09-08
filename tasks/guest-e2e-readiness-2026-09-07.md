@@ -97,3 +97,16 @@ Already wired for UAT (verified on pp develop 969ae91): `deployments/instances.j
 Still to do so UAT is actually **used** for guest access: run the same guest seeding on the UAT lane. `scripts/guest/seed-dev-grant.mjs` reads TARGET_ENVIRONMENT_URL from the lane env, so it works unchanged against UAT once /opt/powerplatform-uat/.env carries the UAT org URL plus GUEST_TEST_PRINCIPAL_EMAIL, STRIPE_TEST_CUSTOMER_ID and the billing API vars (dev got these 2026-09-07 19:55 PT; UAT did not). The "dev" in the script name is now wrong — rename to `seed-guest-grant.mjs` with a thin alias. Queued as task 05h4b.
 
 Sequence: dev click-through now → the same click-through on UAT after the release fast-forward → prod (still gated on seven test-mode closes).
+
+### 2026-09-08 08:20 PT — UAT guest access SEEDED (no new values needed from Paxton)
+The guest variables already existed on the dev lane, so nothing had to be invented. Lane host is `pp-dev-uat` (192.168.21.163,
+CT100 on ptait07 192.168.21.138), reachable directly with the proxmox key; `/opt/powerplatform-uat/.env` already carried
+AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET and BILLING_API_URL (http://192.168.21.153:20253) + BILLING_API_KEY.
+- Added to the UAT lane env (backup `.env.bak-guest-20260908-1514`, mode 600): TARGET_ENVIRONMENT_URL=https://orgff9dcfec.crm.dynamics.com,
+  GUEST_TEST_PRINCIPAL_EMAIL and STRIPE_TEST_CUSTOMER_ID copied verbatim from the dev lane.
+- Seeded inside the running uat app container (values passed with `-e` rather than recreating the lane):
+  environment `d301694e-fcfa-48a7-b318-7a46a46fd527` (org b100f72c…, orgff9dcfec), grant `2f5a85f5-…` for ai-dev01@cognizio.company,
+  and **verifyAuth PASS (customerId=internal)** — the same signature dev produced on 2026-09-07.
+- GUEST_TEST_ENVIRONMENT_ID recorded in the lane env for the e2e suites.
+- UAT is now at parity with dev for guest access; the click-through can be exercised on https://powerplatform-uat… once the release
+  fast-forward carries the current develop head. PR #96 (tier-aware seeding) still merges so the next tier is one command.
