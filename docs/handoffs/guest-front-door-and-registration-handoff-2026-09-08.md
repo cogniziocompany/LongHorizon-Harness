@@ -52,19 +52,25 @@ Two things I had wrong earlier, written down so the next reader does not repeat 
 
 Far less is missing than it appeared. The portal is live, signup and billing controllers are merged, Stripe products and prices exist, metering works with guest isolation proven, and there is a product to land in.
 
-**The real question is now which of two parallel $39 tracks is the one to carry forward**, because there appear to be two:
+**Settled 2026-09-08 by Paxton: the September guest launch track is canonical; the older design is deprecated.**
 
-- The **Easy Button** track, August, price `price_1TsBP9CXyLTnTERyMFHhpOn7`, driven through the Power Pages portal, with an A1–A8 scenario matrix that was written but never merged.
-- The **guest launch** track, September, dev prices `price_1UCpYaQVmqxwMkjoBX4ATB3L` (base) and `price_1UCpYbQVmqxwMkjoqmvb8wYT` (metered), meter `cognizioware_guest_tokens`, with guest execution and charging switched on for dev and UAT on 2026-09-08.
+| | Canonical | Deprecated |
+|---|---|---|
+| Base price | `price_1UCpYaQVmqxwMkjoBX4ATB3L` | `price_1TsBP9CXyLTnTERyMFHhpOn7` |
+| Metered price | `price_1UCpYbQVmqxwMkjoqmvb8wYT` | — |
+| Meter | `cognizioware_guest_tokens` | — |
+| Controllers | `GuestSubscriptionController`, `GuestWebhookController` | `SignupController`, `PartnerBillingController` |
+| Front door | public route in the React app, Stripe embedded snippet | Power Pages portal `easybutt0n.powerappsportals.com` |
+| Switches | guest execution + charging on, dev and UAT, 2026-09-08 | — |
 
-These are different Stripe objects. Whether they are two stages of one plan or two implementations of the same idea is exactly what the expert should settle first, because everything downstream — which webhook provisions the account, which price the portal charges, which meter counts usage — depends on the answer.
+Nothing new may be wired to the deprecated price, controllers or portal. Retiring them — redirecting or taking down the portal, removing the dead Stripe objects, deciding the fate of the unmerged A1–A8 matrix — is separate work and should be scheduled deliberately rather than done incidentally.
 
-The A1–A8 matrix is the fastest way to find out what actually still works: it is a written end-to-end test of the purchase journey. It sits 293 commits behind `develop`, so it needs rebasing before it can be trusted, and its results from August cannot be assumed to hold.
+**One consequence to be explicit about:** the A1–A8 scenario matrix on `codex/easybutton-a1-runner` tests the deprecated journey against the deprecated price and the deprecated portal. It is 293 commits behind `develop`. It is therefore **not** the fast route to confidence I suggested earlier — rebasing it would validate a flow we are retiring. The guest journey needs its own end-to-end test, and that is a gap.
 
 ## Questions for the expert
 
-1. **Is `easybutt0n.powerappsportals.com` still the intended front door?** It is live and it is what the existing QA matrix drives. If it stays, no new storefront should be built. If it is being replaced, say what replaces it and what happens to the Easy Button flow behind it.
-2. **Which of the two $39 tracks survives** — Easy Button (`price_1TsBP9CXyLTnTERyMFHhpOn7`) or guest launch (`price_1UCpYaQVmqxwMkjo...`)? Retire one explicitly rather than leaving both wired, and say which price the live portal charges today.
+1. **How and when does the deprecated Power Pages portal come down?** It is live at `easybutt0n.powerappsportals.com` and still charges the deprecated price. Decide whether it redirects to the new route, shows a notice, or is taken down, and who owns that change — an abandoned storefront that still takes money is the risk here.
+2. **What end-to-end test covers the guest journey?** The only written matrix tests the deprecated flow. Define the equivalent for the guest track before launch, not after.
 3. **What exactly happens on the payment webhook, in order?** Our billing service is the single server-side Stripe writer and must stay so. Enumerate every step from `checkout.session.completed` to a usable account: Entra guest invitation, licence assignment in our tenant, Power Apps environment creation, Dataverse `SystemUser`, security role, and the welcome message telling them their email is now the account.
 4. **Can that chain run unattended?** If any step needs a human administrator, self-serve is not achievable as described, and the plan must say so plainly rather than discovering it at launch.
 5. **What does "temporary" licensed guest access mean mechanically?** Duration, what reclaims the licence, what happens to their environment on lapse or cancellation, and how that interacts with the `pac solution export` promise that they own their production tenant.
