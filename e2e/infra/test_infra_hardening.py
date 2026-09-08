@@ -271,6 +271,11 @@ def test_cancelled_run_resume_requires_ack(client) -> None:
     assert snapshot["controls"]["can_resume"] is True
     assert snapshot["run"]["status"] == "cancelled"
 
+    # Resume without acknowledgement must be rejected with 409.
+    no_ack = api.post(f"/api/runs/{run_id}/resume", json={"mode": "continue"})
+    assert no_ack.status_code == 409
+    assert "cancelReasonAck" in no_ack.json()["detail"]
+
     process.returncode = None
     resumed = api.post(
         f"/api/runs/{run_id}/resume",

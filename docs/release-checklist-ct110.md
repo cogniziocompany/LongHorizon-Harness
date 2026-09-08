@@ -51,6 +51,9 @@ Then verify the hardened lifecycle behavior:
   409 until `cancelReasonAck` is supplied.
 - Resume/migration only proceeds after the predecessor worker reaches a terminal
   status (`completed`, `failed`, `cancelled`, `blocked`, `incomplete`).
+- `POST /api/runs/{id}/resume {"mode":"continue"}` validates the latest round
+  `checkpoint.json` fingerprint; a mismatch or missing checkpoint rejects with
+  409 so the worker cannot restart from a torn ledger.
 
 ## 3. Exact CT110 `config.toml`
 

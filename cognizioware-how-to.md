@@ -74,6 +74,10 @@ Operational notes for Docker nodes:
 - Migration/successor creation waits until the predecessor worker reaches a
   terminal lifecycle status (`completed`, `failed`, `cancelled`, `blocked`,
   `incomplete`). Do not assume the manager `report.json` alone is enough.
+- Each recorded round writes a `checkpoint.json` with a SHA-256 fingerprint.
+  `POST /api/runs/{id}/resume {"mode":"continue"}` validates the latest
+  checkpoint before relaunching the worker; a missing or mismatched fingerprint
+  rejects the resume with 409.
 
 ## 3. Our modifications on top of upstream
 

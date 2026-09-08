@@ -198,20 +198,39 @@ def _separate_claims(round_item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _derive_verdict(executor_output: str, auditor_report: str) -> dict[str, Any]:
-    """Derive a round-level verdict from executor claim and auditor findings."""
+    """Derive a round-level verdict from executor claim and auditor findings.
 
-    report = (auditor_report or "").strip().lower()
-    claim = (executor_output or "").strip().lower()
+    The auditor report is treated as structured text: a leading
+    ``Status: <value>`` line is the authoritative signal.  Substring matching
+    against freeform text is forbidden because it converts ``incomplete``,
+    ``blocked`` and other status words into false acceptances.
+    """
+
+    report = (auditor_report or "").strip()
+    claim = (executor_output or "").strip()
     if not report and not claim:
         return {"state": "pending", "summary": "no claim or findings recorded"}
+
+    # Parse an explicit ``Status:`` line at the start of the report.
+    status_value: str | None = None
+    first_line = report.splitlines()[0] if report else ""
+    if ":" in first_line:
+        key, value = first_line.split(":", 1)
+        if key.strip().lower() == "status":
+            status_value = value.strip().lower()
+
+    if status_value == "complete":
+        return {"state": "accepted", "summary": "auditor accepted executor claim", "authority": "auditor"}
+    if status_value in {"incomplete", "needs_revision", "blocked", "failed", "rejected"}:
+        return {"state": "rejected", "summary": f"auditor report status is {status_value}", "authority": "auditor"}
+
+    # No structured status line, but auditor text exists: keep the finding
+    # separate from a pure executor claim rather than guessing.
     if report:
-        if any(marker in report for marker in ("status: complete", "complete", "aligned", "verified")):
-            return {"state": "accepted", "summary": "auditor accepted executor claim", "authority": "auditor"}
-        if any(marker in report for marker in ("failed", "rejected", "mismatch", "error")):
-            return {"state": "rejected", "summary": "auditor rejected executor claim", "authority": "auditor"}
+        return {"state": "pending", "summary": "auditor findings recorded without structured status", "authority": "auditor"}
     if claim:
         return {"state": "claimed", "summary": "executor produced a claim; no auditor findings yet", "authority": "executor"}
-    return {"state": "pending", "summary": "auditor findings recorded without executor claim"}
+    return {"state": "pending", "summary": "no claim or findings recorded"}
 
 
 def _status(raw: dict[str, Any], events: list[dict[str, Any]], approvals: list[dict[str, Any]]) -> str:

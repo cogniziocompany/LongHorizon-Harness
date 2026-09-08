@@ -2543,7 +2543,11 @@ class RunSupervisor:
             if not task.strip():
                 raise ValueError("cannot resume a run without a saved task")
             workspace = str(owner.get("workspace") or self.workspace_root)
+            # Before continuing in place, validate the latest round checkpoint.
+            # A missing or tampered checkpoint is a fail-closed condition: the
+            # worker would otherwise rebuild its state from an untrusted ledger.
             if mode == "continue":
+                self._validate_latest_round_checkpoint(run_id, run_dir)
                 return self._continue_run_in_place(
                     run_id,
                     run_dir=run_dir,
@@ -2692,6 +2696,68 @@ class RunSupervisor:
             workspace_path=workspace_path,
             task=task,
         )
+
+    def _validate_latest_round_checkpoint(self, run_id: str, run_dir: Path) -> None:
+        """Load the latest round checkpoint and verify its fingerprint.
+
+        The checkpoint is written by ``_record_round`` with a SHA-256 fingerprint
+        over the canonical round record.  On resume/continuation we recompute the
+        hash over the same canonical fields and fail closed if the file is missing,
+        malformed, or tampered.
+        """
+
+        logs = self._run_logs_dir(run_id)
+        role_dir = safe_run_role(self.runs_root, run_dir, allow_missing=True)
+        if role_dir is None:
+            raise ValueError("run role path is outside its run boundary")
+        rounds_dir = role_dir / "rounds"
+        if not rounds_dir.is_dir():
+            # A run with no recorded rounds has nothing to validate; the worker
+            # will start from the saved task.
+            return
+        candidates: list[tuple[int, Path]] = []
+        try:
+            for entry in rounds_dir.iterdir():
+                if not entry.is_dir():
+                    continue
+                suffix = entry.name.removeprefix("round_")
+                if suffix == entry.name or not suffix.isdecimal():
+                    continue
+                checkpoint_path = entry / "checkpoint.json"
+                if checkpoint_path.is_file():
+                    candidates.append((int(suffix), checkpoint_path))
+        except OSError as exc:
+            raise ValueError(f"cannot read rounds directory for checkpoint validation: {exc}") from exc
+        if not candidates:
+            return
+        candidates.sort(key=lambda item: item[0])
+        _, latest_path = candidates[-1]
+        try:
+            checkpoint = _read_json(latest_path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"latest round checkpoint is unreadable: {exc}") from exc
+        if not isinstance(checkpoint, dict):
+            raise ValueError("latest round checkpoint is malformed")
+        stored_fingerprint = str(checkpoint.get("fingerprint") or "")
+        if not stored_fingerprint:
+            raise ValueError("latest round checkpoint has no fingerprint")
+        # Recompute the fingerprint over the canonical round record fields.
+        canonical_record = {
+            key: value
+            for key, value in checkpoint.items()
+            if key not in {"schema_version", "checkpoint_kind", "recorded_at", "fingerprint"}
+        }
+        canonical = json.dumps(
+            canonical_record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        computed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        if computed != stored_fingerprint:
+            raise ValueError(
+                "latest round checkpoint fingerprint mismatch: checkpoint may be tampered or torn"
+            )
 
     def command_receipt(self, run_id: str, command_id: str) -> dict[str, Any] | None:
         return self._bus(run_id).receipt_for(command_id)
