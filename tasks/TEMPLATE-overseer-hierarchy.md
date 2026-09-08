@@ -454,3 +454,5 @@ How to watch it (Paxton): `python C:\tmp\overseer_status.py` (runs, queue, lanes
 
 ## Single status artifact (2026-09-07 23:25 PT)
 There is ONE page: the **Cognizioware Ship Plane** https://claude.ai/code/artifact/8b0c8b20-79bf-4181-9179-b64b1cbd44c5 (system map + harness task -> PR -> lane -> environment table + countdown + walk-through + Needs Paxton). The former "ship plan" artifact (66bed19d...) is retired and only points there. Source file: scratchpad system-current-state.html. Update it at every milestone and every 2-3 h.
+
+- Lesson 2026-09-07 23:30 PT: task texts that tell a run to READ a file in tasks/ must be PUSHED to origin before launch (the CT110 workspaces read origin/main; 15 local commits were unpushed and run 844e8f00 stalled on a missing plan). Tell runs to read via `git show origin/main:tasks/<file>` and fetch (never checkout) in the shared workspace.
