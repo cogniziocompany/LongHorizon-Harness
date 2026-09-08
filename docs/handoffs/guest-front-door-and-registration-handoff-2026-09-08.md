@@ -7,7 +7,7 @@
 | Written | 2026-09-08 by the overseer session `5321285c-35e2-459a-9dae-92ea8811669f`, corrected the same day after Paxton rejected an earlier framing |
 | For | The expert who will dig up the specs; harness tasks implement the outcome |
 | Question in one line | A stranger pays $39 with nothing but an email. What has to happen, in order, for that email to become a working account inside its own Power Apps environment? |
-| Repos | `cognizioware-powerplatform` (the product they land in), `mcp-cognizioware` (billing service, Stripe, meters, entitlement), purchase page repo **to be determined — it does not exist yet** |
+| Repos | `cognizioware-powerplatform` (the product they land in), `mcp-cognizioware` (billing service, Stripe, meters, entitlement), the purchase page is a **public route in `cognizioware-powerplatform`**, decided 2026-09-08 |
 | Prior art in-repo | `design/plans/guest-launch/DECISION-REGISTER.md` (D02), `design/plans/cognizioware-guest-launch-plan.md`, `design/grant-guest-b2b-read-only-access-d365-ce.md` |
 
 ## The flow, as the owner describes it
@@ -21,7 +21,7 @@ Stated by Paxton on 2026-09-08, and this supersedes any earlier reading in this 
 5. That email is provisioned as a **guest user in a new Power Apps environment**.
 6. Everything past step 5 is being planned with other experts and is out of scope here.
 
-The purchase page was originally intended to be Power Pages hosted in Power Platform. That is no longer the plan; the current intent is a standalone web app, Vue or similar. **The choice is not settled and the page is not built.**
+The purchase page was originally intended to be Power Pages hosted in Power Platform, and was briefly considered as a standalone Vue app. **Settled 2026-09-08: it is a public route in the existing React app**, declared beside `/login` and outside the `AuthGuard`, reusing the same host and deploy lane. It is not built yet — harness task 53 builds it.
 
 ## What corrects the record
 
