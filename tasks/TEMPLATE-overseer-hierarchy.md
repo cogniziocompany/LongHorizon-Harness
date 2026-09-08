@@ -458,3 +458,5 @@ There is ONE page: the **Cognizioware Ship Plane** https://claude.ai/code/artifa
 - Lesson 2026-09-07 23:30 PT: task texts that tell a run to READ a file in tasks/ must be PUSHED to origin before launch (the CT110 workspaces read origin/main; 15 local commits were unpushed and run 844e8f00 stalled on a missing plan). Tell runs to read via `git show origin/main:tasks/<file>` and fetch (never checkout) in the shared workspace.
 
 - Lesson 2026-09-08 02:10 PT: `gh workflow run <wf> -r <branch>` runs the workflow FILE from that branch. Three billing promotion attempts ran the stale develop copy of promote-billing.yml after the fixes were merged to main. Dispatch promotions with `-r main` (the sha to promote is an input); keep promote workflows only on main.
+
+- Lesson 2026-09-08: a harness release can pass import/meta checks and still kill every run on the first round (KeyError in role resolution). Before a CT110 release, run one 1-round smoke task on the new code (auditor path included) or the unit suite on Linux; keep the previous release-src for a fast rollback.

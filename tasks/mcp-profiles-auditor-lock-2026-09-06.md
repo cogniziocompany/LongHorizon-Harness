@@ -80,3 +80,8 @@ Order: A (git lock) → C (session id) → B (profiles) → D (Hydra + ops) → 
   here). Deploy script staged at C:\tmp\pp-fix2\deploy-harness.sh (aborts if any run is active). Finding: the built-in profiles used invented
   aliases (ssh-list, github-read, langfuse-read…) that the gateway does not know — remapped to the real dash-free mcp_aliases (kb, guides, skills,
   memory, langfuse_mcp, github, youtrack, ssh, hydra, hydrafleet, proxmox*); audit = non-mutating servers only, since the gateway cannot make ssh read-only.
+
+## Progress 2026-09-08 04:25 PT - release deployed to CT110
+- Release main 8423a76 deployed (launcher paused, five runs aborted, deploy-harness.sh, runs resumed): /api/meta shows mcp_gateway_configured true and profiles none/audit/default/ops/full.
+- Regression found on resume: every run failed with KeyError auditor_format_repair (build_role_agent resolves mcp_profile for the runtime-only format-repair role, which has no CLI flags and was missing from _ROLE_PARENTS). Hotfix 29c3a20 (alias map auditor_format_repair -> auditor in _resolve_role_option/_resolve_role_model + test) deployed 04:15 PT; all five runs resumed and running. Auto-deploy job retired.
+- Remaining for M4: Hydra fleet plane deploy on corsairai300 (feat/harness-fleet) and the fleet.easybutt0n.ai restore (#100 in the lane chain).
