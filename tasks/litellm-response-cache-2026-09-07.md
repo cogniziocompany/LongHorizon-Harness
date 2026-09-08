@@ -6,3 +6,16 @@
 **Session for deployment coordination:** the plan's author session 3fbf60f8 can be resumed from the mcp-tools repo for the probe/verification steps (`claude --resume 3fbf60f8-149a-43e7-a36c-56a7184bc5dc -p "<step>"`), like the Skill Hub task.
 **Out of scope noted by the plan:** audioqa-mcp restart loop (already task 09; container stopped).
 - 19:05 PT (Paxton): ESCALATED - it affects token usage. Moved to the front of the queue as 05a (launches on the next free kimi slot; the mcp-tools workspace is free). Operator steps on CT204 follow immediately after review.
+
+## Progress 2026-09-07 18:10-19:05 PT
+- Run 286aa6b4 complete (5 commits, 8 files, 42 hook tests). PR #95 merged 18:10. Namespace mechanism confirmed in the running 1.100.0 build (caching.py `_add_namespace_to_cache_key`: `kwargs["cache"]["namespace"]` or `metadata.redis_namespace` prefixes the redis key).
+- REDIS_HOST/PORT/PASSWORD appended to mcp-tools.env on CT204 and CT202 (backups kept, mode 600); redis started on CT204 from the branch compose before merge (the UAT lane never creates services).
+- Lane 34175509287 FAILED at the UAT apply: the router crash-looped on `ImportError: cache_namespacer` because both lane steps copy only thinking_normalizer.py into /opt/.../hooks. Recovered UAT by pushing the file and restarting.
+- Isolation probe then FAILED: key A and key B shared one cache key (no prefix). Cause: `_derive_namespace` accepted only dicts; the proxy passes a `UserAPIKeyAuth` pydantic object, so every request was left unscoped. Direct requests with `cache.namespace` / `metadata.redis_namespace` did prefix, proving the mechanism.
+- Fix PR #96 (hook reads dict or attributes, 3 new tests, 45 passing on CT110 in a throwaway venv; lane copies hooks/*.py for UAT and prod). Hot-loaded on CT204: A1 miss, A2 hit ns 46b2..., B1 miss, B2 hit ns 2a70... = isolated. Merged 19:00; lane 34176691032 running with watcher `C:\tmp\watch_cache_lane2.py` (probes CT204, then CT202 after the prod deploy).
+- Known: the post-deploy smoke step still calls bare GET /health and times out (task 09b); the deploy itself completes before it.
+
+## Lessons
+- Hook tests that pass a plain dict for `user_api_key_dict` do not prove proxy behaviour; add an object-style fixture (pydantic UserAPIKeyAuth) for every pre-call hook.
+- Any new file under infrastructure/docker/litellm/hooks needs the lane to ship it; the lane now globs the directory. Verify deployment surface, not just the repo, before calling a gateway feature "deployed".
+- harness user's `~/.local/bin/pytest` on CT110 is broken (pytest-asyncio missing typing_extensions); executors reporting green there may have used another interpreter. Throwaway venv: /tmp/venv-hooks.
