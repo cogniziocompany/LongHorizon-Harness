@@ -1311,7 +1311,7 @@ class RunSupervisor:
             item = {
                 "id": run_dir.name,
                 "task": task,
-                "status": str(status.get("status") or report.get("status") or "idle"),
+                "status": str(status.get("status") or report.get("status") or "unknown"),
                 "mtime": mtime,
                 "log_dir": str(logs),
             }
@@ -2520,6 +2520,18 @@ class RunSupervisor:
                 raise ValueError("cannot resume an active run")
             if not is_terminal_status(current.get("status")):
                 raise ValueError(f"run is not resumable from status {current.get('status') or 'unknown'}")
+            # Migration/successor creation must wait until the predecessor run has
+            # reached a terminal lifecycle status.  ``report.json`` is the audit
+            # outcome and can be satisfied before the supervisor has observed the
+            # process exit, so require the supervisor's own status decision too.
+            supervisor_status = canonical_lifecycle_status(current.get("status"), default="unknown")
+            report_status = canonical_lifecycle_status(
+                (_read_json(logs / "report.json") or {}).get("status"), default=""
+            )
+            if supervisor_status not in TERMINAL_STATUSES:
+                raise ValueError(
+                    f"predecessor worker has not reached a terminal status: {supervisor_status}"
+                )
             owner = self.owner(run_id)
             report = _read_json(logs / "report.json")
             # The owner record is written before the worker starts and is

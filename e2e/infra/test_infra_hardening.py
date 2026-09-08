@@ -115,7 +115,10 @@ def test_worker_killed_mid_round_can_resume(client) -> None:
     assert stopped["controls"]["can_resume"] is True
 
     process.returncode = None
-    resumed = api.post(f"/api/runs/{run_id}/resume", json={})
+    resumed = api.post(
+        f"/api/runs/{run_id}/resume",
+        json={"cancelReasonAck": "operator reviewed cancelled snapshot"},
+    )
     assert resumed.status_code == 200
     run = resumed.json()["run"]
     assert run["id"] == run_id
@@ -269,7 +272,10 @@ def test_cancelled_run_resume_requires_ack(client) -> None:
     assert snapshot["run"]["status"] == "cancelled"
 
     process.returncode = None
-    resumed = api.post(f"/api/runs/{run_id}/resume", json={"mode": "continue"})
+    resumed = api.post(
+        f"/api/runs/{run_id}/resume",
+        json={"mode": "continue", "cancelReasonAck": "operator reviewed cancellation"},
+    )
     assert resumed.status_code == 200
     assert resumed.json()["run"]["id"] == run_id
     assert resumed.json()["run"]["owner"]["resume_kind"] == "continue"
