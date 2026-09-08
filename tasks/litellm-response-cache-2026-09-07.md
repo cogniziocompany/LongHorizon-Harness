@@ -19,3 +19,4 @@
 - Hook tests that pass a plain dict for `user_api_key_dict` do not prove proxy behaviour; add an object-style fixture (pydantic UserAPIKeyAuth) for every pre-call hook.
 - Any new file under infrastructure/docker/litellm/hooks needs the lane to ship it; the lane now globs the directory. Verify deployment surface, not just the repo, before calling a gateway feature "deployed".
 - harness user's `~/.local/bin/pytest` on CT110 is broken (pytest-asyncio missing typing_extensions); executors reporting green there may have used another interpreter. Throwaway venv: /tmp/venv-hooks.
+- 19:25 PT: lane 34176691032 green through QA Verify (prod); smoke step failed on the known bare /health sweep. Cache LIVE on CT202: /cache/ping healthy, probe A1 miss / A2 hit ns a587..., B1 miss / B2 hit ns 96b7... (isolated), redis DBSIZE 149, TTL 300. Same on CT204. audioqa container restarted by the compose up and stopped again (task 09). M2 DONE.
