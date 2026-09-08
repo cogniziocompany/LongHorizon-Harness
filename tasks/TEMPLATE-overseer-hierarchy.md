@@ -507,3 +507,12 @@ The launcher now falls back to the local **qwen3.8 trio**, with two guards Paxto
 one deliverable per task, name the files to read rather than describing them, and split a multi-repo or multi-subsystem task rather than writing a
 long one. Today's queue is all under the limit; the largest is the Hydra panel task at ~17k characters, which is close to the practical ceiling once
 its rounds accumulate.
+
+## Sweep cadence (2026-09-08, Paxton)
+
+The audit loop now runs **every 5 minutes** and chooses its own depth:
+- **Local mode** — any active run on the qwen3.8 trio, or fewer than two Ollama keys healthy: **full sweep every tick**. Local runs are
+  one-at-a-time, slower, and stall quietly, so they need the closer watch.
+- **Normal mode** — no local run and two or more keys healthy: quick pass only (gates + prod health), with the full sweep on the hour and at
+  half past. This keeps the cadence cheap when the fleet is running on the cloud pool.
+The full sweep is: fleet plane (Hydra, the window, the node registration and its three repair traps), lanes, open PRs, and capacity.
