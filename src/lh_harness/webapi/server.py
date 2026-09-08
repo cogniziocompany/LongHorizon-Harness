@@ -12,6 +12,7 @@ import os
 import re
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -21,6 +22,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from ..dashboard.state import DashboardState
+from ..launcher import Launcher
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
@@ -677,12 +679,35 @@ def create_app(
     queue_store: QueueStore | None = None
     if runs_root is not None:
         queue_store = QueueStore(runs_root)
-    app = FastAPI(title="LongHorizon-Harness Web API", version="1")
+    queue_config = default_queue_config()
+    if queue_store is not None:
+        try:
+            from ..config import PROJECT_CONFIG_PATH, load_run_defaults
+
+            project = load_run_defaults(PROJECT_CONFIG_PATH)
+            if isinstance(project.get("queue"), dict):
+                queue_config = queue_config_from_config(project)
+        except Exception:
+            pass
+    launcher: Launcher | None = None
+    if supervisor is not None and queue_store is not None:
+        launcher = Launcher(supervisor, queue_store, queue_config=queue_config)
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> Any:
+        if launcher is not None:
+            await launcher.start()
+        yield
+        if launcher is not None:
+            await launcher.stop()
+
+    app = FastAPI(title="LongHorizon-Harness Web API", version="1", lifespan=_lifespan)
     app.state.registry = registry
     app.state.queue_store = queue_store
     app.state.auth_token = token
     app.state.allowed_origins = origins
     app.state.bind_host = bind_host
+    app.state.launcher = launcher
     if supervisor is not None:
         async def _shutdown_owned_workers() -> None:
             await asyncio.to_thread(supervisor.shutdown)

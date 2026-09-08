@@ -66,9 +66,11 @@ class QueueEntry:
     status: str = "pending"
     run_id: str | None = None
     reason: str | None = None
+    skip_reasons: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     launched_at: float | None = None
+    last_checked_at: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -93,9 +95,11 @@ class QueueEntry:
             "status",
             "run_id",
             "reason",
+            "skip_reasons",
             "created_at",
             "updated_at",
             "launched_at",
+            "last_checked_at",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -394,6 +398,15 @@ class QueueStore:
             return None
         entry.status = "failed"
         entry.reason = reason[:_MAX_QUEUE_REASON_CHARS]
+        return self.update(entry)
+
+    def record_skip(self, queue_id: str, reason: str) -> QueueEntry | None:
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if entry.status != "pending":
+            return None
+        entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
         return self.update(entry)
 
     def counts(self) -> dict[str, int]:
