@@ -448,3 +448,6 @@ How to watch it (Paxton): `python C:\tmp\overseer_status.py` (runs, queue, lanes
 - **Rollback:** `pct stop 204` on ptait07, `pct start 204` on ptait01 (untouched copy). Static IP means no DNS change; the two must never run at once.
 - **Untouched:** CT105 pihole, CT202 prod, the GPU span. No swap, sysctl, ZFS or network changes.
 - Also done 21:05 PT on corsairai300 (not a host-level change): docker build cache + dangling images pruned, root disk 98% → 72%, no container stopped.
+
+## Standing instruction (Paxton 2026-09-07 23:35 PT)
+"Continue to manage the deployment pipelines and task queue for lh-harness" - added to the overseer goal: keep the queue draining (launcher CAP 4, guest/billing/fleet-window first), review every finished run into a PR, push every PR through its lane with gates deciding and prod auto-approved, chase reds immediately, and report milestones every 2-3 h.
