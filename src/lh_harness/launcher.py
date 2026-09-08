@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,17 @@ def _normalize_workspace(value: str) -> str:
     return os.path.normpath(os.path.abspath(str(value or "")))
 
 
+def _read_report_json(path: Path) -> dict[str, Any]:
+    """Load a report.json if it exists and is valid JSON."""
+
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 class Launcher:
     """Poll the queue and launch eligible entries through the supervisor."""
 
@@ -60,6 +72,10 @@ class Launcher:
         )
         self._task: asyncio.Task | None = None
         self._stopping = False
+        # One launcher instance must never launch two runs into the same
+        # workspace across concurrent ticks.  This lock serializes the critical
+        # section from eligibility check through store mark_launched.
+        self._launch_lock = threading.Lock()
 
     @staticmethod
     def _load_project_queue_config() -> dict[str, Any]:
@@ -100,13 +116,15 @@ class Launcher:
 
     def _tick_sync(self) -> None:
         try:
-            self._run_pass()
+            with self._launch_lock:
+                self._run_pass()
         except Exception as exc:
             self._emit_service_event("queue.error", {"error": str(exc)[:200]})
 
     def _run_pass(self) -> None:
         entries = self.queue_store.list()
         active = self._active_runs()
+        self._update_launched_entries(active)
         capacities = self._remaining_capacity(active)
         launched = False
         for entry in entries:
@@ -128,6 +146,74 @@ class Launcher:
                 capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
             else:
                 self._skip(entry, skip_reason)
+
+    def _update_launched_entries(
+        self, active: dict[str, dict[str, Any]]
+    ) -> None:
+        """Promote launched entries to done/failed once their run is terminal."""
+
+        for entry in self.queue_store.list():
+            if entry.status != "launched" or not entry.run_id:
+                continue
+            run_id = entry.run_id
+            if run_id in active:
+                continue
+            status = self.supervisor.status(run_id)
+            lifecycle = canonical_lifecycle_status(status.get("status"))
+            if lifecycle in ACTIVE_STATUSES:
+                continue
+            run_status = status.get("status") or "unknown"
+            # The supervisor exposes owner/status but not the manager report.
+            # Read the durable audit result directly from the run directory.
+            report = self._read_run_report(run_id)
+            # A cancelled worker can still carry a successful manager audit.
+            # Treat the queue entry as done when the run report is satisfied,
+            # even if the operator stopped the process.
+            completion_satisfied = report.get("completion_satisfied") is True
+            if run_status == "completed" or completion_satisfied:
+                reason = "run completed"
+                if run_status != "completed":
+                    reason = f"run {run_status} with completion satisfied"
+                updated = self.queue_store.mark_done(
+                    entry.queue_id, reason=reason
+                )
+                self._emit_run_event(
+                    run_id,
+                    "queue.done",
+                    {
+                        "queue_id": entry.queue_id,
+                        "run_id": run_id,
+                        "trio": entry.trio,
+                        "workspace": entry.workspace,
+                    },
+                )
+            else:
+                updated = self.queue_store.mark_failed(
+                    entry.queue_id, reason=f"run {run_status}"
+                )
+                self._emit_run_event(
+                    run_id,
+                    "queue.failed",
+                    {
+                        "queue_id": entry.queue_id,
+                        "run_id": run_id,
+                        "trio": entry.trio,
+                        "workspace": entry.workspace,
+                        "run_status": run_status,
+                    },
+                )
+            if updated is not None:
+                updated.last_checked_at = _now()
+                self.queue_store.update(updated)
+
+    def _read_run_report(self, run_id: str) -> dict[str, Any]:
+        """Read the manager audit report for a run from durable storage."""
+
+        runs_root = getattr(self.supervisor, "runs_root", None)
+        if runs_root is None:
+            return {}
+        report_path = Path(runs_root) / run_id / "lh_harness" / "report.json"
+        return _read_report_json(report_path)
 
     def _capacity_reason(self, entry: QueueEntry, capacities: dict[str, int]) -> str | None:
         if capacities.get(entry.trio, 0) <= 0:
@@ -232,6 +318,7 @@ class Launcher:
                 max_rounds=entry.max_rounds,
                 prompt_language="en",
                 mcp_profile=mcp_profile,
+                base_check=entry.base_check or None,
             )
             run_id = str(created.get("id") or "")
         except Exception as exc:

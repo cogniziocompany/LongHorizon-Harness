@@ -407,6 +407,15 @@ def _safe_run_id(run_id: str) -> bool:
     )
 
 
+def _runs_root_config_path(runs_root: str | Path | None) -> Path | None:
+    """Return the project config path inside ``runs_root/.lh-harness`` if it exists."""
+
+    if not runs_root:
+        return None
+    path = Path(runs_root) / ".lh-harness" / "config.toml"
+    return path if path.is_file() else None
+
+
 def _bounded_command_id(value: str | None) -> str | None:
     if value is None:
         return None
@@ -805,7 +814,10 @@ def create_app(
         try:
             from ..config import PROJECT_CONFIG_PATH, load_run_defaults
 
-            project = load_run_defaults(PROJECT_CONFIG_PATH)
+            # Prefer a project config next to the runs root; fall back to the
+            # current working directory so existing deployments keep working.
+            config_path = _runs_root_config_path(runs_root) or PROJECT_CONFIG_PATH
+            project = load_run_defaults(config_path)
             if isinstance(project.get("queue"), dict):
                 queue_config = queue_config_from_config(project)
         except Exception:
