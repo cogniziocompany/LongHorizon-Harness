@@ -23,6 +23,7 @@ L2 induction, policy gain, L3 abstraction, skill crystallization, retrieval into
 
 ## Progress
 - 2026-09-07 18:40 PT: task file created; queue entries 16a/16b added; PDF committed.
+- 2026-09-08 (routing, task 16a runs after task 49 on this workspace): the run owner will carry `route` (see `docs/handoffs/dynamic-model-routing-handoff-2026-09-08.md`, "Interfaces other tasks read"). The L1 trace's agent/model per role must read `owner.route.bound.roles` when present and fall back to `owner.role_configs`; add optional `route_tier` per role and a redacted `route_rationale` (≤ 512 chars). The seeded L3 environment lists routing backends by NAME (`local-span`, `synthetic`, `ollama-cloud`) with their `max_concurrent`, never URLs. No import of `model_routing`; read the JSON.
 
 ### 2026-09-08 09:45 PT — the three levels exist per instance, seeded for now, and must be viewable
 Paxton: every lh-harness instance carries all three MSCE levels from the start; we hardcode them for now and learn later; and the web UX must make

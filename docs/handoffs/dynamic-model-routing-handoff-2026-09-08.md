@@ -84,7 +84,7 @@ The reasoning behind it, which the design should either encode or overturn:
 The four open questions above are settled. They are no longer open; the implementing task must build them and may only disagree in its completion report, with evidence.
 
 1. **Route per run, observe per round.** The worker command and the adapters are built once, and both resume paths re-read the owner's role configs, so a mid-run switch has no support in the code. Per-round failures are appended to the route history and re-routing happens at the next bind — a new run, or a resume. A transient state is waited out inside the episode rather than routed around.
-2. **No retry of a round that already worked, on a better model.** Exactly one automatic re-enqueue is allowed, and only for a refusal *before* round zero: when no round has run and the abort reason is a provider rate limit, quota, authentication failure, unavailable model, or the new not-permitted state, the launcher creates one new pending entry that records what it is a retry of, marks the offending model in availability, and fails the original with the reason recorded. A run that produced rounds is never restarted — that double-spends the budget that was scarce in the first place, and it hides whether the task or the model failed.
+2. **No retry of a round that already worked, on a better model; bounded relaunch for a refusal *before* round zero** (revised by Paxton in the 2026-09-08 interview, replacing "exactly one re-enqueue"). When no round has run and the abort reason is a provider rate limit, quota, authentication failure, unavailable model, or the new not-permitted state, the launcher marks the offending model in availability, fails the original entry with the reason recorded, and creates a new pending entry that records what it is a retry of and which attempt it is. Every attempt must bind a route that differs from every earlier attempt for the failing role, or wait until an earlier state's trust window has expired; when neither is possible the entry is refused naming everything tried. The cap is configurable and defaults to three attempts (the original plus two). A run that produced rounds is never restarted — that double-spends the budget that was scarce in the first place, and it hides whether the task or the model failed.
 3. **Never pull a model.** Pulling is a host-level change, and the standing rule is that no host change happens without an explicit human go. A cold model stays a legal candidate at the adequate tier with a warning, and the rationale names it so a person can decide to load it.
 4. **An override is a field on the queue entry, never code.** It is set through the API, the Hydra panel or the chat tool, carries who set it and why, is validated against the key-scoped catalogue, and is honoured even when availability disagrees — recorded at the override tier with the disagreement in the rationale. It survives a resume: continue copies the owner minus the resume-cleared keys, which must not include the route, and retry passes the role configs through while also accepting newly supplied ones.
 
@@ -111,4 +111,39 @@ The harness virtual key's allow-list has been widened from 28 to 33 models, addi
 
 ### Failure evidence to build fixtures from
 
-Captured on 2026-09-08: a 403 naming the model the key could not access, on three runs; four workers exiting with status 2 at 14:04 with no recorded reason; and an upstream 500 relayed to the client as a 400 on one run. None of these is a quota body. The two real quota bodies are not in the repo — the monthly-cap wording names the account and points at an upgrade URL, and the rate-limit wording is distinct — so the monthly-cap fixture is reconstructed and must be marked as such until the verbatim body is pasted with the account redacted.
+Captured on 2026-09-08: a 403 naming the model the key could not access, on three runs; four workers exiting with status 2 at 14:04 with no recorded reason; and an upstream 500 relayed to the client as a 400 on one run. None of these is a quota body. The two real quota bodies are not in the repo — the monthly-cap wording names the account and points at an upgrade URL, and the rate-limit wording is distinct. Per the interview, the overseer captures both fresh with one 1-token probe per capped provider from the router box and pastes them, account id redacted, under "Captured provider bodies" below before task 49 launches; until that paragraph exists the monthly-cap fixture is reconstructed and must be marked as such.
+
+### Captured provider bodies
+
+_Pending: to be pasted by the overseer before task 49 launches. Redact the account identifier to `<account>`; keep the rest verbatim, including the upgrade URL and any Retry-After header._
+
+### Interfaces other tasks read
+
+Defined once here; tasks 45 (fleet window), 46 (Hydra panel) and 16a (MSCE experience layer) are told to read these shapes and must not re-key them.
+
+- **Runs** carry `route` in the run summary and the snapshot: `route.bound.roles.{manager,executor,auditor}.{model, backend, tier, rationale}`, plus `route.provisional` and `route.override`. `tier` is one of ideal, adequate, degraded, override, refused. An absent field renders nothing, never "unknown".
+- **Queue rows** carry the same `route`; a pending row shows `provisional`, a launched row shows `bound`. A failed row's `reason` is the run's failure reason verbatim. A refused row's per-role tier is `refused` and the rationale lists everything that was tried.
+- **The write path** for a human or the chat agent is one endpoint on pending entries that pins one role to a model and requires `by` and `reason`; the Hydra panel and the chat tool both call it, and the fleet window never does.
+- **The experience trace** (16a) reads `owner.route.bound.roles` for the model per role, falls back to `owner.role_configs`, and carries `route_tier` and a redacted `route_rationale` per role. The seeded environment level lists routing backends by name only.
+
+### Interview outcomes (Paxton, 2026-09-08, planning session `3e1c0873-c857-479c-bdf5-a4e3a3fca3b6`)
+
+| Decision | Answer |
+|---|---|
+| Base branch | `origin/main` (PR #3 merged 2026-09-08 18:33Z) |
+| Pre-round refusal | Bounded relaunch, default three attempts, different route per attempt |
+| Chat key scope | One `harness-ops` virtual key with `fleet-runners`, `rsi-loop` and `hive-mind`, so chat.easybutt0n.ai can enqueue and route, read ops status and QA runs, and recall memory |
+| Quota fixtures | Captured fresh by probe, pasted above |
+| Human write surface | Hydra only; fleet.easybutt0n.ai stays read-only |
+| Queue order on this workspace | 48 → 49 → 16a → 18 |
+
+### Coverage of the overseer control-plane plan
+
+The Hydra control-plane plan (`based-on-this-tasks-template-overseer-hi-fancy-fountain.md`, work items 1 to 8) planned placement, a "top-level model required" invariant, capacity routing, an executor-seat swap on migrate, an activity feed with rationale, chat fleet access and a template rewrite. Placement stays Hydra's decision (node); the model is the queue's decision (route); both are recorded on the entry. `create_fleet_run` becomes an enqueue and no longer bypasses the queue; the invariant becomes "a run needs a top-level model or a route bound by the queue". The migrate path's executor swap becomes a re-bind on the successor entry, linked through the route history. Overrides land in the same activity feed with `by` and `reason`. Chat access is the key scope above. Lifecycle vocabulary, atomic workspace reservation and confirm-exit-before-migrate remain task 14d's. The TRMS evaluation program is out of scope: a product evaluation run is not a harness run and never takes a route.
+
+### Collisions and housekeeping
+
+- Task 48 (working-tree contention) edits `launcher.py` on its own branch; keep launcher edits narrow.
+- PR #112 in the tools repo owns the e2e and admin model registry; do not duplicate it.
+- `docs/queue.md` (config example) and `src/lh_harness/config.py` (template) both point `key_health_url` at the forbidden bare `/health`; slice 8 fixes both.
+- The PC-side launcher script carries a literal bearer token for CT110; rotate that token when the script is retired after the CT110 release.

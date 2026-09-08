@@ -68,11 +68,13 @@ repo; I monitor you.
    (POST .../instructions), loop-protection gates (resolve continue + rationale when the
    cause is environmental). ESCALATE to me: deploy/rollout gates, contract drift, repeated
    organic failures.
-2. WHEN IT COMPLETES: create the next run yourself in your repo workspace — POST /api/runs
-   with top-level "model" set (REQUIRED or the workspace config leaks and the worker dies),
-   roles ⟨trio⟩, the task text carrying: authoritative spec file to read FIRST, BUILD-ONLY /
-   no-deploy/no-reboot boundaries, reserved paths of other workstreams, frozen contracts,
-   branch name, pacing + auditor-no-fetch lines. Then monitor it the same way.
+2. WHEN IT COMPLETES: enqueue the next task yourself for your repo workspace — POST /api/queue
+   (or the `lhharness` MCP tool harness_enqueue_task) with trio ⟨kimi|qwen⟩ or per-role
+   requirements; the queue chooses and records the models. Until CT110 carries the queue,
+   POST /api/runs with top-level "model" set (REQUIRED or the workspace config leaks and the
+   worker dies) and roles ⟨trio⟩. The task text carries: authoritative spec file to read FIRST,
+   BUILD-ONLY / no-deploy/no-reboot boundaries, reserved paths of other workstreams, frozen
+   contracts, branch name, pacing + auditor-no-fetch lines. Then monitor it the same way.
 3. REPORT to me: completions with audit evidence, unresolvable gates, readiness for any
    batched deploy window. Acknowledge with your monitoring plan.
 ```
@@ -92,13 +94,14 @@ cannot find its spec will gate on "spec not found" and burn a round.
 - **Deploy windows**: batch every action that restarts shared infrastructure (orchestrator
   netns/tunnel couplings, routers, runner services) into announced windows; list blast radius
   per host. Never let any tier reboot the host that carries the overseer/workbench.
-- **Capacity routing**: local-GPU executors (qwen3.8) for the runs that justify it; cloud
-  executors for backfill/overflow so runs don't starve each other.
-- **Standard trio (2026-08-30, Paxton)**: manager `glm-5.3:cloud`; executor
-  `kimi-k2.7-code:cloud`; auditor `kimi-k3:cloud`. glm-5.3-flash:cloud is live in the router
-  as the pooled fallback/chat workhorse but CANNOT hold the Claude Code executor seat --
-  deterministic "Content block is not a thinking block" (2026-08-31). minimax-m3 is retired from the manager seat: it repeatedly ignored
-  operator gate resolves (asked the same question 4x through 4 consumed answers).
+- **Model assignment and capacity are the queue's decision, not the overseer's** (2026-09-08; see
+  "Model assignment" at the end of this file). The overseer states requirements per role or a
+  preset, reads the recorded route and rationale, and overrides one role on one entry with a
+  reason when it must. It does not edit a model dict. Until task 49 is released on CT110 the
+  hand split in "Model assignment" stays in force. Standing model facts that still hold:
+  glm-5.3-flash:cloud cannot hold the Claude Code executor seat (deterministic "Content block is
+  not a thinking block", 2026-08-31); minimax-m3 is retired from the manager seat (ignored gate
+  resolves, asked the same question 4x).
 - **Session audits**: periodically resume each repo session for a status-vs-tasking report
   (per-item, with commit evidence); reconcile against the repo (`git log`, gap-list docs)
   rather than trusting prose; honest gaps get new runs, not blame.
@@ -224,8 +227,9 @@ an operator stop with a rationale marking it complete-at-boundary (not a failure
 - POST /api/runs reads `roles` (per-role `{agent, model}`) and `max_rounds`. Unknown keys such as `role_configs` or `rounds` are SILENTLY
   ignored: the run then executes every role on the top-level `model` with the default 25 rounds. After every launch, confirm with
   `pgrep -af 'lh_harness run'` that `--manager-model/--auditor-model/--max-rounds` are present. (Run 2ff4e39d ran all-kimi for this reason.)
-- Resume (`POST /api/runs/{id}/resume`) takes only `mode` (continue|retry) and `extra_rounds`; it cannot change models. To change a role model,
-  launch a NEW run on the same worktree with a CONTINUATION paragraph naming the commits already on the branch.
+- Resume (`POST /api/runs/{id}/resume`): `mode` continue keeps the owner's role models; `mode` retry passes the owner's role configs through and
+  also accepts a new `roles` dict, so a role model CAN be changed on a retry-mode resume (corrected 2026-09-08; verified in
+  supervisor/service.py). Continue-mode cannot change models; for that, retry-resume or a NEW run with a CONTINUATION paragraph.
 
 ## glm-5.3:cloud as manager — known failure (2026-09-05, broker run 2a38855a rounds 7-8)
 - Symptom: the manager phase fails with `API Error: Content block is not a thinking block` once its prompt grows past ~43 KB; LiteLLM logs 200 OK
@@ -496,7 +500,7 @@ copied from the primary). Queue entries and the task text's "Work ONLY in …" l
 Rules: never let two runs share a tree (a gate-waiting run still holds it); when routing to a `-b` tree, check the other tree is not mid-PR on the
 same branch; and prefer the primary tree for anything that will be released to the node.
 
-## Capacity fallback: local qwen3.8 when the Ollama keys run out (2026-09-08, Paxton)
+## Capacity fallback: local qwen3.8 when the Ollama keys run out (2026-09-08, Paxton) — HISTORY, superseded by "Model assignment" below
 
 When fewer than two Ollama keys are healthy the kimi pool cannot launch, and the queue stalls — it did today at one healthy key of seven.
 The launcher now falls back to the local **qwen3.8 trio**, with two guards Paxton set:
@@ -517,7 +521,7 @@ The audit loop now runs **every 5 minutes** and chooses its own depth:
   half past. This keeps the cadence cheap when the fleet is running on the cloud pool.
 The full sweep is: fleet plane (Hydra, the window, the node registration and its three repair traps), lanes, open PRs, and capacity.
 
-## Model assignment per role (2026-09-08, after the Ollama monthly cap)
+## Model assignment per role (2026-09-08, after the Ollama monthly cap) — the hand split in force until task 49 ships
 
 The Ollama cloud accounts hit their **monthly** cap (not a rate limit), so every `:pool` and `:cloud` model started refusing, including the
 auditor's, which failed runs in under a second with `provider_provider_error`. Paxton added the Synthetic provider; the overseer registered four
@@ -540,3 +544,27 @@ local backend's two-way parallelism; the Synthetic subscription allows 2 concurr
 
 **The constraint this creates:** the executor now has a 64k window, so a task whose text plus repo reading plus round history exceeds it will
 truncate. Keep task text to one deliverable, name the files to read, and split rather than sprawl.
+
+## Model assignment (current doctrine, 2026-09-08; supersedes the "Standard trio", "Local model policy", "Capacity fallback" and "Model assignment per role" sections above)
+
+Model choice per role and capacity accounting move out of this template and into the harness queue (task 49; design contract
+`docs/handoffs/dynamic-model-routing-handoff-2026-09-08.md`, record `tasks/dynamic-model-routing-2026-09-08.md`). The rules an overseer or repo
+session follows from then on:
+
+- **State requirements, not models.** An entry carries `trio` (`kimi` = dev: manager deep + large window, executor fast + free + local-preferred,
+  auditor balanced + large window; `qwen` = all local, QA) or per-role requirements. The queue picks a model per role from the router's
+  key-scoped catalogue and what is observed to be available, records a provisional route at enqueue and the bound route at launch, and writes the
+  rationale on the entry and the run. Read it before touching a run (playbook step 0).
+- **Capacity is per backend** (local span 2 parallel; Synthetic 2 per model per pack), consumed at bind. The old global trio caps and the
+  "two :pool runs", "probe keys before launch", "24k characters" rules are retired once 49 is on CT110.
+- **Availability has memory.** Rate limit (minutes), monthly cap (until the month rolls), key allow-list 403 (`not_permitted`, until the
+  catalogue changes), cold, saturated, auth failed, unknown-but-usable. A run that dies before round zero records why in its own record and in
+  the queue entry, and is relaunched at most three times on a different route before it is refused with the list of what was tried.
+- **Override one role on one entry with a reason** through `POST /api/queue/{id}/route`, the Hydra queue panel, or the chat tool; never by
+  editing a script or this file. The override survives a resume.
+- **Never pull a local model.** A cold model is a candidate with a warning; loading it is a host action that needs an explicit go.
+- **The 403 allow-list lesson (2026-09-08, runs b3cce9fd, 4378f326, 77a56594):** a model newly registered on the router is not usable until it is
+  on the harness virtual key's allow-list; the runs died in 0.6 s with `403 key not allowed to access model`. Task 49 draws candidates from the
+  key-scoped catalogue so this cannot recur; until then, add the model to the key before pointing a role at it.
+- **Until 49 ships:** the hand split in the section above stays (manager `glm-5.2:synthetic`, executor local `qwen3.8-nothink`, auditor
+  `kimi-k3:synthetic`, concurrency 3), set in the PC launcher and retired with it.
