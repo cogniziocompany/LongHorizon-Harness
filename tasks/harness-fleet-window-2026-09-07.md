@@ -133,3 +133,18 @@ Keep the title. Update: Hydra box -> "Hydra fleet MCP (control) · fleet.easybut
 - hydra-ocr-service has been "unhealthy" since deploy: compose healthcheck execs curl in python:3.11-slim → hydra #19 (python urllib probe) chain-merging.
 - RC on Hydra (#17) is deployed with #18; rc-host trust material + rc-migrate + PTAIT09 disable remain operator steps for Paxton.
 - qa #18 (11b): the run's manager refused to sign off because the auditor's own test run wrote into config-baselines; the overseer verified directly on CT110 (52/52 unit, 9/9 gate-report, validate-workflows OK, clean tree, no deletions; the 18 "failures" were Playwright browser tests with no chromium on CT110), pushed the merge, chain merging. Lesson for the task template: auditors must run only the hermetic unit target (`test:unit`), never `npm test` when that maps to Playwright.
+
+### 2026-09-08 09:05 PT — why the fleet window is empty while Hydra's sidebar has data
+Paxton compared the two views. They are the same subject seen from two planes, and they are fed differently:
+- **Hydra (control plane, corsairai300)** *pulls*. CT110 is registered as an external harness node (`/harness/nodes` → ct110, online,
+  hasToken true) and Hydra's fleet routes call the harness API live, so its sidebar shows runs the moment they exist.
+- **Fleet window (report plane, fleet-admin on CT202)** *is pushed to*. Nothing queries the harness; nodes, runs, gates and events only
+  appear when the harness reporter and the device agents post them.
+Verified now: `GET https://fleet.easybutt0n.ai/api/fleet/overview` → `{"nodes":[],"runs":[],"gates":[],"counts":{...0},"issues":[]}`.
+CT110 **is** enrolled (`LH_HARNESS_FLEET_URL/NODE/LABELS/KEY` all present in `/home/harness/.lh-harness-secrets.env`), but the deployed
+harness build has **no fleet reporter module** — `ls /home/harness/release-src/src/lh_harness/` shows nothing fleet-related. So there is no
+producer: enrolment without a reporter is exactly an empty window.
+The reporter is LongHorizon-Harness PR #3 (`feat/fleet-reporter`, run 878831fc): events, heartbeat and round content push. It conflicted with
+everything main gained overnight; the rebase task 05h6b is now **running** (20260908T155915Z_42a8b0c2) in the parallel tree
+`LongHorizon-Harness-b`. Order after it lands: merge → release to CT110 in a quiet window (abort runs → deploy → resume) → the window fills.
+Device rows come from the second producer, ptait09 fleet device emission (merged upstream as #45), which needs the device rollout.
