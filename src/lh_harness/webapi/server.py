@@ -1079,13 +1079,70 @@ def create_app(
             pass
         return effective
 
+    @app.get("/api/fleet/contentions")
+    def fleet_contentions() -> dict[str, Any]:
+        if runs_root is None:
+            raise HTTPException(status_code=501, detail="fleet contentions require a configured runs root")
+        path = Path(runs_root) / "queue" / "contention.json"
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+        except FileNotFoundError:
+            return {"ok": True, "available": False, "contentions": []}
+        except Exception:
+            pass
+        return {"ok": True, "available": False, "contentions": []}
+
     @app.get("/api/runs")
     def runs() -> dict[str, Any]:
         result: list[dict[str, Any]] = []
+        contentions = _load_contentions(runs_root)
         for item in registry.run_items():
             item_run_id = str(item.get("id") or "")
-            result.append(build_run_summary(item, state=registry.state_for(item_run_id)))
+            summary = build_run_summary(item, state=registry.state_for(item_run_id))
+            result.append(_annotate_contention(summary, contentions))
         return {"runs": result}
+
+    def _load_contentions(runs_root_value: Any) -> list[dict[str, Any]]:
+        if runs_root_value is None:
+            return []
+        path = Path(runs_root_value) / "queue" / "contention.json"
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get("contentions"), list):
+                return data["contentions"]
+        except Exception:
+            pass
+        return []
+
+    def _annotate_contention(
+        summary: dict[str, Any], contentions: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        run_id = summary.get("id")
+        matches = [
+            group for group in contentions
+            if any(member.get("run_id") == run_id for member in group.get("members", []))
+        ]
+        if not matches:
+            return summary
+        annotated = dict(summary)
+        annotated["contention"] = {
+            "contention_id": matches[0]["contention_id"],
+            "severity": matches[0]["severity"],
+            "peers": [
+                {
+                    "run_id": member.get("run_id"),
+                    "workspace": member.get("workspace"),
+                    "branch": member.get("branch"),
+                }
+                for member in matches[0].get("members", [])
+                if member.get("run_id") != run_id
+            ],
+        }
+        return annotated
 
     @app.post("/api/runs")
     def create_run(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
