@@ -1,0 +1,80 @@
+# Handoff: dynamic per-run model routing across local and cloud providers
+
+## Handoff header
+
+| Field | Value |
+|---|---|
+| Written | 2026-09-08 by the overseer session `5321285c-35e2-459a-9dae-92ea8811669f` |
+| For | Whoever designs the permanent solution; a harness task will implement it |
+| Question in one line | At the moment a run is created, how should the orchestrator choose a model per role from what is actually available locally and across two cloud providers, and record that choice so it can be audited and re-derived? |
+| **Repo that owns it** | **`LongHorizon-Harness`** — the queue, the service-side launcher and the run contract all live here (`src/lh_harness/queue.py`, `launcher.py`, `webapi/server.py`, `mcp_tools.py`). Model *definitions* live in `cognizioware-mcp-tools` (`infrastructure/litellm-config.yaml`), so a second, smaller change lands there; the harness must not hardcode provider URLs. |
+| Router | LiteLLM at `https://litellm.easybutt0n.ai` (prod CT202, `192.168.21.161:4000`); every harness agent's `ANTHROPIC_BASE_URL` points at it |
+| Today's state | Role models are a **hardcoded dict in the overseer's own launcher script** on the PC, changed by hand three times in one day |
+
+## Why this exists
+
+On 2026-09-08 model availability changed four times in a few hours and each change was absorbed by a human editing a script:
+
+1. Six of seven Ollama keys hit their **rate** limit, so the cloud trio could not start and the queue stalled at one healthy key.
+2. A local fallback was added by hand (`qwen3.8`), which worked but is one-run-at-a-time.
+3. The auditor's model then hit a **monthly** cap — a different failure from a rate limit — and every new run died in under a second with `provider_provider_error` before producing a single round. Three runs were lost before it was traced, because a run that fails before round zero records no reason.
+4. A new provider (Synthetic) was added, registered on the live router by hand, and the roles were re-pointed at it.
+
+Each step was correct and each was manual. The permanent answer is for the orchestrator to make this decision itself, per run, from observed availability.
+
+## What "available" actually means — the four signals, and their traps
+
+- **Local (Ollama on the span pair, `192.168.21.110:11442`)** — `GET /api/ps` shows what is *loaded* (today `qwen3.8:27b`, 19.3 GB across two 3090s); `OLLAMA_NUM_PARALLEL=2` caps concurrency; `OLLAMA_CONTEXT_LENGTH=65536` caps the window. A model that is *pullable* but not *loaded* has a cold-start cost that matters for a role called dozens of times per round.
+- **Ollama cloud** — failures are **not one thing**. A per-key rate limit clears within the hour; a **monthly account cap does not clear until the month rolls**. Treating them the same is what kept the overseer's watcher probing keys that could never recover. The error bodies differ and are machine-distinguishable.
+- **Synthetic** — subscription packs, each 1000 requests / 5 hours and **2 concurrent per model**. Two packs are held; whether they add is unverified. Its `/models` endpoint lists what is servable.
+- **The router itself** — `/v1/models` is the authority on what names resolve, and a name can resolve while its backing provider refuses. Availability must be proven by a *cheap completion*, not by presence in a list. `/health/liveliness` and `/health/readiness` are the cheap probes; a bare `/health` runs a completion against **every** configured backend and costs real money, so it is forbidden.
+
+## What the roles actually need (measured today, one realistic question, through the router)
+
+| model | latency | window | note |
+|---|---|---|---|
+| `qwen3.8-nothink` (local) | 1.3 s | 64k | fastest by far; tool-heavy work |
+| `qwen3.8` (local) | 5.6 s | 64k | thinking variant |
+| `glm-5.3-flash:synthetic` | 7.6 s | 512k | |
+| `kimi-k3:synthetic` | 8.7 s | 512k | most concise answer |
+| `glm-5.2:synthetic` | 13.1 s | 512k | most reasoning tokens |
+
+The split in force right now, chosen by hand: manager `glm-5.2:synthetic`, executor **local** `qwen3.8-nothink`, auditor `kimi-k3:synthetic`, run concurrency 3.
+
+The reasoning behind it, which the design should either encode or overturn:
+
+- The **executor** makes the most calls per round and is mostly tool-driving, so it belongs on the cheapest fast model — and putting it local conserves the cloud request budget for judgement. Its cost is a **64k window**, which becomes a hard constraint on task size.
+- The **manager** plans once per round and benefits most from depth and a large window.
+- The **auditor** reads a diff and must be rigorous but concise; a large window matters when the diff is large.
+
+## What we want designed
+
+1. **A routing decision made at enqueue and re-checked at launch.** A queue entry should carry the *intent* (role requirements) and the launcher should bind the *actual* models when the run starts, because availability moves between enqueue and launch. Say where each half belongs and what happens when they disagree.
+2. **A capability/requirement vocabulary.** Roles should ask for what they need — context window, tool-calling quality, latency class, cost class, locality — rather than naming a model. Define the smallest vocabulary that expresses today's split without becoming a scheduler DSL.
+3. **An availability model with the right memory.** Rate limit, monthly cap, cold model, saturated concurrency and hard auth failure are different states with different recovery times. Define the states, how each is detected (cheaply), how long each is trusted, and what a probe costs.
+4. **Concurrency accounting.** Local parallelism is 2; Synthetic is 2 concurrent per model per pack. The current answer is a global run cap, which is blunt: it throttles work that would not contend. Propose accounting that is per-backend, not global.
+5. **Recorded provenance and re-derivability.** Every run must record which models it used per role and **why** that route was chosen, in a form the fleet surfaces can show and a person can quote. It should be possible to ask "why did this run use that model" a week later.
+6. **Degradation, not stalling.** When nothing ideal is available the run should still start on something adequate, saying so, rather than the queue silently head-blocking. Define the ladder and the point at which it is honest to refuse.
+7. **The task-size feedback loop.** A local executor's 64k window means a task text plus repo reading plus round history must fit. Should the router reject/route-away a task whose text exceeds a threshold, warn at enqueue, or split it? The overseer's current script refuses local fallback above ~24k characters of task text — crude, and it belongs in the design.
+
+## Constraints that are not negotiable
+
+- **No provider URLs or keys in the harness.** Model names resolve through the router; keys live in env files on the router boxes.
+- **Never a bare `/health` against the gateway.** Liveness, readiness or a single named model only.
+- **Availability is proven by behaviour, not by configuration.** A name in `/v1/models` is not availability.
+- **A run that cannot start must say why**, in its own record. Today a pre-round failure leaves an empty run and a silent queue, which is how three runs were lost before anyone noticed.
+- **Warn, do not block, on anything ambiguous** — consistent with the working-tree contention work already queued.
+
+## Open questions we do not have a settled answer to
+
+- Should routing be per-run or per-round? A long run may outlive the availability that chose it.
+- Is a failed round on a degraded model worth a retry on a better one, or does that double-spend the budget that was scarce in the first place?
+- Should the orchestrator ever *pull* a local model it wants, or only use what is already loaded?
+- How should a human override a route for one run without editing code — and should that override survive a resume?
+
+## Evidence to rely on
+
+- Ollama monthly cap error body names the account and points at an upgrade URL; the rate-limit body is different — both were captured today.
+- `provider_provider_error` at `[cli_executor] failed · 0.6s` is the signature of a role whose model is refusing before any work happens.
+- The four Synthetic models registered on the live router today: `glm-5.3-flash:synthetic`, `glm-5.2:synthetic`, `kimi-k3:synthetic`, `qwen3.8-27b:synthetic`.
+- `docs/queue.md` describes the queue contract the routing intent must fit into.
