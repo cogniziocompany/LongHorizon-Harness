@@ -148,3 +148,20 @@ The reporter is LongHorizon-Harness PR #3 (`feat/fleet-reporter`, run 878831fc):
 everything main gained overnight; the rebase task 05h6b is now **running** (20260908T155915Z_42a8b0c2) in the parallel tree
 `LongHorizon-Harness-b`. Order after it lands: merge → release to CT110 in a quiet window (abort runs → deploy → resume) → the window fills.
 Device rows come from the second producer, ptait09 fleet device emission (merged upstream as #45), which needs the device rollout.
+
+### 2026-09-08 09:10 PT — task 45: hybrid pull so the window shows every harness session (running)
+Paxton's requirement, verbatim intent: *"I should see, the human user and the AI agent, an lh-harness in both fleet and hydra. SAME FLEET."*
+The window stays push-fed (reporter + device agents, untouched) and gains an **additive read-through poller** so it is correct with or without a
+reporter and backfills sessions the reporter never sent:
+- Nodes come from `FLEET_HARNESS_NODES_JSON` (same shape Hydra uses: nodeId, baseUrl, uiBaseUrl, tokenEnv, labels), token read by env name only.
+- The poller is **read-only** against the harness (run list + snapshot for status, round, gates), bounded timeouts, ~20 s default.
+- Rows are upserted into the same tables the push path writes, tagged with origin; **a pushed row is never overwritten by a pulled one**.
+- A node that stops answering is marked degraded with last error/last seen; existing rows are not blanked.
+- Every run row links out to the running lh-harness web UI (`<uiBaseUrl>/runs/<run_id>`), and per-round session ids
+  `<run_id>.<round_tag>.<role>` are shown so a session joins to a trace.
+**Parity contract (tested, and stated in the README so a future change that re-keys or filters rows is recognised as breaking it):** the same node
+id, the same run ids and the same statuses must appear on all four surfaces within one poll interval — the window in a browser, Hydra in a browser,
+the window's read API, and Hydra's fleet MCP tools. Identical strings, no re-keying per surface, so a human and an agent can quote the same id.
+Source repo is ptait09-easybutt0n-ai (fleet-admin's home); the copy in cognizioware-mcp-tools is vendored, so the overseer re-vendors and deploys
+through that lane afterwards, then sets `FLEET_HARNESS_NODES_JSON` and the token env on CT202.
+Run 20260908T160511Z_059e273a, 8 runs now active across 8 working trees.
