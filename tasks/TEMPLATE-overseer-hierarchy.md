@@ -516,3 +516,27 @@ The audit loop now runs **every 5 minutes** and chooses its own depth:
 - **Normal mode** — no local run and two or more keys healthy: quick pass only (gates + prod health), with the full sweep on the hour and at
   half past. This keeps the cadence cheap when the fleet is running on the cloud pool.
 The full sweep is: fleet plane (Hydra, the window, the node registration and its three repair traps), lanes, open PRs, and capacity.
+
+## Model assignment per role (2026-09-08, after the Ollama monthly cap)
+
+The Ollama cloud accounts hit their **monthly** cap (not a rate limit), so every `:pool` and `:cloud` model started refusing, including the
+auditor's, which failed runs in under a second with `provider_provider_error`. Paxton added the Synthetic provider; the overseer registered four
+of its models on the live prod router (`glm-5.3-flash:synthetic`, `glm-5.2:synthetic`, `kimi-k3:synthetic`, `qwen3.8-27b:synthetic`) with the key
+read from `mcp-tools.env`. Task 47 lands the same thing in the repo.
+
+Measured through the router on one realistic diagnostic question:
+
+| model | latency | note |
+|---|---|---|
+| `qwen3.8-nothink` (local) | 1.3 s | ptait01 span pair, 2×3090, `OLLAMA_NUM_PARALLEL=2`, **64k window** |
+| `qwen3.8` (local) | 5.6 s | same host, thinking |
+| `glm-5.3-flash:synthetic` | 7.6 s | 512k |
+| `kimi-k3:synthetic` | 8.7 s | 512k, most concise answer |
+| `glm-5.2:synthetic` | 13.1 s | 512k, most reasoning tokens |
+
+**The split now in the launcher:** manager `glm-5.2:synthetic` (deepest planner), executor **local** `qwen3.8-nothink` (fast, tool-heavy, and it
+keeps the Synthetic request budget for judgement), auditor `kimi-k3:synthetic` (concise verification). Run concurrency is `CAP=3` to sit near the
+local backend's two-way parallelism; the Synthetic subscription allows 2 concurrent per model per pack.
+
+**The constraint this creates:** the executor now has a 64k window, so a task whose text plus repo reading plus round history exceeds it will
+truncate. Keep task text to one deliverable, name the files to read, and split rather than sprawl.
