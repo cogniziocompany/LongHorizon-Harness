@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from ..dashboard.state import DashboardState
 from ..launcher import Launcher
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
+from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
@@ -780,7 +781,9 @@ def create_app(
                 "resume": supervisor is not None and not bool(getattr(supervisor, "attached_only", False)),
                 "stop": supervisor is not None,
                 "abort": supervisor is not None,
+                "fleet_mcp_tools": queue_store is not None,
             },
+            mcp_gateway_alias="lhharness",
             agents=catalogue["agents"],
             models=catalogue["models"],
             defaults={
@@ -869,6 +872,34 @@ def create_app(
         if removed is None:
             raise HTTPException(status_code=404, detail="queue entry not found")
         return {"ok": True, "queue_id": queue_id, "status": "deleted"}
+
+    @app.get("/api/mcp/fleet/tools")
+    def mcp_fleet_tools() -> dict[str, Any]:
+        return {"ok": True, "gateway_alias": "lhharness", "tools": tools_manifest()}
+
+    @app.post("/api/mcp/fleet/{tool_name}")
+    def mcp_fleet_invoke(
+        tool_name: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        result = _dispatch_mcp_tool(
+            tool_name,
+            body.get("arguments", {}),
+            queue_store=queue_store,
+            registry=registry,
+            supervisor=supervisor,
+            auth_token=token,
+            request_token=normalize_request_token(request.headers.get("authorization")),
+        )
+        status = result.get("code", 200)
+        if status == 401:
+            return JSONResponse(result, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+        if status == 404:
+            return JSONResponse(result, status_code=404)
+        if status >= 400:
+            return JSONResponse(result, status_code=status)
+        return result
 
     @app.post("/api/queue/{queue_id}/priority")
     def update_queue_priority(queue_id: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
@@ -1228,12 +1259,20 @@ def create_app(
         if supervisor is not None and not supervisor.can_control(run_id):
             raise HTTPException(status_code=409, detail="run is not accepting approvals")
         expected_revision_int = _strict_optional_revision(body.get("expected_revision"))
+        user_input = _body_text(body.get("user_input", body.get("instructions", "")), field="user_input", max_chars=50_000)
+        # Fleet/chat gateways cannot safely carry non-ASCII bytes in tool args,
+        # so the resolve gate enforces ASCII-only operator input.
+        if user_input:
+            try:
+                user_input.encode("ascii")
+            except UnicodeEncodeError:
+                raise HTTPException(status_code=422, detail="user_input must be ASCII-only") from None
         try:
             ok = state_for_run.resolve_approval(
                 approval_id,
                 action=_body_text(body.get("action", body.get("decision", "continue")), field="action", required=True, max_chars=128),
                 reason=_body_text(body.get("reason", body.get("note", "")), field="reason", max_chars=10_000),
-                user_input=_body_text(body.get("user_input", body.get("instructions", "")), field="user_input", max_chars=50_000),
+                user_input=user_input,
                 extra_rounds=_optional_extra_rounds(body.get("extra_rounds")),
                 command_id=_bounded_command_id(request.headers.get("Idempotency-Key")),
                 expected_revision=expected_revision_int,
