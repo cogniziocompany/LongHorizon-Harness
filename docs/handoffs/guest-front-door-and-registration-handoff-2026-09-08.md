@@ -21,7 +21,9 @@ Stated by Paxton on 2026-09-08, and this supersedes any earlier reading in this 
 5. That email is provisioned as a **guest user in a new Power Apps environment**.
 6. Everything past step 5 is being planned with other experts and is out of scope here.
 
-The purchase page was originally intended to be Power Pages hosted in Power Platform, and was briefly considered as a standalone Vue app. **Settled 2026-09-08: it is a public route in the existing React app**, declared beside `/login` and outside the `AuthGuard`, reusing the same host and deploy lane. It is not built yet — harness task 53 builds it.
+**CORRECTION, 2026-09-08 evening.** An earlier version of this handoff said no purchase page existed. That was wrong, and the error was mine. `design/handoffs/powerplatform-expert-pickup-handoff.md` (2026-08-09) documents an "Easy Button / $39-subscription" flow described as *complete and verified in dev*, and its QA runner drives a **live Power Pages portal at `https://easybutt0n.powerappsportals.com`**, which answers 200 today. `SignupController.cs` and `PartnerBillingController.cs` are on `mcp-cognizioware` `develop`. So the Power Pages front door was built, not skipped.
+
+A harness task to add a public purchase route to the React app was queued and then **aborted** once this came to light, because it would have stood up a second storefront beside a working one.
 
 ## What corrects the record
 
@@ -34,26 +36,35 @@ Two things I had wrong earlier, written down so the next reader does not repeat 
 
 | Piece | State | Evidence |
 |---|---|---|
-| Purchase page | **Being built into the existing app** | no standalone pricing or checkout app exists in any repo; decision 2026-09-08 is to add a public route to the React app beside `/login`, rather than build a separate site. Harness task 53 |
+| Purchase portal | **Live** | `https://easybutt0n.powerappsportals.com` answers 200; it is the Power Pages site the Easy Button QA runner targets |
+| Self-serve signup + partner billing | **On `develop`** | `SignupController.cs`, `PartnerBillingController.cs`, plus `GuestSubscriptionController.cs` and `GuestWebhookController.cs` |
+| Easy Button A1–A8 QA matrix | **Written, never merged** | branches `codex/easybutton-a1-runner` (12 ahead, **293 behind** `develop`) and `codex/easybutton-qa-checkpoints`; A1 reported 3/3 in ~68s in August |
 | Stripe guest product, prices, meter | **Live, test mode** | dev: product `prod_VDG4R7cjnzMBxF`, base `price_1UCpYaQVmqxwMkjoBX4ATB3L`, metered `price_1UCpYbQVmqxwMkjoqmvb8wYT`, meter `cognizioware_guest_tokens` |
 | Guest usage metering | **Proven end to end** | a guest usage event reached Stripe; the observation meter moved while the task meter stayed flat |
 | Guest execution + charging switches | **On, dev and UAT** | enabled 2026-09-08 on both billing lanes |
 | Billing service guest routes | **Live** | dev `sha-bfd65ec`, UAT `sha-b9b06b7` |
 | Stripe return pages | **Built** | `/checkout/success`, `/checkout/cancel` in the SPA — usable as return targets from any purchase page |
-| Guest identity provisioning | **Not built** | nothing creates an Entra guest, assigns a licence, or creates a Dataverse user from a payment |
+| Guest identity provisioning | **Unverified** | not traced end to end in this session; the August handoff asserts the dev flow was verified, but against the Easy Button price, not the September guest prices |
 | Per-customer Power Apps environment provisioning | **Not built** | no code provisions a new environment on purchase |
 | Environment discovery in the product | **Broken, fix queued** | the app asks Microsoft Global Discovery with a token scoped to a single environment; Microsoft refuses; the error is mis-mapped to a 403 reading "stale environment" and the UI swallows it entirely. Harness task 51 |
 
-## The gap, stated precisely
+## The gap, restated after the correction
 
-Steps 1 and 2 need a purchase page, now decided as a public route in the existing app (task 53) rather than a separate site. Steps 3 to 5 need an automated provisioning chain that does not exist. What *does* exist is everything in the middle: Stripe products and prices, a billing service that owns every server-side Stripe call, working metering with guest isolation, and a product to land in.
+Far less is missing than it appeared. The portal is live, signup and billing controllers are merged, Stripe products and prices exist, metering works with guest isolation proven, and there is a product to land in.
 
-So this is not a repair job. It is one new surface plus one new backend chain, with the payment plumbing already proven underneath.
+**The real question is now which of two parallel $39 tracks is the one to carry forward**, because there appear to be two:
+
+- The **Easy Button** track, August, price `price_1TsBP9CXyLTnTERyMFHhpOn7`, driven through the Power Pages portal, with an A1–A8 scenario matrix that was written but never merged.
+- The **guest launch** track, September, dev prices `price_1UCpYaQVmqxwMkjoBX4ATB3L` (base) and `price_1UCpYbQVmqxwMkjoqmvb8wYT` (metered), meter `cognizioware_guest_tokens`, with guest execution and charging switched on for dev and UAT on 2026-09-08.
+
+These are different Stripe objects. Whether they are two stages of one plan or two implementations of the same idea is exactly what the expert should settle first, because everything downstream — which webhook provisions the account, which price the portal charges, which meter counts usage — depends on the answer.
+
+The A1–A8 matrix is the fastest way to find out what actually still works: it is a written end-to-end test of the purchase journey. It sits 293 commits behind `develop`, so it needs rebasing before it can be trusted, and its results from August cannot be assumed to hold.
 
 ## Questions for the expert
 
-1. **Settled 2026-09-08 — the purchase page is a public route in the existing React app**, beside `/login`, served by the same host and deploy lane. No separate site, no Power Pages. Confirm this holds once the rest of the chain is designed, and say so if any later requirement breaks it.
-2. **Which Stripe embedded product?** Stripe offers a pricing table, embedded Checkout, and Payment Links — each with a different amount of client-side code and a different amount of control over the email field and post-payment redirect. Which one, and what does it imply for capturing the email as the account identity?
+1. **Is `easybutt0n.powerappsportals.com` still the intended front door?** It is live and it is what the existing QA matrix drives. If it stays, no new storefront should be built. If it is being replaced, say what replaces it and what happens to the Easy Button flow behind it.
+2. **Which of the two $39 tracks survives** — Easy Button (`price_1TsBP9CXyLTnTERyMFHhpOn7`) or guest launch (`price_1UCpYaQVmqxwMkjo...`)? Retire one explicitly rather than leaving both wired, and say which price the live portal charges today.
 3. **What exactly happens on the payment webhook, in order?** Our billing service is the single server-side Stripe writer and must stay so. Enumerate every step from `checkout.session.completed` to a usable account: Entra guest invitation, licence assignment in our tenant, Power Apps environment creation, Dataverse `SystemUser`, security role, and the welcome message telling them their email is now the account.
 4. **Can that chain run unattended?** If any step needs a human administrator, self-serve is not achievable as described, and the plan must say so plainly rather than discovering it at launch.
 5. **What does "temporary" licensed guest access mean mechanically?** Duration, what reclaims the licence, what happens to their environment on lapse or cancellation, and how that interacts with the `pac solution export` promise that they own their production tenant.
@@ -67,3 +78,8 @@ So this is not a repair job. It is one new surface plus one new backend chain, w
 - Guest observation meters stay isolated from task meters via `GuestObservationOnlyPriceIds`. That isolation is proven and must not regress.
 - The billing service remains the only writer of server-side Stripe calls. A purchase page must never hold a secret key.
 - `powerplatform-dev` is `org9130dfc5.crm.dynamics.com`; `powerplatform-uat` is `orgff9dcfec.crm.dynamics.com`. Both are bare Dataverse — the QA gate scores the TRMS profile near 26 there purely from drift, so a thin app in those orgs is expected, not a regression.
+
+## Two things worth knowing before you read the August handoff
+
+- It contains **live credentials in plain text** — a QA gateway token and a billing API key — in a committed file, while its own secrets section says not to commit them. Treat anything quoted there as exposed.
+- Its verification checklist was never completed, and it flags a stale `APP_IMAGE_TAG` on the powerplatform prod lane risking a downgrade on restart. That same class of stale pin was found and corrected on both billing lanes on 2026-09-08, so it is worth re-checking on the powerplatform lane too.
