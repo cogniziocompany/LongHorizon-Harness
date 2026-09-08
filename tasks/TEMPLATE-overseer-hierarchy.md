@@ -485,3 +485,13 @@ generated MCP config. Source: the "Auditor git lock, MCP profiles per role, sess
 - Applied to the ten queued task texts and the four in-flight ones on 2026-09-08 07:30 PT.
 
 - **Lesson (2026-09-08, my error):** I added an explicit per-role `mcp_profile` to the launcher payload. The API accepted it (200) but every run died at worker start with "supervised run role configuration does not match its reservation", with zero events, so the failure looked mysterious. Four launches were lost. The server defaults already apply the right profiles (`/api/meta` → manager/executor `default`, auditor `audit`), so the launcher sends no profile; the defect is queued into task 14d. Rule: when changing the launch payload, launch ONE probe run and confirm it reaches round 1 before letting the launcher fill every slot.
+
+## Parallel working trees (2026-09-08)
+
+Only two or three runs were active while nine tasks queued. Cause: the harness allows **one run per working tree**, and the whole queue
+targeted three repos, so the priority tasks at the front were head-blocked by lower-priority runs already holding those trees.
+
+Fix: second checkouts on CT110 — `mcp-cognizioware-b`, `cognizioware-mcp-tools-b`, `LongHorizon-Harness-b` (same remote, own `.lh-harness/config.toml`
+copied from the primary). Queue entries and the task text's "Work ONLY in …" line must both name the tree the run will use.
+Rules: never let two runs share a tree (a gate-waiting run still holds it); when routing to a `-b` tree, check the other tree is not mid-PR on the
+same branch; and prefer the primary tree for anything that will be released to the node.
