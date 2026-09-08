@@ -125,6 +125,8 @@ def test_launcher_launches_highest_priority_kimi(tmp_path: Path) -> None:
     assert events_path.is_file()
     lines = events_path.read_text(encoding="utf-8").splitlines()
     assert any("queue.launched" in line for line in lines)
+    contention_path = root / "queue" / "contention.json"
+    assert contention_path.is_file()
 
 
 def test_launcher_skips_qwen_at_zero_capacity(tmp_path: Path) -> None:
