@@ -483,3 +483,5 @@ generated MCP config. Source: the "Auditor git lock, MCP profiles per role, sess
   (`x-litellm-tags lh-session/…`) and the MCP path (`X-LH-Session`), so completion reports quote the run id; and the run must
   `git fetch && git merge origin/<base>` before declaring completion (this is what made four PRs unmergeable tonight).
 - Applied to the ten queued task texts and the four in-flight ones on 2026-09-08 07:30 PT.
+
+- **Lesson (2026-09-08, my error):** I added an explicit per-role `mcp_profile` to the launcher payload. The API accepted it (200) but every run died at worker start with "supervised run role configuration does not match its reservation", with zero events, so the failure looked mysterious. Four launches were lost. The server defaults already apply the right profiles (`/api/meta` → manager/executor `default`, auditor `audit`), so the launcher sends no profile; the defect is queued into task 14d. Rule: when changing the launch payload, launch ONE probe run and confirm it reaches round 1 before letting the launcher fill every slot.
