@@ -495,3 +495,15 @@ Fix: second checkouts on CT110 — `mcp-cognizioware-b`, `cognizioware-mcp-tools
 copied from the primary). Queue entries and the task text's "Work ONLY in …" line must both name the tree the run will use.
 Rules: never let two runs share a tree (a gate-waiting run still holds it); when routing to a `-b` tree, check the other tree is not mid-PR on the
 same branch; and prefer the primary tree for anything that will be released to the node.
+
+## Capacity fallback: local qwen3.8 when the Ollama keys run out (2026-09-08, Paxton)
+
+When fewer than two Ollama keys are healthy the kimi pool cannot launch, and the queue stalls — it did today at one healthy key of seven.
+The launcher now falls back to the local **qwen3.8 trio**, with two guards Paxton set:
+- **One local run at a time** (unchanged rule).
+- **Only for a task text that fits the 64k window** — the launcher refuses to fall back when the task file exceeds ~24,000 characters, and
+  logs `FALLBACK kimi->qwen (keys_ok=N, task=M chars)` so the reason is visible.
+**Write tasks small enough to be digestible.** The 64k window has to hold the task text, the repo reading, the round history and the diff. Aim for
+one deliverable per task, name the files to read rather than describing them, and split a multi-repo or multi-subsystem task rather than writing a
+long one. Today's queue is all under the limit; the largest is the Hydra panel task at ~17k characters, which is close to the practical ceiling once
+its rounds accumulate.
