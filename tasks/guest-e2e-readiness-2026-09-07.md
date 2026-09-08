@@ -83,3 +83,17 @@ The "seven successful test-mode closes before production" rule is procedural (pl
 - Public was still 502: the prod tunnel routes billing.easybutt0n.ai to `http://mcp-billing-service:20251` (container DNS), but cloudflared-prod is on `mcp-cognizioware-prod-network` while the compose puts the app on `mcp-cognizioware-networkk`. Every `docker compose up` of that service drops the manual cross-network attachment. Fixed with `docker network connect mcp-cognizioware-prod-network mcp-billing-service` + a cloudflared-prod restart. Public auth-config 200.
 - `/api/health` still 502/hangs on the legacy image too - that is the ORIGINAL hang (unbounded secondary-DB probes), which hotfix 05h3b fixes.
 - Follow-ups: (a) the lane compose must declare both networks (or the tunnel must use the LAN IP like mcp-cognizioware.easybutt0n.ai does) so a rollout never breaks routing again - fold into the 05h3b PR; (b) re-run the prod promotion only after 05h3b lands.
+
+### 2026-09-08 07:15 PT — powerplatform-uat added to the guest path (Paxton)
+Two Dataverse environments, both already in the repo; no new environment is needed.
+
+| tier | environment | Dataverse URL | ids |
+|---|---|---|---|
+| dev | powerplatform-dev | https://org9130dfc5.crm.dynamics.com | app env record d30303b8, org b400f72c, QA_ENV_ID_DEV 29007c42-33a9-494a-93a2-141051b371b7 |
+| uat | powerplatform-uat | https://orgff9dcfec.crm.dynamics.com | admin-center environment 3cc0ade2-2466-ea20-aa98-0d14b4b37c03 (Paxton, 2026-07-11), orgId b100f72c-687d-f111-b27b-6045bd07ba0c, mcpEnv 2dd00c35-f536-4234-ad59-c28dd534f905, QA_ENV_ID_UAT fc984eea-b69f-4a0d-a317-92b50d3cc6a6 |
+
+Already wired for UAT (verified on pp develop 969ae91): `deployments/instances.json` uat entry (dataverseUrl/orgId/mcpEnv, dir /opt/powerplatform-uat, branch release, health :3001), `.github/workflows/eval-gate.yml` tier→ENV_ORG_URL mapping (uat → orgff9dcfec), promote.yml and trms-qa-eval.yml, and the repo variable QA_ENV_ID_UAT.
+
+Still to do so UAT is actually **used** for guest access: run the same guest seeding on the UAT lane. `scripts/guest/seed-dev-grant.mjs` reads TARGET_ENVIRONMENT_URL from the lane env, so it works unchanged against UAT once /opt/powerplatform-uat/.env carries the UAT org URL plus GUEST_TEST_PRINCIPAL_EMAIL, STRIPE_TEST_CUSTOMER_ID and the billing API vars (dev got these 2026-09-07 19:55 PT; UAT did not). The "dev" in the script name is now wrong — rename to `seed-guest-grant.mjs` with a thin alias. Queued as task 05h4b.
+
+Sequence: dev click-through now → the same click-through on UAT after the release fast-forward → prod (still gated on seven test-mode closes).
