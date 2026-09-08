@@ -57,7 +57,7 @@ def _provenance(*sources: dict[str, Any] | None) -> dict[str, Any]:
     """
 
     result: dict[str, Any] = {}
-    limits = {"agent": 64, "model": 256, "workspace": 4096}
+    limits = {"agent": 64, "model": 256, "workspace": 4096, "mcp_profile": 256}
     for field in _PROVENANCE_FIELDS:
         for source in sources:
             if not isinstance(source, dict) or field not in source:

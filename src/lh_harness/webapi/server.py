@@ -5,13 +5,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import gzip
+import hashlib
 import hmac
 import ipaddress
+import json
 import mimetypes
 import os
 import re
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -19,14 +23,18 @@ from urllib.parse import quote, urlsplit
 from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 
 from ..dashboard.state import DashboardState
+from ..launcher import Launcher
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
+from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
 from ..supervisor.control_bus import CommandConflict, RevisionConflict
 from ..fleet import get_reporter
+from ..queue import QueueStore, default_queue_config, queue_config_from_config
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
@@ -400,6 +408,15 @@ def _safe_run_id(run_id: str) -> bool:
     )
 
 
+def _runs_root_config_path(runs_root: str | Path | None) -> Path | None:
+    """Return the project config path inside ``runs_root/.lh-harness`` if it exists."""
+
+    if not runs_root:
+        return None
+    path = Path(runs_root) / ".lh-harness" / "config.toml"
+    return path if path.is_file() else None
+
+
 def _bounded_command_id(value: str | None) -> str | None:
     if value is None:
         return None
@@ -693,6 +710,122 @@ def _stream_projection_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+# Fields that make a snapshot expensive for the UI switch path.  The summary
+# snapshot omits them; the dashboard later fetches rounds/transcripts on demand.
+_HEAVY_SNAPSHOT_FIELDS = frozenset({"rounds", "events", "legacy"})
+
+
+def _summary_from_full(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Return a lightweight snapshot for run list switching.
+
+    Keeps run, mission, active_round/role, approvals, operator_messages and
+    controls.  Drops rounds, events and legacy.  The full payload remains
+    available through the unparameterized snapshot route and the per-round
+    transcript/artifact endpoints.
+    """
+
+    result = dict(snapshot)
+    for field in _HEAVY_SNAPSHOT_FIELDS:
+        result.pop(field, None)
+    # Preserve the schema contract and diagnostics shape without the heavy
+    # arrays; the UI uses event_count as a freshness hint.
+    result["diagnostics"] = {**snapshot.get("diagnostics", {})}
+    result["diagnostics"].pop("warnings", None)
+    result["diagnostics"]["event_count"] = snapshot.get("diagnostics", {}).get("event_count", 0)
+    return result
+
+
+def _snapshot_etag(snapshot: dict[str, Any]) -> str:
+    """Stable ETag for a snapshot payload; changes when content changes."""
+
+    digest = hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    )
+    return f'"{digest.hexdigest()}"'
+
+
+class _SnapshotCache:
+    """In-memory cache for per-run snapshots keyed by filesystem mtime+size."""
+
+    def __init__(self, ttl_seconds: float = 2.0) -> None:
+        self._lock = threading.Lock()
+        self._data: dict[str, tuple[tuple[float, int, float], dict[str, Any]]] = {}
+        self._ttl = ttl_seconds
+
+    def _signature(self, state: DashboardState, run_id: str) -> tuple[float, int, float]:
+        events_path = state.role_dir / "events.jsonl"
+        rounds_root = state._safe_rounds_root()
+        try:
+            events_stat = events_path.stat()
+            events_mtime = events_stat.st_mtime
+            events_size = events_stat.st_size
+        except (OSError, ValueError):
+            events_mtime = 0.0
+            events_size = 0
+        rounds_mtime = 0.0
+        if rounds_root is not None:
+            try:
+                rounds_stat = rounds_root.stat()
+                rounds_mtime = rounds_stat.st_mtime
+            except (OSError, ValueError):
+                pass
+        return (events_mtime, events_size, rounds_mtime)
+
+    def _control_signature(self, state: DashboardState) -> str:
+        """Include control-bus state that affects operator_messages/approvals.
+
+        The control bus writes append files and updates receipts that are not
+        captured by the events.jsonl mtime/size or the rounds directory mtime.
+        """
+        control_dir = getattr(state, "control_bus", None)
+        if control_dir is None:
+            return ""
+        control_root = Path(control_dir.run_dir) / "control"
+        sig: list[tuple[float, int]] = []
+        # The control bus persists commands in ``commands.jsonl`` and receipts
+        # in ``command_receipts.jsonl``.  Include both so applied/resolved
+        # operator interactions invalidate the cached snapshot.
+        for name in ("commands.jsonl", "command_receipts.jsonl"):
+            try:
+                st = (control_root / name).stat()
+                sig.append((st.st_mtime, st.st_size))
+            except (OSError, ValueError):
+                sig.append((0.0, 0))
+        return json.dumps(sig, separators=(",", ":"))
+
+    def get(self, state: DashboardState, run_id: str) -> tuple[tuple[float, int, float, str], dict[str, Any]] | None:
+        signature = self._signature(state, run_id)
+        control_signature = self._control_signature(state)
+        with self._lock:
+            cached = self._data.get(run_id)
+            if cached is None:
+                return None
+            cached_signature, snapshot = cached
+            # Treat the signature as a freshness hint: if the on-disk state has
+            # changed, always rebuild.  Otherwise reuse the in-memory copy for
+            # ``ttl_seconds`` so rapid switch polling avoids repeated rebuilds.
+            now = time.monotonic()
+            if cached_signature != signature + (control_signature,):
+                return None
+            if now - getattr(self, "_last_write", {}).get(run_id, 0.0) > self._ttl:
+                return None
+            return signature + (control_signature,), snapshot
+
+    def put(self, run_id: str, signature: tuple[float, int, float, str], snapshot: dict[str, Any]) -> None:
+        with self._lock:
+            self._data[run_id] = (signature, snapshot)
+            last_write = getattr(self, "_last_write", {})
+            last_write[run_id] = time.monotonic()
+            self._last_write = last_write
+
+    def invalidate(self, run_id: str) -> None:
+        with self._lock:
+            self._data.pop(run_id, None)
+            last_write = getattr(self, "_last_write", {})
+            last_write.pop(run_id, None)
+            self._last_write = last_write
+
+
 def create_app(
     *,
     state: DashboardState | None = None,
@@ -721,14 +854,54 @@ def create_app(
     )
     token = _configured_token(auth_token)
     origins = {str(item).rstrip("/") for item in (allowed_origins or ()) if str(item).strip()}
-    app = FastAPI(title="LongHorizon-Harness Web API", version="1")
+    queue_store: QueueStore | None = None
+    if runs_root is not None:
+        queue_store = QueueStore(runs_root)
+    queue_config = default_queue_config()
+    if queue_store is not None:
+        try:
+            from ..config import PROJECT_CONFIG_PATH, load_run_defaults
+
+            # Prefer a project config next to the runs root; fall back to the
+            # current working directory so existing deployments keep working.
+            config_path = _runs_root_config_path(runs_root) or PROJECT_CONFIG_PATH
+            project = load_run_defaults(config_path)
+            if isinstance(project.get("queue"), dict):
+                queue_config = queue_config_from_config(project)
+        except Exception:
+            pass
+    launcher: Launcher | None = None
+    if supervisor is not None and queue_store is not None:
+        launcher = Launcher(supervisor, queue_store, queue_config=queue_config)
+
+    snapshot_cache = _SnapshotCache(ttl_seconds=2.0)
+
+    def _cached_snapshot_for(state: DashboardState, run_id: str) -> dict[str, Any]:
+        cached = snapshot_cache.get(state, run_id)
+        if cached is not None:
+            return cached[1]
+        snapshot = _snapshot_for(registry, state, run_id)
+        signature = snapshot_cache._signature(state, run_id)
+        control_signature = snapshot_cache._control_signature(state)
+        snapshot_cache.put(run_id, signature + (control_signature,), snapshot)
+        return snapshot
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> Any:
+        if launcher is not None:
+            await launcher.start()
+        yield
+        if launcher is not None:
+            await launcher.stop()
+
+    app = FastAPI(title="LongHorizon-Harness Web API", version="1", lifespan=_lifespan)
     app.state.registry = registry
+    app.state.queue_store = queue_store
     app.state.auth_token = token
     app.state.allowed_origins = origins
     app.state.bind_host = bind_host
-
     _maybe_start_fleet_reporter(registry, supervisor)
-
+    app.state.launcher = launcher
     if supervisor is not None:
         async def _shutdown_owned_workers() -> None:
             await asyncio.to_thread(supervisor.shutdown)
@@ -775,7 +948,9 @@ def create_app(
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
         response.headers.setdefault("Referrer-Policy", "same-origin")
-        response.headers.setdefault("Cache-Control", "no-store")
+        # API snapshot responses set their own cache headers via _snapshot_response.
+        if not request.url.path.startswith("/api/runs/") or not request.url.path.endswith("/snapshot"):
+            response.headers.setdefault("Cache-Control", "no-store")
         return response
 
     @app.get("/api/meta")
@@ -801,7 +976,9 @@ def create_app(
                 "resume": supervisor is not None and not bool(getattr(supervisor, "attached_only", False)),
                 "stop": supervisor is not None,
                 "abort": supervisor is not None,
+                "fleet_mcp_tools": queue_store is not None,
             },
+            mcp_gateway_alias="lhharness",
             agents=catalogue["agents"],
             models=catalogue["models"],
             defaults={
@@ -839,6 +1016,117 @@ def create_app(
         """
 
         return _meta_response(request, force_models=True)
+
+    @app.post("/api/queue")
+    def create_queue_entry(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        try:
+            entry = queue_store.create(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"ok": True, "queue_id": entry.queue_id}
+
+    @app.get("/api/queue")
+    def list_queue(
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        entries = queue_store.list()
+        valid_statuses = {"pending", "launched", "done", "failed"}
+        filtered = entries
+        if status is not None:
+            if status not in valid_statuses:
+                raise HTTPException(status_code=422, detail=f"status must be one of: {', '.join(sorted(valid_statuses))}")
+            filtered = [item for item in entries if item.status == status]
+        groups: dict[str, list[dict[str, Any]]] = {
+            "pending": [],
+            "launched": [],
+            "done": [],
+            "failed": [],
+        }
+        for item in entries:
+            groups[item.status].append(item.to_dict())
+        return {
+            "entries": [item.to_dict() for item in filtered],
+            "groups": groups,
+            "counts": queue_store.counts(),
+        }
+
+    @app.delete("/api/queue/{queue_id}")
+    def delete_queue_entry(queue_id: str) -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        entry = queue_store.get(queue_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        if entry.status != "pending":
+            raise HTTPException(status_code=409, detail=f"cannot delete entry with status {entry.status}")
+        removed = queue_store.delete(queue_id)
+        if removed is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        return {"ok": True, "queue_id": queue_id, "status": "deleted"}
+
+    @app.get("/api/mcp/fleet/tools")
+    def mcp_fleet_tools() -> dict[str, Any]:
+        return {"ok": True, "gateway_alias": "lhharness", "tools": tools_manifest()}
+
+    @app.post("/api/mcp/fleet/{tool_name}")
+    def mcp_fleet_invoke(
+        tool_name: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        result = _dispatch_mcp_tool(
+            tool_name,
+            body.get("arguments", {}),
+            queue_store=queue_store,
+            registry=registry,
+            supervisor=supervisor,
+            auth_token=token,
+            request_token=normalize_request_token(request.headers.get("authorization")),
+        )
+        status = result.get("code", 200)
+        if status == 401:
+            return JSONResponse(result, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+        if status == 404:
+            return JSONResponse(result, status_code=404)
+        if status >= 400:
+            return JSONResponse(result, status_code=status)
+        return result
+
+    @app.post("/api/queue/{queue_id}/priority")
+    def update_queue_priority(queue_id: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        priority = body.get("priority")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise HTTPException(status_code=422, detail="priority must be an integer")
+        entry = queue_store.get(queue_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        if entry.status != "pending":
+            raise HTTPException(status_code=409, detail=f"cannot update priority for status {entry.status}")
+        updated = queue_store.set_priority(queue_id, priority)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        return {"ok": True, "queue_id": queue_id, "priority": updated.priority}
+
+    @app.get("/api/queue/config")
+    def queue_config_endpoint() -> dict[str, Any]:
+        if queue_store is None:
+            return default_queue_config()
+        effective = default_queue_config()
+        try:
+            from ..config import load_run_defaults, PROJECT_CONFIG_PATH
+            project = load_run_defaults(PROJECT_CONFIG_PATH)
+            project_queue = project.get("queue")
+            if isinstance(project_queue, dict):
+                effective = queue_config_from_config(project)
+        except Exception:
+            pass
+        return effective
 
     @app.get("/api/runs")
     def runs() -> dict[str, Any]:
@@ -899,9 +1187,60 @@ def create_app(
             created = {**created, "owner": _public_owner(created["owner"])}
         return {"ok": True, "run": created}
 
+    def _snapshot_response(
+        request: Request,
+        state: DashboardState,
+        run_id: str,
+        *,
+        summary_only: bool,
+    ) -> Response:
+        snapshot = _cached_snapshot_for(state, run_id)
+        etag = _snapshot_etag(snapshot)
+        if_none_match = request.headers.get("if-none-match")
+        # Fast equality without hashing twice on the 304 path.
+        if if_none_match and if_none_match == etag:
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "private, max-age=2"})
+        if summary_only:
+            body = _summary_from_full(snapshot)
+        else:
+            body = snapshot
+        content = json.dumps(body, ensure_ascii=False, default=str).encode("utf-8")
+        # gzip the payload ourselves when the client accepts it and the
+        # response is large enough to benefit.  Starlette's GZipMiddleware
+        # would otherwise handle it, but explicit control lets us keep the
+        # 304 path cheap and only compress full snapshots.
+        accepts_gzip = "gzip" in (request.headers.get("accept-encoding") or "").lower()
+        if accepts_gzip and len(content) > 256:
+            compressed = gzip.compress(content, compresslevel=5)
+            return Response(
+                content=compressed,
+                media_type="application/json",
+                headers={
+                    "Content-Encoding": "gzip",
+                    "ETag": etag,
+                    "Cache-Control": "private, max-age=2",
+                    "Vary": "Accept-Encoding",
+                },
+            )
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers={
+                "ETag": etag,
+                "Cache-Control": "private, max-age=2",
+                "Vary": "Accept-Encoding",
+            },
+        )
+
     @app.get("/api/runs/{run_id}/snapshot")
-    def snapshot(run_id: str) -> dict[str, Any]:
-        return _snapshot_for(registry, _state_or_404(registry, run_id), run_id)
+    def snapshot(
+        run_id: str,
+        request: Request,
+        fields: str | None = Query(None),
+    ) -> Response:
+        state_for_run = _state_or_404(registry, run_id)
+        summary_only = fields == "summary"
+        return _snapshot_response(request, state_for_run, run_id, summary_only=summary_only)
 
     @app.get("/api/runs/{run_id}/events")
     def events(
@@ -947,7 +1286,7 @@ def create_app(
             await websocket.close(code=4403, reason="origin is not allowed")
             return
         await websocket.accept(subprotocol=selected_subprotocol)
-        initial_snapshot = _snapshot_for(registry, state_for_run, run_id)
+        initial_snapshot = _cached_snapshot_for(state_for_run, run_id)
         await websocket.send_json({"kind": "snapshot", "data": initial_snapshot})
         last_projection_signature = _stream_projection_signature(initial_snapshot)
         tailer = _event_tailer(state_for_run, run_id)
@@ -988,7 +1327,7 @@ def create_app(
                     cursor = current_tail[-1].event_id if current_tail else None
                     await websocket.send_json({
                         "kind": "snapshot",
-                        "data": _snapshot_for(registry, state_for_run, run_id),
+                        "data": _cached_snapshot_for(state_for_run, run_id),
                     })
                     fresh = []
                 if fresh:
@@ -999,7 +1338,7 @@ def create_app(
                     # Round files, approvals, and active-role state change beside
                     # the event log. Refresh the projection after each batch so
                     # clients do not need to independently poll every file.
-                    updated_snapshot = _snapshot_for(registry, state_for_run, run_id)
+                    updated_snapshot = _cached_snapshot_for(state_for_run, run_id)
                     await websocket.send_json({"kind": "snapshot", "data": updated_snapshot})
                     last_projection_signature = _stream_projection_signature(updated_snapshot)
                 else:
@@ -1008,7 +1347,7 @@ def create_app(
                     # event log. Poll their projection once per second in both
                     # supervised and attached (`lh-harness run`) modes.
                     if idle_ticks % 4 == 0:
-                        updated_snapshot = _snapshot_for(registry, state_for_run, run_id)
+                        updated_snapshot = _cached_snapshot_for(state_for_run, run_id)
                         projection_signature = _stream_projection_signature(updated_snapshot)
                         if projection_signature != last_projection_signature:
                             await websocket.send_json({"kind": "snapshot", "data": updated_snapshot})
@@ -1150,6 +1489,9 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not accepted:
             raise HTTPException(status_code=409, detail="run is not accepting instructions")
+        # Operator interactions change operator_messages and possibly approvals,
+        # so the next REST/WS snapshot must not reuse a stale cache.
+        snapshot_cache.invalidate(run_id)
         return {
             "ok": True,
             "status": "accepted",
@@ -1168,12 +1510,20 @@ def create_app(
         if supervisor is not None and not supervisor.can_control(run_id):
             raise HTTPException(status_code=409, detail="run is not accepting approvals")
         expected_revision_int = _strict_optional_revision(body.get("expected_revision"))
+        user_input = _body_text(body.get("user_input", body.get("instructions", "")), field="user_input", max_chars=50_000)
+        # Fleet/chat gateways cannot safely carry non-ASCII bytes in tool args,
+        # so the resolve gate enforces ASCII-only operator input.
+        if user_input:
+            try:
+                user_input.encode("ascii")
+            except UnicodeEncodeError:
+                raise HTTPException(status_code=422, detail="user_input must be ASCII-only") from None
         try:
             ok = state_for_run.resolve_approval(
                 approval_id,
                 action=_body_text(body.get("action", body.get("decision", "continue")), field="action", required=True, max_chars=128),
                 reason=_body_text(body.get("reason", body.get("note", "")), field="reason", max_chars=10_000),
-                user_input=_body_text(body.get("user_input", body.get("instructions", "")), field="user_input", max_chars=50_000),
+                user_input=user_input,
                 extra_rounds=_optional_extra_rounds(body.get("extra_rounds")),
                 command_id=_bounded_command_id(request.headers.get("Idempotency-Key")),
                 expected_revision=expected_revision_int,
@@ -1182,6 +1532,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not ok:
             raise HTTPException(status_code=409, detail="approval is missing, resolved, or read-only")
+        snapshot_cache.invalidate(run_id)
         return {
             "ok": True,
             "approval_id": approval_id,
@@ -1259,6 +1610,11 @@ def create_app(
         if receipt is None:
             raise HTTPException(status_code=404, detail="command receipt not found")
         return receipt
+
+    # Compress JSON API responses when the client accepts gzip.  The snapshot
+    # route handles compression explicitly for large payloads; this covers the
+    # rest of the API (events, runs list, queue).
+    app.add_middleware(GZipMiddleware, minimum_size=512, compresslevel=5)
 
     if _STATIC_DIR.is_dir():
         # Starlette's FileResponse delegates MIME detection to Python.  A

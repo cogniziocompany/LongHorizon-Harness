@@ -484,7 +484,9 @@ def test_websocket_publishes_operator_messages_without_role_events(tmp_path: Pat
         }]
 
 
-def test_api_meta_includes_mcp_profiles_and_gateway_configured(tmp_path: Path) -> None:
+def test_api_meta_includes_mcp_profiles_and_gateway_configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LH_HARNESS_MCP_GATEWAY_KEY", raising=False)
+    monkeypatch.delenv("LH_HARNESS_MCP_GATEWAY_URL", raising=False)
     root, state = _fixture(tmp_path)
     app = create_app(state=state, runs_root=root, run_id="run-1")
     response = TestClient(app).get("/api/meta")

@@ -108,3 +108,43 @@ Keep the title. Update: Hydra box -> "Hydra fleet MCP (control) · fleet.easybut
 - Ship Plane artifact re-published at the same URL with the refreshed facts and unchanged title.
 
 - 2026-09-08 06:45 PT: fleet.easybutt0n.ai restored (fleet-admin healthy on CT202 via #100/#102 lanes); ct110 enrolled against it (device key rotated once because the first enrol echoed it; key lives only in /home/harness/.lh-harness-secrets.env as LH_HARNESS_FLEET_KEY with URL/NODE/LABELS). Fleet window view re-vendored from ptait09 #43 as mcp-tools #104 (chain merges after the current lane). Reporter PR #3 rebased on main; release to CT110 in the next quiet window once the ingest routes are live.
+
+- 2026-09-08 09:15 PT: with the QA classifier fixed, the #105 lane passed its UAT gate (6/6) but the CT202 deploy failed building the vendored fleet-admin image: the upstream Dockerfile copied migrate.js from the context root while it lives in src/. Fixed in mcp-tools #107 (chain: merge after the #106 lane, deploy, verify view) and upstream ptait09 #44 (merged). Reporter release to CT110 follows once /harness/* routes answer on fleet.easybutt0n.ai.
+
+### 2026-09-08 03:45 PT — fleet view deploy chain
+- #108 (gate-poll checkout) merged; its lane passed the UAT gate but Deploy to CT202 failed building fleet-admin: web stage `npm ci` had no lockfile because infrastructure/.gitignore ignores every package-lock.json, so the vendored web/ shipped without it. PR #109 un-ignores that file and vendors it from upstream 804a4f0; chain merges + watches the lane + probes fleet health/overview/view root.
+- Lesson: a vendored tree must be checked against the repo's .gitignore (git status --ignored) before the PR; a Docker build that runs npm ci needs the lockfile tracked.
+
+### 2026-09-08 05:30 PT — batch of run results
+- 05h8 fleet device emission → ptait09 #45 (CONFLICTING with easybutt0n-runner-v2 after #43/#44/#46) → integration task 05h8b queued.
+- 13a Fleet Chat lh-harness tool → ptait09 #46 MERGED (operator follow-ups: harness-ops virtual key, OPENWEBUI_GATEWAY_KEY, one-time Knowledge upload).
+- 13b Remote Control on Hydra → hydra #17 MERGED (main CI green); deploy batched with the orchestrator tarball window.
+- 14c Hydra control-plane apply → hydra #18 (CONFLICTING: built on feat/harness-fleet, 41 behind main) → integration task 14c2 queued.
+- 14e hivemind memory MCP → mcp-tools #110 MERGED, lane green, memory-mcp healthy on CT202 :3120 (repo-managed now).
+- 11 admin config parity gate → qa #18 (CONFLICTING, 4 files) → integration task 11b queued.
+- 14a product eval catalog → pp #95 open (chain merges when green); first real TRMS attempt needs the dev eval Dataverse org + eval SP + cgz publisher (Paxton).
+- 12 harness queue API/UX speed: slices 1–4 done (499 tests), 2 extra rounds granted for e2e happy path + docs.
+- Lesson: runs based on a moving branch should `git merge origin/<base>` before declaring done; add "rebase onto current base before completion" to the task template's HARD RULES.
+
+### 2026-09-08 06:10 PT — Hydra control plane LIVE on corsairai300
+- hydra #18 (14c control-plane apply, merged main via integration run 14c2) → Hydra's own CI deploys main to corsairai300 (self-hosted hydra-host runner; deploy job = compose up orchestrator/redis/ocr + force-recreate tunnel + smoke). CI 34229017609 green.
+- The CI redeploys had dropped the CT110 seeding: the live /opt/cognizioware-hydra/.env had no HARNESS_NODES_JSON / HARNESS_TOKEN_CT110 (the 09-05 deploy had put them in the compose file, which the repo compose replaced with `${HARNESS_NODES_JSON:-[]}`). Seeded both into the mode-600 .env (token read from the overseer's gitignored tasks/.env at runtime; nothing stored in scripts), recreated the orchestrator: /harness/nodes now lists ct110 external, online, hasToken true.
+- Gotcha (now in the seed script's comments): recreating the orchestrator orphans the tunnel container (network_mode service:orchestrator) → chat.easybutt0n.ai and hydra.cognizioware.com 502 until `docker compose up -d --force-recreate tunnel`. Chat was down ~2 min; both 200 after.
+- hydra-ocr-service has been "unhealthy" since deploy: compose healthcheck execs curl in python:3.11-slim → hydra #19 (python urllib probe) chain-merging.
+- RC on Hydra (#17) is deployed with #18; rc-host trust material + rc-migrate + PTAIT09 disable remain operator steps for Paxton.
+- qa #18 (11b): the run's manager refused to sign off because the auditor's own test run wrote into config-baselines; the overseer verified directly on CT110 (52/52 unit, 9/9 gate-report, validate-workflows OK, clean tree, no deletions; the 18 "failures" were Playwright browser tests with no chromium on CT110), pushed the merge, chain merging. Lesson for the task template: auditors must run only the hermetic unit target (`test:unit`), never `npm test` when that maps to Playwright.
+
+### 2026-09-08 09:05 PT — why the fleet window is empty while Hydra's sidebar has data
+Paxton compared the two views. They are the same subject seen from two planes, and they are fed differently:
+- **Hydra (control plane, corsairai300)** *pulls*. CT110 is registered as an external harness node (`/harness/nodes` → ct110, online,
+  hasToken true) and Hydra's fleet routes call the harness API live, so its sidebar shows runs the moment they exist.
+- **Fleet window (report plane, fleet-admin on CT202)** *is pushed to*. Nothing queries the harness; nodes, runs, gates and events only
+  appear when the harness reporter and the device agents post them.
+Verified now: `GET https://fleet.easybutt0n.ai/api/fleet/overview` → `{"nodes":[],"runs":[],"gates":[],"counts":{...0},"issues":[]}`.
+CT110 **is** enrolled (`LH_HARNESS_FLEET_URL/NODE/LABELS/KEY` all present in `/home/harness/.lh-harness-secrets.env`), but the deployed
+harness build has **no fleet reporter module** — `ls /home/harness/release-src/src/lh_harness/` shows nothing fleet-related. So there is no
+producer: enrolment without a reporter is exactly an empty window.
+The reporter is LongHorizon-Harness PR #3 (`feat/fleet-reporter`, run 878831fc): events, heartbeat and round content push. It conflicted with
+everything main gained overnight; the rebase task 05h6b is now **running** (20260908T155915Z_42a8b0c2) in the parallel tree
+`LongHorizon-Harness-b`. Order after it lands: merge → release to CT110 in a quiet window (abort runs → deploy → resume) → the window fills.
+Device rows come from the second producer, ptait09 fleet device emission (merged upstream as #45), which needs the device rollout.

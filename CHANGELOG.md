@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.1.8 (Unreleased)
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
 
 - **Fleet reporting.** Nodes can now stream live telemetry to
   `fleet.easybutt0n.ai` over a single outbound HTTPS path, so NAT'd hosts are
@@ -23,31 +30,22 @@
     `LH_HARNESS_FLEET_NODE`, `LH_HARNESS_FLEET_KEY`, and `LH_HARNESS_FLEET_LABELS`.
   - Documentation: [docs/fleet-reporting.md](docs/fleet-reporting.md) and README
     env table.
+- Service-side task queue with durable atomic JSON persistence under the runs root.
+  - `POST /api/queue`, `GET /api/queue`, `DELETE /api/queue/{id}`, and priority endpoints.
+  - Capacity-gated launcher with trio limits, workspace collision avoidance, and idempotent restarts.
+  - Fleet MCP tools exposed under the LiteLLM alias `lhharness` (access group `fleet-runners`).
+  - ASCII-only `harness_resolve_gate` validation and `/api/runs/{id}/approvals/{id}/resolve` wiring.
+- End-to-end happy-path test for the local queue API.
+  - `e2e/happy_path.sh` and `e2e/happy_path.py` start a local service, use a fake `codex` agent, and assert the run reaches `completed`.
+  - Covers `queue.launched`, the inter-tick double-launch race, and `base_check` wiring.
+- `Makefile` target `e2e-happy` and pytest marker `e2e` so heavy stack tests run separately from the main suite.
+- Server-side caching for `/api/runs/{id}/snapshot`, cutting full snapshot p95 latency from ~37 ms to ~5 ms and summary snapshot p95 latency from ~37 ms to ~4 ms on a 16-round synthetic run.
+- Documentation: `docs/queue.md`, `docs/ux-performance.md`, and `docs/release-checklist-ct110.md`.
 
-## 0.1.7 · 2026-08-20
+### Changed
 
-- A finished run is no longer a dead end: the workbench is now a conversation.
-  Read the reply, type a follow-up, and the run continues on its own round
-  ledger instead of replanning from scratch.
-- `--reasoning-effort` for every role, with per-role overrides.
-- The transcript now reads in strict chronological order.
-- Graceful stop escalates to force stop only when a worker ignores it.
+- Web API now embeds a service-side supervisor and launcher when run with `lh-harness web`.
 
-## 0.1.6 · 2026-08-15
+### Fixed
 
-- Added [OpenCode](https://github.com/anomalyco/opencode) CLI support.
-
-## 0.1.5 · 2026-08-14
-
-- Added phase-1 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
-  CLI support.
-
-## 0.1.4 · 2026-08-11
-
-- The new Dashboard has landed: a React/FastAPI workbench launched with
-  `lh-harness web`.
-
-## 0.1.3 · 2026-08-07
-
-- Every run now ends with a plain-language reply from the verified state.
-- Tasks act on the launch directory by default.
+- Race where two queue entries for the same workspace could be launched across concurrent ticks is now prevented by a launch lock and active-run re-check.

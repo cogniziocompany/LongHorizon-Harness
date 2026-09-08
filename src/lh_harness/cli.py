@@ -510,6 +510,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Provider endpoint for the agent CLI. The trailing `/v1` is normalized when required by the backend.",
     )
     run_parser.add_argument(
+        "--base-check",
+        default=run_default("base_check"),
+        help="Optional base commit or branch guard recorded with the run for queue-triggered launches.",
+    )
+    run_parser.add_argument(
         "--prompt-language",
         choices=("en", "zh"),
         default=run_default("prompt_language", "en"),
@@ -1861,6 +1866,8 @@ def _run_command(args: argparse.Namespace) -> int:
         # A hosted dashboard keeps this same PID alive after Manager returns;
         # finalize before entering that serving loop so the right panel and
         # later API clients see a terminal run immediately.
+        if report is not None and getattr(args, "base_check", None):
+            report["base_check"] = str(args.base_check)
         _finalize_embedded_supervisor(
             dashboard_supervisor,
             run_id,
@@ -1871,6 +1878,8 @@ def _run_command(args: argparse.Namespace) -> int:
         # The summary is printed before the dashboard blocks, so the outcome is
         # visible in the console even when the operator leaves the UI running.
         if report is not None:
+            if getattr(args, "base_check", None):
+                report["base_check"] = str(args.base_check)
             _print_run_summary(report, log_dir=log_dir, workspace=workspace)
         if dashboard_handle is not None:
             if _should_keep_embedded_dashboard(

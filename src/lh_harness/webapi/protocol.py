@@ -29,6 +29,7 @@ def build_meta(
     defaults: dict[str, Any] | None = None,
     mcp_profiles: list[dict[str, Any]] | None = None,
     mcp_gateway_configured: bool = False,
+    mcp_gateway_alias: str | None = None,
     model_discovery: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return the stable handshake payload used by both clients."""
@@ -53,6 +54,8 @@ def build_meta(
     if mcp_profiles is not None:
         result["mcp_profiles"] = mcp_profiles
     result["mcp_gateway_configured"] = bool(mcp_gateway_configured)
+    if mcp_gateway_alias is not None:
+        result["mcp_gateway_alias"] = mcp_gateway_alias
     if model_discovery is not None:
         result["model_discovery"] = model_discovery
     return result

@@ -85,7 +85,19 @@ export function useRunFeed(runId: string, authRevision = 0): RunFeedHandle {
     };
 
     const initialEpoch = feedEpoch;
-    accept(fetchSnapshot(runId), (snapshot) => dispatch({ type: 'snapshot', snapshot }), initialEpoch);
+    // Fetch the lightweight summary first so the run switch paints quickly;
+    // the full snapshot (with rounds/events) streams in through the WebSocket
+    // and is also fetched explicitly below so a non-WS client still works.
+    accept(
+      fetchSnapshot(runId, 'summary'),
+      (summary) => dispatch({ type: 'snapshot', snapshot: summary as Snapshot }),
+      initialEpoch,
+    );
+    accept(
+      fetchSnapshot(runId, 'full'),
+      (snapshot) => dispatch({ type: 'snapshot', snapshot }),
+      initialEpoch,
+    );
     accept(fetchEvents(runId, null, 500), (replay) => {
       if (replay.resync_required || replay.cursor_gap) {
         setError(text('事件游标已轮转，正在从最新快照重新同步。', 'The event cursor has rotated. Resyncing from the latest snapshot.'));
@@ -94,7 +106,8 @@ export function useRunFeed(runId: string, authRevision = 0): RunFeedHandle {
         feedEpoch += 1;
         const resyncEpoch = feedEpoch;
         dispatch({ type: 'reset', runId });
-        accept(fetchSnapshot(runId), (snapshot) => dispatch({ type: 'snapshot', snapshot }), resyncEpoch);
+        accept(fetchSnapshot(runId, 'summary'), (snapshot) => dispatch({ type: 'snapshot', snapshot: snapshot as Snapshot }), resyncEpoch);
+        accept(fetchSnapshot(runId, 'full'), (snapshot) => dispatch({ type: 'snapshot', snapshot }), resyncEpoch);
         return;
       }
       dispatch({ type: 'replay', events: replay.events });

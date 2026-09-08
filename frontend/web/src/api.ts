@@ -173,8 +173,9 @@ export function fetchMeta(): Promise<WebMeta> {
   return getJson<WebMeta>('/api/meta');
 }
 
-export function fetchSnapshot(runId: string): Promise<Snapshot> {
-  return getJson<Snapshot>(`/api/runs/${encodeURIComponent(runId)}/snapshot`);
+export function fetchSnapshot(runId: string, fields: 'full' | 'summary' = 'full'): Promise<Snapshot> {
+  const query = fields === 'summary' ? '?fields=summary' : '';
+  return getJson<Snapshot>(`/api/runs/${encodeURIComponent(runId)}/snapshot${query}`);
 }
 
 export interface EventReplay {

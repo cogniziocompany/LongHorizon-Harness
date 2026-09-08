@@ -50,3 +50,94 @@ The "seven successful test-mode closes before production" rule is procedural (pl
 - 2026-09-08 02:30 PT billing promotion chain (record): promote-billing needed (a) the workflow on main (#77, legacy push deploy disabled), (b) the prod branch, (c) the billing-dev gate dispatched with base_url http://192.168.21.153:20252 (dev/uat/prod = .153:20252/20253/20251), (d) polls with GITHUB_TOKEN + latest-status acceptance + uat gate dispatch (#78), (e) no secrets in step if (#80), (f) dispatch with -r main, (g) the production environment branch policy extended to main (custom policy allowed only prod, release). All fixed; promotion re-dispatched 02:30 PT with the approver loop. fleet-admin: FLEET_DATABASE_URL (agent-db on .154, schema fleet already present) + FLEET_ADMIN_KEY set on CT202; compose CRLF-normalised and wired to that URL on PR #100.
 
 - 2026-09-08 02:45 PT: billing promotion of 5601a10 reached production (dev gate, release ff, uat gate green, production approved) and stopped at "Roll out prod lane": /opt/mcp-cognizioware-prod does not exist and the lane prod compose defines a new stack (own postgres, port 20251) that would collide with the live mcp-billing-service. NOT forced. Ensure-customer is live on billing dev and UAT (.153:20252/:20253); prod provisioning of the lane is added to 05h3. The human click-through tomorrow is on dev and is unaffected.
+
+- 2026-09-08 07:40 PT: release-readiness admin card + docs (run 2fca56d1, mcp-cognizioware #84) merged; dev lane green; card visible at billing dev /admin (health 200). Task 05h2b complete on dev; UAT/prod ride the next billing promotion (prod lane provisioning still 05h3).
+
+### 2026-09-08 03:10 PT — 05h3 billing prod-lane/health run complete
+- Run 49fa03f5 finished (3 rounds). PR mcp-cognizioware #85 → develop: bounded health checks (`/api/health/live`, `/api/health/ready`, `/api/health` alias; root cause = unbounded secondary-replication LongCount queries), Docker HEALTHCHECK → live, instances.json/promote-billing → ready, ci.yml dispatches billing-dev/billing-uat QA gates (closes the "dev gate status never posted" gap), configurable poll windows, `scripts/deploy/provision-prod-lane.sh` (first-run /opt/mcp-cognizioware-prod, dry-run refuses on port/DB mismatch, adopts the existing container + postgres). Executor-reported 365 tests pass (audit env had no SDK; CI build is the check).
+- Cloudflare Pages check on mcp-cognizioware PRs fails on every PR (also on merged #82) — not a gate; chain scripts ignore it.
+- Next: merge #85 when build green → dev lane → dev gate auto-dispatched → promote-billing (uat gate → prod). Prod first rollout = operator runs provision-prod-lane.sh dry-run on CT100 then the promote lane.
+- mcp-tools: #106's poll helper was sourced in checkout-less ubuntu jobs → PR #108 (sparse checkout) merges after the #107 lane finishes.
+
+### 2026-09-08 04:20 PT — billing prod lane: adoption design + CT100 provisioned
+- #85 merged → dev rollout OK (health/live+ready 200) but the new QA-gate dispatch step failed twice: ct210-billing runner has no `gh` (→ #86 curl + base_url), then HTTP 422 "No ref found for: main" (qa repo default branch is master → in #87).
+- CT100 dry-run of 05h3's provision script exposed three design defects: (1) rollout.sh's hot-patch tripwire refuses to roll when docker-compose.override.yml exists, which is exactly what the script wrote; (2) the override joined network `mcp-network`, which does not exist on CT100 (live network is `mcp-cognizioware-networkk`); (3) the lean lane compose dropped the live env mapping (EntraId__/Stripe__/Onboarding__/YouTrack__ keys are built in the live compose from raw .env names) → the first promote would have started prod misconfigured. Also `docker compose config --format=json` emits long-form port objects, which the port check did not parse.
+- Fix = PR #87 (feat/prod-lane-adoption → develop): the lane compose adopts the live stack (same project mcp-cognizioware-prod, same service+container mcp-billing-service, external network, live env mapping copied, ghcr image by APP_IMAGE_TAG, /api/health/live healthcheck, DualDatabase__SecondaryRequired=true, no postgres/volume); instances.json prod `service`; rollout.sh per-instance service; provision = safety check + mkdir + .env copy; tests + docs.
+- Done on CT100 (ptait01 → pct exec 100): jq installed; dry-run passes (port 20251, DB host postgres); `/opt/mcp-cognizioware-prod/.env` provisioned (mode 600, copy of the live env). Tmp copies removed.
+- Next: #87 merge → dev lane (curl dispatch to master) → promote-billing from main for the develop head: release ff → uat gate → prod (auto-approved) recreates mcp-billing-service in place (seconds). After the first rollout the legacy /opt/mcp-cognizioware compose must not `up` the billing service again (follow-up: remove that block).
+- Gotcha: promote-billing.yml on main is still the pre-#85 file (poll windows, /ready health live on develop only); it deploys from the pinned ref's checkout so the compose/rollout changes apply, but the workflow text itself only updates when develop is promoted to main.
+
+### 2026-09-08 04:25 PT — INCIDENT: first prod billing lane rollout (sha d712263) → health hang, autoheal restart loop
+- promote-billing 34218478595: dev check, release ff, uat gate all green; production approved by the overseer; rollout recreated mcp-billing-service in place with ghcr sha-d712263 (adoption compose worked: same project/service/network, env mapping present, app served /api/v1/admin/auth-config in 7 ms and real tunnel traffic).
+- BUT every health route hangs (>15 s, 0 bytes): /api/health/live, /ready, /api/health — from the host and inside the container. Logs: "Secondary database connection test failed (CanConnect returned false)" then "InvalidOperationException: The secondary PostgreSQL database is required but unavailable. Refusing primary-only fallback" (DualDatabase__SecondaryRequired=true; the external secondary is unreachable from prod). Container healthcheck fails → the legacy stack's autoheal container restarts the service every ~2.5 min → public 502 between restarts. Dev lane with the same image answers /live in ms (secondary reachable/absent there).
+- Rollout reported failure ("health reports '', expected sha-d712263"); rollback target unknown. The overseer's rollback (legacy compose `up -d --no-deps mcp-billing-service` from /opt/mcp-cognizioware, restores mcp-billing-service:latest) was blocked by the auto-mode classifier → handed to Paxton.
+- Hotfix task 05h3b queued at the front (fix/health-live-independent): root cause of the /live hang, truly dependency-free live endpoint, bounded ready with 503 body, fail-fast SecondaryRequired semantics, black-hole integration test.
+- Lesson: the 05h3 hermetic tests could not see this; the prod lane needs a real "secondary reachable" check and the rollback target must be recorded (previous image tag) by rollout.sh before recreating.
+
+### 2026-09-08 05:45 PT — M1: pp PROD promotion LIVE
+- promote run 34221868784, develop 5d0cae0: dev/uat/prod deploy + secondary CE QA + primary eval + eval score gates all green; prod approved by the overseer loop. Contains: restore, Env→Session v2, guest slices 0–4, eval-gate fixes (#91 smoke path, #92 gate error status, #93 statuses permission, #94 pwsh smoke precondition). Third attempt tonight (first: 404 status POST; second: missing image; third: one flaky eval case) — the fourth passed unchanged, confirming eval flakiness on micro-form-spacer.
+- Next: pinned promotion of 5ca3073 (eval catalog #95, dev green) chained; then pp #87/#88 (PROD_PROMOTED_SHA seed) if still relevant.
+
+### 2026-09-08 06:45 PT — prod billing RESTORED (rollback + tunnel network)
+- Paxton approved the rollback. `docker compose -f docker-compose.prod.yml up -d --no-deps mcp-billing-service` from /opt/mcp-cognizioware recreated the container on mcp-billing-service:latest; healthy, host /api/v1/admin/auth-config 200. The autoheal restart loop stopped.
+- Public was still 502: the prod tunnel routes billing.easybutt0n.ai to `http://mcp-billing-service:20251` (container DNS), but cloudflared-prod is on `mcp-cognizioware-prod-network` while the compose puts the app on `mcp-cognizioware-networkk`. Every `docker compose up` of that service drops the manual cross-network attachment. Fixed with `docker network connect mcp-cognizioware-prod-network mcp-billing-service` + a cloudflared-prod restart. Public auth-config 200.
+- `/api/health` still 502/hangs on the legacy image too - that is the ORIGINAL hang (unbounded secondary-DB probes), which hotfix 05h3b fixes.
+- Follow-ups: (a) the lane compose must declare both networks (or the tunnel must use the LAN IP like mcp-cognizioware.easybutt0n.ai does) so a rollout never breaks routing again - fold into the 05h3b PR; (b) re-run the prod promotion only after 05h3b lands.
+
+### 2026-09-08 07:15 PT — powerplatform-uat added to the guest path (Paxton)
+Two Dataverse environments, both already in the repo; no new environment is needed.
+
+| tier | environment | Dataverse URL | ids |
+|---|---|---|---|
+| dev | powerplatform-dev | https://org9130dfc5.crm.dynamics.com | app env record d30303b8, org b400f72c, QA_ENV_ID_DEV 29007c42-33a9-494a-93a2-141051b371b7 |
+| uat | powerplatform-uat | https://orgff9dcfec.crm.dynamics.com | admin-center environment 3cc0ade2-2466-ea20-aa98-0d14b4b37c03 (Paxton, 2026-07-11), orgId b100f72c-687d-f111-b27b-6045bd07ba0c, mcpEnv 2dd00c35-f536-4234-ad59-c28dd534f905, QA_ENV_ID_UAT fc984eea-b69f-4a0d-a317-92b50d3cc6a6 |
+
+Already wired for UAT (verified on pp develop 969ae91): `deployments/instances.json` uat entry (dataverseUrl/orgId/mcpEnv, dir /opt/powerplatform-uat, branch release, health :3001), `.github/workflows/eval-gate.yml` tier→ENV_ORG_URL mapping (uat → orgff9dcfec), promote.yml and trms-qa-eval.yml, and the repo variable QA_ENV_ID_UAT.
+
+Still to do so UAT is actually **used** for guest access: run the same guest seeding on the UAT lane. `scripts/guest/seed-dev-grant.mjs` reads TARGET_ENVIRONMENT_URL from the lane env, so it works unchanged against UAT once /opt/powerplatform-uat/.env carries the UAT org URL plus GUEST_TEST_PRINCIPAL_EMAIL, STRIPE_TEST_CUSTOMER_ID and the billing API vars (dev got these 2026-09-07 19:55 PT; UAT did not). The "dev" in the script name is now wrong — rename to `seed-guest-grant.mjs` with a thin alias. Queued as task 05h4b.
+
+Sequence: dev click-through now → the same click-through on UAT after the release fast-forward → prod (still gated on seven test-mode closes).
+
+### 2026-09-08 08:20 PT — UAT guest access SEEDED (no new values needed from Paxton)
+The guest variables already existed on the dev lane, so nothing had to be invented. Lane host is `pp-dev-uat` (192.168.21.163,
+CT100 on ptait07 192.168.21.138), reachable directly with the proxmox key; `/opt/powerplatform-uat/.env` already carried
+AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET and BILLING_API_URL (http://192.168.21.153:20253) + BILLING_API_KEY.
+- Added to the UAT lane env (backup `.env.bak-guest-20260908-1514`, mode 600): TARGET_ENVIRONMENT_URL=https://orgff9dcfec.crm.dynamics.com,
+  GUEST_TEST_PRINCIPAL_EMAIL and STRIPE_TEST_CUSTOMER_ID copied verbatim from the dev lane.
+- Seeded inside the running uat app container (values passed with `-e` rather than recreating the lane):
+  environment `d301694e-fcfa-48a7-b318-7a46a46fd527` (org b100f72c…, orgff9dcfec), grant `2f5a85f5-…` for ai-dev01@cognizio.company,
+  and **verifyAuth PASS (customerId=internal)** — the same signature dev produced on 2026-09-07.
+- GUEST_TEST_ENVIRONMENT_ID recorded in the lane env for the e2e suites.
+- UAT is now at parity with dev for guest access; the click-through can be exercised on https://powerplatform-uat… once the release
+  fast-forward carries the current develop head. PR #96 (tier-aware seeding) still merges so the next tier is one command.
+
+### 2026-09-08 08:45 PT — why the guest meter shows no events (root-caused, proven against the dev sandbox)
+Paxton asked why the "Cognizioware guest tokens (observation only, TEST)" meter is empty. Three separate reasons, verified:
+1. **The service sends Stripe a meter ID where Stripe expects an event name.** `UsageEventsController.RecordGuestMeterAsync` builds a
+   `GuestStripeMeterEvent` with `MeterId: _settings.GuestMeterId`; `GuestStripeWriter` passes that as the first argument of
+   `RecordBillingMeterEventAsync`, and `StripeService` assigns that argument to `fields["event_name"]`. Dev had
+   `Stripe__GuestMeterId=mtr_test_61VMDVxi…`. Proof against acct_1TsqbjQVmqxwMkjo (mcp-cognizioware-dev sandbox):
+   `event_name=mtr_test_61VMDVxi…` → `invalid_request_error "No active meter found for event name …"`;
+   `event_name=cognizioware_guest_tokens` with a customer from that account → **accepted**, event visible on the meter.
+   The account's four active meters are cognizioware_guest_tokens, sms_segments, task_tokens, voice_seconds — one meter per event name.
+2. **Both guest switches are off** in dev and uat (`Billing__GuestChargingEnabled=false`, `Billing__GuestExecutionEnabled=false`), so nothing
+   generates guest usage yet. Operator flips these, not a task.
+3. **The UAT sandbox is a different Stripe account** (key …WZlf, its own product/price/meter `mtr_test_61VMDmus…`) from dev (…rh0W), so the
+   UAT dashboard is empty simply because nothing has run against it. That split is correct, not a bug.
+Also found: the powerplatform dev lane's `STRIPE_TEST_CUSTOMER_ID=cus_TPFW7YS21tEYUs` does not exist in the dev billing Stripe account
+(customers there are `cus_Utwk…`), so usage pinned to it fails with "No such customer" — the ensure-customer endpoint should supply the id.
+**Actions:** stopgap applied to the dev and uat lane env (`Stripe__GuestMeterId=cognizioware_guest_tokens`, backups `.env.bak-guestmeter-*`)
+so events flow as soon as the switches flip; task 05h5b queued at the front to do it properly (a real `GuestMeterEventName` setting, the usage
+kind carried in the payload, a startup guard that refuses an `mtr_`-shaped value, tests, docs).
+
+### 2026-09-08 08:50 PT — guest usage PROVEN end to end on dev (and a lane trap found)
+After the meter-name stopgap and turning `Billing__GuestExecutionEnabled=true` (charging deliberately left false), a guest-channel usage event
+posted to `/api/v1/usage/events` produced the expected writer line — *"Recording observation-only guest meter event: meter=cognizioware_guest_tokens
+price=price_1UCpYb… product=prod_VDG4R7… customer=cus_Utwk… quantity=2000"* — and the Stripe guest meter moved to **2001** (1 manual probe + 2000 from
+the service) while `task_tokens` stayed at 1000. The observation path is correct once the event name is right.
+**Trap found (I caused it, then fixed it):** a plain `docker compose up -d --no-deps app` on a lane silently rolled the dev billing lane back to an
+image from 2026-07-14 (44c4ccc, 42 commits behind develop, predating the guest meter code). `deployments/tier/docker-compose.yml` resolves
+`APP_IMAGE_TAG` from the lane `.env`, which still pinned the July tag, while `rollout.sh` passes the tag inline and never persists it. Prod's compose
+requires the tag explicitly; dev and uat do not. Fixed on the box by pinning `sha-32a365e` and recreating; slice 6 of task 05h5b makes it structural.
+**Usage contract for the afternoon session:** correlation_id, attempt_id, tenant_id, customer_id and a positive total_tokens are all required
+(snake_case), Authorization carries the Lindy webhook secret, and principal_id/channel/source_event_id mark it as guest.

@@ -460,3 +460,38 @@ There is ONE page: the **Cognizioware Ship Plane** https://claude.ai/code/artifa
 - Lesson 2026-09-08 02:10 PT: `gh workflow run <wf> -r <branch>` runs the workflow FILE from that branch. Three billing promotion attempts ran the stale develop copy of promote-billing.yml after the fixes were merged to main. Dispatch promotions with `-r main` (the sha to promote is an input); keep promote workflows only on main.
 
 - Lesson 2026-09-08: a harness release can pass import/meta checks and still kill every run on the first round (KeyError in role resolution). Before a CT110 release, run one 1-round smoke task on the new code (auditor path included) or the unit suite on Linux; keep the previous release-src for a fast rollback.
+
+- **Lesson (2026-09-08):** never dispatch a pinned promotion in the same breath as the merge. The develop CI must finish pushing `app:sha-<short>` first, or the dev deploy fails with "no matching manifest" (pp run 34218125635). Chain: wait for the CI run of the merged sha → then dispatch.
+- **Lesson (2026-09-08):** when a run moves inline workflow logic into a repo script, every ubuntu job that calls it needs its own `actions/checkout` (mcp-tools #108, pp #92). Self-hosted lane runners (ct210-*) have no `gh`; use curl against the REST API and pass the QA repo's real default branch (`master`) as `ref`.
+- **Lesson (2026-09-08):** a "provision by override file" design must be checked against the rollout tripwire and the real host (network names, env mapping) before it is accepted; a CT dry-run found three defects in 05h3 that the hermetic tests could not.
+
+- **Lesson (2026-09-08, overseer error):** I fed a task false "ground truth" about the Env→Session v2 routes. My grep filtered on `/environments` so it never showed `Route path="/sessions"`, and I grepped the literal `tab=archived` which is absent because the code builds it with `setSearchParams({tab})`. The run's auditor caught it and stopped for a decision. When writing ground truth into a task: print the whole route table (no filter) and grep the *symbol* (`setSearchParams`, `searchParams.get`) rather than the rendered string, and say "verified at <repo> <sha>" so a run can re-check and contradict me.
+
+## Standing rules now baked into every task and every launch (2026-09-08)
+
+Verified live on CT110 (`GET /api/meta`): `mcp_gateway_configured: true`, profiles `none / audit / default / ops / full`,
+role defaults `manager=default, executor=default, auditor=audit`; `mcp_profiles.py`, `episode_session_id` and
+`AUDITOR_NETWORK_GIT_DENY` are all in the deployed source (`/home/harness/release-src`), and `X-LH-Session` is set on the
+generated MCP config. Source: the "Auditor git lock, MCP profiles per role, session-id headers" handoff.
+
+- The launcher (`C:/tmp/launch_queue.py`) now sends `mcp_profile` explicitly per role in both trios: manager and executor
+  `default`, auditor `audit`. Relying on the server default worked, but stating it means a run's provenance shows it.
+- Every task text carries a STANDING RULES paragraph: the auditor is read-only and blocked from network git (no fetch/pull/
+  push/clone/gh) and must not run anything that writes into the workspace (this is what invalidated audits on tasks 11, 12,
+  15 and 05h2d — the auditor ran the browser/test target and dirtied fixtures, baselines and screenshots); manager and
+  executor use `default`; the episode session id `<run_id>.<round_tag>.<role>` appears on both the LLM path
+  (`x-litellm-tags lh-session/…`) and the MCP path (`X-LH-Session`), so completion reports quote the run id; and the run must
+  `git fetch && git merge origin/<base>` before declaring completion (this is what made four PRs unmergeable tonight).
+- Applied to the ten queued task texts and the four in-flight ones on 2026-09-08 07:30 PT.
+
+- **Lesson (2026-09-08, my error):** I added an explicit per-role `mcp_profile` to the launcher payload. The API accepted it (200) but every run died at worker start with "supervised run role configuration does not match its reservation", with zero events, so the failure looked mysterious. Four launches were lost. The server defaults already apply the right profiles (`/api/meta` → manager/executor `default`, auditor `audit`), so the launcher sends no profile; the defect is queued into task 14d. Rule: when changing the launch payload, launch ONE probe run and confirm it reaches round 1 before letting the launcher fill every slot.
+
+## Parallel working trees (2026-09-08)
+
+Only two or three runs were active while nine tasks queued. Cause: the harness allows **one run per working tree**, and the whole queue
+targeted three repos, so the priority tasks at the front were head-blocked by lower-priority runs already holding those trees.
+
+Fix: second checkouts on CT110 — `mcp-cognizioware-b`, `cognizioware-mcp-tools-b`, `LongHorizon-Harness-b` (same remote, own `.lh-harness/config.toml`
+copied from the primary). Queue entries and the task text's "Work ONLY in …" line must both name the tree the run will use.
+Rules: never let two runs share a tree (a gate-waiting run still holds it); when routing to a `-b` tree, check the other tree is not mid-PR on the
+same branch; and prefer the primary tree for anything that will be released to the node.
