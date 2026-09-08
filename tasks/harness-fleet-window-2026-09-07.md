@@ -165,3 +165,19 @@ the window's read API, and Hydra's fleet MCP tools. Identical strings, no re-key
 Source repo is ptait09-easybutt0n-ai (fleet-admin's home); the copy in cognizioware-mcp-tools is vendored, so the overseer re-vendors and deploys
 through that lane afterwards, then sets `FLEET_HARNESS_NODES_JSON` and the token env on CT202.
 Run 20260908T160511Z_059e273a, 8 runs now active across 8 working trees.
+
+### 2026-09-08 09:25 PT — the harness task queue must be visible in the web UX
+Paxton: the queue in `docs/queue.md` has to be viewable by a person, not only through the API. That doc already designates the client —
+*"Hydra | Deep links to /api/queue + optional queue panel that POSTs enqueue"* — so the panel goes in Hydra (control plane, may write) and a
+read-only mirror goes in the fleet window (report plane).
+- **Task 46 (Hydra, queued)** gained slice 7: a Queue section under the fleet list showing name, workspace, trio, priority, requested_by, status,
+  the full selectable queue id and timestamps, grouped exactly as `GET /api/queue` groups them, counts in the header; writes are enqueue,
+  re-prioritise and delete, each requiring a rationale like the run controls, errors inline, no optimistic mutation. A waiting entry must explain
+  itself: if its workspace matches a non-terminal run, say so, because that is the commonest reason a queued item looks stuck (it is exactly what
+  head-blocked our own queue this morning).
+- **Task 45 (fleet window, running)** received the same as an injected instruction, read-only: poll `/api/queue` per node in the same cycle, render
+  the section beside the runs, no writes.
+**Live state that both must handle:** the deployed harness build predates the queue API — `GET /api/queue` returns **404** on ct110 today, and the
+node serves **no dashboard at its web root** (404; `_STATIC_DIR` points at `_frontend/web/dist`, which is not in the repo and not on the box). So
+both surfaces feature-detect per node and show one quiet line — "Queue API not available on this node (needs the harness release)" — rather than an
+empty table implying an empty queue. The queue API arrives on ct110 with the harness release that also carries the fleet reporter.
