@@ -26,6 +26,7 @@ from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
 from ..supervisor.control_bus import CommandConflict, RevisionConflict
+from ..queue import QueueStore, default_queue_config, queue_config_from_config
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
@@ -673,8 +674,12 @@ def create_app(
     )
     token = _configured_token(auth_token)
     origins = {str(item).rstrip("/") for item in (allowed_origins or ()) if str(item).strip()}
+    queue_store: QueueStore | None = None
+    if runs_root is not None:
+        queue_store = QueueStore(runs_root)
     app = FastAPI(title="LongHorizon-Harness Web API", version="1")
     app.state.registry = registry
+    app.state.queue_store = queue_store
     app.state.auth_token = token
     app.state.allowed_origins = origins
     app.state.bind_host = bind_host
@@ -788,6 +793,89 @@ def create_app(
         """
 
         return _meta_response(request, force_models=True)
+
+    @app.post("/api/queue")
+    def create_queue_entry(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        try:
+            entry = queue_store.create(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"ok": True, "queue_id": entry.queue_id}
+
+    @app.get("/api/queue")
+    def list_queue(
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        entries = queue_store.list()
+        valid_statuses = {"pending", "launched", "done", "failed"}
+        filtered = entries
+        if status is not None:
+            if status not in valid_statuses:
+                raise HTTPException(status_code=422, detail=f"status must be one of: {', '.join(sorted(valid_statuses))}")
+            filtered = [item for item in entries if item.status == status]
+        groups: dict[str, list[dict[str, Any]]] = {
+            "pending": [],
+            "launched": [],
+            "done": [],
+            "failed": [],
+        }
+        for item in entries:
+            groups[item.status].append(item.to_dict())
+        return {
+            "entries": [item.to_dict() for item in filtered],
+            "groups": groups,
+            "counts": queue_store.counts(),
+        }
+
+    @app.delete("/api/queue/{queue_id}")
+    def delete_queue_entry(queue_id: str) -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        entry = queue_store.get(queue_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        if entry.status != "pending":
+            raise HTTPException(status_code=409, detail=f"cannot delete entry with status {entry.status}")
+        removed = queue_store.delete(queue_id)
+        if removed is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        return {"ok": True, "queue_id": queue_id, "status": "deleted"}
+
+    @app.post("/api/queue/{queue_id}/priority")
+    def update_queue_priority(queue_id: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        priority = body.get("priority")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise HTTPException(status_code=422, detail="priority must be an integer")
+        entry = queue_store.get(queue_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        if entry.status != "pending":
+            raise HTTPException(status_code=409, detail=f"cannot update priority for status {entry.status}")
+        updated = queue_store.set_priority(queue_id, priority)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        return {"ok": True, "queue_id": queue_id, "priority": updated.priority}
+
+    @app.get("/api/queue/config")
+    def queue_config_endpoint() -> dict[str, Any]:
+        if queue_store is None:
+            return default_queue_config()
+        effective = default_queue_config()
+        try:
+            from ..config import load_run_defaults, PROJECT_CONFIG_PATH
+            project = load_run_defaults(PROJECT_CONFIG_PATH)
+            project_queue = project.get("queue")
+            if isinstance(project_queue, dict):
+                effective = queue_config_from_config(project)
+        except Exception:
+            pass
+        return effective
 
     @app.get("/api/runs")
     def runs() -> dict[str, Any]:
