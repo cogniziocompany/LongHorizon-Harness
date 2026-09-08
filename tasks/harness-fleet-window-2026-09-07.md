@@ -114,3 +114,14 @@ Keep the title. Update: Hydra box -> "Hydra fleet MCP (control) · fleet.easybut
 ### 2026-09-08 03:45 PT — fleet view deploy chain
 - #108 (gate-poll checkout) merged; its lane passed the UAT gate but Deploy to CT202 failed building fleet-admin: web stage `npm ci` had no lockfile because infrastructure/.gitignore ignores every package-lock.json, so the vendored web/ shipped without it. PR #109 un-ignores that file and vendors it from upstream 804a4f0; chain merges + watches the lane + probes fleet health/overview/view root.
 - Lesson: a vendored tree must be checked against the repo's .gitignore (git status --ignored) before the PR; a Docker build that runs npm ci needs the lockfile tracked.
+
+### 2026-09-08 05:30 PT — batch of run results
+- 05h8 fleet device emission → ptait09 #45 (CONFLICTING with easybutt0n-runner-v2 after #43/#44/#46) → integration task 05h8b queued.
+- 13a Fleet Chat lh-harness tool → ptait09 #46 MERGED (operator follow-ups: harness-ops virtual key, OPENWEBUI_GATEWAY_KEY, one-time Knowledge upload).
+- 13b Remote Control on Hydra → hydra #17 MERGED (main CI green); deploy batched with the orchestrator tarball window.
+- 14c Hydra control-plane apply → hydra #18 (CONFLICTING: built on feat/harness-fleet, 41 behind main) → integration task 14c2 queued.
+- 14e hivemind memory MCP → mcp-tools #110 MERGED, lane green, memory-mcp healthy on CT202 :3120 (repo-managed now).
+- 11 admin config parity gate → qa #18 (CONFLICTING, 4 files) → integration task 11b queued.
+- 14a product eval catalog → pp #95 open (chain merges when green); first real TRMS attempt needs the dev eval Dataverse org + eval SP + cgz publisher (Paxton).
+- 12 harness queue API/UX speed: slices 1–4 done (499 tests), 2 extra rounds granted for e2e happy path + docs.
+- Lesson: runs based on a moving branch should `git merge origin/<base>` before declaring done; add "rebase onto current base before completion" to the task template's HARD RULES.
