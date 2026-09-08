@@ -466,3 +466,20 @@ There is ONE page: the **Cognizioware Ship Plane** https://claude.ai/code/artifa
 - **Lesson (2026-09-08):** a "provision by override file" design must be checked against the rollout tripwire and the real host (network names, env mapping) before it is accepted; a CT dry-run found three defects in 05h3 that the hermetic tests could not.
 
 - **Lesson (2026-09-08, overseer error):** I fed a task false "ground truth" about the Env→Session v2 routes. My grep filtered on `/environments` so it never showed `Route path="/sessions"`, and I grepped the literal `tab=archived` which is absent because the code builds it with `setSearchParams({tab})`. The run's auditor caught it and stopped for a decision. When writing ground truth into a task: print the whole route table (no filter) and grep the *symbol* (`setSearchParams`, `searchParams.get`) rather than the rendered string, and say "verified at <repo> <sha>" so a run can re-check and contradict me.
+
+## Standing rules now baked into every task and every launch (2026-09-08)
+
+Verified live on CT110 (`GET /api/meta`): `mcp_gateway_configured: true`, profiles `none / audit / default / ops / full`,
+role defaults `manager=default, executor=default, auditor=audit`; `mcp_profiles.py`, `episode_session_id` and
+`AUDITOR_NETWORK_GIT_DENY` are all in the deployed source (`/home/harness/release-src`), and `X-LH-Session` is set on the
+generated MCP config. Source: the "Auditor git lock, MCP profiles per role, session-id headers" handoff.
+
+- The launcher (`C:/tmp/launch_queue.py`) now sends `mcp_profile` explicitly per role in both trios: manager and executor
+  `default`, auditor `audit`. Relying on the server default worked, but stating it means a run's provenance shows it.
+- Every task text carries a STANDING RULES paragraph: the auditor is read-only and blocked from network git (no fetch/pull/
+  push/clone/gh) and must not run anything that writes into the workspace (this is what invalidated audits on tasks 11, 12,
+  15 and 05h2d — the auditor ran the browser/test target and dirtied fixtures, baselines and screenshots); manager and
+  executor use `default`; the episode session id `<run_id>.<round_tag>.<role>` appears on both the LLM path
+  (`x-litellm-tags lh-session/…`) and the MCP path (`X-LH-Session`), so completion reports quote the run id; and the run must
+  `git fetch && git merge origin/<base>` before declaring completion (this is what made four PRs unmergeable tonight).
+- Applied to the ten queued task texts and the four in-flight ones on 2026-09-08 07:30 PT.
