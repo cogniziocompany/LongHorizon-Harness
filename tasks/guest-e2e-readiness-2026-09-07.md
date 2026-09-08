@@ -110,3 +110,22 @@ AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET and BILLING_API_URL (http://192.168.21.1
 - GUEST_TEST_ENVIRONMENT_ID recorded in the lane env for the e2e suites.
 - UAT is now at parity with dev for guest access; the click-through can be exercised on https://powerplatform-uat… once the release
   fast-forward carries the current develop head. PR #96 (tier-aware seeding) still merges so the next tier is one command.
+
+### 2026-09-08 08:45 PT — why the guest meter shows no events (root-caused, proven against the dev sandbox)
+Paxton asked why the "Cognizioware guest tokens (observation only, TEST)" meter is empty. Three separate reasons, verified:
+1. **The service sends Stripe a meter ID where Stripe expects an event name.** `UsageEventsController.RecordGuestMeterAsync` builds a
+   `GuestStripeMeterEvent` with `MeterId: _settings.GuestMeterId`; `GuestStripeWriter` passes that as the first argument of
+   `RecordBillingMeterEventAsync`, and `StripeService` assigns that argument to `fields["event_name"]`. Dev had
+   `Stripe__GuestMeterId=mtr_test_61VMDVxi…`. Proof against acct_1TsqbjQVmqxwMkjo (mcp-cognizioware-dev sandbox):
+   `event_name=mtr_test_61VMDVxi…` → `invalid_request_error "No active meter found for event name …"`;
+   `event_name=cognizioware_guest_tokens` with a customer from that account → **accepted**, event visible on the meter.
+   The account's four active meters are cognizioware_guest_tokens, sms_segments, task_tokens, voice_seconds — one meter per event name.
+2. **Both guest switches are off** in dev and uat (`Billing__GuestChargingEnabled=false`, `Billing__GuestExecutionEnabled=false`), so nothing
+   generates guest usage yet. Operator flips these, not a task.
+3. **The UAT sandbox is a different Stripe account** (key …WZlf, its own product/price/meter `mtr_test_61VMDmus…`) from dev (…rh0W), so the
+   UAT dashboard is empty simply because nothing has run against it. That split is correct, not a bug.
+Also found: the powerplatform dev lane's `STRIPE_TEST_CUSTOMER_ID=cus_TPFW7YS21tEYUs` does not exist in the dev billing Stripe account
+(customers there are `cus_Utwk…`), so usage pinned to it fails with "No such customer" — the ensure-customer endpoint should supply the id.
+**Actions:** stopgap applied to the dev and uat lane env (`Stripe__GuestMeterId=cognizioware_guest_tokens`, backups `.env.bak-guestmeter-*`)
+so events flow as soon as the switches flip; task 05h5b queued at the front to do it properly (a real `GuestMeterEventName` setting, the usage
+kind carried in the payload, a startup guard that refuses an `mtr_`-shaped value, tests, docs).
