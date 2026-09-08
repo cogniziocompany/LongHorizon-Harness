@@ -76,6 +76,13 @@ class EventEnvelope:
             data["role"] = self.role
         if self.status is not None:
             data["status"] = self.status
+        if self.run_id and self.role:
+            # Use the same session-id helper as the LLM/MCP path so fleet events
+            # can be joined to Langfuse traces and run directories directly.
+            from ..adapters.claude_code import episode_session_id
+
+            round_tag = f"round_{self.round}" if self.round is not None else "round_unknown"
+            data["session_id"] = episode_session_id(self.run_id, round_tag, self.role)
         return data
 
 
