@@ -78,3 +78,37 @@ The reasoning behind it, which the design should either encode or overturn:
 - `provider_provider_error` at `[cli_executor] failed · 0.6s` is the signature of a role whose model is refusing before any work happens.
 - The four Synthetic models registered on the live router today: `glm-5.3-flash:synthetic`, `glm-5.2:synthetic`, `kimi-k3:synthetic`, `qwen3.8-27b:synthetic`.
 - `docs/queue.md` describes the queue contract the routing intent must fit into.
+
+## Decisions (2026-09-08) — binding
+
+The four open questions above are settled. They are no longer open; the implementing task must build them and may only disagree in its completion report, with evidence.
+
+1. **Route per run, observe per round.** The worker command and the adapters are built once, and both resume paths re-read the owner's role configs, so a mid-run switch has no support in the code. Per-round failures are appended to the route history and re-routing happens at the next bind — a new run, or a resume. A transient state is waited out inside the episode rather than routed around.
+2. **No retry of a round that already worked, on a better model.** Exactly one automatic re-enqueue is allowed, and only for a refusal *before* round zero: when no round has run and the abort reason is a provider rate limit, quota, authentication failure, unavailable model, or the new not-permitted state, the launcher creates one new pending entry that records what it is a retry of, marks the offending model in availability, and fails the original with the reason recorded. A run that produced rounds is never restarted — that double-spends the budget that was scarce in the first place, and it hides whether the task or the model failed.
+3. **Never pull a model.** Pulling is a host-level change, and the standing rule is that no host change happens without an explicit human go. A cold model stays a legal candidate at the adequate tier with a warning, and the rationale names it so a person can decide to load it.
+4. **An override is a field on the queue entry, never code.** It is set through the API, the Hydra panel or the chat tool, carries who set it and why, is validated against the key-scoped catalogue, and is honoured even when availability disagrees — recorded at the override tier with the disagreement in the rationale. It survives a resume: continue copies the owner minus the resume-cleared keys, which must not include the route, and retry passes the role configs through while also accepting newly supplied ones.
+
+### Strategy: one queue, two entry points, no duplicated surfaces
+
+- **The decision point is the queue.** The route is provisional at enqueue and bound at launch, and both are recorded. Every entry point — web UX, Hydra panel, MCP tool, chat — writes a queue entry, and only the launcher creates runs.
+- **The catalogue is the router, fetched with the harness's own key.** The router's model-info endpoint returns window, tool-calling, reasoning and cost, and because the key is scoped it also returns exactly the models that key may use. Drawing candidates from that response makes the 403 class that killed three runs today impossible by construction. A small harness-side overlay supplies only what the router cannot say: backend, latency class, locality, and per-backend concurrency. No third registry — the tools repo already owns the e2e and admin registry.
+- **Availability memory lives in the harness**, under the runs root, with a state per model and a different trust window per state: healthy, rate limited, quota exhausted until the month rolls, authentication failed, not permitted until the catalogue changes, cold, saturated, and unknown-but-usable.
+- **Provenance rides the existing reporter.** The route goes into the run owner, the public owner projection, the provenance field list and the starting status, so the heartbeat and the run-status wrapper carry it with no fleet schema change. The fleet window stays read-only; Hydra is the only write surface.
+
+### The pre-round plumbing fix, and why it is required here
+
+Three runs died today with no reason recorded anywhere, and a person had to trace it. That diagnosis gap is the reason this work exists, so the fix belongs in this task rather than a separate one:
+
+- the launcher must build a failure reason from the run status or the report and put it, the abort reason, the rounds run and the route on the queue-failed event;
+- the run-event emitter must also post the record to the fleet reporter, best-effort;
+- the starting status must carry the route;
+- the heartbeat's queue length must read the queue store's pending count;
+- a worker that exits non-zero **before** writing a report must have the last 2 KB of its worker log recorded as the failure reason. That is today's four "worker exited with status 2" failures, which currently leave nothing behind at all.
+
+### Ops step already completed
+
+The harness virtual key's allow-list has been widened from 28 to 33 models, adding the local no-think model and the four Synthetic names, and all three role models were verified to return healthy through that key. The catalogue-scoped candidate rule above is what stops the class returning.
+
+### Failure evidence to build fixtures from
+
+Captured on 2026-09-08: a 403 naming the model the key could not access, on three runs; four workers exiting with status 2 at 14:04 with no recorded reason; and an upstream 500 relayed to the client as a 400 on one run. None of these is a quota body. The two real quota bodies are not in the repo — the monthly-cap wording names the account and points at an upgrade URL, and the rate-limit wording is distinct — so the monthly-cap fixture is reconstructed and must be marked as such until the verbatim body is pasted with the account redacted.
