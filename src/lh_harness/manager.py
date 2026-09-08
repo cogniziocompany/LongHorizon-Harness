@@ -1009,6 +1009,15 @@ async def _run_impl(
     )
     await _write_remote_text(env, f"{config.harness_dir.rstrip('/')}/orchestration/orchestration_transcript.txt", transcript)
     _append_event(events_path, "role_harness_done", final)
+    # Push the final report.json to fleet-admin when configured.  This is a
+    # best-effort side-car; any failure must not alter the already-written
+    # local report.
+    try:
+        from .fleet.reporter import post_report
+
+        post_report(config.runs_root, config.log_dir)
+    except Exception:
+        logger.exception("fleet report hook failed; dropping telemetry")
     emit(
         "run_done",
         status=final["status"],
@@ -2343,6 +2352,15 @@ async def _record_round(
     _append_jsonl_nofollow(rounds_jsonl, asdict(record))
     await _write_remote_round_text(env, config, record.round_index, "round.json", payload)
     _append_event(events_path, "managed_round_recorded", asdict(record))
+    # Push the complete round content (artifacts + trajectories) to fleet-admin
+    # when configured.  This is intentionally best-effort and must never delay
+    # or fail the local durable round record.
+    try:
+        from .fleet.reporter import post_round_content
+
+        post_round_content(config.runs_root, config.log_dir, record.round_index)
+    except Exception:
+        logger.exception("fleet round content hook failed; dropping telemetry")
 
 
 async def _ensure_remote_layout(env: Environment, config: HarnessConfig) -> None:
@@ -2457,6 +2475,15 @@ def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
                         flock.flock(fh.fileno(), flock.LOCK_UN)
                     except OSError:
                         pass
+        # Push the same public event to fleet-admin when configured.  The local
+        # ledger is already durable; any fleet failure must remain a side-car
+        # concern and never propagate into the run.
+        try:
+            from .fleet.reporter import post_event_record
+
+            post_event_record(record)
+        except Exception:
+            logger.exception("fleet event hook failed; dropping telemetry")
     finally:
         if raw_fd is not None:
             try:

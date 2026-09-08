@@ -18,6 +18,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from ..fleet.reporter import wrap_status_writer
+
 
 _MAX_CONTROL_RECORD_BYTES = 512 * 1024
 _MAX_CONTROL_LOG_BYTES = 16 * 1024 * 1024
@@ -485,6 +487,10 @@ class ControlBus:
         # revision before either append obtains the file lock.
         self.lock_path = self.root / ".control.lock"
         self._lock = threading.RLock()
+        # Emit a public run.status event to fleet-admin when lifecycle status
+        # changes.  The wrapper is fail-open: when fleet reporting is disabled
+        # it calls the original write_status unchanged.
+        self.write_status = wrap_status_writer(self.write_status)
 
     @contextmanager
     def _locked(self):

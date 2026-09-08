@@ -224,6 +224,13 @@ def build_run_summary(item: dict[str, Any], *, state: DashboardState | None = No
         "log_dir": item.get("log_dir", ""),
     }
     summary.update(_provenance(*provenance_sources))
+    if state is not None:
+        try:
+            owner = state.control_bus.read_owner()
+            if isinstance(owner, dict) and owner.get("youtrack_issue_id"):
+                summary["youtrack_issue_id"] = str(owner["youtrack_issue_id"])
+        except (OSError, ValueError, RuntimeError):
+            pass
     return summary
 
 

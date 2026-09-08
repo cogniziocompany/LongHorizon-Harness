@@ -537,6 +537,22 @@ lh-harness web --workspace-root .               # Serve the workbench for anothe
 | `--auth-token` | Bearer token, required for any non-loopback `--host` (also `LH_HARNESS_WEB_TOKEN`) |
 | `--no-open` | Do not open the URL in a browser |
 
+##### Fleet reporting environment
+
+Used by `lh-harness web` and the node Docker image to stream telemetry to
+`fleet.easybutt0n.ai` over an outbound HTTPS path.  All are optional; when
+`LH_HARNESS_FLEET_URL` is unset the reporter is not started.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LH_HARNESS_FLEET_URL` | *(none)* | Fleet-admin origin (e.g. `https://fleet.easybutt0n.ai`). |
+| `LH_HARNESS_FLEET_KEY` | *(none)* | Per-host HMAC key for signing POST bodies. |
+| `LH_HARNESS_FLEET_NODE` | `socket.gethostname()` | Node identity reported as `X-Fleet-Host`. |
+| `LH_HARNESS_FLEET_LABELS` | *(none)* | `kind=ct110,repo=...` style labels. |
+
+See [docs/fleet-reporting.md](docs/fleet-reporting.md) for what is pushed,
+endpoint paths, the 8 MB round-content cap, and the privacy note.
+
 ### Common CLI options
 
 | Option | Description |
