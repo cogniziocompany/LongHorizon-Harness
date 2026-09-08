@@ -451,3 +451,6 @@ How to watch it (Paxton): `python C:\tmp\overseer_status.py` (runs, queue, lanes
 
 ## Standing instruction (Paxton 2026-09-07 23:35 PT)
 "Continue to manage the deployment pipelines and task queue for lh-harness" - added to the overseer goal: keep the queue draining (launcher CAP 4, guest/billing/fleet-window first), review every finished run into a PR, push every PR through its lane with gates deciding and prod auto-approved, chase reds immediately, and report milestones every 2-3 h.
+
+## Single status artifact (2026-09-07 23:25 PT)
+There is ONE page: the **Cognizioware Ship Plane** https://claude.ai/code/artifact/8b0c8b20-79bf-4181-9179-b64b1cbd44c5 (system map + harness task -> PR -> lane -> environment table + countdown + walk-through + Needs Paxton). The former "ship plan" artifact (66bed19d...) is retired and only points there. Source file: scratchpad system-current-state.html. Update it at every milestone and every 2-3 h.
