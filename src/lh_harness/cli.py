@@ -86,6 +86,9 @@ _ROLE_OPTIONS = (
     ("final_response", "manager", "the closing reply written for you"),
 )
 _ROLE_PARENTS = {role: parent for role, parent, _ in _ROLE_OPTIONS}
+# Runtime-only permission roles that have no CLI flags of their own resolve through
+# their nearest flagged role (the format-repair pass runs under the auditor budget/model).
+_ROLE_ALIASES = {"auditor_format_repair": "auditor"}
 _ROLE_SCOPES = {role: scope for role, _, scope in _ROLE_OPTIONS}
 
 # Per-role episode budgets as (dest prefix, timeout seconds). The
@@ -2044,7 +2047,7 @@ def _resolve_role_option(args: argparse.Namespace, role: str, suffix: str):
         value = getattr(args, f"{role}_{suffix}", None)
         if value:
             return value
-        role = _ROLE_PARENTS[role]
+        role = _ROLE_PARENTS.get(role) if role in _ROLE_PARENTS else _ROLE_ALIASES.get(role)
     return getattr(args, suffix)
 
 
@@ -2064,7 +2067,7 @@ def _resolve_role_model(args: argparse.Namespace, role: str) -> str | None:
             return value
         if getattr(args, f"{current}_agent", None):
             return None
-        current = _ROLE_PARENTS[current]
+        current = _ROLE_PARENTS.get(current) if current in _ROLE_PARENTS else _ROLE_ALIASES.get(current)
     return getattr(args, "model", None)
 
 
@@ -2091,7 +2094,7 @@ def _resolve_role_reasoning_effort(
             return value
         if getattr(args, f"{current}_agent", None):
             return None
-        current = _ROLE_PARENTS[current]
+        current = _ROLE_PARENTS.get(current) if current in _ROLE_PARENTS else _ROLE_ALIASES.get(current)
     return getattr(args, "reasoning_effort", None)
 
 
