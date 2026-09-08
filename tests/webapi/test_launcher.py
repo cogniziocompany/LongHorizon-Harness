@@ -287,3 +287,38 @@ def test_launcher_fails_entry_when_create_run_raises(tmp_path: Path) -> None:
     assert updated is not None
     assert updated.status == "failed"
     assert "launch failed" in (updated.reason or "")
+
+
+def test_launcher_no_double_launch_across_ticks(tmp_path: Path) -> None:
+    """A second tick must not launch into a workspace that got an active run between ticks.
+
+    This covers the inter-tick race where a concurrent manual run or the previous
+    tick's launched worker becomes active before the next poll finishes.  The
+    launcher re-evaluates the active-run set inside its serialized launch section
+    and skips the workspace.
+    """
+    root, store, supervisor = _fixture(tmp_path)
+    config = default_queue_config()
+    config["capacity"]["kimi_max"] = 3
+    launcher = Launcher(supervisor, store, queue_config=config)
+
+    workspace = str(tmp_path / "shared")
+    first = store.create(_base_entry(trio="kimi", workspace=workspace, priority=10))
+
+    asyncio.run(launcher.tick())
+    first_updated = store.get(first.queue_id)
+    assert first_updated is not None
+    assert first_updated.status == "launched"
+    assert first_updated.run_id is not None
+
+    # Simulate a manual/concurrent run appearing in the same workspace before the
+    # next launcher tick, in addition to the already-launched queue entry.
+    supervisor.add_run("manual-run", workspace, status="running", trio="kimi")
+
+    second = store.create(_base_entry(trio="kimi", workspace=workspace, priority=5))
+    asyncio.run(launcher.tick())
+
+    second_updated = store.get(second.queue_id)
+    assert second_updated is not None
+    assert second_updated.status == "pending"
+    assert any("has active run" in reason for reason in second_updated.skip_reasons)
