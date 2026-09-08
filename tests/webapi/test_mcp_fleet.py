@@ -69,6 +69,7 @@ def test_mcp_fleet_tools_manifest(client_fixture: Any = None) -> None:
             "harness_list_queue",
             "harness_run_status",
             "harness_resolve_gate",
+            "harness_list_contentions",
         }
         enqueue = next(tool for tool in data["tools"] if tool["name"] == "harness_enqueue_task")
         assert "kimi" in enqueue["description"]
