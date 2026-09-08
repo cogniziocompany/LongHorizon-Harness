@@ -1397,6 +1397,7 @@ class RunSupervisor:
         reasoning_effort: str | None = None,
         mcp_profile: str | None = None,
         allow_auditor_write_mcp: bool = False,
+        youtrack_issue_id: str | None = None,
         _recover_reservation: bool = False,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -1416,6 +1417,7 @@ class RunSupervisor:
                 reasoning_effort=reasoning_effort,
                 mcp_profile=mcp_profile,
                 allow_auditor_write_mcp=allow_auditor_write_mcp,
+                youtrack_issue_id=youtrack_issue_id,
             )
         request = {
             "task": task,
@@ -1429,6 +1431,7 @@ class RunSupervisor:
             "reasoning_effort": reasoning_effort,
             "mcp_profile": mcp_profile,
             "allow_auditor_write_mcp": allow_auditor_write_mcp,
+            "youtrack_issue_id": youtrack_issue_id,
         }
         fingerprint = hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         path = self._idempotency_path("create", key)
@@ -1503,6 +1506,7 @@ class RunSupervisor:
                 prompt_language=prompt_language,
                 run_id=reserved_run_id,
                 reasoning_effort=reasoning_effort,
+                youtrack_issue_id=youtrack_issue_id,
                 _recover_reservation=bool(existing),
                 _idempotency_fingerprint=fingerprint,
             )
@@ -1536,6 +1540,7 @@ class RunSupervisor:
         reasoning_effort: str | None = None,
         mcp_profile: str | None = None,
         allow_auditor_write_mcp: bool = False,
+        youtrack_issue_id: str | None = None,
         _recover_reservation: bool = False,
         _idempotency_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -1646,6 +1651,10 @@ class RunSupervisor:
         reservation["mcp_profile"] = mcp_profile
         if _idempotency_fingerprint:
             reservation["idempotency_fingerprint"] = _idempotency_fingerprint
+        # Carried through to the owner record and heartbeat summary; ignored if
+        # unset.  Validation is lenient so integrations can pass any ticket id.
+        if youtrack_issue_id:
+            reservation["youtrack_issue_id"] = str(youtrack_issue_id)[:64]
         return self._launch_worker(
             run_id=run_id,
             run_dir=run_dir,

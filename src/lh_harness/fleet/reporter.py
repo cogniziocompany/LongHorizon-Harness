@@ -18,11 +18,13 @@ import logging
 import os
 import queue
 import socket
+import stat
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,14 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF_SECONDS = (0.0, 1.0, 2.0)
 _WARN_ONCE_INTERVAL_SECONDS = 300.0
 _MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
+_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
+_TRAJECTORY_ROLES = (
+    "manager",
+    "executor",
+    "auditor",
+    "auditor_format_repair",
+    "final_response",
+)
 
 
 @dataclass(frozen=True)
@@ -399,6 +409,221 @@ def _json_default(value: object) -> Any:
     if isinstance(value, set):
         return sorted(value)
     return str(value)
+
+
+def _safe_read_text(path: Any, max_bytes: int = _MAX_ARTIFACT_BYTES) -> dict[str, Any]:
+    """Read a local file through no-follow, returning content or a truncation marker.
+
+    If ``path`` is not a string/Path, or does not resolve safely, the file is
+    omitted.  Files larger than ``max_bytes`` are never dropped silently: they
+    are returned with ``{"truncated": true, "bytes": N}``.
+    """
+
+    try:
+        target = Path(path)
+    except (TypeError, ValueError):
+        return {}
+    try:
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return {}
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return {}
+        size = int(metadata.st_size)
+        remaining = max_bytes + 1
+        data = bytearray()
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            data.extend(chunk)
+            remaining -= len(chunk)
+        too_large = len(data) > max_bytes
+        raw = bytes(data[:max_bytes])
+        if too_large:
+            return {"truncated": True, "bytes": size}
+        try:
+            text = raw.decode("utf-8", errors="replace")
+            try:
+                return {"json": json.loads(text)}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return {"text": text}
+        except (UnicodeDecodeError, TypeError, ValueError):
+            return {"truncated": True, "bytes": size}
+    except OSError:
+        return {}
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _is_safe_name(name: str) -> bool:
+    if not name or len(name) > 256:
+        return False
+    if name in {".", ".."} or "/" in name or "\\" in name:
+        return False
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
+        return False
+    return True
+
+
+def _collect_round_content(
+    runs_root: str | Path,
+    run_dir: str | Path,
+    round_index: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collect artifacts and role trajectories for one round.
+
+    All filesystem access is routed through ``safe_run_rounds`` / ``safe_run_role``
+    boundary helpers so the walk never escapes the validated run directory.  Each
+    artifact or trajectory is capped at ``_MAX_ARTIFACT_BYTES``; larger files are
+    represented by an explicit ``{truncated: true, bytes: N}`` marker.
+    """
+
+    artifacts: list[dict[str, Any]] = []
+    trajectories: list[dict[str, Any]] = []
+    try:
+        from ..utils.run_boundary import safe_run_rounds
+
+        rounds_dir = safe_run_rounds(runs_root, run_dir, allow_missing=True)
+    except Exception:
+        logger.exception("fleet round content walk failed")
+        return artifacts, trajectories
+    if rounds_dir is None:
+        return artifacts, trajectories
+    try:
+        round_dir = rounds_dir / f"round_{round_index:03d}"
+        # Validate the round directory is a real child of the validated rounds root.
+        resolved_rounds = rounds_dir.resolve(strict=False)
+        resolved_round = round_dir.resolve(strict=False)
+        if resolved_round.parent != resolved_rounds or not resolved_round.is_dir():
+            return artifacts, trajectories
+    except (OSError, RuntimeError, ValueError):
+        return artifacts, trajectories
+
+    try:
+        entries = sorted(round_dir.iterdir())
+    except OSError:
+        entries = []
+
+    seen_trajectory_files: set[str] = set()
+    for entry in entries:
+        name = entry.name
+        if not _is_safe_name(name):
+            continue
+        try:
+            if entry.is_symlink() or not entry.is_file():
+                continue
+        except OSError:
+            continue
+        target = entry.resolve()
+        try:
+            target.relative_to(resolved_round)
+        except (ValueError, OSError, RuntimeError):
+            continue
+        content = _safe_read_text(target, max_bytes=_MAX_ARTIFACT_BYTES)
+        if not content:
+            continue
+        for role in _TRAJECTORY_ROLES:
+            base = f"{role}_raw_trajectory"
+            normalized = f"{role}_trajectory.jsonl"
+            if name.startswith(base) or name == normalized:
+                seen_trajectory_files.add(name)
+                trajectories.append(
+                    {
+                        "role": role,
+                        "file": name,
+                        "content": content,
+                    }
+                )
+                break
+        else:
+            # Anything that is not a recognized trajectory file is treated as a
+            # round artifact (plan text, screenshots, metadata, etc.).
+            artifacts.append(
+                {
+                    "name": name,
+                    "content": content,
+                }
+            )
+
+    return artifacts, trajectories
+
+
+def post_round_content(
+    runs_root: str | Path,
+    run_dir: str | Path,
+    round_index: int,
+) -> None:
+    """Queue a round content payload to fleet-admin when configured.
+
+    Safe to call from any thread; no-ops when fleet reporting is disabled.
+    """
+    reporter = get_reporter()
+    if reporter is None or not reporter.enabled:
+        return
+    run_id = str(Path(run_dir).name)
+    artifacts, trajectories = _collect_round_content(runs_root, run_dir, round_index)
+    _safe_call(reporter.queue_round_content, run_id, round_index, artifacts, trajectories)
+
+
+def _read_report(log_dir: Path) -> dict[str, Any] | None:
+    """Read logs/report.json if it exists and is safe JSON."""
+
+    try:
+        target = Path(log_dir) / "report.json"
+        fd = os.open(
+            target,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return None
+        data = os.read(fd, _MAX_ARTIFACT_BYTES + 1)
+        if len(data) > _MAX_ARTIFACT_BYTES:
+            return {"truncated": True, "bytes": int(metadata.st_size)}
+        text = data.decode("utf-8", errors="replace")
+        return json.loads(text)
+    except Exception:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def post_report(
+    runs_root: str | Path,
+    run_dir: str | Path,
+) -> None:
+    """Queue the final logs/report.json to fleet-admin when configured.
+
+    Safe to call from any thread; no-ops when fleet reporting is disabled.
+    """
+    reporter = get_reporter()
+    if reporter is None or not reporter.enabled:
+        return
+    try:
+        from ..utils.run_boundary import safe_run_logs
+
+        log_dir = safe_run_logs(runs_root, run_dir, allow_missing=True)
+    except Exception:
+        log_dir = None
+    if log_dir is None:
+        return
+    report = _read_report(log_dir)
+    if report is None:
+        return
+    run_id = str(Path(run_dir).name)
+    _safe_call(reporter.queue_round_content, run_id, 0, [], [], report)
 
 
 _reporter: FleetReporter | None = None

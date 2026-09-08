@@ -825,6 +825,7 @@ def create_app(
             if prompt_language not in {"en", "zh"}:
                 raise ValueError("prompt_language must be en or zh")
             mcp_profile = _body_text(body.get("mcp_profile"), field="mcp_profile", max_chars=64) or None
+            youtrack_issue_id = _body_text(body.get("youtrack_issue_id"), field="youtrack_issue_id", max_chars=64) or None
             created = supervisor.create_run(
                 task=task,
                 agent=agent,
@@ -836,6 +837,7 @@ def create_app(
                 run_id=run_id_value,
                 reasoning_effort=reasoning_effort,
                 mcp_profile=mcp_profile,
+                youtrack_issue_id=youtrack_issue_id,
                 idempotency_key=_bounded_command_id(request.headers.get("Idempotency-Key")),
             )
         except IdempotencyConflict as exc:

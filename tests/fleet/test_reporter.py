@@ -19,8 +19,12 @@ import pytest
 from lh_harness.dashboard.state import ApprovalOption, DashboardState
 from lh_harness.fleet.reporter import (
     FleetReporter,
+    _collect_round_content,
     _parse_labels,
+    _read_report,
     get_reporter,
+    post_report,
+    post_round_content,
     wrap_event_sink,
     wrap_status_writer,
 )
@@ -444,3 +448,119 @@ def test_parse_labels():
     assert _parse_labels("") == {}
     assert _parse_labels("  a = b , c=d  ") == {"a": "b", "c": "d"}
     assert _parse_labels("no-equals") == {}
+
+
+def test_round_content_path_traversal(tmp_path):
+    """Round content collection must stay inside the validated run directory."""
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / "run-ok"
+    log_dir = run_dir / "lh_harness"
+    role_dir = log_dir / "role_orchestration"
+    rounds_dir = role_dir / "rounds"
+    round_dir = rounds_dir / "round_001"
+    round_dir.mkdir(parents=True)
+
+    # A symlink inside the rounds directory pointing outside the run dir must not
+    # be followed.  The same is true for a file whose path escapes via traversal.
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    symlink_escape = round_dir / "escape.txt"
+    try:
+        symlink_escape.symlink_to(outside)
+    except OSError:
+        # Some test environments lack symlink support; skip traversal-via-link.
+        pass
+
+    (round_dir / "manager_plan.txt").write_text("plan", encoding="utf-8")
+    (round_dir / "executor_raw_trajectory.jsonl").write_text(
+        json.dumps({"step": 1}), encoding="utf-8"
+    )
+    traversal_file = round_dir / "..%2f..%2foutside.txt"
+    traversal_file.write_text("bad name but inside", encoding="utf-8")
+
+    artifacts, trajectories = _collect_round_content(runs_root, run_dir, 1)
+    names = {a["name"] for a in artifacts}
+    assert "manager_plan.txt" in names
+    assert "escape.txt" not in names
+    assert len(trajectories) == 1
+    assert trajectories[0]["role"] == "executor"
+
+
+def test_truncation_marker(tmp_path):
+    """Files larger than the 8 MB cap are represented by a truncation marker."""
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / "run-big"
+    log_dir = run_dir / "lh_harness"
+    role_dir = log_dir / "role_orchestration"
+    rounds_dir = role_dir / "rounds"
+    round_dir = rounds_dir / "round_001"
+    round_dir.mkdir(parents=True)
+
+    big = round_dir / "big.bin"
+    big.write_bytes(b"x" * (8 * 1024 * 1024 + 1))
+    (round_dir / "manager_plan.txt").write_text("small", encoding="utf-8")
+
+    artifacts, _ = _collect_round_content(runs_root, run_dir, 1)
+    by_name = {a["name"]: a["content"] for a in artifacts}
+    assert by_name["big.bin"] == {"truncated": True, "bytes": 8 * 1024 * 1024 + 1}
+    assert by_name["manager_plan.txt"]["text"] == "small"
+
+
+def test_report_push(http_server, _isolate_reporter, tmp_path):
+    """post_report reads logs/report.json and queues it as a round payload."""
+    _setenv(http_server, "report-node", "report-key", None)
+    get_reporter(version="0.4.0", capacity=1, reset=True)
+
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / "run-report"
+    log_dir = run_dir / "lh_harness"
+    (log_dir / "role_orchestration" / "rounds").mkdir(parents=True)
+    report = {"schema_version": 2, "status": "complete", "task": "done"}
+    (log_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False), encoding="utf-8"
+    )
+
+    post_report(runs_root, run_dir)
+    reporter = get_reporter()
+    reporter.stop(timeout=5.0)
+
+    round_requests = [r for r in _StubHandler.requests if r["path"] == "/harness/rounds"]
+    assert len(round_requests) == 1
+    body = round_requests[0]["body"]
+    assert body["run_id"] == "run-report"
+    assert body["report"] == report
+
+
+def test_round_content_push_hook(http_server, _isolate_reporter, tmp_path):
+    """post_round_content sends a complete round payload to fleet-admin."""
+    _setenv(http_server, "round-node", "round-key", None)
+    get_reporter(version="0.4.0", capacity=1, reset=True)
+
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / "run-round"
+    log_dir = run_dir / "lh_harness"
+    role_dir = log_dir / "role_orchestration"
+    rounds_dir = role_dir / "rounds"
+    round_dir = rounds_dir / "round_002"
+    round_dir.mkdir(parents=True)
+    (round_dir / "manager_plan.txt").write_text("plan text", encoding="utf-8")
+    (round_dir / "executor_raw_trajectory.jsonl").write_text(
+        json.dumps({"step": 1, "thinking": "deep thought"}),
+        encoding="utf-8",
+    )
+    (round_dir / "screenshot.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+    post_round_content(runs_root, run_dir, 2)
+    reporter = get_reporter()
+    reporter.stop(timeout=5.0)
+
+    round_requests = [r for r in _StubHandler.requests if r["path"] == "/harness/rounds"]
+    assert len(round_requests) == 1
+    body = round_requests[0]["body"]
+    assert body["run_id"] == "run-round"
+    assert body["round"] == 2
+    artifact_names = {a["name"] for a in body["artifacts"]}
+    assert "manager_plan.txt" in artifact_names
+    assert "screenshot.png" in artifact_names
+    trajectory_roles = {t["role"] for t in body["trajectories"]}
+    assert "executor" in trajectory_roles

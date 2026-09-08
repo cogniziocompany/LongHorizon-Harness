@@ -1645,6 +1645,7 @@ def _run_command(args: argparse.Namespace) -> int:
         workspace_path=workspace,
         harness_dir=harness_dir,
         log_dir=log_dir,
+        runs_root=args.runs_root,
         prompt_language=args.prompt_language,
     )
     env = _build_env(args.env, tmp_dir=str(run_dir / "tmp"))
