@@ -181,3 +181,21 @@ read-only mirror goes in the fleet window (report plane).
 node serves **no dashboard at its web root** (404; `_STATIC_DIR` points at `_frontend/web/dist`, which is not in the repo and not on the box). So
 both surfaces feature-detect per node and show one quiet line — "Queue API not available on this node (needs the harness release)" — rather than an
 empty table implying an empty queue. The queue API arrives on ct110 with the harness release that also carries the fleet reporter.
+
+### 2026-09-08 09:35 PT — Paxton's correction: neither surface is redundant, and the planes are
+The expert's aside that Hydra is redundant against the harness's own UI is **rejected**. The confirmed architecture:
+- **fleet.easybutt0n.ai** — every lh-harness run, everywhere. The wallboard.
+- **Hydra** — the **device** fleet and the control plane: terminals, shells, heads on real machines, in real time.
+- **An lh-harness run is an agent that consumes Hydra devices.** It may reach into the device fleet to execute (bash, a head, a terminal).
+**Use case, verbatim:** *"I access hydra, can see all the harness in the right side panel, then if any are using the hydra tools, I should see it
+in the terminal and the heads on the left hand side of the screen."*
+- **Task 46** gained slice 8: a run row on the right shows which head/terminal it drives; the device entry on the left shows which run is driving it;
+  selecting either highlights the other without stealing focus; the cockpit links into the existing terminal for that head. Identifiers unchanged on
+  both sides. Derived only from what the orchestrator already exposes — if the data cannot support the pairing today, the run must say which field
+  would be needed rather than fake it.
+- **Task 16a (MSCE experience layer, queued)** gained the device dimension through all three levels: L1 traces record the device/head/terminal and the
+  Hydra node an exec went through (identical id strings, absent when there was no remote exec); L2 policies keep the device *requirement* and drop the
+  instance ("needs a linux shell head with docker", not "used head 7 on desk03"); L3 environmental cognition holds the fleet itself — which hosts
+  exist, what each can run, and the standing constraints (no host-level change without an explicit go, restart a runner from outside it, some hosts
+  have no IPv6 egress). Redaction still applies; device ids and hostnames are fine, tokens are not. Scope guard: fields and capture only, no Hydra
+  client, no dependency on the device fleet being present.
