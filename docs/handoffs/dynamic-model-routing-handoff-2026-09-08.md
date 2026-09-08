@@ -113,6 +113,10 @@ The harness virtual key's allow-list has been widened from 28 to 33 models, addi
 
 Captured on 2026-09-08: a 403 naming the model the key could not access, on three runs; four workers exiting with status 2 at 14:04 with no recorded reason; and an upstream 500 relayed to the client as a 400 on one run. None of these is a quota body. The two real quota bodies are not in the repo — the monthly-cap wording names the account and points at an upgrade URL, and the rate-limit wording is distinct. Per the interview, the overseer captures both fresh with one 1-token probe per capped provider from the router box and pastes them, account id redacted, under "Captured provider bodies" below before task 49 launches; until that paragraph exists the monthly-cap fixture is reconstructed and must be marked as such.
 
+### Router cooldown is not a provider cap (found 2026-09-08 14:00 PT)
+
+Ten zero-round deaths traced to the router itself: it benched a deployment for 300 seconds after two failures, a rate limit counted as a failure, so a momentary limit became a five-minute outage while the provider's budget read fully unused. The cooldown is now 20 seconds and rate limits no longer trigger it. For the availability model this is its own short transient state: trust a router "cooldown" or "no deployments available" body for the cooldown length only, never classify it as quota exhausted, and say "router cooldown" in the rationale.
+
 ### Captured provider bodies
 
 _Pending: to be pasted by the overseer before task 49 launches. Redact the account identifier to `<account>`; keep the rest verbatim, including the upgrade URL and any Retry-After header._
