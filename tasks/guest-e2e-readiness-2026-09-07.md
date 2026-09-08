@@ -141,3 +141,9 @@ image from 2026-07-14 (44c4ccc, 42 commits behind develop, predating the guest m
 requires the tag explicitly; dev and uat do not. Fixed on the box by pinning `sha-32a365e` and recreating; slice 6 of task 05h5b makes it structural.
 **Usage contract for the afternoon session:** correlation_id, attempt_id, tenant_id, customer_id and a positive total_tokens are all required
 (snake_case), Authorization carries the Lindy webhook secret, and principal_id/channel/source_event_id mark it as guest.
+
+## Progress 2026-09-08 (overseer)
+
+- **CI compose validation was failing every PR in `mcp-cognizioware`.** The guest-meter branch deliberately made the lane compose require `APP_IMAGE_TAG` — so a bare `docker compose up -d` fails loudly instead of silently redeploying a stale pinned image, which is what rolled the dev box back to a July image earlier — and removed the variable from `env.dev.example`. The CI "Validate lane compose" step copies that example and runs `docker compose config`, so it broke on the requirement it was meant to enforce. Fixed on the branch by giving the structural check a throwaway tag; build and all 376 hermetic tests were already passing.
+- **Cloudflare Pages is red on `develop` itself**, not just on PRs #90 and #91, so it is pre-existing and does not gate either of them. Worth its own fix; it is the only red check left on #91.
+- PR #91 (guest kill switches in the admin UI) is green apart from that pre-existing Pages check. PR #90 (guest meter events keyed by event name, carrying the usage kind) is re-running after the CI fix.
