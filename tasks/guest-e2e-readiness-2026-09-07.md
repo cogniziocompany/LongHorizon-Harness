@@ -73,3 +73,7 @@ The "seven successful test-mode closes before production" rule is procedural (pl
 - Rollout reported failure ("health reports '', expected sha-d712263"); rollback target unknown. The overseer's rollback (legacy compose `up -d --no-deps mcp-billing-service` from /opt/mcp-cognizioware, restores mcp-billing-service:latest) was blocked by the auto-mode classifier → handed to Paxton.
 - Hotfix task 05h3b queued at the front (fix/health-live-independent): root cause of the /live hang, truly dependency-free live endpoint, bounded ready with 503 body, fail-fast SecondaryRequired semantics, black-hole integration test.
 - Lesson: the 05h3 hermetic tests could not see this; the prod lane needs a real "secondary reachable" check and the rollback target must be recorded (previous image tag) by rollout.sh before recreating.
+
+### 2026-09-08 05:45 PT — M1: pp PROD promotion LIVE
+- promote run 34221868784, develop 5d0cae0: dev/uat/prod deploy + secondary CE QA + primary eval + eval score gates all green; prod approved by the overseer loop. Contains: restore, Env→Session v2, guest slices 0–4, eval-gate fixes (#91 smoke path, #92 gate error status, #93 statuses permission, #94 pwsh smoke precondition). Third attempt tonight (first: 404 status POST; second: missing image; third: one flaky eval case) — the fourth passed unchanged, confirming eval flakiness on micro-form-spacer.
+- Next: pinned promotion of 5ca3073 (eval catalog #95, dev green) chained; then pp #87/#88 (PROD_PROMOTED_SHA seed) if still relevant.
