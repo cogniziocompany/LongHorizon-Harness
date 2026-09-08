@@ -108,3 +108,5 @@ Keep the title. Update: Hydra box -> "Hydra fleet MCP (control) · fleet.easybut
 - Ship Plane artifact re-published at the same URL with the refreshed facts and unchanged title.
 
 - 2026-09-08 06:45 PT: fleet.easybutt0n.ai restored (fleet-admin healthy on CT202 via #100/#102 lanes); ct110 enrolled against it (device key rotated once because the first enrol echoed it; key lives only in /home/harness/.lh-harness-secrets.env as LH_HARNESS_FLEET_KEY with URL/NODE/LABELS). Fleet window view re-vendored from ptait09 #43 as mcp-tools #104 (chain merges after the current lane). Reporter PR #3 rebased on main; release to CT110 in the next quiet window once the ingest routes are live.
+
+- 2026-09-08 09:15 PT: with the QA classifier fixed, the #105 lane passed its UAT gate (6/6) but the CT202 deploy failed building the vendored fleet-admin image: the upstream Dockerfile copied migrate.js from the context root while it lives in src/. Fixed in mcp-tools #107 (chain: merge after the #106 lane, deploy, verify view) and upstream ptait09 #44 (merged). Reporter release to CT110 follows once /harness/* routes answer on fleet.easybutt0n.ai.
