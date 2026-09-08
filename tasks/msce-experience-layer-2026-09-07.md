@@ -23,3 +23,20 @@ L2 induction, policy gain, L3 abstraction, skill crystallization, retrieval into
 
 ## Progress
 - 2026-09-07 18:40 PT: task file created; queue entries 16a/16b added; PDF committed.
+
+### 2026-09-08 09:45 PT — the three levels exist per instance, seeded for now, and must be viewable
+Paxton: every lh-harness instance carries all three MSCE levels from the start; we hardcode them for now and learn later; and the web UX must make
+them accessible.
+- **Task 16a (queued)** gained: a seeded-defaults module plus an optional `[experience]` override in the instance's own `.lh-harness/config.toml`.
+  **L3 is genuinely populated now** — the fleet as data, not comments: which hosts exist and what each is for, what a head on each can run, and the
+  standing constraints that already govern us (no host-level change without an explicit go; restart a runner from outside it; no e2e or QA on a dev
+  box; prod goes through the lanes and gates decide; some hosts have no IPv6 egress; a lane compose resolving a stale image tag silently rolls a
+  service back). **L2** starts empty but as a real addressable collection with its final shape. **L1** is per run, already specified. Every seeded
+  item carries `origin: seeded|learned` and `seeded_at`, and a learned item supersedes a seeded one without erasing the record of what was seeded.
+- **Read-only API** so a UI can render them: `GET /api/experience/environment`, `GET /api/experience/policies`, and
+  `GET /api/experience/runs/{run_id}/traces` — same bearer boundary, paginated, redacted, stable ids. No write endpoints in this task.
+- **Task 46 (Hydra, queued)** gained slice 9: per-node Environment disclosure (collapsed, origin badges), a Policies list with an honest empty
+  state, and a per-run Traces view in the cockpit including the device/head/terminal and Hydra node where an execution happened.
+- **Task 45 (window, running)** received the same read-only surfaces as an instruction; **task 44 (UX gate, queued)** now asserts they render, that
+  the empty state is honest, that a 404 shows one quiet line rather than an empty list implying empty memory, and that ids and origin badges survive.
+Redaction is unchanged and binding: the API must never return a value redaction would have stripped from a trace.
