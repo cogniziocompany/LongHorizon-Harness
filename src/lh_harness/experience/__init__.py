@@ -18,6 +18,14 @@ dedupe on (run_id, round_index), size caps), and ``capture`` is the single
 finalization entry point wired into ``manager._run_impl`` — off by default,
 gated by ``LH_HARNESS_EXPERIENCE=1`` or ``[run] experience = true``.
 
+Slice 5 seeds the levels every instance carries from the start (Paxton
+2026-09-08): ``seed`` ships L3 (the device fleet as stable knowledge —
+hosts, standing constraints, routing backends by name) as data, and L2 as
+an empty but already addressable collection in its final shape, with an
+optional ``[experience]`` override in the instance's ``.lh-harness/config.toml``.
+L1 stays per run. Every seeded item carries ``origin``/``seeded_at`` and is
+redacted before it leaves the module.
+
 Explicitly out of scope for Phase 1 (``tasks/msce-experience-layer-2026-09-07.md``):
 L2 induction, policy gain, L3 abstraction beyond the seeded defaults,
 skill crystallization, retrieval into prompts, and direct memory-mcp writes.
@@ -53,6 +61,18 @@ from .tags import (
     roles_from_owner,
     tool_names_from_round_dir,
 )
+from .seed import (
+    ENVIRONMENT_KINDS,
+    ORIGIN_LEARNED,
+    ORIGIN_SEEDED,
+    POLICY_ITEM_SCHEMA,
+    SEEDED_AT,
+    SUMMARY_MAX_CHARS,
+    SeededLevels,
+    empty_policy_collection,
+    load_seeded_levels,
+    supersede,
+)
 from .reward import (
     WEIGHT_GOAL,
     WEIGHT_PROCESS,
@@ -78,15 +98,22 @@ __all__ = [
     "ALPHA_MID",
     "DEFAULT_GAMMA",
     "DEVICE_FIELD_NAMES",
+    "ENVIRONMENT_KINDS",
     "ENV_FLAG",
     "EXPERIENCE_FILENAME",
+    "ORIGIN_LEARNED",
+    "ORIGIN_SEEDED",
+    "POLICY_ITEM_SCHEMA",
     "REDACTED",
     "ROUTE_RATIONALE_MAX_CHARS",
+    "SEEDED_AT",
+    "SUMMARY_MAX_CHARS",
     "CaptureResult",
     "RewardBreakdown",
     "RewardTerms",
     "RoleTrace",
     "SECRET_ENV_VAR_NAMES",
+    "SeededLevels",
     "StoreStats",
     "TraceCaps",
     "TraceUnit",
@@ -98,9 +125,11 @@ __all__ = [
     "backfill",
     "content_hash",
     "detect_branch",
+    "empty_policy_collection",
     "error_signature",
     "experience_enabled",
     "experience_ledger_path",
+    "load_seeded_levels",
     "next_step_tag",
     "persist_run_experience",
     "redact_text",
@@ -110,6 +139,7 @@ __all__ = [
     "reward_breakdown",
     "roles_from_owner",
     "run_dir_for_log_dir",
+    "supersede",
     "task_context_id",
     "terminal_reward",
     "tool_names_from_round_dir",
