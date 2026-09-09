@@ -46,9 +46,15 @@ _RUN_KEYS = {
     "dashboard",
     "dashboard_port",
     "allow_auditor_write_mcp",
+    "experience",
     "roles",
     "timeouts",
 }
+# Top-level tables a project config.toml may carry. [experience] is the
+# instance's optional MSCE level-3 override (read by lh_harness.experience.seed,
+# NOT a run default — it never lands on HarnessConfig and never changes the
+# run flow); [run] and [queue] drive run defaults.
+_TOP_LEVEL_KEYS = {"run", "queue", "experience"}
 _QUEUE_TRIOS = {"kimi", "qwen"}
 _QUEUE_CAPACITY_KEYS = {
     "kimi_max",
@@ -112,6 +118,11 @@ dashboard = true
 # its explicit 8799 default for the operator-facing control plane.
 dashboard_port = 0
 
+# MSCE experience layer (Phase 1): persist valued L1 traces to
+# role_orchestration/experience.jsonl in the run dir at finalization. Off by
+# default; LH_HARNESS_EXPERIENCE=1 overrides in either direction.
+# experience = false
+
 [run.timeouts]
 manager = 300
 gui_executor = 1800
@@ -170,6 +181,23 @@ auditor = 300
 # min_healthy_keys = 2  # healthy Ollama Cloud keys required before kimi launches
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
+
+# MSCE experience levels L2/L3 (Paxton 2026-09-08): instance overrides for the
+# seeded defaults shipped in lh_harness.experience.seed. Read-only knowledge —
+# never a run default, never changes the run flow. Entries APPEND to the
+# built-in L3 environment items; give an entry its own id and set supersedes
+# to replace a seeded item (the seed record is kept, marked superseded_by).
+# [[experience.environment]]
+# id = "l3.host.mynode"
+# kind = "host"              # host | constraint | routing_backend | note
+# summary = "what this host is for"
+# detail = {hostname = "mynode", can_run = ["bash", "docker heads"]}
+#
+# [[experience.environment]]
+# id = "l3.backend.synthetic.packs-4"
+# kind = "routing_backend"
+# summary = "synthetic pack count raised to 4 on 2026-09-12"
+# supersedes = "l3.backend.synthetic"
 """
 
 
@@ -201,9 +229,12 @@ def load_run_defaults(path: str | Path = PROJECT_CONFIG_PATH) -> dict[str, Any]:
         raise ProjectConfigError(f"could not read {source}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ProjectConfigError(f"{source} must contain a TOML table")
-    unknown_root = set(payload) - {"run", "queue"}
+    unknown_root = set(payload) - _TOP_LEVEL_KEYS
     if unknown_root:
         raise ProjectConfigError(f"unknown top-level key(s): {_names(unknown_root)}")
+    experience = payload.get("experience", {})
+    if not isinstance(experience, dict):
+        raise ProjectConfigError("[experience] must be a TOML table")
     run = payload.get("run", {})
     if not isinstance(run, dict):
         raise ProjectConfigError("[run] must be a TOML table")
@@ -318,6 +349,8 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         defaults["allow_auditor_write_mcp"] = _boolean(
             run["allow_auditor_write_mcp"], "run.allow_auditor_write_mcp"
         )
+    if "experience" in run:
+        defaults["experience"] = _boolean(run["experience"], "run.experience")
 
     roles = run.get("roles", {})
     if not isinstance(roles, dict):

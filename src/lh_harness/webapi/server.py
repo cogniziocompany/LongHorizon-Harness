@@ -57,6 +57,7 @@ _WEB_DEFAULT_AUDITOR_MODEL = (
 )
 from .protocol import build_meta
 from .snapshot import _provenance, build_run_summary, build_snapshot
+from .experience_routes import register_experience_api
 
 # Vite builds directly into this directory, so a source checkout and an
 # installed wheel resolve the same path.  It is absent until the frontend is
@@ -962,6 +963,10 @@ def create_app(
         if not request.url.path.startswith("/api/runs/") or not request.url.path.endswith("/snapshot"):
             response.headers.setdefault("Cache-Control", "no-store")
         return response
+
+    # Read-only MSCE experience levels (L1/L2/L3) for the fleet surfaces.
+    # Registration adds no auth surface: the middleware above guards /api/*.
+    register_experience_api(app, registry, runs_root=registry.runs_root)
 
     @app.get("/api/meta")
     def meta(request: Request) -> dict[str, Any]:

@@ -553,6 +553,19 @@ Used by `lh-harness web` and the node Docker image to stream telemetry to
 See [docs/fleet-reporting.md](docs/fleet-reporting.md) for what is pushed,
 endpoint paths, the 8 MB round-content cap, and the privacy note.
 
+##### Experience layer (MSCE Phase 1)
+
+Optional, **off by default**.  When enabled, each finished run appends one
+redacted, valued L1 trace per managed round to
+`role_orchestration/experience.jsonl` inside its own run dir — a deterministic
+terminal reward (goal/process/satisfaction), a per-round reflection weight from
+the independent audit, and Eq. 2 value backfill.  Enable with
+`LH_HARNESS_EXPERIENCE=1` (any truthy value; overrides config either way) or
+`[run] experience = true` in the instance config.  When off, runs are
+byte-identical to a build without the layer.  See
+[docs/experience-layer.md](docs/experience-layer.md) for what is captured, the
+value formula, redaction, and what Phase 1 deliberately excludes.
+
 ### Common CLI options
 
 | Option | Description |

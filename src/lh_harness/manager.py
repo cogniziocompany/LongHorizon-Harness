@@ -1018,6 +1018,48 @@ async def _run_impl(
         post_report(config.runs_root, config.log_dir)
     except Exception:
         logger.exception("fleet report hook failed; dropping telemetry")
+    # MSCE experience layer (Phase 1): persist valued L1 traces beside the
+    # ledger once the final report is durably written. Never-fatal by
+    # contract: gated off by default (off runs stay byte-identical), local
+    # files only (no network, no LLM call), and any capture failure is
+    # recorded as a non-fatal event rather than affecting the finished run.
+    try:
+        from .experience.capture import (
+            experience_enabled,
+            persist_run_experience,
+            run_dir_for_log_dir,
+        )
+
+        if experience_enabled(config):
+            capture_result = persist_run_experience(
+                rounds=rounds,
+                report=final,
+                config=config,
+                run_dir=run_dir_for_log_dir(log_dir),
+            )
+            _append_event(
+                events_path,
+                "experience_captured",
+                {
+                    "run_id": capture_result.run_id,
+                    "rounds_captured": capture_result.rounds_captured,
+                    "records_written": capture_result.written,
+                    "skipped_duplicates": capture_result.skipped_duplicates,
+                    "dropped": capture_result.dropped,
+                    "terminal_reward": capture_result.terminal_reward,
+                    "reward_reason": capture_result.reward_reason,
+                },
+            )
+    except Exception as exc:  # experience capture must never fail a run
+        logger.exception("experience capture failed; run report unaffected")
+        try:
+            _append_event(
+                events_path,
+                "experience_capture_failed",
+                {"error": type(exc).__name__},
+            )
+        except Exception:
+            logger.debug("experience_capture_failed event append failed", exc_info=True)
     emit(
         "run_done",
         status=final["status"],
