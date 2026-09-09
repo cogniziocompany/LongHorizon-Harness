@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Experience layer (MSCE Phase 1).** Optional valued L1 trace persistence:
+  one redacted JSONL record per managed round written to
+  `role_orchestration/experience.jsonl` in the run dir at finalization,
+  carrying a deterministic terminal reward split into goal/process/satisfaction
+  terms (R = 0.45·goal + 0.30·process + 0.25·satisfaction), a per-round
+  reflection weight from the independent audit, and Eq. 2 value backfill
+  (γ = 0.9).  Off by default (`LH_HARNESS_EXPERIENCE=1` or
+  `[run] experience = true`); when off, runs are byte-identical to previous
+  builds.  New package `src/lh_harness/experience/`; documentation in
+  [docs/experience-layer.md](docs/experience-layer.md).
 - **Fleet reporting.** Nodes can now stream live telemetry to
   `fleet.easybutt0n.ai` over a single outbound HTTPS path, so NAT'd hosts are
   visible without any inbound firewall rule.  Enabled only when
