@@ -33,6 +33,7 @@ _ENV_URL = "LH_HARNESS_FLEET_URL"
 _ENV_NODE = "LH_HARNESS_FLEET_NODE"
 _ENV_KEY = "LH_HARNESS_FLEET_KEY"
 _ENV_LABELS = "LH_HARNESS_FLEET_LABELS"
+_ENV_ALL = (_ENV_URL, _ENV_NODE, _ENV_KEY, _ENV_LABELS)
 
 _BATCH_INTERVAL_SECONDS = 2.0
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
@@ -113,7 +114,30 @@ class FleetReporter:
         version: str = "unknown",
         capacity: int = 0,
     ) -> None:
-        self._url = (fleet_url or os.environ.get(_ENV_URL) or "").rstrip("/")
+        env_values = {
+            _ENV_URL: fleet_url or os.environ.get(_ENV_URL),
+            _ENV_NODE: node or os.environ.get(_ENV_NODE),
+            _ENV_KEY: key or os.environ.get(_ENV_KEY),
+            _ENV_LABELS: labels if labels else _parse_labels(os.environ.get(_ENV_LABELS, "")),
+        }
+        # An absent URL disables the reporter entirely; anything short of all
+        # four variables is a misconfiguration that must be LOUD so an
+        # unregistered node can never masquerade as an idle one.  Names only,
+        # never values.
+        self._missing_env = [name for name in _ENV_ALL if not env_values.get(name)]
+        self._configured = not self._missing_env
+        if self._missing_env:
+            logger.warning(
+                "fleet reporter configuration incomplete; missing environment "
+                "variables: %s (this node will NOT register with any fleet; "
+                "set them in the service EnvironmentFile and restart the service)",
+                ", ".join(self._missing_env),
+            )
+        self._url = (env_values[_ENV_URL] or "").rstrip("/")
+        self._ever_succeeded = False
+        self._last_attempt_ok: bool | None = None
+        self._last_attempt_error: str | None = None
+        self._attempt_lock = threading.Lock()
         if not self._url:
             self._enabled = False
             self._node = ""
@@ -155,6 +179,38 @@ class FleetReporter:
     @property
     def labels(self) -> dict[str, str]:
         return dict(self._labels)
+
+    @property
+    def configured(self) -> bool:
+        """True only when all four LH_HARNESS_FLEET_* variables were present and
+        non-empty at construction.  False means this node cannot be registered."""
+        return self._configured
+
+    @property
+    def missing_env(self) -> tuple[str, ...]:
+        """Names of the LH_HARNESS_FLEET_* variables missing at construction."""
+        return tuple(self._missing_env)
+
+    def registration_state(self) -> dict[str, Any]:
+        """Snapshot of registration history for /api/meta exposure.
+
+        ``ever_succeeded`` flips True on the first successful POST and stays
+        True; ``last_ok``/``last_error`` describe the most recent attempt
+        (None before the first attempt completes).
+        """
+        with self._attempt_lock:
+            return {
+                "ever_succeeded": self._ever_succeeded,
+                "last_ok": self._last_attempt_ok,
+                "last_error": self._last_attempt_error,
+            }
+
+    def _record_registration_attempt(self, *, success: bool, error: str | None) -> None:
+        with self._attempt_lock:
+            self._last_attempt_ok = success
+            self._last_attempt_error = error
+            if success:
+                self._ever_succeeded = True
 
     def queue_event(self, envelope: EventEnvelope) -> None:
         """Enqueue one public event.  Never blocks the caller."""
@@ -347,12 +403,14 @@ class FleetReporter:
             try:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     resp.read()
+                self._record_registration_attempt(success=True, error=None)
                 return
             except urllib.error.HTTPError as exc:
                 last_error = exc
                 # 4xx client errors are not retried; payload is malformed or auth failed.
                 if 400 <= exc.code < 500:
                     self._warn_once(f"fleet reporter rejected {endpoint}: HTTP {exc.code}")
+                    self._record_registration_attempt(success=False, error=f"HTTP {exc.code}")
                     return
             except Exception as exc:
                 last_error = exc
@@ -362,6 +420,7 @@ class FleetReporter:
         self._warn_once(
             f"fleet reporter could not POST {endpoint} after {attempt} attempts: {last_error}"
         )
+        self._record_registration_attempt(success=False, error=str(last_error))
 
     def _build_request(
         self,
