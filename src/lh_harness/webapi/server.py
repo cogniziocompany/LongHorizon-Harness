@@ -976,8 +976,14 @@ def create_app(
             dsh_binary=resolve_dsh_binary(),
             opencode_binary=resolve_opencode_binary(),
         )
+        reporter = get_reporter()
+        fleet_state = reporter.registration_state() if reporter is not None else {}
         return build_meta(
             endpoint=endpoint,
+            fleet_configured=bool(reporter is not None and reporter.configured),
+            fleet_ever_succeeded=bool(fleet_state.get("ever_succeeded", False)),
+            fleet_last_ok=fleet_state.get("last_ok"),
+            fleet_last_error=fleet_state.get("last_error"),
             capabilities={
                 "approvals": live_control,
                 "injections": live_control,
