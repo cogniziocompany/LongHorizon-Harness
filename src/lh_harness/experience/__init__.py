@@ -12,6 +12,12 @@ every text field before persistence (MSCE B.11 — the sink is shared), and
 real tool names, error signature, per-role model trio) from the run's own
 artifacts, read-only.
 
+Slice 3 persists the result: ``store`` writes one append-only
+``role_orchestration/experience.jsonl`` inside the run dir (content-hash
+dedupe on (run_id, round_index), size caps), and ``capture`` is the single
+finalization entry point wired into ``manager._run_impl`` — off by default,
+gated by ``LH_HARNESS_EXPERIENCE=1`` or ``[run] experience = true``.
+
 Explicitly out of scope for Phase 1 (``tasks/msce-experience-layer-2026-09-07.md``):
 L2 induction, policy gain, L3 abstraction beyond the seeded defaults,
 skill crystallization, retrieval into prompts, and direct memory-mcp writes.
@@ -23,8 +29,22 @@ is a pure function of data the run already produced.
 from __future__ import annotations
 
 from .backfill import DEFAULT_GAMMA, backfill
+from .capture import (
+    ENV_FLAG,
+    CaptureResult,
+    experience_enabled,
+    persist_run_experience,
+    run_dir_for_log_dir,
+)
 from .redact import REDACTED, SECRET_ENV_VAR_NAMES, redact_text, redact_trace, redact_value
 from .reflection import ALPHA_HIGH, ALPHA_LOW, ALPHA_MID, alpha
+from .store import (
+    EXPERIENCE_FILENAME,
+    StoreStats,
+    append_trace_records,
+    content_hash,
+    experience_ledger_path,
+)
 from .tags import (
     detect_branch,
     error_signature,
@@ -58,28 +78,38 @@ __all__ = [
     "ALPHA_MID",
     "DEFAULT_GAMMA",
     "DEVICE_FIELD_NAMES",
+    "ENV_FLAG",
+    "EXPERIENCE_FILENAME",
     "REDACTED",
     "ROUTE_RATIONALE_MAX_CHARS",
+    "CaptureResult",
     "RewardBreakdown",
     "RewardTerms",
     "RoleTrace",
     "SECRET_ENV_VAR_NAMES",
+    "StoreStats",
     "TraceCaps",
     "TraceUnit",
     "WEIGHT_GOAL",
     "WEIGHT_PROCESS",
     "WEIGHT_SATISFACTION",
     "alpha",
+    "append_trace_records",
     "backfill",
+    "content_hash",
     "detect_branch",
     "error_signature",
+    "experience_enabled",
+    "experience_ledger_path",
     "next_step_tag",
+    "persist_run_experience",
     "redact_text",
     "redact_trace",
     "redact_value",
     "repo_from_owner",
     "reward_breakdown",
     "roles_from_owner",
+    "run_dir_for_log_dir",
     "task_context_id",
     "terminal_reward",
     "tool_names_from_round_dir",

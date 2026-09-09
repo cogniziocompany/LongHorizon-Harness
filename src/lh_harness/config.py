@@ -46,6 +46,7 @@ _RUN_KEYS = {
     "dashboard",
     "dashboard_port",
     "allow_auditor_write_mcp",
+    "experience",
     "roles",
     "timeouts",
 }
@@ -111,6 +112,11 @@ dashboard = true
 # cannot accidentally share or race a fixed listener. Standalone `web` keeps
 # its explicit 8799 default for the operator-facing control plane.
 dashboard_port = 0
+
+# MSCE experience layer (Phase 1): persist valued L1 traces to
+# role_orchestration/experience.jsonl in the run dir at finalization. Off by
+# default; LH_HARNESS_EXPERIENCE=1 overrides in either direction.
+# experience = false
 
 [run.timeouts]
 manager = 300
@@ -318,6 +324,8 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         defaults["allow_auditor_write_mcp"] = _boolean(
             run["allow_auditor_write_mcp"], "run.allow_auditor_write_mcp"
         )
+    if "experience" in run:
+        defaults["experience"] = _boolean(run["experience"], "run.experience")
 
     roles = run.get("roles", {})
     if not isinstance(roles, dict):

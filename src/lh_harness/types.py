@@ -122,6 +122,10 @@ class HarnessConfig:
     auditor_output_chars: int = 24_000
     role_verified_context_chars: int = 60_000
     role_history_chars: int = 100_000
+    # MSCE experience layer (Phase 1): persist valued L1 traces to the run
+    # dir at finalization. OFF by default; [run] experience = true or
+    # LH_HARNESS_EXPERIENCE=1 enables it, and off runs stay byte-identical.
+    experience: bool = False
     # English is the production default; Chinese remains available for
     # OSWorldv2-compatible role prompts and operator-facing control headers.
     prompt_language: PromptLanguage = "en"
