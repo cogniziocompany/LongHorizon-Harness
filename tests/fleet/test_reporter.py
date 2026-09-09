@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import hmac
 import json
+import logging
 import os
 import queue
 import threading
@@ -142,6 +143,76 @@ def test_disabled_when_url_unset(_isolate_reporter):
     reporter.queue_heartbeat([], 0, 0)
     reporter.queue_round_content("r", 1, [], [], None)
     reporter.stop()
+
+
+def test_configured_true_when_all_env_present(_isolate_reporter, caplog):
+    """All four LH_HARNESS_FLEET_* vars set -> configured, silent start."""
+    _setenv("http://127.0.0.1:1", "cfg-node", "cfg-key", "kind=test")
+    with caplog.at_level(logging.WARNING, logger="lh_harness.fleet.reporter"):
+        reporter = get_reporter(reset=True)
+    assert reporter.configured is True
+    assert reporter.missing_env == ()
+    warns = [
+        r for r in caplog.records
+        if r.name == "lh_harness.fleet.reporter" and r.levelno >= logging.WARNING
+    ]
+    assert warns == []
+    state = reporter.registration_state()
+    assert state == {"ever_succeeded": False, "last_ok": None, "last_error": None}
+
+
+def test_configured_false_warns_all_four_when_none_present(_isolate_reporter, caplog):
+    """No LH_HARNESS_FLEET_* vars set -> not configured, WARN names all four."""
+    _setenv(None, None, None, None)
+    with caplog.at_level(logging.WARNING, logger="lh_harness.fleet.reporter"):
+        reporter = get_reporter(reset=True)
+    assert reporter.configured is False
+    assert set(reporter.missing_env) == {
+        "LH_HARNESS_FLEET_URL",
+        "LH_HARNESS_FLEET_NODE",
+        "LH_HARNESS_FLEET_KEY",
+        "LH_HARNESS_FLEET_LABELS",
+    }
+    warns = [
+        r for r in caplog.records
+        if r.name == "lh_harness.fleet.reporter" and r.levelno >= logging.WARNING
+    ]
+    assert len(warns) == 1
+    message = warns[0].getMessage()
+    for name in (
+        "LH_HARNESS_FLEET_URL",
+        "LH_HARNESS_FLEET_NODE",
+        "LH_HARNESS_FLEET_KEY",
+        "LH_HARNESS_FLEET_LABELS",
+    ):
+        assert name in message
+
+
+def test_configured_false_warns_only_missing_when_partial(_isolate_reporter, caplog):
+    """A partial set is a misconfiguration: WARN names exactly the missing vars,
+    and never any configured VALUE (names only, never values)."""
+    _setenv("http://127.0.0.1:1", None, "cfg-secret-key-value", None)
+    with caplog.at_level(logging.WARNING, logger="lh_harness.fleet.reporter"):
+        reporter = get_reporter(reset=True)
+    assert reporter.configured is False
+    assert set(reporter.missing_env) == {
+        "LH_HARNESS_FLEET_NODE",
+        "LH_HARNESS_FLEET_LABELS",
+    }
+    warns = [
+        r for r in caplog.records
+        if r.name == "lh_harness.fleet.reporter" and r.levelno >= logging.WARNING
+    ]
+    assert len(warns) == 1
+    message = warns[0].getMessage()
+    # Only the missing names appear.
+    assert "LH_HARNESS_FLEET_NODE" in message
+    assert "LH_HARNESS_FLEET_LABELS" in message
+    # The present names and every configured value stay out of the log line.
+    assert "LH_HARNESS_FLEET_URL" not in message
+    assert "LH_HARNESS_FLEET_KEY" not in message
+    assert "http://127.0.0.1:1" not in message
+    assert "cfg-secret-key-value" not in message
 
 
 def test_hmac_signature_correct(http_server, _isolate_reporter):
