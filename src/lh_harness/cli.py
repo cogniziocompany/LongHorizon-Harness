@@ -100,6 +100,17 @@ _BUDGET_OPTIONS = (
     ("auditor", 300),
 )
 
+# Context-injection ceilings as (HarnessConfig field, fallback chars, scope).
+# These bound how much prior-round material is re-sent into role prompts every
+# round, so they drive per-run token cost far more than the static instruction
+# blocks do. Fallbacks mirror HarnessConfig's defaults so the flags are
+# behaviour-neutral; see HarnessConfig for the measurements behind them.
+_CONTEXT_CAP_OPTIONS = (
+    ("role_history_chars", 100_000, "auditor-report and harness-feedback history"),
+    ("role_verified_context_chars", 60_000, "verified intermediate context"),
+    ("auditor_output_chars", 24_000, "executor output handed to the auditor"),
+)
+
 
 class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
     """Append each option's default while keeping the epilog's own line breaks."""
@@ -580,6 +591,17 @@ def main(argv: list[str] | None = None) -> int:
             type=_positive_int,
             default=run_default(f"{role}_timeout", timeout),
             help=f"Per-episode timeout in seconds for {scope}.",
+        )
+    for dest, fallback, scope in _CONTEXT_CAP_OPTIONS:
+        run_parser.add_argument(
+            "--" + dest.replace("_", "-"),
+            type=_positive_int,
+            default=run_default(dest, fallback),
+            help=(
+                f"Maximum characters of {scope} re-injected into role prompts "
+                "each round. Lower values cut per-round token cost; set too low "
+                "the manager loses trusted intermediate state."
+            ),
         )
     run_parser.add_argument(
         "--dashboard",
@@ -1652,6 +1674,7 @@ def _run_command(args: argparse.Namespace) -> int:
         log_dir=log_dir,
         runs_root=args.runs_root,
         prompt_language=args.prompt_language,
+        **{dest: getattr(args, dest) for dest, _, _ in _CONTEXT_CAP_OPTIONS},
     )
     env = _build_env(args.env, tmp_dir=str(run_dir / "tmp"))
 

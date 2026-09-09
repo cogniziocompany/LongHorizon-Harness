@@ -119,6 +119,22 @@ class HarnessConfig:
     harness_dir: str = DEFAULT_HARNESS_DIR
     log_dir: str = DEFAULT_LOG_DIR
     runs_root: str = DEFAULT_STATE_ROOT
+    # Context-injection ceilings. These bound how much prior-round material is
+    # re-sent into each role prompt every round, so they set the token cost of a
+    # run far more than the static instruction blocks do (all static role text
+    # together measures ~4.1k tokens). role_history_chars is applied TWICE by
+    # build_role_manager_prompt - once to auditor reports, once to harness
+    # feedback - so the manager's history budget is double this value.
+    #
+    # Measured 2026-09-09 against the previous ceilings (24k/60k/100k): manager
+    # prompts ranged 2,994 -> 149,043 tokens (p50 28,954, p90 80,405), and 19.3%
+    # of manager calls exceeded 64k. The floor is ~3k, so essentially everything
+    # above that was injected history rather than fixed prefix.
+    # Values below are TODAY'S behaviour, deliberately unchanged in this change
+    # so that making them configurable is behaviour-neutral. Lowering them is a
+    # separate, evidenced change: truncation here is a CORRECTNESS risk, not just
+    # a saving - if a lower cap drops an auditor's rejection reason, the manager
+    # repeats the mistake it was told to fix.
     auditor_output_chars: int = 24_000
     role_verified_context_chars: int = 60_000
     role_history_chars: int = 100_000
