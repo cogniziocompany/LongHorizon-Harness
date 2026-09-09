@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[run] experience = true`); when off, runs are byte-identical to previous
   builds.  New package `src/lh_harness/experience/`; documentation in
   [docs/experience-layer.md](docs/experience-layer.md).
+- **Experience read-only API.** The three MSCE levels are viewable by the
+  fleet surfaces through `GET /api/experience/environment` (L3 — the seeded
+  fleet knowledge: hosts, standing constraints, routing backends, with
+  `origin`/`seeded_at`/`source`/`superseded_*` per item),
+  `GET /api/experience/policies` (L2 — empty but addressable, paginated,
+  with the final item schema declared), and
+  `GET /api/experience/runs/<run_id>/traces` (L1 — paginated, redacted
+  again at serve time, read from the run-dir ledger through the same
+  run-boundary checks as every run-scoped route).  Same bearer middleware as
+  the rest of `/api/*`; read-only, no write endpoints.
 - **Fleet reporting.** Nodes can now stream live telemetry to
   `fleet.easybutt0n.ai` over a single outbound HTTPS path, so NAT'd hosts are
   visible without any inbound firewall rule.  Enabled only when

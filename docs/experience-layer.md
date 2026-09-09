@@ -171,3 +171,48 @@ walk away from the terminal round when α < 1, and the terminal round's `value`
 equals the `reward_terms` combination
 `round(0.45 · goal + 0.30 · process + 0.25 · satisfaction, 6)` clamped to
 [-1, 1].
+
+## Read-only API for the fleet surfaces
+
+The two fleet surfaces (the Hydra right-hand panel and the fleet wallboard)
+read the three levels through three read-only GET endpoints, registered with
+the rest of the web API and guarded by the same `/api/*` bearer middleware —
+no `?token=` shortcut, no exception. There are no write endpoints in Phase 1.
+
+```
+GET /api/experience/environment            — L3 for this instance
+GET /api/experience/policies?offset&limit  — L2, paginated
+GET /api/experience/runs/<run_id>/traces?offset&limit
+                                             — L1 for one run, paginated
+```
+
+Response shapes:
+
+- **environment**: `{level: "L3", kind: "environment", count, items}` where
+  each item carries a stable quotable `id`, `level`, `kind` (`host`,
+  `constraint`, `routing_backend` or `note`), `origin` (`seeded` today —
+  L3 is seeded code/config data, and is *learned* later when induction
+  lands), `seeded_at`, `source` (`code` or `config`), `superseded_by` /
+  `superseded_at`, a one-line `summary`, and free-form `detail`.
+- **policies**: `{level: "L2", kind: "policy", schema, total, offset, limit,
+  items}`. The collection is empty until induction; `schema` is the final
+  item shape (`POLICY_ITEM_SCHEMA` in `experience/seed.py`), declared as data
+  so a UI renders against it now instead of reverse-engineering it later.
+  `offset` (default 0) / `limit` (default 50, max 500) page a
+  deterministic id-sorted order.
+- **traces**: `{run_id, level: "L1", kind: "trace", ledger:
+  "role_orchestration/experience.jsonl", captured, total, offset, limit,
+  items}` with `items` in ledger (round) order, read tolerantly (a truncated
+  tail line from a cut finalization is skipped). `captured` is false when the
+  run finished with the layer off. Device fields (`device_id`,
+  `terminal_id`, `hydra_node`) are served exactly as recorded — never
+  re-keyed or truncated — and stay absent for rounds that did no remote
+  execution. The same run-boundary checks as every other run-scoped route
+  apply; unknown or foreign run ids are a 404.
+
+Redaction is a serve-time rule, not just a write-time one: every item of
+every response passes through `redact_value` again before it is returned, so
+the API can never return a value redaction would strip from a trace — even
+from a ledger written by another tool. Hostnames and device ids survive;
+tokens and keys do not (`***REDACTED***`). Serving is strictly read-only: no
+endpoint writes to a run dir, a workspace, or anywhere else.

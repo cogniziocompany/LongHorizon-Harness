@@ -52,6 +52,7 @@ from .store import (
     append_trace_records,
     content_hash,
     experience_ledger_path,
+    read_trace_records,
 )
 from .tags import (
     detect_branch,
@@ -132,6 +133,7 @@ __all__ = [
     "load_seeded_levels",
     "next_step_tag",
     "persist_run_experience",
+    "read_trace_records",
     "redact_text",
     "redact_trace",
     "redact_value",

@@ -79,6 +79,23 @@ def experience_ledger_path(role_dir: str | os.PathLike[str]) -> Path:
     return Path(role_dir) / EXPERIENCE_FILENAME
 
 
+def read_trace_records(
+    path: str | os.PathLike[str],
+    *,
+    max_bytes: int = _SCAN_MAX_BYTES,
+) -> list[dict[str, Any]]:
+    """All parseable records of a trace ledger, in file order (read-only).
+
+    Same defensive posture as the append path: a bounded no-follow read,
+    malformed or truncated tail lines skipped, and a missing or swapped
+    (symlinked) ledger reading as empty. The run-scoped API surface serves L1
+    traces through this; records come back in ledger (round) order exactly as
+    persisted, and are redacted again by the caller before they are served.
+    """
+    _, records, _ = _load_existing(Path(path), max_bytes=max_bytes)
+    return records
+
+
 def content_hash(record: Mapping[str, Any]) -> str:
     """sha256 over the canonical JSON of one record (hash field excluded)."""
     payload = {key: value for key, value in dict(record).items() if key != "content_hash"}
@@ -166,15 +183,30 @@ def _scan_existing(path: Path) -> tuple[int, set[tuple[str, int]], bool]:
     unreadable (zero size, no keys): the subsequent anchored append then also
     fails closed, so a swapped ledger can never be written through.
     """
+    size, records, unterminated = _load_existing(path, max_bytes=_SCAN_MAX_BYTES)
+    keys: set[tuple[str, int]] = set()
+    for record in records:
+        key = dedupe_key(record)
+        if key is not None:
+            keys.add(key)
+    return (size, keys, unterminated)
+
+
+def _load_existing(path: Path, *, max_bytes: int) -> tuple[int, list[dict[str, Any]], bool]:
+    """Bounded no-follow read of the ledger: (size, records, unterminated tail).
+
+    Non-regular or unreadable targets read as empty; a writer cut mid-line
+    leaves a truncated tail record that is skipped, never fatal.
+    """
     fd: int | None = None
     try:
         fd = _open_nofollow(path)
         metadata = os.fstat(fd)
         if not stat_is_regular(metadata):
-            return (0, set(), False)
+            return (0, [], False)
         size = int(metadata.st_size)
         remaining = size + 1
-        bounded = min(remaining, _SCAN_MAX_BYTES)
+        bounded = min(remaining, max_bytes)
         data = bytearray()
         while bounded > 0:
             chunk = os.read(fd, min(bounded, 1024 * 1024))
@@ -183,7 +215,7 @@ def _scan_existing(path: Path) -> tuple[int, set[tuple[str, int]], bool]:
             data.extend(chunk)
             bounded -= len(chunk)
         body = bytes(data)
-        keys: set[tuple[str, int]] = set()
+        records: list[dict[str, Any]] = []
         for raw in body.split(b"\n"):
             raw = raw.strip()
             if not raw:
@@ -194,13 +226,11 @@ def _scan_existing(path: Path) -> tuple[int, set[tuple[str, int]], bool]:
                 # A truncated tail line is skipped, never fatal.
                 continue
             if isinstance(parsed, dict):
-                key = dedupe_key(parsed)
-                if key is not None:
-                    keys.add(key)
+                records.append(parsed)
         unterminated = bool(body) and not body.endswith(b"\n")
-        return (size, keys, unterminated)
+        return (size, records, unterminated)
     except OSError:
-        return (0, set(), False)
+        return (0, [], False)
     finally:
         if fd is not None:
             try:
