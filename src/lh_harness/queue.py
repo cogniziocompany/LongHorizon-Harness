@@ -24,7 +24,12 @@ _QUEUE_DIR = "queue"
 _MAX_QUEUE_ID_CHARS = 128
 _MAX_QUEUE_TASK_CHARS = 100_000
 _MAX_QUEUE_REASON_CHARS = 4_000
+_MAX_QUEUE_DEDUP_CHARS = 256
 _VALID_STATUS = frozenset({"pending", "launched", "done", "failed"})
+# Non-terminal entries are still waiting to be, or being, launched. A dedup key
+# is considered "in use" only while its entry is in one of these states; once an
+# entry reaches ``done``/``failed`` the key is free for a fresh (retry) entry.
+_NON_TERMINAL_STATUS = frozenset({"pending", "launched"})
 _VALID_TRIOS = frozenset({"kimi", "qwen"})
 
 
@@ -71,6 +76,7 @@ class QueueEntry:
     updated_at: float = field(default_factory=time.time)
     launched_at: float | None = None
     last_checked_at: float | None = None
+    dedup_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -100,6 +106,7 @@ class QueueEntry:
             "updated_at",
             "launched_at",
             "last_checked_at",
+            "dedup_key",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -203,6 +210,21 @@ def _validate_base_check(value: Any) -> str:
     return value.strip()
 
 
+def _validate_dedup_key(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError("dedup_key must be a string")
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > _MAX_QUEUE_DEDUP_CHARS:
+        raise ValueError("dedup_key is too long")
+    if "\x00" in text:
+        raise ValueError("dedup_key contains a NUL byte")
+    return text
+
+
 def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
     """Convert a POST /api/queue body into validated launch parameters."""
 
@@ -227,6 +249,7 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "priority": _validate_priority(body.get("priority")),
         "base_check": _validate_base_check(body.get("base_check")),
         "requested_by": _validate_requested_by(body.get("requested_by")),
+        "dedup_key": _validate_dedup_key(body.get("dedup_key")),
     }
 
 
@@ -303,12 +326,44 @@ class QueueStore:
         _atomic_bytes_write(self._path(entry.queue_id), payload.encode("utf-8"))
 
     def create(self, body: dict[str, Any]) -> QueueEntry:
+        """Create a queue entry, de-duplicating by ``dedup_key`` when supplied.
+
+        Idempotent-enqueue semantics: when ``dedup_key`` is a non-empty string
+        and a non-terminal entry (``pending`` or ``launched``) with the same key
+        already exists, that existing entry is returned unchanged instead of
+        creating a second one. Two orchestrators (or a retrying client) asking
+        for the same work therefore resolve to a single entry, and the
+        launcher's ``mark_launched`` pending-guard still ensures that entry is
+        launched at most once. A key is freed once its entry reaches a terminal
+        state (``done``/``failed``), so reusing the key afterwards creates a
+        fresh entry -- a retry. Enqueues without a key behave exactly as before,
+        each minting a unique ``q-<hex>`` id.
+
+        Residual: the lookup is a read-then-write over the entry directory. It
+        removes duplicate enqueues from sequential or retrying callers; a
+        simultaneous cross-process race where two ``create`` calls both miss the
+        lookup before either writes is a narrow window. The full
+        single-orchestrator guarantee against that window is the lease proposed
+        as new work in the migration plan (section 4), not implemented here.
+        """
         params = _normalize_request(body)
+        dedup_key = params.get("dedup_key")
+        if dedup_key:
+            existing = self._find_non_terminal_by_dedup(dedup_key)
+            if existing is not None:
+                return existing
         queue_id = f"q-{uuid.uuid4().hex[:16]}"
         now = _now()
         entry = QueueEntry(queue_id=queue_id, created_at=now, updated_at=now, **params)
         self._write(entry)
         return entry
+
+    def _find_non_terminal_by_dedup(self, dedup_key: str) -> QueueEntry | None:
+        """Return the non-terminal entry currently holding ``dedup_key``, if any."""
+        for entry in self.list():
+            if entry.dedup_key == dedup_key and entry.status in _NON_TERMINAL_STATUS:
+                return entry
+        return None
 
     def list(self) -> list[QueueEntry]:
         entries: list[QueueEntry] = []

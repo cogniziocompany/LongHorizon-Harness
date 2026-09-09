@@ -629,7 +629,11 @@ def _snapshot_for(registry: StateRegistry, state: DashboardState, run_id: str) -
     return result
 
 
-def _maybe_start_fleet_reporter(registry: StateRegistry, supervisor: RunSupervisor | None) -> None:
+def _maybe_start_fleet_reporter(
+    registry: StateRegistry,
+    supervisor: RunSupervisor | None,
+    queue_store: QueueStore | None = None,
+) -> None:
     """Start the fleet reporter when LH_HARNESS_FLEET_URL is configured.
 
     The reporter is a fail-open side-car: if the env var is unset, this function
@@ -655,6 +659,7 @@ def _maybe_start_fleet_reporter(registry: StateRegistry, supervisor: RunSupervis
     def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int]:
         runs: list[dict[str, Any]] = []
         active = 0
+        queue_len = 0
         try:
             for item in registry.run_items():
                 run_id = str(item.get("id") or "")
@@ -666,10 +671,15 @@ def _maybe_start_fleet_reporter(registry: StateRegistry, supervisor: RunSupervis
                 active = sum(
                     1 for p in supervisor._processes.values() if p.poll() is None
                 )
+            # Real queue depth: the non-terminal entries (pending + launched)
+            # the orchestrator still owns, read from the durable QueueStore so
+            # the fleet window sees the actual backlog instead of a placeholder.
+            if queue_store is not None:
+                counts = queue_store.counts()
+                queue_len = counts.get("pending", 0) + counts.get("launched", 0)
         except Exception:
             logger.exception("fleet heartbeat callback failed")
-        # The queue length is not tracked by the supervisor; report 0.
-        return runs, active, active_cap, 0
+        return runs, active, active_cap, queue_len
 
     reporter = get_reporter(version=version, capacity=active_cap)
     if reporter is not None and reporter.enabled:
@@ -900,7 +910,7 @@ def create_app(
     app.state.auth_token = token
     app.state.allowed_origins = origins
     app.state.bind_host = bind_host
-    _maybe_start_fleet_reporter(registry, supervisor)
+    _maybe_start_fleet_reporter(registry, supervisor, queue_store)
     app.state.launcher = launcher
     if supervisor is not None:
         async def _shutdown_owned_workers() -> None:
