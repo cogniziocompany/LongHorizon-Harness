@@ -321,22 +321,68 @@ The work that would actually prevent the round-zero kills — dynamic routing's 
 
 ---
 
-## Appendix A — Pending secondary commits (referenced, not implemented in this commit)
+## Appendix A — Secondary commits (status reconciled with landed work)
 
-These three are the secondary deliverables. They are described here so later rounds implement them as narrow, individually-auditable commits on this branch. None is implemented by this commit.
+These three are the secondary deliverables. They were implemented after the plan
+above landed, as narrow, individually-auditable commits on this branch. Their
+status as of this reconciliation commit is given per item; where a commit landed
+differently from the sketch in earlier rounds, the as-built form is stated and
+the divergence named.
 
 ### A.1 Idempotency key on queue entry creation (with duplicate-rejection tests)
-- Accept an `Idempotency-Key` header on `POST /api/queue` (`server.py:1020`), validate via the existing `_bounded_command_id`, and reject/de-duplicate a duplicate — mirroring `create_run` (`server.py:1180`,`1182`; `supervisor/service.py:403`,`1448`).
-- Touches `queue.py` (collision-safe — task 48 does not touch `queue.py`) and a thin header read in `server.py` (contested with task 48 — pass-through only, no eligibility-gate change).
-- Tests: a duplicate enqueue with the same key is rejected/de-duplicated; distinct keys produce distinct entries; the `mark_launched` pending-guard still prevents re-launch. Hermetic `make test` (loopback `TestClient`, no live calls).
+- **Status (landed).** Done at commit `0de7b2d3`. Landed as an optional
+  `dedup_key` field on `QueueEntry` — the 18th field,
+  `dedup_key: str | None = None`, appended last (`queue.py:79`) — **not** as an
+  `Idempotency-Key` header as originally sketched. `QueueStore.create`
+  (`queue.py:328`) returns the existing non-terminal entry (`pending` or
+  `launched`) for a matching key instead of minting a second `q-<hex>`; the key
+  is freed once its entry reaches `done`/`failed`, so reusing it creates a fresh
+  (retry) entry. Enqueues without a key behave exactly as before. Combined with
+  `mark_launched`'s pending-guard, a dedup'd entry is launched at most once.
+  `webapi/server.py` is untouched: `POST /api/queue` forwards the body straight
+  to `queue_store.create(body)`, so `dedup_key` passes through end-to-end — the
+  "thin header read in `server.py`" sketched in earlier rounds did not happen,
+  which is what kept the change collision-safe with task 48. Tests:
+  `tests/webapi/test_queue_dedup.py` (hermetic, loopback `TestClient`, no live
+  calls). Residual: the lookup is a read-then-write; a simultaneous
+  cross-process race where two `create` calls both miss the lookup is a narrow
+  window, deferred to the lease proposed as new work in §4.2/§4.3, not
+  implemented here.
+- Validation (`_validate_dedup_key`, `queue.py:213`): `None`/empty/whitespace is
+  treated as no key (returns `None`); non-string or `bool` raises `ValueError`;
+  over 256 chars (`_MAX_QUEUE_DEDUP_CHARS`, `queue.py:27`) raises `ValueError`;
+  a NUL byte raises `ValueError`. Non-terminal status set is
+  `_NON_TERMINAL_STATUS` (`queue.py:32`).
 
 ### A.2 Orchestrator liveness signal
-- Launcher writes `runs_root/queue/launcher_heartbeat.json` (timestamp + tick count + lease owner) each tick — additive file write, **not** an edit to the eligibility gate.
-- `_heartbeat` (`server.py:655`–`676`) returns real `queue_len` from `queue_store.counts()` (`queue.py:412`) instead of the hardcoded 0 (`server.py:672`), plus the last-tick timestamp.
-- Touches `server.py` (contested with task 48) — kept to reading the heartbeat file and replacing the `0` literal; declared collision, kept narrow.
+- **Status (landed, partial by design).** The queue-depth half is done at commit
+  `3efb79bd`: the fleet `_heartbeat` in `webapi/server.py` now reports the real
+  non-terminal queue depth — `counts().pending + counts().launched` read from
+  the durable `QueueStore` — instead of the hardcoded `0`, so a stale or dead
+  orchestrator shows up as a frozen or growing depth rather than a constant
+  zero. `_maybe_start_fleet_reporter` gained an optional `queue_store` param
+  (default `None`; prior behaviour preserved when absent); the single call site
+  passes the existing `queue_store`. The launcher last-tick half — writing
+  `runs_root/queue/launcher_heartbeat.json` (timestamp + tick count + lease
+  owner) each tick — is deliberately **deferred** to the plan's future-work items
+  (§4.4), because it requires editing `launcher.py`, which is contested by task
+  48 (`feat/workspace-contention`, PR #8, touches `launcher.py`/`mcp_tools.py`/
+  `server.py`) and task 49; only the unambiguous, `server.py`-only half was
+  delivered. Tests: `tests/webapi/test_fleet_liveness.py` (hermetic, no live
+  calls); full hermetic suite 548 passed / 2 skipped.
 
-### A.3 `docs/queue.md` — the 17-field queue entry contract
-- Extends the existing `docs/queue.md` (which today lists only the 8 enqueue request fields) to enumerate **all 17** `QueueEntry` fields (`queue.py:57`–`73`): `queue_id`, `name`, `task`, `workspace`, `max_rounds`, `trio`, `priority`, `requested_by`, `base_check`, `status`, `run_id`, `reason`, `skip_reasons`, `created_at`, `updated_at`, `launched_at`, `last_checked_at` — each with type, default, validation rule, and who writes it. This is the interface the chat agent codes against.
+### A.3 `docs/queue.md` — the 18-field queue entry contract
+- **Status (landed).** Done at commit `ca4670ca`. The work **extended the
+  pre-existing `docs/queue.md` operator guide append-only (+139/-0)** rather than
+  creating a new file: `docs/queue.md` was already tracked on `origin/main`
+  (from the queue-API work) with an 8-field enqueue-request example, and this
+  commit appended the full entry contract after it with zero deletions. The doc
+  enumerates **all 18** `QueueEntry` fields — `queue_id`, `name`, `task`,
+  `workspace`, `max_rounds`, `trio`, `priority`, `requested_by`, `base_check`,
+  `status`, `run_id`, `reason`, `skip_reasons`, `created_at`, `updated_at`,
+  `launched_at`, `last_checked_at`, `dedup_key` — each with type, default,
+  validation rule, and who writes it, plus a dedicated *Idempotent enqueue
+  (`dedup_key`)* section. This is the interface the chat agent codes against.
 
 ---
 
