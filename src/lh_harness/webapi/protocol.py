@@ -31,6 +31,10 @@ def build_meta(
     mcp_gateway_configured: bool = False,
     mcp_gateway_alias: str | None = None,
     model_discovery: dict[str, dict[str, Any]] | None = None,
+    fleet_configured: bool = False,
+    fleet_ever_succeeded: bool = False,
+    fleet_last_ok: bool | None = None,
+    fleet_last_error: str | None = None,
 ) -> dict[str, Any]:
     """Return the stable handshake payload used by both clients."""
 
@@ -54,6 +58,15 @@ def build_meta(
     if mcp_profiles is not None:
         result["mcp_profiles"] = mcp_profiles
     result["mcp_gateway_configured"] = bool(mcp_gateway_configured)
+    # Fleet registration state, in the same plain-flag style as
+    # mcp_gateway_configured.  ``fleet_configured`` False means this node
+    # cannot register (missing env vars) and must never be read as idle.
+    # ``fleet_last_ok``/``fleet_last_error`` are None until the first
+    # registration POST completes (POSTs are batched on a 2 s worker flush).
+    result["fleet_configured"] = bool(fleet_configured)
+    result["fleet_ever_succeeded"] = bool(fleet_ever_succeeded)
+    result["fleet_last_ok"] = fleet_last_ok
+    result["fleet_last_error"] = fleet_last_error
     if mcp_gateway_alias is not None:
         result["mcp_gateway_alias"] = mcp_gateway_alias
     if model_discovery is not None:
