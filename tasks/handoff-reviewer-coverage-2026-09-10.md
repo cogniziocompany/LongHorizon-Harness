@@ -7,7 +7,7 @@ from notes.
 
 ## The short version
 
-**The only missing artifact is a 65-line workflow file, copied into four repos.** The hard parts —
+**The only missing artifact is a 65-line workflow file, copied into three repos.** The hard parts —
 the OAuth token, its org-wide visibility, the trigger semantics, the two bugs that made earlier
 attempts useless — are already solved and are recorded below so you don't rediscover them.
 
@@ -19,8 +19,8 @@ attempts useless — are already solved and are recorded below so you don't redi
 | `mcp-cognizioware` | present |
 | `cognizioware-powerplatform` | **404 — missing** |
 | `cognizioware-hydra` | **404 — missing** |
-| `LongHorizon-Harness` | **404 — missing** |
-| `cognizioware-qa` | **404 — missing** |
+| `LongHorizon-Harness` | **present** — added 2026-09-10 via PR #15, `7b27032` |
+| `cognizioware-qa` | **404 — missing** — note: default branch is **`master`**, not `main` |
 
 `cognizioware-powerplatform` is the one that matters most: the customer-facing session-flow defects
 (queue task 107, currently at the head of the queue) ship there, and they will merge unreviewed
@@ -73,9 +73,19 @@ Job gate — the reviewer only runs when a **human with write access** types `@c
       ( github.event_name == 'issue_comment' &&
         github.event.issue.pull_request != null &&
         contains(github.event.comment.body, '@claude') &&
-        ( author_association == 'OWNER' || 'MEMBER' || 'COLLABORATOR' ) )
+        ( github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'COLLABORATOR' ) )
       || ( github.event_name == 'pull_request_review_comment' && ...same... )
 ```
+
+> **Spell out every comparison. Do not condense it.** An earlier draft of this document wrote that
+> gate as `author_association == 'OWNER' || 'MEMBER' || 'COLLABORATOR'`. In GitHub Actions
+> expression syntax `||` short-circuits on the first truthy operand, and a non-empty string literal
+> such as `'MEMBER'` **is truthy** — so that condition evaluates to **always true** and silently
+> disables the write-access gate for every commenter, including outside contributors. It looks
+> correct and it reads correctly in English. Copy the real file rather than this snippet.
+> (Caught by the reviewer this document argues for, on its first run, reviewing this document.)
 
 Invocation:
 
@@ -114,22 +124,31 @@ later `@claude` mention on that PR until the runner's 6-hour default fired.
 Since mcp-tools PR #131 the reviewer authenticates with `CLAUDE_CODE_OAUTH_TOKEN` — a **subscription
 OAuth token, not a metered API key.** Each `@claude` spends Paxton's personal Claude quota. That is
 why nobody has bulk-invoked it across the 25-PR backlog, and why review-on-open was not chosen.
-**Adding the workflow to four repos does not itself cost anything** — the cost is per invocation.
+**Adding the workflow to three repos does not itself cost anything** — the cost is per invocation.
 Say this explicitly to whoever asks for review-on-open.
 
 ## Rollout order — lowest blast radius first
 
-1. **`cognizioware-qa`** — gates other lanes, ships nothing itself. Safest place to confirm the copy
-   works end to end: open a throwaway PR, comment `@claude`, watch the run.
-2. **`LongHorizon-Harness`** — active PRs (#7, #8, #10 open) and no deploy fires on push to `main`
-   (its only workflow is `release.yml`, on `push: tags`), so a workflow file lands with no side
-   effects.
+1. **`cognizioware-qa`** — gates other lanes, ships nothing itself. **Its default branch is
+   `master`, not `main`** — target that, or the PR opens against a branch nobody merges. Safest
+   place to confirm the copy works end to end: open a throwaway PR, comment `@claude`, watch the run.
+2. ~~**`LongHorizon-Harness`**~~ — **DONE 2026-09-10**, PR #15, merged as `7b27032`. Read back from
+   `main`: the file is present at 2,491 bytes. The reviewer then fired for real on PR #14 (run
+   `34512622903`, `completed/success` in 2m 45s) and found a genuine security defect in this very
+   document — see the boxed warning above the gate snippet. No deploy fired, as predicted: this
+   repo's only other workflow is `release.yml`, on `push: tags` and `workflow_dispatch`.
 3. **`cognizioware-powerplatform`** — the one that actually matters. Do it once 1 and 2 have each
    produced a real review.
-4. **`cognizioware-hydra`** — **CHECK BEFORE ACTING.** PR **#26** already adds the reviewer to hydra
-   and is deliberately gated behind the BMAD spec process (queue task 116, itself behind task 111)
-   by Paxton's direction. **Do not duplicate it and do not merge it** — coordinate, or you will
-   create a conflicting second workflow.
+4. **`cognizioware-hydra`** — **CHECK BEFORE ACTING, AND IT NEEDS A QUIET WINDOW.** PR **#26**
+   already adds the reviewer to hydra. **Do not duplicate it.** Two separate reasons to hold it,
+   and the second is the bigger one:
+   - It is gated behind Paxton's direction on the BMAD spec process (queue task 116, behind 111).
+   - **Merging it triggers a deploy.** `hydra-ci.yml` carries a `deploy` job on
+     `runs-on: [self-hosted, hydra-host]` fired by `push: [main]`, targeting corsairai300 — and its
+     own line 143 records *"2026-09-08: two deploys wiped the CT110 node seeding"*. **CT110 runs
+     every harness job and sits on that same host.** So this is not a low-risk one-file add like
+     `qa`: it needs a zero-active-runs window, the same treatment a router config change gets.
+     Merging it while a run is live risks the harness itself.
 
 ## How to verify it actually works — do not stop at "the file is there"
 
