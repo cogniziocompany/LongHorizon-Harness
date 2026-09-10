@@ -581,6 +581,26 @@ def main(argv: list[str] | None = None) -> int:
             default=run_default(f"{role}_timeout", timeout),
             help=f"Per-episode timeout in seconds for {scope}.",
         )
+    # Character limit overrides
+    run_parser.add_argument(
+        "--auditor-output-chars",
+        type=_positive_int,
+        default=None,
+        help="Maximum characters for auditor output (default: 24000)",
+    )
+    run_parser.add_argument(
+        "--role-verified-context-chars",
+        type=_positive_int,
+        default=None,
+        help="Maximum characters for role-verified context (default: 60000)",
+    )
+    run_parser.add_argument(
+        "--role-history-chars",
+        type=_positive_int,
+        default=None,
+        help="Maximum characters for role history (default: 100000)",
+    )
+
     run_parser.add_argument(
         "--dashboard",
         action=argparse.BooleanOptionalAction,
@@ -1641,6 +1661,36 @@ def _run_command(args: argparse.Namespace) -> int:
         # each audited episode also carries the list in its metadata.
         print(f"Guard excludes: {', '.join(guard_exclude_paths)}")
 
+    # `.lh-harness/config.toml` is this estate's configuration surface - per
+    # workspace budgets are set through it - so the context-injection ceilings
+    # must resolve from it too. Precedence is
+    #     CLI flag  >  LH_HARNESS_* env  >  config.toml  >  dataclass default
+    # which is why these arrive as CONSTRUCTOR ARGUMENTS: HarnessConfig's
+    # __post_init__ applies any environment override on top of them, and the
+    # explicit CLI flags below (which stay `default=None`, so "operator typed
+    # it" remains distinguishable from "argparse filled it") override both.
+    # `run_default` is nested in the parser builder and is not in scope here,
+    # so the defaults are re-read; a broken project config is not fatal to a
+    # run that never asked for these caps.
+    try:
+        cap_run_defaults = load_run_defaults()
+    except ProjectConfigError:
+        cap_run_defaults = {}
+    context_cap_defaults: dict[str, int] = {}
+    for cap_name in ("auditor_output_chars", "role_verified_context_chars", "role_history_chars"):
+        raw_cap = cap_run_defaults.get(cap_name)
+        if raw_cap is None:
+            continue
+        try:
+            cap_value = int(raw_cap)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            print(f"warning: {PROJECT_CONFIG_PATH} {cap_name}={raw_cap!r} is not an integer; ignoring")
+            continue
+        if cap_value < 1:
+            print(f"warning: {PROJECT_CONFIG_PATH} {cap_name}={raw_cap!r} must be positive; ignoring")
+            continue
+        context_cap_defaults[cap_name] = cap_value
+
     config = HarnessConfig(
         max_total_episodes=max_rounds,
         manager_budget=EpisodeBudget(max_duration_seconds=args.manager_timeout),
@@ -1652,7 +1702,15 @@ def _run_command(args: argparse.Namespace) -> int:
         log_dir=log_dir,
         runs_root=args.runs_root,
         prompt_language=args.prompt_language,
+        **context_cap_defaults,
     )
+    # Override character limits with CLI arguments if provided
+    if args.auditor_output_chars is not None:
+        config.auditor_output_chars = args.auditor_output_chars
+    if args.role_verified_context_chars is not None:
+        config.role_verified_context_chars = args.role_verified_context_chars
+    if args.role_history_chars is not None:
+        config.role_history_chars = args.role_history_chars
     env = _build_env(args.env, tmp_dir=str(run_dir / "tmp"))
 
     # The dashboard starts before agent creation so startup status is visible.

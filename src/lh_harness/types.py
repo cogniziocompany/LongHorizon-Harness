@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 
 def _launch_directory() -> str:
@@ -125,6 +126,46 @@ class HarnessConfig:
     # English is the production default; Chinese remains available for
     # OSWorldv2-compatible role prompts and operator-facing control headers.
     prompt_language: PromptLanguage = "en"
+
+    # Environment overrides for the context-injection ceilings, in
+    # (variable, field) order. Kept as a table so a fourth cap cannot be added
+    # to the dataclass and forgotten here.
+    _ENV_CAP_OVERRIDES: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("LH_HARNESS_AUDITOR_OUTPUT_CHARS", "auditor_output_chars"),
+        ("LH_HARNESS_ROLE_VERIFIED_CONTEXT_CHARS", "role_verified_context_chars"),
+        ("LH_HARNESS_ROLE_HISTORY_CHARS", "role_history_chars"),
+    )
+
+    def __post_init__(self) -> None:
+        # An unparseable or non-positive override keeps the existing value, but
+        # it is WARNED rather than swallowed. A setting that looks like it
+        # applied and silently did not is worse than one that rejects the input:
+        # the operator sees the number they typed in their shell and believes
+        # the run is bounded by it.
+        for env_name, field_name in self._ENV_CAP_OVERRIDES:
+            raw = os.environ.get(env_name)
+            if not raw:
+                continue
+            current = getattr(self, field_name)
+            try:
+                value = int(raw)
+            except ValueError:
+                warnings.warn(
+                    f"{env_name}={raw!r} is not an integer; "
+                    f"keeping {field_name}={current}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+            if value < 1:
+                warnings.warn(
+                    f"{env_name}={raw!r} must be a positive integer; "
+                    f"keeping {field_name}={current}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+            setattr(self, field_name, value)
 
 
 def audit_report_to_dict(report: AuditReport) -> dict[str, Any]:
