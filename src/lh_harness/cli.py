@@ -561,6 +561,26 @@ def main(argv: list[str] | None = None) -> int:
             default=run_default(f"{role}_timeout", timeout),
             help=f"Per-episode timeout in seconds for {scope}.",
         )
+    # Character limit overrides
+    run_parser.add_argument(
+        "--auditor-output-chars",
+        type=_positive_int,
+        default=None,
+        help="Maximum characters for auditor output (default: 24000)",
+    )
+    run_parser.add_argument(
+        "--role-verified-context-chars",
+        type=_positive_int,
+        default=None,
+        help="Maximum characters for role-verified context (default: 60000)",
+    )
+    run_parser.add_argument(
+        "--role-history-chars",
+        type=_positive_int,
+        default=None,
+        help="Maximum characters for role history (default: 100000)",
+    )
+
     run_parser.add_argument(
         "--dashboard",
         action=argparse.BooleanOptionalAction,
@@ -1627,6 +1647,13 @@ def _run_command(args: argparse.Namespace) -> int:
         log_dir=log_dir,
         prompt_language=args.prompt_language,
     )
+    # Override character limits with CLI arguments if provided
+    if args.auditor_output_chars is not None:
+        config.auditor_output_chars = args.auditor_output_chars
+    if args.role_verified_context_chars is not None:
+        config.role_verified_context_chars = args.role_verified_context_chars
+    if args.role_history_chars is not None:
+        config.role_history_chars = args.role_history_chars
     env = _build_env(args.env, tmp_dir=str(run_dir / "tmp"))
 
     # The dashboard starts before agent creation so startup status is visible.

@@ -125,6 +125,26 @@ class HarnessConfig:
     # OSWorldv2-compatible role prompts and operator-facing control headers.
     prompt_language: PromptLanguage = "en"
 
+    def __post_init__(self) -> None:
+        # Override character limits from environment variables if set
+        if auditor_output_env := os.environ.get("LH_HARNESS_AUDITOR_OUTPUT_CHARS"):
+            try:
+                self.auditor_output_chars = int(auditor_output_env)
+            except ValueError:
+                pass  # Keep default if invalid
+
+        if role_verified_context_env := os.environ.get("LH_HARNESS_ROLE_VERIFIED_CONTEXT_CHARS"):
+            try:
+                self.role_verified_context_chars = int(role_verified_context_env)
+            except ValueError:
+                pass  # Keep default if invalid
+
+        if role_history_env := os.environ.get("LH_HARNESS_ROLE_HISTORY_CHARS"):
+            try:
+                self.role_history_chars = int(role_history_env)
+            except ValueError:
+                pass  # Keep default if invalid
+
 
 def audit_report_to_dict(report: AuditReport) -> dict[str, Any]:
     return asdict(report)
