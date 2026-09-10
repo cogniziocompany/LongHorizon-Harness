@@ -1636,6 +1636,36 @@ def _run_command(args: argparse.Namespace) -> int:
         # each audited episode also carries the list in its metadata.
         print(f"Guard excludes: {', '.join(guard_exclude_paths)}")
 
+    # `.lh-harness/config.toml` is this estate's configuration surface - per
+    # workspace budgets are set through it - so the context-injection ceilings
+    # must resolve from it too. Precedence is
+    #     CLI flag  >  LH_HARNESS_* env  >  config.toml  >  dataclass default
+    # which is why these arrive as CONSTRUCTOR ARGUMENTS: HarnessConfig's
+    # __post_init__ applies any environment override on top of them, and the
+    # explicit CLI flags below (which stay `default=None`, so "operator typed
+    # it" remains distinguishable from "argparse filled it") override both.
+    # `run_default` is nested in the parser builder and is not in scope here,
+    # so the defaults are re-read; a broken project config is not fatal to a
+    # run that never asked for these caps.
+    try:
+        cap_run_defaults = load_run_defaults()
+    except ProjectConfigError:
+        cap_run_defaults = {}
+    context_cap_defaults: dict[str, int] = {}
+    for cap_name in ("auditor_output_chars", "role_verified_context_chars", "role_history_chars"):
+        raw_cap = cap_run_defaults.get(cap_name)
+        if raw_cap is None:
+            continue
+        try:
+            cap_value = int(raw_cap)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            print(f"warning: {PROJECT_CONFIG_PATH} {cap_name}={raw_cap!r} is not an integer; ignoring")
+            continue
+        if cap_value < 1:
+            print(f"warning: {PROJECT_CONFIG_PATH} {cap_name}={raw_cap!r} must be positive; ignoring")
+            continue
+        context_cap_defaults[cap_name] = cap_value
+
     config = HarnessConfig(
         max_total_episodes=max_rounds,
         manager_budget=EpisodeBudget(max_duration_seconds=args.manager_timeout),
@@ -1646,6 +1676,7 @@ def _run_command(args: argparse.Namespace) -> int:
         harness_dir=harness_dir,
         log_dir=log_dir,
         prompt_language=args.prompt_language,
+        **context_cap_defaults,
     )
     # Override character limits with CLI arguments if provided
     if args.auditor_output_chars is not None:
