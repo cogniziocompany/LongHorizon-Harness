@@ -62,6 +62,12 @@ export interface StatusViewOptions {
  * it does not expose Argus' mission/DAG/project concepts. The aliases are
  * useful to clients that prefer either noun (`current` or `currentStage`).
  */
+export interface WorkspaceContentionView {
+  contention_id: string;
+  severity: string;
+  peers: { run_id: string; workspace: string; branch: string | null }[];
+}
+
 export interface StatusView {
   runId: string;
   runStatus: string;
@@ -91,6 +97,7 @@ export interface StatusView {
   awaitingHandoff: boolean;
   warnings: string[];
   notices: string[];
+  contention: WorkspaceContentionView | null;
   progress: {
     completed: number;
     total: number;
@@ -102,6 +109,46 @@ const ROLE_KEYS: readonly Exclude<StatusStageKey, 'record'>[] = ['manager', 'exe
 
 const DONE_VALUES = new Set(['done', 'complete', 'completed', 'success', 'succeeded', 'passed', 'ok', 'finished']);
 const ACTIVE_VALUES = new Set(['active', 'running', 'started', 'starting', 'in_progress', 'in-progress', 'processing']);
+const VALID_CONTENTION_TIERS = new Set(['same_repo', 'same_repo_same_branch', 'shared_git_dir', 'same_tree']);
+
+function safeContentionTier(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  return VALID_CONTENTION_TIERS.has(value) ? value : null;
+}
+
+function safeContentionPeers(value: unknown): Array<{ run_id: string; workspace: string; branch: string | null }> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is Record<string, unknown> => item != null && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => ({
+      run_id: typeof item.run_id === 'string' ? item.run_id : String(item.run_id ?? ''),
+      workspace: typeof item.workspace === 'string' ? item.workspace : String(item.workspace ?? ''),
+      branch: item.branch == null ? null : String(item.branch),
+    }));
+}
+
+function latestContentionEvent(snapshot: Snapshot): WorkspaceContentionView | null {
+  // build_snapshot tails the last 200 events, so a very long run may scroll
+  // the notice out of the status panel.  The sidebar badge is the durable
+  // indicator; this panel notice is best-effort from available events.
+  let latest: WorkspaceContentionView | null = null;
+  for (let i = snapshot.events.length - 1; i >= 0; i -= 1) {
+    const event = snapshot.events[i];
+    if (event?.type !== 'fleet.contention.detected') continue;
+    const payload = event.payload;
+    if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) continue;
+    const severity = safeContentionTier(payload.severity);
+    if (severity == null) continue;
+    const rawPeers = Array.isArray(payload.peers) ? payload.peers : payload.members;
+    latest = {
+      contention_id: typeof payload.contention_id === 'string' ? payload.contention_id : String(event.event_id ?? ''),
+      severity,
+      peers: safeContentionPeers(rawPeers),
+    };
+    break;
+  }
+  return latest;
+}
 const WAITING_VALUES = new Set(['waiting', 'waiting_approval', 'waiting-approval', 'approval', 'paused', 'queued']);
 const BLOCKED_VALUES = new Set(['blocked', 'incomplete', 'needs_revision', 'needs-revision', 'invalid']);
 const FAILED_VALUES = new Set(['failed', 'failure', 'error', 'errored', 'timeout', 'timed_out', 'timed-out']);
@@ -574,6 +621,9 @@ export function projectStatus(snapshot: Snapshot, options: StatusViewOptions = {
     ...pendingApprovals.map((item) => item.message).filter(Boolean),
     ...(snapshot.controls.can_resume ? ['This run can be resumed.'] : []),
   ]));
+  // Unlike pendingApprovals, contention is NOT suppressed on terminal runs;
+  // it is marked historical so operators can still see the overlap.
+  const contention = latestContentionEvent(snapshot);
   const next = nextStepInfo(snapshot, current, rounds);
   const progressStages = stages.filter((item) => item.key !== 'record' && item.status !== 'skipped');
   const progressDone = progressStages.filter((item) => item.status === 'done');
@@ -609,6 +659,7 @@ export function projectStatus(snapshot: Snapshot, options: StatusViewOptions = {
     awaitingHandoff,
     warnings,
     notices,
+    contention,
     progress: { completed: progressDone.length, total, ratio },
   };
 }

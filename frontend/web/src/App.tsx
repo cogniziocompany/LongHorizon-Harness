@@ -24,6 +24,7 @@ import {
   Files,
   FlaskConical,
   FolderOpen,
+  GitBranch,
   ListChecks,
   LoaderCircle,
   KeyRound,
@@ -1489,6 +1490,20 @@ function localizedStageStatus(status: string, language: UiLanguage): string {
   return uiText(language, zh, en);
 }
 
+function localizedContention(contention: { severity: string; peers: Array<{ run_id: string; workspace: string }> } | null, language: UiLanguage): { title: string; body: string } | null {
+  if (!contention) return null;
+  const peerText = contention.peers
+    .map((peer) => `${peer.run_id} · ${compactText(peer.workspace, 60)}`)
+    .join(', ');
+  const title = uiText(language, '工作区重叠', 'Workspace overlap');
+  const body = uiText(
+    language,
+    `等级：${contention.severity}。与 ${peerText} 共享树/仓库。`,
+    `Tier: ${contention.severity}. Shared tree/repository with ${peerText}.`,
+  );
+  return { title, body };
+}
+
 function StatusPanel({ view, snapshot, connection, mobileOpen, onMobileClose, onDetails }: { view: StatusView; snapshot: Snapshot; connection: string; mobileOpen: boolean; onMobileClose: () => void; onDetails: () => void }) {
   const { language, text } = useUiLanguage();
   const hasRun = Boolean(view.runId && view.task.trim());
@@ -1536,7 +1551,11 @@ function StatusPanel({ view, snapshot, connection, mobileOpen, onMobileClose, on
     <section className="status-section"><div className="status-section-title"><span>{text('本轮执行链', 'Execution chain')}</span><small>{totalCount ? `${doneCount}/${totalCount}` : '—'}</small></div>{stages.length ? <ol className="status-stage-list">{stages.filter((stage) => stage.key !== 'record').map((stage) => <li className={`status-stage stage-${stage.status}`} key={stage.id}><span className="stage-marker">{stage.status === 'done' ? <Check size={10} /> : stage.status === 'failed' ? <X size={10} /> : stage.status === 'active' || stage.status === 'stopping' ? <LoaderCircle className="trajectory-spinner" size={10} /> : stage.status === 'waiting' ? <CircleDotDashed size={10} /> : stage.status === 'blocked' ? <AlertTriangle size={10} /> : <Circle size={8} />}</span><div><strong>{stage.label}</strong><small>{localizedStageStatus(stage.status, language)}</small></div></li>)}</ol> : <p className="status-empty-copy">{text('暂无轮次结果；任务开始后会在这里显示每个阶段。', 'No round results yet. Each stage will appear here after the task starts.')}</p>}</section>
     <section className="status-section"><div className="status-section-title"><span>{text('下一步', 'Next step')}</span><small>{round ? (view.activeRound !== null ? `R${round.round}` : text(`最近 R${round.round}`, `Latest R${round.round}`)) : '—'}</small></div><div className="status-next-step"><span className="status-next-icon"><ArrowRight size={13} /></span><div><strong>{nextStep}</strong><p>{nextDetail}</p></div></div></section>
     {hasRun && <section className="status-section"><div className="status-section-title"><span>{text('角色输出', 'Role output')}</span><small>{roleItems.length}</small></div><div className="status-role-list">{roleItems.map((role) => <div className="status-role-row" key={role.key}><span className={`role-marker phase-${role.status}`}>{role.key === 'manager' ? 'M' : role.key === 'executor' ? 'E' : 'A'}</span><div className="status-role-copy"><div><strong>{role.label}</strong><span className={`role-status-text phase-${role.status}`}>{roleState(role.status)}</span></div><small><ExpandableText text={localizedRoleSummary(role, language)} lines={2} /></small></div></div>)}</div></section>}
-    {(view.pendingApprovals.length > 0 || view.warnings.length > 0) && <section className="status-section status-notices"><div className="status-section-title"><span>{text('需要关注', 'Needs attention')}</span><small>{view.pendingApprovals.length + view.warnings.length}</small></div>{view.pendingApprovals.length > 0 && <div className="status-notice notice-approval"><span><AlertTriangle size={11} /></span><div><strong>{text('等待你的确认', 'Waiting for your approval')}</strong><small>{text(`${view.pendingApprovals.length} 个审批请求暂停了任务`, `${view.pendingApprovals.length} approval request${view.pendingApprovals.length === 1 ? '' : 's'} paused the task`)}</small></div></div>}{view.warnings.map((warning, index) => <div className="status-notice notice-warning" key={`${warning}-${index}`}><span><AlertTriangle size={11} /></span><div><strong>{text('运行提示', 'Run notice')}</strong><small>{compactText(warning, 180)}</small></div></div>)}</section>}
+    {(view.pendingApprovals.length > 0 || view.warnings.length > 0 || view.contention) && <section className="status-section status-notices"><div className="status-section-title"><span>{text('需要关注', 'Needs attention')}</span><small>{view.pendingApprovals.length + view.warnings.length + (view.contention ? 1 : 0)}</small></div>{view.pendingApprovals.length > 0 && <div className="status-notice notice-approval"><span><AlertTriangle size={11} /></span><div><strong>{text('等待你的确认', 'Waiting for your approval')}</strong><small>{text(`${view.pendingApprovals.length} 个审批请求暂停了任务`, `${view.pendingApprovals.length} approval request${view.pendingApprovals.length === 1 ? '' : 's'} paused the task`)}</small></div></div>}{view.contention && (() => {
+      const localized = localizedContention(view.contention, language);
+      if (!localized) return null;
+      return <div className={`status-notice notice-contention tier-${view.contention.severity}`}><span><GitBranch size={11} /></span><div><strong>{localized.title}</strong><small>{compactText(localized.body, 220)}</small></div></div>;
+    })()}{view.warnings.map((warning, index) => <div className="status-notice notice-warning" key={`${warning}-${index}`}><span><AlertTriangle size={11} /></span><div><strong>{text('运行提示', 'Run notice')}</strong><small>{compactText(warning, 180)}</small></div></div>)}</section>}
     {hasRun && <button className="status-details-link" onClick={onDetails}>{text('查看 artifacts、轨迹与事件', 'View artifacts, trajectory, and events')} <ExternalLink size={13} /></button>}
   </aside>;
 }

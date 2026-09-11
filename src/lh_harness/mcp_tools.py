@@ -15,8 +15,13 @@ this repo) maps the gateway alias ``lhharness`` to those endpoints.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from typing import Any
+
+from .contention import detect_contention, groups_to_json
+from .workspace_identity import resolve_many
 
 # Descriptions exposed to clients and the gateway.  They carry the operating
 # rules: scoped task text, trio usage, and lane policy.
@@ -34,6 +39,9 @@ Rules:
   run (qwen_max=1).
 - production deploys always go through deployment lanes, never through this
   queue tool.
+- second checkouts are permitted and never blocked, but raise a warning naming
+  the peer workspaces; the caller should confirm the sibling tree is not mid-PR
+  on the same branch.
 """
 
 _LIST_QUEUE_DESCRIPTION = """List harness queue entries and their statuses.
@@ -51,6 +59,14 @@ _RESOLVE_GATE_DESCRIPTION = """Resolve an operator gate for a running harness ru
 
 user_input must be plain ASCII. Any non-ASCII character is rejected because
 MCP/chat clients cannot safely transmit formatting bytes through the gateway.
+"""
+
+_LIST_CONTENTIONS_DESCRIPTION = """List current workspace contentions reported by the launcher.
+
+Returns grouped overlaps so AI clients can warn operators before they start
+work in a sibling tree. Second checkouts are permitted and never blocked, but
+raise a warning naming the peers; confirm the sibling tree is not mid-PR on the
+same branch.
 """
 
 
@@ -128,6 +144,11 @@ def tools_manifest() -> list[dict[str, Any]]:
                 "reason": _string_param("Operator reason for the resolution.", required=False),
             },
         ),
+        _tool_spec(
+            "harness_list_contentions",
+            _LIST_CONTENTIONS_DESCRIPTION,
+            {},
+        ),
     ]
 
 
@@ -159,7 +180,21 @@ def dispatch(
         return _run_status(arguments, registry=registry, supervisor=supervisor)
     if tool_name == "harness_resolve_gate":
         return _resolve_gate(arguments, registry=registry, supervisor=supervisor)
+    if tool_name == "harness_list_contentions":
+        return _list_contentions(runs_root=_runs_root(registry, supervisor))
     return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
+
+
+def _runs_root(registry: Any, supervisor: Any) -> str | None:
+    if supervisor is not None:
+        root = getattr(supervisor, "runs_root", None)
+        if root:
+            return str(root)
+    if registry is not None:
+        root = getattr(registry, "runs_root", None)
+        if root:
+            return str(root)
+    return None
 
 
 def _bounded(value: Any, *, field: str, max_chars: int = 4096, required: bool = False) -> str:
@@ -195,7 +230,15 @@ def _enqueue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any]:
         entry = queue_store.create(body)
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "code": 422}
-    return {"ok": True, "queue_id": entry.queue_id, "status": entry.status}
+    result: dict[str, Any] = {"ok": True, "queue_id": entry.queue_id, "status": entry.status}
+    warnings = _contention_warnings(
+        entry.workspace,
+        queue_store,
+        include_pending=True,
+    )
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 def _list_queue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any]:
@@ -207,11 +250,15 @@ def _list_queue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any
     filtered = entries
     if status is not None and status in valid_statuses:
         filtered = [item for item in entries if item.status == status]
-    return {
+    result: dict[str, Any] = {
         "ok": True,
         "entries": [item.to_dict() for item in filtered],
         "counts": queue_store.counts(),
     }
+    contentions = _read_contentions(queue_store.runs_root)
+    if contentions:
+        result["contentions"] = contentions
+    return result
 
 
 def _run_status(arguments: dict[str, Any], *, registry: Any, supervisor: Any) -> dict[str, Any]:
@@ -228,12 +275,140 @@ def _run_status(arguments: dict[str, Any], *, registry: Any, supervisor: Any) ->
         public_owner = {
             key: value for key, value in owner.items() if key not in {"token", "api_key", "auth"}
         }
-    return {
+    result: dict[str, Any] = {
         "ok": True,
         "run_id": run_id,
         "managed": managed_status.get("managed") is not False,
         **managed_status,
         "owner": public_owner,
+    }
+    if supervisor is not None:
+        workspace = public_owner.get("workspace") if isinstance(public_owner, dict) else None
+        if workspace:
+            warnings = _contention_warnings_for_run(run_id, workspace, supervisor)
+            if warnings:
+                result["warnings"] = warnings
+    return result
+
+
+def _list_contentions(*, runs_root: str | None) -> dict[str, Any]:
+    if runs_root is None:
+        return {"ok": False, "error": "contentions require a configured runs root", "code": 501}
+    contentions = _read_contentions(runs_root)
+    return {"ok": True, "contentions": contentions}
+
+
+def _read_contentions(runs_root_value: Any) -> list[dict[str, Any]]:
+    if runs_root_value is None:
+        return []
+    path = __import__("pathlib").Path(runs_root_value) / "queue" / "contention.json"
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("contentions"), list):
+            return data["contentions"]
+    except Exception:
+        pass
+    return []
+
+
+def _contention_warnings(
+    workspace: str,
+    queue_store: Any,
+    *,
+    include_pending: bool,
+) -> list[dict[str, Any]]:
+    """Build warning payloads for a workspace against active runs and queued entries."""
+
+    try:
+        runs_root = queue_store.runs_root
+    except AttributeError:
+        return []
+    return _warnings_for_workspace(workspace, runs_root, include_pending=include_pending)
+
+
+def _contention_warnings_for_run(
+    run_id: str,
+    workspace: str,
+    supervisor: Any,
+) -> list[dict[str, Any]]:
+    try:
+        runs_root = supervisor.runs_root
+    except AttributeError:
+        return []
+    return _warnings_for_workspace(
+        workspace,
+        runs_root,
+        include_pending=False,
+        exclude_run_id=run_id,
+    )
+
+
+def _active_run_workspaces(runs_root: Any, include_pending: bool) -> dict[str, str]:
+    """Collect workspace paths for active runs and optionally pending queue entries."""
+
+    workspaces: dict[str, str] = {}
+    if include_pending:
+        try:
+            from .queue import QueueStore
+
+            store = QueueStore(runs_root)
+            for entry in store.list():
+                if entry.status not in {"pending", "launched"}:
+                    continue
+                if not entry.workspace:
+                    continue
+                workspaces[entry.queue_id] = str(entry.workspace)
+        except Exception:
+            pass
+    return workspaces
+
+
+def _warnings_for_workspace(
+    workspace: str,
+    runs_root: Any,
+    *,
+    include_pending: bool,
+    exclude_run_id: str | None = None,
+) -> list[dict[str, Any]]:
+    workspaces = _active_run_workspaces(runs_root, include_pending=include_pending)
+    if exclude_run_id:
+        workspaces.pop(exclude_run_id, None)
+
+    target = os.path.abspath(workspace)
+    all_paths = sorted(set([*workspaces.values(), target]))
+    identities = resolve_many(all_paths, budget_seconds=2.0)
+    target_identity = identities.get(target) or identities.get(workspace)
+    if target_identity is None:
+        return []
+
+    active_identities: dict[str, Any] = {}
+    for run_id, ws in workspaces.items():
+        if not ws:
+            continue
+        identity = identities.get(ws) or identities.get(os.path.abspath(ws))
+        if identity is not None:
+            active_identities[run_id] = identity
+
+    groups = detect_contention(active_identities, min_emit_severity="same_repo")
+    warnings: list[dict[str, Any]] = []
+    for group in groups:
+        peer_names = [peer.run_id for peer in group.members if peer.run_id != exclude_run_id]
+        if not peer_names:
+            continue
+        warnings.append(_warning_payload(group.severity, peer_names))
+    return warnings
+
+
+def _warning_payload(severity: str, peer_ids: list[str]) -> dict[str, Any]:
+    en = f"Workspace overlaps with {', '.join(peer_ids)} (severity: {severity}). Second checkouts are allowed, but verify the sibling tree is not mid-PR on the same branch."
+    zh = f"工作区与 {', '.join(peer_ids)} 重叠（等级：{severity}）。允许第二个 checkout，但请确认同级树不在同一分支的 PR 中间。"
+    return {
+        "code": "workspace_contention",
+        "severity": severity,
+        "message": en,
+        "message_zh": zh,
+        "detail": {"peer_ids": peer_ids},
     }
 
 
