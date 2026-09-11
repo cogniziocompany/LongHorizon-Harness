@@ -314,6 +314,54 @@ def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> Non
             pass
 
 
+def _atomic_exclusive_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
+    """Create a new regular file atomically, failing if the target exists.
+
+    This is the same anchored, no-follow write as ``_atomic_bytes_write`` but
+    uses ``O_CREAT | O_EXCL`` on the final path instead of ``os.replace``.  It
+    lets reservation protocols detect a concurrent holder rather than
+    unconditionally overwriting it.
+    """
+
+    path = Path(path)
+    parent_fd = _ensure_dir_fd_nofollow(path.parent)
+    fd: int | None = None
+    try:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        nonblock = getattr(os, "O_NONBLOCK", 0)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | cloexec | nofollow | nonblock
+        fd = _open_private_regular_at(parent_fd, path.name, flags, mode=mode)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise OSError("exclusive write target is not an unaliased regular file")
+        try:
+            os.fchmod(fd, mode)
+        except OSError:
+            pass
+        with os.fdopen(fd, "wb") as handle:
+            fd = None
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            pass
+    except FileExistsError:
+        raise
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
+
+
 class RevisionConflict(ValueError):
     """Raised when a command was based on a stale control-bus revision."""
 

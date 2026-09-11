@@ -43,6 +43,18 @@ curl -H "Authorization: Bearer $TOKEN" \
      https://$SERVICE_HOST/api/queue/config
 ```
 
+Then verify the hardened lifecycle behavior:
+- A run with no readable status is reported as `unknown`, not `idle` or empty.
+- Round snapshots expose `executor_claim` and `auditor_findings` as separate
+  namespaces plus a derived `verdict`.
+- `POST /api/runs/{id}/resume {"mode":"continue"}` on a `cancelled` run returns
+  409 until `cancelReasonAck` is supplied.
+- Resume/migration only proceeds after the predecessor worker reaches a terminal
+  status (`completed`, `failed`, `cancelled`, `blocked`, `incomplete`).
+- `POST /api/runs/{id}/resume {"mode":"continue"}` validates the latest round
+  `checkpoint.json` fingerprint; a mismatch or missing checkpoint rejects with
+  409 so the worker cannot restart from a torn ledger.
+
 ## 3. Exact CT110 `config.toml`
 
 Place this file at the project working directory used by the service process, e.g. `/opt/longhorizon-harness/.lh-harness/config.toml`. The queue directory lives under the configured `runs_root`, not next to it.

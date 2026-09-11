@@ -38,13 +38,27 @@ def client(monkeypatch, tmp_path: Path):
     return TestClient(app), supervisor, process
 
 
+# A stopped run ends as ``cancelled`` once the supervisor observes the process
+# exit.  Resuming a cancelled run now requires the operator to acknowledge the
+# cancellation reason, so tests that resume from the stopped-run fixture carry a
+# short acknowledgement note.
+_RESUME_ACK = {"cancelReasonAck": "operator reviewed the stopped run"}
+
+
 def _stopped_run(client: TestClient, process: FakeProcess) -> str:
     created = client.post("/api/runs", json={"task": "long job", "max_rounds": 4})
     assert created.status_code == 200
     run_id = created.json()["run"]["id"]
     assert client.post(f"/api/runs/{run_id}/stop", json={}).status_code == 200
     process.returncode = -15
-    assert client.get(f"/api/runs/{run_id}/snapshot").json()["controls"]["can_resume"] is True
+    # Poll until the supervisor reconciles the stopped process to a terminal
+    # status and the snapshot offers resume.  A single snapshot may still see
+    # the brief ``stopping`` window.
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        snapshot = client.get(f"/api/runs/{run_id}/snapshot").json()
+        if snapshot["controls"]["can_resume"] is True:
+            break
     return run_id
 
 
@@ -53,7 +67,7 @@ def test_resume_defaults_to_continuing_the_same_run(client) -> None:
     run_id = _stopped_run(api, process)
     process.returncode = None
 
-    response = api.post(f"/api/runs/{run_id}/resume", json={})
+    response = api.post(f"/api/runs/{run_id}/resume", json=_RESUME_ACK)
 
     assert response.status_code == 200
     run = response.json()["run"]
@@ -69,7 +83,7 @@ def test_resume_retry_creates_a_new_run(client) -> None:
     run_id = _stopped_run(api, process)
     process.returncode = None
 
-    response = api.post(f"/api/runs/{run_id}/resume", json={"mode": "retry"})
+    response = api.post(f"/api/runs/{run_id}/resume", json={**_RESUME_ACK, "mode": "retry"})
 
     assert response.status_code == 200
     assert response.json()["run"]["id"] != run_id
@@ -81,7 +95,7 @@ def test_resume_accepts_an_extra_round_grant(client) -> None:
     run_id = _stopped_run(api, process)
     process.returncode = None
 
-    response = api.post(f"/api/runs/{run_id}/resume", json={"extra_rounds": 9})
+    response = api.post(f"/api/runs/{run_id}/resume", json={**_RESUME_ACK, "extra_rounds": 9})
 
     assert response.status_code == 200
     assert "--max-rounds=9" in supervisor.owner(run_id)["command"]
@@ -92,7 +106,7 @@ def test_resume_rejects_an_unknown_mode(client, mode: Any) -> None:
     api, _supervisor, process = client
     run_id = _stopped_run(api, process)
 
-    response = api.post(f"/api/runs/{run_id}/resume", json={"mode": mode})
+    response = api.post(f"/api/runs/{run_id}/resume", json={**_RESUME_ACK, "mode": mode})
 
     assert response.status_code == 422
 
@@ -103,7 +117,7 @@ def test_resume_treats_an_absent_mode_as_continue(client, body: dict[str, Any]) 
     run_id = _stopped_run(api, process)
     process.returncode = None
 
-    response = api.post(f"/api/runs/{run_id}/resume", json=body)
+    response = api.post(f"/api/runs/{run_id}/resume", json={**_RESUME_ACK, **body})
 
     assert response.status_code == 200
     assert response.json()["run"]["id"] == run_id
@@ -114,7 +128,7 @@ def test_resume_rejects_an_out_of_range_grant(client, extra: Any) -> None:
     api, _supervisor, process = client
     run_id = _stopped_run(api, process)
 
-    response = api.post(f"/api/runs/{run_id}/resume", json={"extra_rounds": extra})
+    response = api.post(f"/api/runs/{run_id}/resume", json={**_RESUME_ACK, "extra_rounds": extra})
 
     assert response.status_code == 422
     assert "extra_rounds" in response.json()["detail"]
@@ -126,8 +140,8 @@ def test_resume_replays_a_repeated_idempotency_key(client) -> None:
     process.returncode = None
     headers = {"Idempotency-Key": "resume-once"}
 
-    first = api.post(f"/api/runs/{run_id}/resume", json={}, headers=headers)
-    second = api.post(f"/api/runs/{run_id}/resume", json={}, headers=headers)
+    first = api.post(f"/api/runs/{run_id}/resume", json=_RESUME_ACK, headers=headers)
+    second = api.post(f"/api/runs/{run_id}/resume", json=_RESUME_ACK, headers=headers)
 
     assert first.status_code == second.status_code == 200
     assert second.json()["run"]["owner"]["resume_epoch"] == 1, "a replay must not bump the epoch"
@@ -139,10 +153,10 @@ def test_resume_conflicts_when_a_key_is_reused_for_another_request(client) -> No
     process.returncode = None
     headers = {"Idempotency-Key": "shared"}
 
-    assert api.post(f"/api/runs/{run_id}/resume", json={}, headers=headers).status_code == 200
+    assert api.post(f"/api/runs/{run_id}/resume", json=_RESUME_ACK, headers=headers).status_code == 200
     conflict = api.post(
         f"/api/runs/{run_id}/resume",
-        json={"extra_rounds": 3},
+        json={**_RESUME_ACK, "extra_rounds": 3},
         headers=headers,
     )
 
@@ -154,7 +168,7 @@ def test_a_resumed_run_can_be_stopped_again_over_http(client) -> None:
     run_id = _stopped_run(api, process)
     process.returncode = None
 
-    assert api.post(f"/api/runs/{run_id}/resume", json={}).status_code == 200
+    assert api.post(f"/api/runs/{run_id}/resume", json=_RESUME_ACK).status_code == 200
     stopped = api.post(f"/api/runs/{run_id}/stop", json={})
 
     assert stopped.status_code == 200
@@ -196,7 +210,7 @@ def test_the_snapshot_exposes_the_resume_generation(client) -> None:
     assert "resume_epoch" not in api.get(f"/api/runs/{run_id}/snapshot").json()["run"]
 
     process.returncode = None
-    assert api.post(f"/api/runs/{run_id}/resume", json={}).status_code == 200
+    assert api.post(f"/api/runs/{run_id}/resume", json=_RESUME_ACK).status_code == 200
     snapshot = api.get(f"/api/runs/{run_id}/snapshot").json()
 
     assert snapshot["run"]["resume_epoch"] == 1

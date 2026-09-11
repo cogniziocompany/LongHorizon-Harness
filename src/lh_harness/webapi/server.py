@@ -1198,7 +1198,10 @@ def create_app(
         except IdempotencyConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (TypeError, ValueError, OSError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            detail = str(exc)
+            if isinstance(exc, ValueError) and "reserved by another launch" in detail:
+                raise HTTPException(status_code=409, detail=detail) from exc
+            raise HTTPException(status_code=400, detail=detail) from exc
         if isinstance(created.get("owner"), dict):
             created = {**created, "owner": _public_owner(created["owner"])}
         return {"ok": True, "run": created}
@@ -1589,7 +1592,36 @@ def create_app(
         mode = _body_text(body.get("mode", "continue"), field="mode", max_chars=16) or "continue"
         if mode not in {"continue", "retry"}:
             raise HTTPException(status_code=422, detail="mode must be continue or retry")
+        # Cancelled runs may only be resumed after the operator explicitly
+        # acknowledges the cancellation reason.  The acknowledgement is supplied as
+        # a short operator note so it can be recorded in the run history.
+        cancel_reason_ack = _body_text(
+            body.get("cancelReasonAck") or body.get("cancel_reason_ack"),
+            field="cancelReasonAck",
+            max_chars=10_000,
+        )
         try:
+            run_status = canonical_lifecycle_status(supervisor.status(run_id).get("status"))
+            if run_status == "cancelled":
+                if not cancel_reason_ack:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="cancelled run requires a cancelReasonAck note to resume",
+                    )
+                try:
+                    bus = supervisor._bus(run_id)
+                    bus.append(
+                        "resume",
+                        {
+                            "mode": mode,
+                            "cancel_reason_ack": cancel_reason_ack,
+                            "acknowledged_at": time.time(),
+                        },
+                        created_by="web",
+                        command_id="resume-cancel-ack",
+                    )
+                except Exception:
+                    pass
             created = supervisor.resume(
                 run_id,
                 mode=mode,

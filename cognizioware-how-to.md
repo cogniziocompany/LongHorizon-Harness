@@ -45,11 +45,39 @@ device agent installs/restarts it on fleet devices (`harness_install` /
 `harness_restart`) and proxies `/api/*` over its outbound WS (`harness_http`)
 — no harness port is ever exposed on the network. Windows devices run it via
 Docker Desktop/WSL2, which is what makes Windows a supported placement.
+
+Build command (run from repo root):
+
+```bash
+docker build -f docker/Dockerfile -t lh-harness-node:latest .
+```
+
+The `Dockerfile` installs the harness from the repo checkout via `pip install`
+so the image is a snapshot of the tree at build time. The entrypoint
+materializes a fleet-default `config.toml` from the harness's own
+`CONFIG_TEMPLATE` (never inventing keys) and then serves the web control plane
+with the bearer token from `LH_HARNESS_WEB_TOKEN`.
+
 Fleet orchestration (placement, migration, offload, aggregated monitoring)
 lives in Hydra's `/fleet/*` REST + `/fleet-mcp` MCP (alias `hydrafleet`,
 access group `fleet-runners`); CT110 stays registered as the `external`
 primary + fallback node. See `docker/README.md` and
 `tasks/TEMPLATE-overseer-hierarchy.md` §Addressing.
+
+Operational notes for Docker nodes:
+- `POST /api/runs/{id}/resume {"mode":"continue"}` now requires
+  `cancelReasonAck` when the run is `cancelled`. Supply a short operator note
+  acknowledging the cancellation reason, e.g.:
+  `{"mode":"continue","cancelReasonAck":"operator reviewed"}`.
+- Run inventory that cannot be read is reported as `unknown` rather than
+  `idle`; `unknown` is non-terminal and never treated as a zero-state.
+- Migration/successor creation waits until the predecessor worker reaches a
+  terminal lifecycle status (`completed`, `failed`, `cancelled`, `blocked`,
+  `incomplete`). Do not assume the manager `report.json` alone is enough.
+- Each recorded round writes a `checkpoint.json` with a SHA-256 fingerprint.
+  `POST /api/runs/{id}/resume {"mode":"continue"}` validates the latest
+  checkpoint before relaunching the worker; a missing or mismatched fingerprint
+  rejects the resume with 409.
 
 ## 3. Our modifications on top of upstream
 
