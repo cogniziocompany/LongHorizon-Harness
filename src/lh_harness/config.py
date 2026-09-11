@@ -57,6 +57,10 @@ _QUEUE_CAPACITY_KEYS = {
     "key_health_url",
     "poll_seconds",
 }
+_QUEUE_BACKEND_KEYS = {
+    "queue_backend",
+    "database_url",
+}
 _STRING_KEYS = {
     "model",
     "runs_root",
@@ -170,6 +174,10 @@ auditor = 300
 # min_healthy_keys = 2  # healthy Ollama Cloud keys required before kimi launches
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
+
+# Queue backend selection: "file" (default) or "postgres"
+# queue_backend = "file"
+# database_url = "postgresql://user:password@host:port/database"
 """
 
 
@@ -271,7 +279,26 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["key_health_url"] = capacity["key_health_url"].strip()
     if isinstance(capacity.get("poll_seconds"), (int, float)):
         normalized_capacity["poll_seconds"] = max(1.0, float(capacity["poll_seconds"]))
-    return {"trios": normalized_trios, "capacity": normalized_capacity}
+
+    # Handle queue backend configuration
+    backend_config = queue.get("backend", {})
+    if not isinstance(backend_config, dict):
+        raise ProjectConfigError("[queue.backend] must be a TOML table")
+    unknown_backend = set(backend_config) - _QUEUE_BACKEND_KEYS
+    if unknown_backend:
+        raise ProjectConfigError(
+            f"unknown [queue.backend] key(s): {_names(unknown_backend)}"
+        )
+    normalized_backend: dict[str, Any] = {
+        "queue_backend": "file",
+        "database_url": "",
+    }
+    if isinstance(backend_config.get("queue_backend"), str):
+        normalized_backend["queue_backend"] = backend_config["queue_backend"].strip()
+    if isinstance(backend_config.get("database_url"), str):
+        normalized_backend["database_url"] = backend_config["database_url"].strip()
+
+    return {"trios": normalized_trios, "capacity": normalized_capacity, "backend": normalized_backend}
 
 
 def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:

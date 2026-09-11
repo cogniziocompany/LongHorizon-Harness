@@ -25,10 +25,10 @@ _MAX_QUEUE_ID_CHARS = 128
 _MAX_QUEUE_TASK_CHARS = 100_000
 _MAX_QUEUE_REASON_CHARS = 4_000
 _MAX_QUEUE_DEDUP_CHARS = 256
-_VALID_STATUS = frozenset({"pending", "launched", "done", "failed"})
+_VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked"})
 # Non-terminal entries are still waiting to be, or being, launched. A dedup key
 # is considered "in use" only while its entry is in one of these states; once an
-# entry reaches ``done``/``failed`` the key is free for a fresh (retry) entry.
+# entry reaches ``done``/``failed``/``blocked`` the key is free for a fresh (retry) entry.
 _NON_TERMINAL_STATUS = frozenset({"pending", "launched"})
 _VALID_TRIOS = frozenset({"kimi", "qwen"})
 
@@ -462,6 +462,17 @@ class QueueStore:
         if entry.status != "pending":
             return None
         entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
+        return self.update(entry)
+
+    def unblock(self, queue_id: str) -> QueueEntry | None:
+        """Move a blocked entry back to pending for retry.
+        """
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if entry.status != "blocked":
+            raise ValueError("entry is not blocked")
+        entry.status = "pending"
         return self.update(entry)
 
     def counts(self) -> dict[str, int]:

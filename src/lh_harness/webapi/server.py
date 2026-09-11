@@ -866,9 +866,6 @@ def create_app(
     origins = {str(item).rstrip("/") for item in (allowed_origins or ()) if str(item).strip()}
     queue_store: QueueStore | None = None
     if runs_root is not None:
-        queue_store = QueueStore(runs_root)
-    queue_config = default_queue_config()
-    if queue_store is not None:
         try:
             from ..config import PROJECT_CONFIG_PATH, load_run_defaults
 
@@ -876,10 +873,32 @@ def create_app(
             # current working directory so existing deployments keep working.
             config_path = _runs_root_config_path(runs_root) or PROJECT_CONFIG_PATH
             project = load_run_defaults(config_path)
+            queue_config = default_queue_config()
             if isinstance(project.get("queue"), dict):
                 queue_config = queue_config_from_config(project)
         except Exception:
             pass
+
+        # Determine which queue store to use based on configuration
+        queue_backend = queue_config.get("backend", {}).get("queue_backend", "file")
+        if queue_backend == "postgres":
+            database_url = queue_config.get("backend", {}).get("database_url", "")
+            if database_url:
+                try:
+                    from ..pg_queue import PgQueueStore
+                    queue_store = PgQueueStore(runs_root, database_url)
+                except ImportError:
+                    # Fall back to file store if psycopg2 is not available
+                    queue_store = QueueStore(runs_root)
+            else:
+                # No database URL provided, fall back to file store
+                queue_store = QueueStore(runs_root)
+        else:
+            # Default to file store
+            queue_store = QueueStore(runs_root)
+    else:
+        queue_config = default_queue_config()
+
     launcher: Launcher | None = None
     if supervisor is not None and queue_store is not None:
         launcher = Launcher(supervisor, queue_store, queue_config=queue_config)
@@ -1050,7 +1069,7 @@ def create_app(
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
         entries = queue_store.list()
-        valid_statuses = {"pending", "launched", "done", "failed"}
+        valid_statuses = {"pending", "launched", "done", "failed", "blocked"}
         filtered = entries
         if status is not None:
             if status not in valid_statuses:
@@ -1061,6 +1080,7 @@ def create_app(
             "launched": [],
             "done": [],
             "failed": [],
+            "blocked": [],
         }
         for item in entries:
             groups[item.status].append(item.to_dict())
