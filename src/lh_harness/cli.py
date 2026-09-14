@@ -389,6 +389,20 @@ def _fallback_hint(role: str, suffix: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Root logging is configured nowhere else today, so only WARNING+ reached
+    # stderr via the handler of last resort. Configure it once: level from
+    # LH_HARNESS_LOG_LEVEL (default INFO), then ship to Seq when SEQ_URL is
+    # set - a no-op otherwise, exactly like the fleet reporter.
+    import logging
+
+    from .seq_logging import _parse_min_level, install_seq_logging
+
+    logging.basicConfig(
+        level=_parse_min_level(os.environ.get("LH_HARNESS_LOG_LEVEL")),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    install_seq_logging()
+
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     run_defaults: dict[str, object] = {}
     config_error: ProjectConfigError | None = None
