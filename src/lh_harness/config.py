@@ -221,6 +221,14 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     unknown_trios = set(trios) - _QUEUE_TRIOS
     if unknown_trios:
         raise ProjectConfigError(f"unknown queue trio(s): {_names(unknown_trios)}")
+
+    # ``backend`` selects the storage engine. The file store is the default and
+    # stays hermetic; only ``postgres`` reaches PgQueueStore.
+    backend = str(queue.get("backend", "file")).strip().lower()
+    if backend not in {"file", "postgres"}:
+        raise ProjectConfigError(f"unknown [queue.backend]: {backend!r}")
+    normalized_backend = backend
+
     normalized_trios: dict[str, dict[str, Any]] = {}
     for name, spec in trios.items():
         if not isinstance(spec, dict):
@@ -271,7 +279,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["key_health_url"] = capacity["key_health_url"].strip()
     if isinstance(capacity.get("poll_seconds"), (int, float)):
         normalized_capacity["poll_seconds"] = max(1.0, float(capacity["poll_seconds"]))
-    return {"trios": normalized_trios, "capacity": normalized_capacity}
+    return {"trios": normalized_trios, "capacity": normalized_capacity, "backend": normalized_backend}
 
 
 def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:

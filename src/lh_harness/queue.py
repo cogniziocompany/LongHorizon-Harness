@@ -20,17 +20,50 @@ from typing import Any
 from .supervisor.control_bus import _atomic_bytes_write
 from .types import DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 
+try:  # Imported lazily so PgQueueStore is optional for the file store.
+    from .pg_queue import PgQueueStore  # noqa: F401
+except Exception:  # pragma: no cover - driver or schema missing
+    PgQueueStore = None  # type: ignore[assignment]
+
 _QUEUE_DIR = "queue"
 _MAX_QUEUE_ID_CHARS = 128
 _MAX_QUEUE_TASK_CHARS = 100_000
 _MAX_QUEUE_REASON_CHARS = 4_000
 _MAX_QUEUE_DEDUP_CHARS = 256
-_VALID_STATUS = frozenset({"pending", "launched", "done", "failed"})
-# Non-terminal entries are still waiting to be, or being, launched. A dedup key
-# is considered "in use" only while its entry is in one of these states; once an
-# entry reaches ``done``/``failed`` the key is free for a fresh (retry) entry.
-_NON_TERMINAL_STATUS = frozenset({"pending", "launched"})
+# ``blocked`` is the PC queue's fifth state: an entry is parked while it waits on
+# something outside the launcher (a missing dependency, a gate, a resource). It
+# is a non-terminal state -- a blocked entry is still parked work, so its dedup
+# key stays "in use" and a fresh enqueue with the same key does not fork a second
+# entry. It resumes through ``blocked`` -> ``pending`` (record_unblock) or
+# ``blocked`` -> ``launched`` (mark_launched).
+_VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked"})
+# Non-terminal entries are still waiting to be, or being, launched, or parked. A
+# dedup key is considered "in use" only while its entry is in one of these states;
+# once an entry reaches a terminal state (``done``/``failed``) the key is free for
+# a fresh (retry) entry.
+_NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
 _VALID_TRIOS = frozenset({"kimi", "qwen"})
+
+# Allowed queue-entry state transitions. Keyed by (from, to); the value is the
+# operation that performs the move. Read-only edges ("update (record_...)") are
+# not a first-class QueueStore method: they are applied by the launcher by
+# mutating the entry's status and calling ``update``. The terminal edges (done,
+# failed) have no outgoing edge -- a terminal entry cannot leave its state.
+_QUEUE_TRANSITIONS: dict[tuple[str, str], str] = {
+    ("pending", "launched"): "mark_launched",
+    ("pending", "done"): "mark_done",
+    ("pending", "failed"): "mark_failed",
+    ("pending", "blocked"): "update (record_block)",
+    ("launched", "done"): "mark_done",
+    ("launched", "failed"): "mark_failed",
+    ("blocked", "pending"): "update (record_unblock)",
+    ("blocked", "launched"): "mark_launched",
+}
+
+
+def _valid_transition(from_status: str, to_status: str) -> bool:
+    """Return True if ``from_status`` -> ``to_status`` is an allowed transition."""
+    return (from_status, to_status) in _QUEUE_TRANSITIONS
 
 
 def _safe_queue_id(value: str) -> bool:
@@ -49,6 +82,33 @@ def _queue_dir(runs_root: str | Path) -> Path:
     path = Path(runs_root).expanduser().resolve() / _QUEUE_DIR
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _select_queue_store(
+    runs_root: str | Path | None, project: dict[str, Any] | None
+) -> QueueStore | PgQueueStore | None:
+    """Pick the queue store backend.
+
+    The file store is the default and stays hermetic. Only ``queue_backend="postgres"``
+    plus a ``database_url`` in the project config reaches ``PgQueueStore``; every
+    other configuration (including no config at all) yields the file-backed store.
+    """
+    if runs_root is None:
+        return None
+    if project is None:
+        return QueueStore(runs_root)
+    queue = project.get("queue", {})
+    if not isinstance(queue, dict):
+        return QueueStore(runs_root)
+    backend = str(queue.get("backend", "file")).strip().lower()
+    if backend not in {"file", "postgres"}:
+        raise ValueError(f"unknown queue backend: {backend!r}")
+    if backend != "postgres":
+        return QueueStore(runs_root)
+    database_url = str(queue.get("database_url", "")).strip()
+    if not database_url:
+        raise ValueError("queue_backend=postgres requires queue.database_url")
+    return PgQueueStore(database_url)
 
 
 def _queue_path(runs_root: str | Path, queue_id: str) -> Path:
