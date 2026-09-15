@@ -205,7 +205,7 @@ def _list_queue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any
     entries = queue_store.list()
     # The status set is canonical in queue.py; "blocked" is a fifth, non-terminal
     # queue state (the PC queue's parked state) surfaced here as its own group.
-    from ..queue import _VALID_STATUS
+    from .queue import _VALID_STATUS
 
     valid_statuses = set(_VALID_STATUS)
     filtered = entries
