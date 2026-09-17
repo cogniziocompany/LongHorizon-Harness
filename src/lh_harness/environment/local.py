@@ -99,12 +99,33 @@ class LocalEnvironment:
         command: str,
         timeout: int = 30,
         tee_path: str | None = None,
+        no_output_stall_seconds: int | float | None = None,
     ) -> ExecResult:
+        """Run ``command``, enforcing both a total budget and a stall watchdog.
+
+        ``no_output_stall_seconds`` is the stalled-episode detector: if the
+        child produces NO stdout or stderr bytes for that long, it is killed
+        immediately and the result carries ``termination_reason="stall"``.
+        The 09-16 fleet evidence (six 3600 s executor timeouts with empty
+        runtime_signals interleaved with 76 s completions on the same
+        workspace/role) shows a hung agent CLI is SILENT, while a working one
+        emits stream-json records continuously.  Wall-clock slowness is
+        therefore distinguished from a hang by OUTPUT PROGRESS, not duration:
+        a slow episode keeps the watchdog fed, a hung one trips it.  ``None``
+        (the default) disables the watchdog so non-agent callers keep the old
+        semantics.
+        """
         start = time.monotonic()
         proc = None
         io_task: asyncio.Task[None] | None = None
         stdout_chunks = bytearray()
         stderr_chunks = bytearray()
+        # The watchdog and the reader cooperate through this event: every
+        # consumed byte sets it, which resets the watchdog's silent window.
+        stall_event: asyncio.Event | None = (
+            asyncio.Event() if no_output_stall_seconds is not None else None
+        )
+        stall_fired = False
         try:
             # The Web bearer token protects the supervisor control plane.  An
             # embedded ``run --dashboard`` executes agent CLIs directly from
@@ -137,9 +158,57 @@ class LocalEnvironment:
                     tee_path,
                     stdout_chunks,
                     stderr_chunks,
+                    stall_event=stall_event,
                 )
             )
-            await asyncio.wait_for(asyncio.shield(io_task), timeout=timeout)
+
+            async def _stall_watchdog() -> None:
+                """Kill the child after a silent window; report 'stall'."""
+                nonlocal stall_fired
+                assert stall_event is not None
+                while True:
+                    stall_event.clear()
+                    try:
+                        await asyncio.wait_for(
+                            stall_event.wait(), timeout=no_output_stall_seconds
+                        )
+                    except asyncio.TimeoutError:
+                        stall_fired = True
+                        await self._terminate(proc)
+                        return
+                    # Output arrived; arm the next silent window.
+
+            watchdog_task = (
+                asyncio.create_task(_stall_watchdog())
+                if stall_event is not None
+                else None
+            )
+            try:
+                await asyncio.wait_for(asyncio.shield(io_task), timeout=timeout)
+            finally:
+                if watchdog_task is not None:
+                    watchdog_task.cancel()
+                    with contextlib.suppress(
+                        asyncio.CancelledError, asyncio.TimeoutError
+                    ):
+                        await asyncio.wait_for(watchdog_task, timeout=5)
+            if stall_fired:
+                # The watchdog killed the child; _communicate_streaming saw EOF
+                # and is draining the tail.  Collect it before reporting.
+                await self._finish_io(io_task)
+                captured_stderr = bytes(stderr_chunks).decode("utf-8", errors="replace")
+                stall_seconds = float(no_output_stall_seconds or 0)
+                stall_message = (
+                    f"Stalled execution detected: no output for {stall_seconds:g}s "
+                    f"(termination_reason=stall)"
+                )
+                return ExecResult(
+                    stdout=bytes(stdout_chunks).decode("utf-8", errors="replace"),
+                    stderr=(captured_stderr + "\n" + stall_message).lstrip("\n"),
+                    exit_code=proc.returncode if proc.returncode is not None else -1,
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                    termination_reason="stall",
+                )
             return ExecResult(
                 stdout=bytes(stdout_chunks).decode("utf-8", errors="replace"),
                 stderr=bytes(stderr_chunks).decode("utf-8", errors="replace"),
@@ -200,6 +269,7 @@ class LocalEnvironment:
         tee_path: str | None,
         stdout_chunks: bytearray,
         stderr_chunks: bytearray,
+        stall_event: asyncio.Event | None = None,
     ) -> None:
         """Drain both streams while optionally teeing stdout to a live file.
 
@@ -207,6 +277,11 @@ class LocalEnvironment:
         reader (the dashboard) sees the agent's stream-json trajectory grow
         live. The caller owns the chunk lists, so partial output survives even
         when the wait is interrupted by timeout or cancellation.
+
+        Every byte consumed on either stream sets ``stall_event`` (when the
+        caller supplied one), feeding the exec() stall watchdog: output
+        progress is the liveness signal that separates a slowly-working agent
+        from a hung one.
         """
         path = Path(tee_path) if tee_path else None
 
@@ -228,6 +303,8 @@ class LocalEnvironment:
                     line = await proc.stdout.readline()
                     if not line:
                         break
+                    if stall_event is not None:
+                        stall_event.set()
                     _append_bounded_tail(stdout_chunks, line, _MAX_STDOUT_CAPTURE_BYTES)
                     if fh is not None:
                         try:
@@ -263,6 +340,8 @@ class LocalEnvironment:
                 chunk = await proc.stderr.read(64 * 1024)
                 if not chunk:
                     return
+                if stall_event is not None:
+                    stall_event.set()
                 _append_bounded_tail(stderr_chunks, chunk, _MAX_STDERR_CAPTURE_BYTES)
 
         await asyncio.gather(_read_stdout(), _read_stderr(), proc.wait())

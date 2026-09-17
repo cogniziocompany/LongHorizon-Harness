@@ -30,6 +30,19 @@ _VALID_STATUS = frozenset({"pending", "launched", "done", "failed"})
 # is considered "in use" only while its entry is in one of these states; once an
 # entry reaches ``done``/``failed`` the key is free for a fresh (retry) entry.
 _NON_TERMINAL_STATUS = frozenset({"pending", "launched"})
+
+# Transition table: {from_status: {to_status: set}, ...}
+# A pending entry can fail directly when its launch attempt raises (the
+# launcher marks the never-launched entry failed before creating a successor).
+# "failed -> pending" happens only through requeue creating a *new* successor;
+# it is listed so `record_skip`-style helpers accept failed entries and so the
+# table documents the only path back to pending.
+_VALID_TRANSITIONS = {
+    "pending": {"launched", "failed"},
+    "launched": {"done", "failed"},
+    "done": set(),  # terminal
+    "failed": {"pending"},  # only via requeue (successor)
+}
 _VALID_TRIOS = frozenset({"kimi", "qwen"})
 
 
@@ -77,6 +90,10 @@ class QueueEntry:
     launched_at: float | None = None
     last_checked_at: float | None = None
     dedup_key: str | None = None
+    # Retry/requeue fields
+    retry_of: str | None = None
+    attempt: int = 1
+    failure_cause: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -107,6 +124,9 @@ class QueueEntry:
             "launched_at",
             "last_checked_at",
             "dedup_key",
+            "retry_of",
+            "attempt",
+            "failure_cause",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -291,6 +311,7 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
+        "max_retries": 2,
     }
     if isinstance(capacity.get("kimi_max"), int):
         normalized_capacity["kimi_max"] = max(0, capacity["kimi_max"])
@@ -302,6 +323,10 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["key_health_url"] = capacity["key_health_url"]
     if isinstance(capacity.get("poll_seconds"), (int, float)):
         normalized_capacity["poll_seconds"] = max(1.0, float(capacity["poll_seconds"]))
+    if isinstance(capacity.get("max_retries"), int):
+        # `requeue` reads this so a configured cap actually bounds retries;
+        # dropping it here would silently reset every deployment to the default.
+        normalized_capacity["max_retries"] = max(0, capacity["max_retries"])
     return {"trios": normalized_trios, "capacity": normalized_capacity}
 
 
@@ -312,9 +337,10 @@ def default_queue_config() -> dict[str, Any]:
 class QueueStore:
     """Atomic file-backed store for queue entries below a runs root."""
 
-    def __init__(self, runs_root: str | Path) -> None:
+    def __init__(self, runs_root: str | Path, config: dict[str, Any] | None = None) -> None:
         self.runs_root = Path(runs_root).expanduser().resolve()
         self._root = _queue_dir(self.runs_root)
+        self._config = config
 
     def _path(self, queue_id: str) -> Path:
         if not _safe_queue_id(queue_id):
@@ -400,8 +426,17 @@ class QueueStore:
         except (TypeError, ValueError):
             return None
         if entry.status not in _VALID_STATUS:
+            # Log unknown status instead of dropping
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Ignoring queue entry {path.name} with unknown status: {entry.status}"
+            )
             return None
         return entry
+
+    def _is_valid_transition(self, from_status: str, to_status: str) -> bool:
+        """Check if a status transition is valid according to the transition table."""
+        return to_status in _VALID_TRANSITIONS.get(from_status, set())
 
     def update(self, entry: QueueEntry) -> QueueEntry:
         entry.updated_at = _now()
@@ -442,6 +477,8 @@ class QueueStore:
         entry = self.get(queue_id)
         if entry is None:
             return None
+        if not self._is_valid_transition(entry.status, "done"):
+            raise ValueError(f"invalid transition from {entry.status} to done")
         entry.status = "done"
         if reason is not None:
             entry.reason = reason[:_MAX_QUEUE_REASON_CHARS]
@@ -451,6 +488,8 @@ class QueueStore:
         entry = self.get(queue_id)
         if entry is None:
             return None
+        if not self._is_valid_transition(entry.status, "failed"):
+            raise ValueError(f"invalid transition from {entry.status} to failed")
         entry.status = "failed"
         entry.reason = reason[:_MAX_QUEUE_REASON_CHARS]
         return self.update(entry)
@@ -459,10 +498,72 @@ class QueueStore:
         entry = self.get(queue_id)
         if entry is None:
             return None
-        if entry.status != "pending":
+        # Allow recording skips on pending and failed entries
+        if entry.status not in ("pending", "failed"):
             return None
         entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
         return self.update(entry)
+
+    def requeue(self, queue_id: str, cause: str) -> QueueEntry | None:
+        """Create a successor pending entry for a failed entry.
+
+        Args:
+            queue_id: The ID of the failed entry to retry
+            cause: The failure cause that triggered the retry
+
+        Returns:
+            The new successor QueueEntry, or None if the original entry not found
+
+        Raises:
+            ValueError: If the original entry is not failed, or if attempt would exceed max_retries
+        """
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+
+        # Load config to get max_retries. `queue_config_from_config` (and
+        # `_flatten_queue_table` in config.py) both normalize [queue.capacity]
+        # into a dict that always carries `max_retries`, so the default only
+        # applies when the store was built with no config at all.
+        max_retries = 2  # default
+        capacity = self._config.get("capacity") if isinstance(self._config, dict) else None
+        if isinstance(capacity, dict):
+            max_retries = int(capacity.get("max_retries", 2))
+
+        # An entry's own attempt counts toward the cap: original=attempt 1,
+        # first retry=attempt 2, ... so the highest allowed attempt is
+        # max_retries + 1.  Refuse when the successor would exceed that cap.
+        # Checked before the status guard so a retry loop that keeps asking
+        # after exhaustion learns it hit the cap, not just that the successor
+        # is (still) pending.
+        if entry.attempt > max_retries:
+            raise ValueError(f"exceeded max_retries ({max_retries})")
+
+        if entry.status != "failed":
+            raise ValueError("can only requeue failed entries")
+
+        # Create successor entry
+        successor = QueueEntry(
+            queue_id=f"q-{uuid.uuid4().hex[:16]}",
+            name=entry.name,
+            task=entry.task,
+            workspace=entry.workspace,
+            max_rounds=entry.max_rounds,
+            trio=entry.trio,
+            priority=entry.priority,
+            requested_by=entry.requested_by,
+            base_check=entry.base_check,
+            status="pending",
+            retry_of=entry.queue_id,
+            attempt=entry.attempt + 1,
+            failure_cause=cause,
+            created_at=_now(),
+            updated_at=_now(),
+            dedup_key=None  # retries must not collide with original dedup_key
+        )
+
+        self._write(successor)
+        return successor
 
     def counts(self) -> dict[str, int]:
         counts: dict[str, int] = {status: 0 for status in _VALID_STATUS}

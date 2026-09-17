@@ -866,9 +866,7 @@ def create_app(
     origins = {str(item).rstrip("/") for item in (allowed_origins or ()) if str(item).strip()}
     queue_store: QueueStore | None = None
     if runs_root is not None:
-        queue_store = QueueStore(runs_root)
-    queue_config = default_queue_config()
-    if queue_store is not None:
+        queue_config = default_queue_config()
         try:
             from ..config import PROJECT_CONFIG_PATH, load_run_defaults
 
@@ -880,6 +878,7 @@ def create_app(
                 queue_config = queue_config_from_config(project)
         except Exception:
             pass
+        queue_store = QueueStore(runs_root, queue_config)
     launcher: Launcher | None = None
     if supervisor is not None and queue_store is not None:
         launcher = Launcher(supervisor, queue_store, queue_config=queue_config)

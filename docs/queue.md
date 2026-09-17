@@ -139,12 +139,15 @@ visible to any caller with the bearer token through `GET /api/queue`.
 | `status` | `str` | `"pending"` | one of `pending`, `launched`, `done`, `failed` (`_VALID_STATUS` `queue.py:28`) | Store, on every transition |
 | `run_id` | `str \| None` | `None` | set when the entry is launched | Store, via `mark_launched` (`queue.py:430`–`439`) |
 | `reason` | `str \| None` | `None` | truncated to 4,000 chars (`_MAX_QUEUE_REASON_CHARS` `queue.py:26`) | Store, via `mark_done` (optional) / `mark_failed` (required) |
-| `skip_reasons` | `list[str]` | `[]` | appended only while `pending`; each item truncated to 4,000 chars | Store, via `record_skip` (`queue.py:458`–`465`) |
+| `skip_reasons` | `list[str]` | `[]` | appended while `pending` (launcher capacity skips) and while `failed` (so the reason accrues after a retryable failure); each item truncated to 4,000 chars | Store, via `record_skip` (`queue.py:497`–`505`) |
 | `created_at` | `float` | `time.time()` at create | epoch seconds | Store, at `create` |
 | `updated_at` | `float` | `time.time()` at create | epoch seconds; re-stamped on every write | Store, on every `update` |
 | `launched_at` | `float \| None` | `None` | epoch seconds; set at launch | Store, via `mark_launched` (`queue.py:438`) |
 | `last_checked_at` | `float \| None` | `None` | epoch seconds; stamped when the launcher evaluates the entry | Launcher (`launcher.py:206`, `:350`, `:365`) — never set by the store or the API |
 | `dedup_key` | `str \| None` | `None` | see *Idempotent enqueue* below | Caller, at enqueue |
+| `retry_of` | `str \| None` | `None` | queue_id of the failed entry this is a retry of | Store, via `requeue` |
+| `attempt` | `int` | `1` | attempt number (1 for original entry) | Store, via `requeue` |
+| `failure_cause` | `str \| None` | `None` | cause of failure that triggered retry | Store, via `mark_failed` / `requeue` |
 
 There is no dedicated `done_at`/`failed_at` field. The terminal time of an entry
 is the `updated_at` value at the moment `mark_done` or `mark_failed` runs (both
@@ -173,8 +176,7 @@ the nine input fields via `_normalize_request` (`queue.py:228`–`253`).
 
 `dedup_key` is the single-orchestrator floor: two orchestrators (or a retrying
 client) asking for the same work resolve to one queue entry, so the work can be
-launched at most once. It was added in commit `0de7b2d3`; the `dedup_key` field
-is the 18th `QueueEntry` field (`queue.py:79`).
+launched at most once. It was added in commit `0de7b2d3`.
 
 **Validation** (`_validate_dedup_key`, `queue.py:213`–`225`):
 
@@ -231,8 +233,8 @@ it collides with task 48). The guarantee today is "harmless via idempotency"
   happened; it can only observe that the `queue_id` is stable for a given
   `dedup_key`.
 
-`dedup_key` is recoverable after enqueue: `QueueEntry.to_dict` serializes all 18
-fields (`queue.py:81`–`86`, via `asdict`), and `GET /api/queue` returns each
+`dedup_key` is recoverable after enqueue: `QueueEntry.to_dict` serializes all 21
+fields (`queue.py:98`–`103`, via `asdict`), and `GET /api/queue` returns each
 entry through `to_dict` (`server.py:1060`, `:1062`), so the key is visible on
 entries and groups. This audit-level visibility is established by the dataclass
 serialization; it is not asserted by a dedicated endpoint test. The hermetic
