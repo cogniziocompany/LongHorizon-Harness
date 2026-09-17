@@ -787,6 +787,10 @@ class RunSupervisor:
         except FileExistsError:
             raise ValueError(f"run already exists: {run_id}") from None
         workspace_path = review_workspace_path(self.runs_root, parsed)
+        # The worker is launched with the review checkout as its cwd, so the
+        # directory must exist before the spawn; the worker itself then
+        # rebuilds it (fetch + verify) through prepare_review_workspace.
+        workspace_path.mkdir(parents=True, exist_ok=True)
         reservation = {
             "run_id": run_id,
             "state": "creating",

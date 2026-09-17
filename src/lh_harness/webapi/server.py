@@ -531,6 +531,10 @@ def _public_owner(owner: dict[str, Any]) -> dict[str, Any]:
         "reasoning_effort",
         "role_configs",
         "max_rounds",
+        # Review-run launch contract: the forced single round and the reviewer
+        # budget are visible so a caller can verify the review shape it got.
+        "run_kind",
+        "reviewer_timeout_s",
         "prompt_language",
         "workspace",
         "resumed_from",
