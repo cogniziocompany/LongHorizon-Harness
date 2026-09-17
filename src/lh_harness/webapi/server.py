@@ -656,17 +656,34 @@ def _maybe_start_fleet_reporter(
     # Capacity is best-effort: count the workers this supervisor already owns.
     active_cap = 0 if supervisor is None else max(1, len(supervisor._processes))
 
-    def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int]:
+    def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int, dict[str, int]]:
         runs: list[dict[str, Any]] = []
         active = 0
         queue_len = 0
+        # Review verdict counts (counts only; never the findings/blocking
+        # bodies) for every review run this node knows about.
+        review_verdicts: dict[str, int] = {}
         try:
+            from ..review import (
+                REVIEW_RUN_KIND,
+                read_review_report,
+            )
+
             for item in registry.run_items():
                 run_id = str(item.get("id") or "")
                 if not run_id:
                     continue
                 state = registry.state_for(run_id)
                 runs.append(build_run_summary(item, state=state))
+                report_root = (
+                    getattr(supervisor, "runs_root", None)
+                    or (registry.runs_root if hasattr(registry, "runs_root") else None)
+                )
+                if report_root is not None:
+                    report = read_review_report(report_root, run_id)
+                    if report is not None:
+                        verdict = str(report.get("verdict") or "cannot_review")
+                        review_verdicts[verdict] = review_verdicts.get(verdict, 0) + 1
             if supervisor is not None:
                 active = sum(
                     1 for p in supervisor._processes.values() if p.poll() is None
@@ -679,7 +696,7 @@ def _maybe_start_fleet_reporter(
                 queue_len = counts.get("pending", 0) + counts.get("launched", 0)
         except Exception:
             logger.exception("fleet heartbeat callback failed")
-        return runs, active, active_cap, queue_len
+        return runs, active, active_cap, queue_len, review_verdicts
 
     reporter = get_reporter(version=version, capacity=active_cap)
     if reporter is not None and reporter.enabled:
@@ -1156,6 +1173,30 @@ def create_app(
     def create_run(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
         if supervisor is None or bool(getattr(supervisor, "attached_only", False)):
             raise HTTPException(status_code=501, detail="run creation requires the standalone Web supervisor")
+        # ``kind: "review"`` is a different run shape: one reviewer role, one
+        # round, no manager/executor, and no caller-controlled knobs. It is
+        # dispatched before the task-run field validation so review requests
+        # never need (and must not send) ``task``/``agent``/``roles``.
+        if body.get("kind") == "review":
+            review_body = {
+                key: body[key]
+                for key in ("repo", "pr_number", "head_sha", "base_ref", "gate_results_url")
+                if key in body
+            }
+            unknown = set(body) - set(review_body) - {"kind"}
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"kind \"review\" accepts only repo, pr_number, head_sha, base_ref, "
+                    f"and gate_results_url; unknown field: {sorted(unknown)[0]}",
+                )
+            try:
+                created = supervisor.create_review_run(spec=review_body)
+            except (TypeError, ValueError, OSError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if isinstance(created.get("owner"), dict):
+                created = {**created, "owner": _public_owner(created["owner"])}
+            return {"ok": True, "run": created}
         try:
             task = _body_text(body.get("task", body.get("instructions", "")), field="task", required=True)
             agent = _body_text(body.get("agent", "codex"), field="agent", required=True, max_chars=64)
@@ -1616,6 +1657,20 @@ def create_app(
             **managed_status,
             "owner": _public_owner(supervisor.owner(run_id)),
         }
+
+    @app.get("/api/runs/{run_id}/review")
+    def run_review(run_id: str) -> dict[str, Any]:
+        """Return the durable review.json verdict for one review run."""
+
+        _state_or_404(registry, run_id)
+        if supervisor is None or not hasattr(supervisor, "runs_root"):
+            raise HTTPException(status_code=501, detail="review endpoint requires the standalone supervisor")
+        from ..review import read_review_report
+
+        payload = read_review_report(supervisor.runs_root, run_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="review.json not found for this run")
+        return {"ok": True, "review": payload}
 
     @app.get("/api/runs/{run_id}/commands/{command_id}")
     def command_receipt(run_id: str, command_id: str) -> dict[str, Any]:

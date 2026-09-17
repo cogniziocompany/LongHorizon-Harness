@@ -224,6 +224,7 @@ class FleetReporter:
         active: int,
         cap: int,
         queue_len: int = 0,
+        review_verdicts: dict[str, int] | None = None,
     ) -> None:
         """Enqueue a periodic heartbeat describing this node."""
         if not self._enabled:
@@ -253,6 +254,9 @@ class FleetReporter:
             ],
             "capacity": {"active": active, "cap": cap},
             "queueLen": queue_len,
+            # Review-run verdict counts only; findings/blocking bodies never
+            # leave the run's own review.json.
+            "reviewVerdicts": dict(review_verdicts or {}),
         }
         self._post("/harness/heartbeat", body, gzip_body=True)
 
@@ -281,12 +285,14 @@ class FleetReporter:
 
     def register_heartbeat(
         self,
-        callback: Callable[[], tuple[list[dict[str, Any]], int, int, int]],
+        callback: Callable[..., tuple[list[dict[str, Any]], int, int, int]],
     ) -> None:
         """Register a callback that produces heartbeat data every 30 s.
 
-        The callback must return ``(runs, active, cap, queue_len)``.  It is
-        invoked on the reporter daemon thread; keep it fast and exception-free.
+        The callback must return ``(runs, active, cap, queue_len)`` and may
+        accept a fifth positional slot: a ``review_verdicts`` count mapping
+        (``{"pass": 2, "fail": 1, "cannot_review": 0}``).  It is invoked on
+        the reporter daemon thread; keep it fast and exception-free.
         """
         if not self._enabled:
             return
@@ -352,8 +358,12 @@ class FleetReporter:
                     and now - self._last_heartbeat >= self._heartbeat_interval
                 ):
                     try:
-                        runs, active, cap, queue_len = self._heartbeat_callback()
-                        self.queue_heartbeat(runs, active, cap, queue_len)
+                        data = self._heartbeat_callback()
+                        runs, active, cap, queue_len = data[:4]
+                        review_verdicts = data[4] if len(data) > 4 else None
+                        self.queue_heartbeat(
+                            runs, active, cap, queue_len, review_verdicts=review_verdicts
+                        )
                     except Exception:
                         logger.exception("fleet reporter heartbeat callback failed")
                     self._last_heartbeat = now
