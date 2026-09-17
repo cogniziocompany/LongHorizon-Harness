@@ -62,6 +62,7 @@ from .supervisor.control_bus import (
 )
 from .auditor_agent import (
     VISIBLE_OUTPUT_KEYS,
+    compact_auditor_report_text,
     has_valid_auditor_control_header,
     parse_audit_report,
     auditor_report_text_from_episode_result,
@@ -1333,9 +1334,35 @@ async def _auditor_report_with_format_repair(
         return _auditor_report_text(
             corrected, round_index, language=config.prompt_language
         ), status
+    if repair_result.status == "timeout" and primary_result.status == "done":
+        # The format-repair pass must not discard an auditor report that already
+        # succeeded. A repair timeout is a header-formatting problem, not an audit
+        # failure, so fall back to the auditor's raw text with an explicit
+        # "unformatted" marker instead of the blocked/suspect runtime stub.
+        return _unformatted_auditor_report_text(
+            raw_report, language=config.prompt_language
+        ), status
     return _auditor_report_text(
         repair_result, round_index, language=config.prompt_language
     ), status
+
+
+def _unformatted_auditor_report_text(raw_report: str, *, language: str = "en") -> str:
+    """Wrap a successful auditor's raw text in an explicit unformatted marker."""
+    body = compact_auditor_report_text(str(raw_report or "").strip())
+    if language == "en":
+        marker = (
+            "[Unformatted auditor report: the format-repair pass timed out, so the "
+            "auditor's raw output is preserved as-is without a normalized control header.]"
+        )
+    else:
+        marker = (
+            "[未格式化的 auditor 报告：格式修复回合超时，因此按原样保留 auditor 的原始输出，"
+            "未附加规范化的控制头。]"
+        )
+    if not body:
+        return marker
+    return f"{marker}\n\n{body}"
 
 
 def _should_repair_auditor_format(result: EpisodeResult, report_text: str) -> bool:
