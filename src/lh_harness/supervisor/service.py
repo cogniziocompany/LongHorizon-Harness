@@ -53,7 +53,17 @@ from ..types import (
     DEFAULT_MAX_ROUNDS,
     MAX_ROUNDS,
 )
-from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
+from ..utils.run_boundary import (
+    CANONICAL_LOG_DIR,
+    LEGACY_LOG_DIR,
+    OSWORLD_COMPAT_LOG_DIR,
+    _MAX_RUN_ID_CHARS,
+    safe_run_control,
+    safe_run_dir,
+    safe_run_logs,
+    safe_run_role,
+    safe_run_rounds,
+)
 
 
 # Keep a private handle for read-only ``ps`` probes. Tests and embedding code
@@ -447,6 +457,42 @@ def _process_identity(pid: int, command: list[str] | tuple[str, ...] | None = No
 
 def _read_json(path: Path) -> dict[str, Any]:
     return _read_json_file(path, max_bytes=8 * 1024 * 1024)
+
+
+def _run_component_name(value: str) -> str | None:
+    """Validate one run-directory component without touching the filesystem.
+
+    Mirrors the lexical half of ``run_boundary.safe_run_dir``; the symlink/
+    existence half is already handled by ``os.scandir`` in the caller.
+    """
+
+    if (
+        not value
+        or len(value) > _MAX_RUN_ID_CHARS
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+    ):
+        return None
+    return value
+
+
+def _summary_logs_dir(run_dir: Path) -> Path:
+    """Best-effort log directory name for a summary row (never deep-validated).
+
+    The full path stays on ``list_run_items``/``state_for``; summaries only
+    need a stable pointer for filtering by prefix.
+    """
+
+    for name in (CANONICAL_LOG_DIR, OSWORLD_COMPAT_LOG_DIR, LEGACY_LOG_DIR):
+        candidate = run_dir / name
+        try:
+            if candidate.is_dir():
+                return candidate
+        except OSError:
+            continue
+    return run_dir / CANONICAL_LOG_DIR
 
 
 def _pending_approval(path: Path) -> bool:
@@ -1236,6 +1282,69 @@ class RunSupervisor:
                     report={},
                 )
             return status
+
+    def list_run_summaries(self, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+        """Enumerate runs cheaply, without per-run deep boundary validation.
+
+        ``GET /api/runs?fields=summary`` answers gate detection (overseer
+        sweeps poll ``waiting_approval``/``running``/``starting``) and must
+        stay O(runs) with a couple of small bounded reads per run — never the
+        full ``safe_run_*`` boundary walk that ``list_run_items`` performs for
+        every run on every request.  Status is the durable ``status.json``
+        projection; the lifecycle-reconciliation replay stays on the full
+        path.  See the list-endpoint staleness note in ``webapi/server.py``.
+        """
+
+        items: list[dict[str, Any]] = []
+        try:
+            if not self.runs_root.is_dir():
+                return items
+        except OSError:
+            return items
+        try:
+            entries = list(os.scandir(self.runs_root))
+        except OSError:
+            return items
+        if self.attached_only:
+            if not self.attached_run_id:
+                return items
+            entries = [entry for entry in entries if entry.name == self.attached_run_id]
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            run_id = entry.name
+            if _run_component_name(run_id) is None:
+                continue
+            try:
+                mtime = float(entry.stat().st_mtime)
+            except OSError:
+                continue
+            control_dir = Path(entry.path) / "control"
+            status = _read_json_file(control_dir / "status.json")
+            owner = _read_json_file(control_dir / "owner.json")
+            if not status and not owner:
+                # No durable control metadata at all: not a managed run this
+                # API has ever seen.  Cheap enumeration is a supervisor
+                # surface, so skip unmanaged/historical directories the same
+                # way ``list_run_items`` skips boundary failures.
+                continue
+            status_name = str(status.get("status") or owner.get("status") or "idle")
+            if statuses is not None and status_name not in statuses:
+                continue
+            items.append(
+                {
+                    "id": run_id,
+                    "status": status_name,
+                    "mtime": mtime,
+                    "workspace": str(owner.get("workspace") or ""),
+                    "max_rounds": owner.get("max_rounds"),
+                    "agent": owner.get("agent"),
+                    "model": owner.get("model"),
+                    "log_dir": str(_summary_logs_dir(Path(entry.path))),
+                }
+            )
+        items.sort(key=lambda item: item["mtime"], reverse=True)
+        return items
 
     def list_run_items(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
