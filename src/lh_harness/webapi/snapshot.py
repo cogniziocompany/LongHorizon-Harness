@@ -176,6 +176,63 @@ def _safe_mcp_profile_resolution(value: object) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _separate_claims(round_item: dict[str, Any]) -> dict[str, Any]:
+    """Return a round projection that separates executor claims from auditor findings.
+
+    The raw dashboard round blends executor output (the executor's claim about
+    what it did) with the auditor report (the auditor's independent findings).
+    The Web snapshot exposes these as distinct namespaces so clients can tell
+    who asserted what, and adds a derived verdict when the auditor produced a
+    finding.
+    """
+
+    if not isinstance(round_item, dict):
+        return round_item
+    result = dict(round_item)
+    executor_output = result.get("executor_output") or ""
+    auditor_report = result.get("auditor_report") or ""
+    result["executor_claim"] = executor_output
+    result["auditor_findings"] = auditor_report
+    result["verdict"] = _derive_verdict(executor_output, auditor_report)
+    return result
+
+
+def _derive_verdict(executor_output: str, auditor_report: str) -> dict[str, Any]:
+    """Derive a round-level verdict from executor claim and auditor findings.
+
+    The auditor report is treated as structured text: a leading
+    ``Status: <value>`` line is the authoritative signal.  Substring matching
+    against freeform text is forbidden because it converts ``incomplete``,
+    ``blocked`` and other status words into false acceptances.
+    """
+
+    report = (auditor_report or "").strip()
+    claim = (executor_output or "").strip()
+    if not report and not claim:
+        return {"state": "pending", "summary": "no claim or findings recorded"}
+
+    # Parse an explicit ``Status:`` line at the start of the report.
+    status_value: str | None = None
+    first_line = report.splitlines()[0] if report else ""
+    if ":" in first_line:
+        key, value = first_line.split(":", 1)
+        if key.strip().lower() == "status":
+            status_value = value.strip().lower()
+
+    if status_value == "complete":
+        return {"state": "accepted", "summary": "auditor accepted executor claim", "authority": "auditor"}
+    if status_value in {"incomplete", "needs_revision", "blocked", "failed", "rejected"}:
+        return {"state": "rejected", "summary": f"auditor report status is {status_value}", "authority": "auditor"}
+
+    # No structured status line, but auditor text exists: keep the finding
+    # separate from a pure executor claim rather than guessing.
+    if report:
+        return {"state": "pending", "summary": "auditor findings recorded without structured status", "authority": "auditor"}
+    if claim:
+        return {"state": "claimed", "summary": "executor produced a claim; no auditor findings yet", "authority": "executor"}
+    return {"state": "pending", "summary": "no claim or findings recorded"}
+
+
 def _status(raw: dict[str, Any], events: list[dict[str, Any]], approvals: list[dict[str, Any]]) -> str:
     report_status = raw.get("report", {}).get("status") if isinstance(raw.get("report"), dict) else None
     if report_status:
@@ -183,6 +240,8 @@ def _status(raw: dict[str, Any], events: list[dict[str, Any]], approvals: list[d
     if any(item.get("status") == "pending" for item in approvals):
         return "waiting_approval"
     names = {str(item.get("event")) for item in events}
+    if "role_harness_failed" in names:
+        return "failed"
     if "role_harness_cancelled" in names:
         return "cancelled"
     if "role_harness_done" in names:
@@ -306,6 +365,7 @@ def build_snapshot(state: DashboardState, *, run_id: str | None = None) -> dict[
             ),
             None,
         )
+    rounds = [_separate_claims(r) for r in rounds]
     active_role = None
     if active_round is not None:
         for item in reversed(rounds):
