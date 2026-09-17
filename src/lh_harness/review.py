@@ -280,15 +280,12 @@ def _git_env() -> dict[str, str]:
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_ASKPASS": "/bin/false",
             "SSH_AUTH_SOCK": "",
-            "GIT_CONFIG_COUNT": "4",
-            "GIT_CONFIG_KEY_0": "credential.helper",
-            "GIT_CONFIG_VALUE_0": "",
-            "GIT_CONFIG_KEY_1": "credential.helper",
-            "GIT_CONFIG_VALUE_1": "",
-            "GIT_CONFIG_KEY_2": "url.https://.insteadOf",
-            "GIT_CONFIG_VALUE_2": "",
-            "GIT_CONFIG_KEY_3": "url.ssh://.insteadOf",
-            "GIT_CONFIG_VALUE_3": "",
+            # Isolate the fetch from the machine's own git config: review
+            # checkouts must not inherit user insteadOf rewrites or credential
+            # helpers (the user config rewrites git@github.com: forms, which
+            # would silently change the fetch URL).
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
         }
     )
     # Review runs hold GH_TOKEN for read access to private PR heads. The
@@ -299,9 +296,9 @@ def _git_env() -> dict[str, str]:
         header = "Authorization: Basic " + base64.b64encode(
             f"x-access-token:{token}".encode("utf-8")
         ).decode("ascii")
-        env["GIT_CONFIG_COUNT"] = "5"
-        env["GIT_CONFIG_KEY_4"] = "http.https://github.com/.extraHeader"
-        env["GIT_CONFIG_VALUE_4"] = header
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraHeader"
+        env["GIT_CONFIG_VALUE_0"] = header
     return env
 
 
@@ -837,6 +834,10 @@ def repo_remote_url(repo: str, *, host: str | None = None) -> str:
             raise ReviewSpecError("review.repo must be a remote repository, not a local path")
         return repo
     base = (host or os.environ.get("LH_HARNESS_REVIEW_GIT_HOST") or "https://github.com").rstrip("/")
+    # A URL-shaped host (file://, ssh://, https://host/path) is joined as-is;
+    # a bare host is treated as a forge base and the repo is appended.
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", base):
+        return f"{base}/{repo}.git"
     return f"{base}/{repo}.git"
 
 
