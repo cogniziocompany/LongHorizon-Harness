@@ -15,9 +15,10 @@ import os
 import re
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -32,10 +33,11 @@ from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token,
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
-from ..supervisor.control_bus import CommandConflict, RevisionConflict
+from ..supervisor.control_bus import CommandConflict, RevisionConflict, _append_jsonl
 from ..fleet import get_reporter
 from ..queue import QueueStore, default_queue_config, queue_config_from_config
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
+from ..workspace_guard import WorkspaceBaseError, probe_open_pr_gh, resolve_run_base
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 from .events import EventTailer
@@ -548,6 +550,40 @@ def _event_tailer(state: DashboardState, run_id: str) -> EventTailer:
     return EventTailer(state.role_dir / "events.jsonl", run_id=run_id)
 
 
+def _emit_run_created_event(
+    supervisor: Any,
+    run_id: str,
+    base: "WorkspaceBase",
+    workspace: str | None,
+) -> None:
+    """Record the guard's base decision in the run's own event ledger.
+
+    Same provenance contract as the queue Launcher's ``queue.launched`` event:
+    the run-created event carries ``workspace_base`` (``base.summary()``) so
+    operators can see which mode the launch used (on-default / in-place /
+    worktree / stash) and which foreign branch was left untouched.
+    """
+
+    try:
+        role_dir = supervisor._run_logs_dir(run_id) / "role_orchestration"
+        record = {
+            "schema_version": 2,
+            "event_id": f"{run_id}:run-created-{time.time():.6f}",
+            "type": "run.created",
+            "ts": time.time(),
+            "run_id": run_id,
+            "payload": {
+                "workspace": workspace,
+                "workspace_base": base.summary(),
+            },
+        }
+        _append_jsonl(role_dir / "events.jsonl", record)
+    except Exception:
+        # The guard decision is already durable in the owner record; a failed
+        # provenance append must never fail the run creation itself.
+        pass
+
+
 def _snapshot_for(registry: StateRegistry, state: DashboardState, run_id: str) -> dict[str, Any]:
     """Overlay durable Supervisor lifecycle state on the log projection.
 
@@ -848,8 +884,15 @@ def create_app(
     auth_token: str | None = None,
     allowed_origins: set[str] | list[str] | tuple[str, ...] | None = None,
     bind_host: str = "127.0.0.1",
+    probe_open_pr: "Callable[[Path, str], str | None] | None" = probe_open_pr_gh,
 ) -> FastAPI:
-    """Create an API app over a live shared state or a historical runs root."""
+    """Create an API app over a live shared state or a historical runs root.
+
+    ``probe_open_pr`` follows the same default-on contract as the queue
+    Launcher (task 195 deliverable 3): production POST /api/runs probes origin
+    for a colliding OPEN PR with no flag or config.  Pass ``None`` only to
+    disable the probe explicitly (tests and offline runs).
+    """
 
     dashboard_state = state or DashboardState(
         log_dir,
@@ -882,7 +925,9 @@ def create_app(
             pass
     launcher: Launcher | None = None
     if supervisor is not None and queue_store is not None:
-        launcher = Launcher(supervisor, queue_store, queue_config=queue_config)
+        launcher = Launcher(
+            supervisor, queue_store, queue_config=queue_config, probe_open_pr=probe_open_pr
+        )
 
     snapshot_cache = _SnapshotCache(ttl_seconds=2.0)
 
@@ -1181,12 +1226,27 @@ def create_app(
                 raise ValueError("prompt_language must be en or zh")
             mcp_profile = _body_text(body.get("mcp_profile"), field="mcp_profile", max_chars=64) or None
             youtrack_issue_id = _body_text(body.get("youtrack_issue_id"), field="youtrack_issue_id", max_chars=64) or None
+            # Workspace branch guard: identical semantics to the queue
+            # Launcher's launch path (task 195 / task 200).  A non-default
+            # checked-out branch must not be used as-is; the run gets a base
+            # cut fresh from origin's default, and another task's
+            # uncommitted/unpushed work is never destroyed.  A refused base
+            # fails loudly as 409 before any run row is created.
+            try:
+                base, guarded_workspace = resolve_run_base(
+                    workspace,
+                    run_label=uuid.uuid4().hex[:8],
+                    base_root=getattr(supervisor, "workspace_root", None),
+                    probe_open_pr=probe_open_pr,
+                )
+            except WorkspaceBaseError as exc:
+                raise HTTPException(status_code=409, detail=f"workspace base refused: {exc}") from exc
             created = supervisor.create_run(
                 task=task,
                 agent=agent,
                 model=model,
                 role_configs=role_configs,
-                workspace=workspace,
+                workspace=guarded_workspace,
                 max_rounds=max_rounds,
                 prompt_language=prompt_language,
                 run_id=run_id_value,
@@ -1195,6 +1255,10 @@ def create_app(
                 youtrack_issue_id=youtrack_issue_id,
                 idempotency_key=_bounded_command_id(request.headers.get("Idempotency-Key")),
             )
+            if base is not None:
+                run_id = str(created.get("id") or "")
+                if run_id:
+                    _emit_run_created_event(supervisor, run_id, base, guarded_workspace)
         except IdempotencyConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (TypeError, ValueError, OSError) as exc:
