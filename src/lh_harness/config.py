@@ -46,6 +46,7 @@ _RUN_KEYS = {
     "dashboard",
     "dashboard_port",
     "allow_auditor_write_mcp",
+    "worker_memory_max",
     "roles",
     "timeouts",
 }
@@ -106,6 +107,14 @@ mcp_add_dirs = []
 guard_exclude_paths = []
 
 max_rounds = 25
+
+# Per-run worker memory isolation (TASK 202). Each run's worker is launched in
+# its own systemd transient scope with this MemoryMax so one run's memory
+# blowup is OOM-killed alone instead of failing the whole lh-harness service;
+# on hosts without systemd-run the worker gets an RLIMIT_AS cap instead. The
+# LH_HARNESS_WORKER_MEMORY_MAX environment variable overrides this value.
+# worker_memory_max = "3G"
+
 dashboard = true
 # Embedded dashboards use an OS-assigned port by default so concurrent runs
 # cannot accidentally share or race a fixed listener. Standalone `web` keeps
@@ -318,6 +327,8 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         defaults["allow_auditor_write_mcp"] = _boolean(
             run["allow_auditor_write_mcp"], "run.allow_auditor_write_mcp"
         )
+    if "worker_memory_max" in run:
+        defaults["worker_memory_max"] = _worker_memory_max(run["worker_memory_max"])
 
     roles = run.get("roles", {})
     if not isinstance(roles, dict):
@@ -401,6 +412,15 @@ def _boolean(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
         raise ProjectConfigError(f"{name} must be true or false")
     return value
+
+
+def _worker_memory_max(value: Any) -> str:
+    from .worker_isolation import parse_memory_limit
+
+    try:
+        return parse_memory_limit(value)
+    except ValueError as exc:
+        raise ProjectConfigError(f"run.worker_memory_max: {exc}") from exc
 
 
 def _names(values: set[str]) -> str:
