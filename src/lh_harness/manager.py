@@ -298,7 +298,10 @@ async def _run_impl(
             "auditor_budget": _budget_to_dict(auditor_budget),
             "resumed": bool(resume),
             "resumed_rounds": len(rounds),
-            "workspace_round_zero": _workspace_round_zero_record(config.workspace_path),
+            "workspace_round_zero": _workspace_round_zero_record(
+                config.workspace_path,
+                workspace_base_mode=getattr(config, "workspace_base_mode", None),
+            ),
         },
     )
     if resume:
@@ -2500,10 +2503,20 @@ def _round_zero_open_prs(branch: str, timeout: float = 10.0) -> list[dict[str, A
     ]
 
 
+_WORKSPACE_BASE_MODES = (
+    "on-default",
+    "in-place",
+    "worktree",
+    "stash",
+    "continuation",
+)
+
+
 def _workspace_round_zero_record(
     workspace_path: str | Path,
     *,
     open_prs: Callable[[str], list[dict[str, Any]] | None] | None = None,
+    workspace_base_mode: str | None = None,
 ) -> dict[str, Any]:
     """Observe-only round-zero snapshot of the workspace handed to a run.
 
@@ -2512,6 +2525,12 @@ def _workspace_round_zero_record(
     open PR already heads that branch (a prelaunch collision).  Every item
     degrades to ``None``/``[]`` when its query fails; this record must never
     gate, block, or otherwise alter a launch.
+
+    Task 201: ``workspace_base_mode`` names the mode the prelaunch guard
+    chose ("on-default" / "in-place" / "worktree" / "stash" / "continuation")
+    so a later reader can tell whether the run was relocated.  It is supplied
+    by the supervisor (queue-triggered launches) and omitted — not guessed —
+    when unknown.
     """
     path = str(workspace_path)
     branch = _round_zero_git(path, ["rev-parse", "--abbrev-ref", "HEAD"])
@@ -2544,13 +2563,18 @@ def _workspace_round_zero_record(
         except Exception:  # noqa: BLE001 - observation must never raise
             listed_prs = None
 
-    return {
+    record: dict[str, Any] = {
         "branch": branch,
         "head_sha": head_sha,
         "ahead_of_remote": ahead_of_remote,
         "uncommitted_paths": uncommitted_paths,
         "open_prs": listed_prs,
     }
+    # An out-of-band unknown mode is recorded as-is rather than silently
+    # dropped, but a mode absent from a launch is simply omitted.
+    if workspace_base_mode is not None:
+        record["workspace_base_mode"] = str(workspace_base_mode)
+    return record
 
 
 def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:

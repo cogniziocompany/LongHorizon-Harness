@@ -127,7 +127,7 @@ visible to any caller with the bearer token through `GET /api/queue`.
 
 | Field | Type | Default | Validation | Written by |
 |---|---|---|---|---|
-| `queue_id` | `str` | — (minted) | `q-<16 hex>` from `uuid.uuid4().hex[:16]` (`queue.py:355`); never caller-supplied | Store, at `create` |
+| `queue_id` | `str` | — (minted) | `q-<16 hex>` from `uuid.uuid4().hex[:16]` (`queue.py:359`); never caller-supplied | Store, at `create` |
 | `name` | `str` | — (required) | non-empty after strip; ≤256 chars; no NUL (`_validate_name`) | Caller, at enqueue |
 | `task` | `str` | — (required) | non-empty after strip; ≤100,000 chars; no NUL. Supplied as `task` (text) **or** `task_file` (server path read into `task`), not both (`queue.py:232`–`239`) | Caller, at enqueue |
 | `workspace` | `str` | — (required) | non-empty after strip; ≤4096 chars; no NUL (`_validate_workspace`) | Caller, at enqueue |
@@ -135,11 +135,13 @@ visible to any caller with the bearer token through `GET /api/queue`.
 | `trio` | `str` | — (required) | one of `kimi`, `qwen` (lower-cased). Supplied as `roles` **or** `trio` (`queue.py:242`) (`_validate_trio`) | Caller, at enqueue |
 | `priority` | `int` | `0` when omitted | integer (bool rejected) (`_validate_priority`) | Caller, at enqueue (mutable via `POST /api/queue/{id}/priority` while pending) |
 | `requested_by` | `str` | — (required) | non-empty after strip; ≤256 chars (`_validate_requested_by`) | Caller, at enqueue |
+| `branch` | `str` | `""` | string, stripped; ≤256 chars; no NUL; no `..`; must not start with `-` (`_validate_branch`). Mutually exclusive with `continue_branch` | Caller, at enqueue |
+| `continue_branch` | `bool` | `False` | boolean (`_validate_continue_branch`). Mutually exclusive with `branch` | Caller, at enqueue |
 | `base_check` | `str` | `""` | string, stripped (`_validate_base_check`) | Caller, at enqueue |
 | `status` | `str` | `"pending"` | one of `pending`, `launched`, `done`, `failed` (`_VALID_STATUS` `queue.py:28`) | Store, on every transition |
-| `run_id` | `str \| None` | `None` | set when the entry is launched | Store, via `mark_launched` (`queue.py:430`–`439`) |
+| `run_id` | `str \| None` | `None` | set when the entry is launched | Store, via `mark_launched` (`queue.py:478`–`487`) |
 | `reason` | `str \| None` | `None` | truncated to 4,000 chars (`_MAX_QUEUE_REASON_CHARS` `queue.py:26`) | Store, via `mark_done` (optional) / `mark_failed` (required) |
-| `skip_reasons` | `list[str]` | `[]` | appended only while `pending`; each item truncated to 4,000 chars | Store, via `record_skip` (`queue.py:458`–`465`) |
+| `skip_reasons` | `list[str]` | `[]` | appended only while `pending`; each item truncated to 4,000 chars | Store, via `record_skip` (`queue.py:506`–`513`) |
 | `created_at` | `float` | `time.time()` at create | epoch seconds | Store, at `create` |
 | `updated_at` | `float` | `time.time()` at create | epoch seconds; re-stamped on every write | Store, on every `update` |
 | `launched_at` | `float \| None` | `None` | epoch seconds; set at launch | Store, via `mark_launched` (`queue.py:438`) |
@@ -148,14 +150,15 @@ visible to any caller with the bearer token through `GET /api/queue`.
 
 There is no dedicated `done_at`/`failed_at` field. The terminal time of an entry
 is the `updated_at` value at the moment `mark_done` or `mark_failed` runs (both
-go through `update`, `queue.py:406`–`409`); the terminal cause is in `reason`.
+go through `update`, `queue.py:454`–`457`); the terminal cause is in `reason`.
 
 ### Caller-supplied vs. service-owned
 
-A caller supplies nine input fields through the enqueue body: `name`, `task` (or
-`task_file`), `workspace`, `trio` (or `roles`), `max_rounds`, `priority`,
-`base_check`, `requested_by`, and `dedup_key`. Of these, `max_rounds`,
-`priority`, `base_check`, and `dedup_key` are optional; the rest are required.
+A caller supplies eleven input fields through the enqueue body: `name`, `task`
+(or `task_file`), `workspace`, `trio` (or `roles`), `max_rounds`, `priority`,
+`branch`, `continue_branch`, `base_check`, `requested_by`, and `dedup_key`. Of
+these, `max_rounds`, `priority`, `branch`, `continue_branch`, `base_check`, and
+`dedup_key` are optional; the rest are required.
 `task_file` and `roles` are alternative input keys for `task` and `trio`
 respectively, not separate stored fields.
 
@@ -167,14 +170,14 @@ The store owns everything else. At `create` it mints `queue_id`, stamps
 written only by the launcher. A caller cannot set `queue_id`, `status`,
 `run_id`, `launched_at`, `reason`, `skip_reasons`, `created_at`, `updated_at`,
 or `last_checked_at` through the enqueue body — `QueueStore.create` reads only
-the nine input fields via `_normalize_request` (`queue.py:228`–`253`).
+the eleven input fields via `_normalize_request` (`queue.py:238`–`277`).
 
 ## Idempotent enqueue (`dedup_key`)
 
 `dedup_key` is the single-orchestrator floor: two orchestrators (or a retrying
 client) asking for the same work resolve to one queue entry, so the work can be
 launched at most once. It was added in commit `0de7b2d3`; the `dedup_key` field
-is the 18th `QueueEntry` field (`queue.py:79`).
+is the 20th `QueueEntry` field (`queue.py:83`).
 
 **Validation** (`_validate_dedup_key`, `queue.py:213`–`225`):
 
@@ -187,12 +190,56 @@ is the 18th `QueueEntry` field (`queue.py:79`).
   `queue.py:27`).
 - Contains a NUL byte (`\x00`) → `ValueError("dedup_key contains a NUL byte")`.
 
-**De-duplication** (`QueueStore.create`, `queue.py:328`–`359`):
+## Continuation opt-in (`branch` / `continue_branch`, task 201)
+
+The workspace branch guard (task 195) never launches a run onto a non-default
+checked-out branch silently: a clean foreign branch is relocated in place to a
+fresh `lh-run/<label>` branch cut from `origin/<default>`, a dirty or
+ahead-of-remote branch is moved into a linked worktree (named-stash fallback),
+and a branch carrying an OPEN pull request is refused outright. That default is
+correct for brand-new work but wrong for **continuation tasks** — entries whose
+job is to finish work on an existing, often PR-carrying branch (the common
+"continue task N's branch" shape in this fleet).
+
+Two per-entry opt-ins turn the guard off for exactly one entry:
+
+- **`branch`** — a non-empty string naming a specific branch to use **as-is**.
+  The workspace must have that branch checked out; the launcher passes
+  `requested_branch` to `prepare_workspace_base`, which returns the workspace
+  unchanged (mode `"continuation"`) with no relocation, no stash, and no
+  open-PR refusal. If the workspace is not on that branch, the launch is
+  blocked with a retryable reason naming both branches.
+- **`continue_branch: true`** — accept whatever branch the workspace currently
+  has checked out, as-is, with the same "no relocation, no stash, no refusal"
+  semantics (mode `"continuation"`).
+
+Setting both in one enqueue is a `422` (`set branch or continue_branch, not
+both`): they are the same decision at different specificity, and a mixed
+signal would leave the launcher's behaviour ambiguous.
+
+**Validation** (`_validate_branch`, `_validate_continue_branch`):
+
+- `branch`: `None`/empty → `""` (no opt-in). Non-string (including `bool`) →
+  `ValueError("branch must be a string")`; >256 chars → `ValueError("branch
+  is too long")`; a NUL byte or `..` → `ValueError("branch contains an invalid
+  sequence")`; a leading `-` → `ValueError("branch must not start with '-'")`
+  (a branch name is never re-interpreted as a git flag).
+- `continue_branch`: `None` → `False`; non-boolean →
+  `ValueError("continue_branch must be a boolean")`.
+- Both set → `ValueError("set branch or continue_branch, not both")`.
+
+The default (both unset) keeps the guard's full protection unchanged: an
+opt-in-less entry on a foreign branch is still relocated or refused exactly as
+before, and an open-PR collision is still loud — only now **retryable** (the
+entry stays `pending` with the reason recorded, see the launcher) rather than
+converted to a terminal `failed` row.
+
+**De-duplication** (`QueueStore.create`, `queue.py:376`–`407`):
 
 - When `dedup_key` is a non-empty string, `create` looks for an existing
   **non-terminal** entry (status `pending` or `launched`,
   `_NON_TERMINAL_STATUS` `queue.py:32`) with the same key
-  (`_find_non_terminal_by_dedup`, `queue.py:361`–`366`).
+  (`_find_non_terminal_by_dedup`, `queue.py:409`–`414`).
 - If one exists, `create` returns that existing entry **unchanged** — no new
   `queue_id`, no new file, no status change. Two enqueues with the same key
   therefore yield one entry.
@@ -201,7 +248,7 @@ is the 18th `QueueEntry` field (`queue.py:79`).
   Reusing the key afterwards creates a **fresh entry** — a retry — rather than
   returning the terminal one.
 
-The launcher's `mark_launched` pending-guard (`queue.py:430`–`439`: it raises
+The launcher's `mark_launched` pending-guard (`queue.py:478`–`487`: it raises
 `ValueError("entry is not pending")` unless `status == "pending"`) then ensures
 that single entry is launched at most once. Together: same key → one entry → at
 most one launch.

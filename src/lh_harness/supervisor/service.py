@@ -1336,6 +1336,7 @@ class RunSupervisor:
         reasoning_effort: str | None = None,
         mcp_profile: str | None = None,
         base_check: str | None = None,
+        workspace_base_mode: str | None = None,
         resume: bool = False,
     ) -> list[str]:
         # Always launch through the interpreter that owns this supervisor.
@@ -1370,6 +1371,8 @@ class RunSupervisor:
             command.append(f"--mcp-profile={mcp_profile}")
         if base_check:
             command.append(f"--base-check={base_check}")
+        if workspace_base_mode:
+            command.append(f"--workspace-base-mode={workspace_base_mode}")
         for role in _ROLE_KEYS:
             spec = (role_configs or {}).get(role)
             if not spec:
@@ -1402,6 +1405,8 @@ class RunSupervisor:
         allow_auditor_write_mcp: bool = False,
         youtrack_issue_id: str | None = None,
         base_check: str | None = None,
+        workspace_base_mode: str | None = None,
+        workspace_base_summary: str | None = None,
         _recover_reservation: bool = False,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -1423,6 +1428,8 @@ class RunSupervisor:
                 allow_auditor_write_mcp=allow_auditor_write_mcp,
                 youtrack_issue_id=youtrack_issue_id,
                 base_check=base_check,
+                workspace_base_mode=workspace_base_mode,
+                workspace_base_summary=workspace_base_summary,
             )
         request = {
             "task": task,
@@ -1514,6 +1521,8 @@ class RunSupervisor:
                 reasoning_effort=reasoning_effort,
                 youtrack_issue_id=youtrack_issue_id,
                 base_check=base_check,
+                workspace_base_mode=workspace_base_mode,
+                workspace_base_summary=workspace_base_summary,
                 _recover_reservation=bool(existing),
                 _idempotency_fingerprint=fingerprint,
             )
@@ -1549,6 +1558,12 @@ class RunSupervisor:
         allow_auditor_write_mcp: bool = False,
         youtrack_issue_id: str | None = None,
         base_check: str | None = None,
+        # Task 201: the launcher records which mode the workspace guard chose
+        # ("on-default" / "in-place" / "worktree" / "stash" / "continuation").
+        # Only create_run (queue-triggered launches) supplies these; other
+        # call sites default to None and the record simply omits them.
+        workspace_base_mode: str | None = None,
+        workspace_base_summary: str | None = None,
         _recover_reservation: bool = False,
         _idempotency_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -1635,6 +1650,7 @@ class RunSupervisor:
             reasoning_effort=reasoning_effort,
             mcp_profile=mcp_profile,
             base_check=base_check,
+            workspace_base_mode=workspace_base_mode,
         )
         started_at = time.time()
         # Reserve the run before launching a process.  This closes the orphan
@@ -1660,6 +1676,12 @@ class RunSupervisor:
         reservation["mcp_profile"] = mcp_profile
         if base_check:
             reservation["base_check"] = base_check
+        # Task 201: durable provenance for the workspace guard's chosen mode;
+        # read by the worker so the round-zero record can name it.
+        if workspace_base_mode:
+            reservation["workspace_base_mode"] = str(workspace_base_mode)
+        if workspace_base_summary:
+            reservation["workspace_base_summary"] = str(workspace_base_summary)[:4_000]
         if _idempotency_fingerprint:
             reservation["idempotency_fingerprint"] = _idempotency_fingerprint
         # Carried through to the owner record and heartbeat summary; ignored if
@@ -2493,6 +2515,15 @@ class RunSupervisor:
                 str(owner.get("prompt_language")) if owner.get("prompt_language") in {"en", "zh"} else "en"
             ),
             reasoning_effort=reasoning_effort,
+            # Task 201: a resumed run keeps the mode the guard chose at its
+            # original launch (carried in the owner record), so a later
+            # reader can still tell whether the round-zero workspace was
+            # relocated.
+            workspace_base_mode=(
+                str(owner.get("workspace_base_mode"))
+                if owner.get("workspace_base_mode")
+                else None
+            ),
             resume=True,
         )
         reservation = {

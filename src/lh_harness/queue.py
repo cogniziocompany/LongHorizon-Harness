@@ -67,6 +67,14 @@ class QueueEntry:
     trio: str
     priority: int
     requested_by: str
+    # Workspace-guard continuation opt-in (task 201).  ``branch`` names a
+    # specific branch to use as-is; ``continue_branch`` accepts whatever branch
+    # the workspace currently has checked out.  When either is set the
+    # launcher's workspace guard leaves the workspace untouched (mode
+    # "continuation"): no relocation, no stash, and no open-PR refusal.  The
+    # default (both unset) keeps the guard's full protection.
+    branch: str = ""
+    continue_branch: bool = False
     base_check: str = ""
     status: str = "pending"
     run_id: str | None = None
@@ -97,6 +105,8 @@ class QueueEntry:
             "trio",
             "priority",
             "requested_by",
+            "branch",
+            "continue_branch",
             "base_check",
             "status",
             "run_id",
@@ -225,6 +235,35 @@ def _validate_dedup_key(value: Any) -> str | None:
     return text
 
 
+def _validate_branch(value: Any) -> str:
+    """Validate the continuation opt-in ``branch`` name (task 201)."""
+
+    if value is None:
+        return ""
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError("branch must be a string")
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) > 256:
+        raise ValueError("branch is too long")
+    if "\x00" in text or ".." in text:
+        raise ValueError("branch contains an invalid sequence")
+    if text.startswith("-"):
+        raise ValueError("branch must not start with '-'")
+    return text
+
+
+def _validate_continue_branch(value: Any) -> bool:
+    """Validate the continuation opt-in ``continue_branch`` flag (task 201)."""
+
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError("continue_branch must be a boolean")
+    return value
+
+
 def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
     """Convert a POST /api/queue body into validated launch parameters."""
 
@@ -240,6 +279,13 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
     task_text = _validate_task(task)
 
     trio = body.get("roles") if "roles" in body else body.get("trio")
+    branch = _validate_branch(body.get("branch"))
+    continue_branch = _validate_continue_branch(body.get("continue_branch"))
+    if branch and continue_branch:
+        # Both opt-ins name the same decision ("use the existing branch as-is")
+        # at different specificity; accepting both would leave the launcher's
+        # behaviour ambiguous, so the enqueue is rejected instead.
+        raise ValueError("set branch or continue_branch, not both")
     return {
         "name": _validate_name(body.get("name")),
         "task": task_text,
@@ -247,6 +293,8 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "max_rounds": _validate_max_rounds(body.get("max_rounds")),
         "trio": _validate_trio(trio),
         "priority": _validate_priority(body.get("priority")),
+        "branch": branch,
+        "continue_branch": continue_branch,
         "base_check": _validate_base_check(body.get("base_check")),
         "requested_by": _validate_requested_by(body.get("requested_by")),
         "dedup_key": _validate_dedup_key(body.get("dedup_key")),
