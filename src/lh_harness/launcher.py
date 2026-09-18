@@ -21,7 +21,7 @@ from typing import Any, Callable
 from .config import PROJECT_CONFIG_PATH, load_run_defaults
 from .queue import QueueEntry, QueueStore, default_queue_config, queue_config_from_config
 from .supervisor.lifecycle import ACTIVE_STATUSES, canonical_lifecycle_status
-from .workspace_guard import WorkspaceBaseError, prepare_workspace_base, probe_open_pr_gh
+from .workspace_guard import WorkspaceBaseError, probe_open_pr_gh, resolve_run_base
 
 # ``httpx`` is already a transitive dependency of FastAPI/TestClient, but the
 # launcher must not fail to import when it is absent.
@@ -322,8 +322,10 @@ class Launcher:
         # 96563c4c under PR #154).  A non-default checked-out branch must not
         # be used as-is; the run gets a base cut fresh from origin's default,
         # and another task's uncommitted/unpushed work is never destroyed.
+        # The same guard helper serves POST /api/runs, so every create-run
+        # call site resolves the launch base identically.
         try:
-            base = prepare_workspace_base(
+            base, workspace = resolve_run_base(
                 entry.workspace,
                 run_label=f"{entry.trio}-{uuid.uuid4().hex[:8]}",
                 base_root=getattr(self.supervisor, "workspace_root", None),
@@ -342,7 +344,7 @@ class Launcher:
                 },
             )
             return
-        workspace = str(base.workspace if base.mode == "worktree" else entry.workspace)
+        workspace = str(workspace)
         try:
             created = self.supervisor.create_run(
                 task=entry.task,

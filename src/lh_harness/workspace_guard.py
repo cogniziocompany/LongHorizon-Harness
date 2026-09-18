@@ -310,3 +310,39 @@ def prepare_workspace_base(
         run_branch=run_branch,
         stashed=True,
     )
+
+
+def resolve_run_base(
+    workspace: str | Path | None,
+    *,
+    run_label: str,
+    base_root: str | Path | None = None,
+    probe_open_pr: Callable[[Path, str], str | None] | None = probe_open_pr_gh,
+) -> tuple[WorkspaceBase | None, str | None]:
+    """Resolve the guard base and the workspace a run must execute in.
+
+    The one guard helper shared by the ``supervisor.create_run`` call sites
+    (the queue ``Launcher`` and ``POST /api/runs``) so neither grows a second
+    copy of the try/prepare/worktree-selection logic:
+
+    * ``workspace=None`` (no explicit workspace in the request) skips the
+      guard and returns ``(None, None)`` — the supervisor then uses its
+      configured workspace root, exactly as before the guard existed.
+    * otherwise the guard resolves a launch-safe base and the run executes in
+      ``base.workspace`` only when the guard produced a linked worktree, and
+      in the requested workspace for every other mode.
+
+    Raises :class:`WorkspaceBaseError` when no clean base can be resolved; the
+    message names the checked-out branch and, when known, any colliding PR.
+    """
+
+    if workspace is None or not str(workspace).strip():
+        return None, None
+    base = prepare_workspace_base(
+        workspace,
+        run_label=run_label,
+        base_root=base_root,
+        probe_open_pr=probe_open_pr,
+    )
+    effective = str(base.workspace if base.mode == "worktree" else workspace)
+    return base, effective
