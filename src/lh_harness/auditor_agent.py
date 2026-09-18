@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .adapters.claude_permissions import is_git_internal_metadata_path
 from .agent_logs import assistant_texts as decode_agent_assistant_texts
 from .agent_logs import visible_output as decode_agent_visible_output
 from .runtime_signals import hard_signal_labels
@@ -214,7 +215,15 @@ def audit_report_from_episode_result(
     contract_audit_status = infer_contract_audit_status(report_text)
     artifact_actions = extract_deleted_artifact_actions(report_text) if integrity_status == "violation" else []
     if result.metadata.get("verifier_workspace_mutation_detected"):
-        paths = _mutation_paths(result.metadata.get("verifier_workspace_mutations"))
+        observed_paths = _mutation_paths(result.metadata.get("verifier_workspace_mutations"))
+        paths = [path for path in observed_paths if not is_git_internal_metadata_path(path)]
+        # Churn confined to git-internal bookkeeping (index stat caches,
+        # .git/worktrees/<name>/ admin files refreshed by read-only git
+        # commands) is not an auditor write; the audit's own verdict stands.
+        git_bookkeeping_only = bool(observed_paths) and not paths
+    else:
+        git_bookkeeping_only = False
+    if result.metadata.get("verifier_workspace_mutation_detected") and not git_bookkeeping_only:
         restore_on_mutation = bool(result.metadata.get("verifier_workspace_restore_on_mutation", True))
         restored = bool(result.metadata.get("verifier_workspace_restored"))
         if paths and all(path.startswith(".git/") for path in paths):
