@@ -11,6 +11,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import os
 import shlex
 import signal
@@ -45,6 +46,7 @@ from .lifecycle import (
     resume_epoch,
 )
 from ..agent_registry import normalise_reasoning_effort, supports_reasoning_effort
+from .. import worker_isolation
 from ..types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
@@ -54,6 +56,9 @@ from ..types import (
     MAX_ROUNDS,
 )
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
+
+
+logger = logging.getLogger(__name__)
 
 
 # Keep a private handle for read-only ``ps`` probes. Tests and embedding code
@@ -71,6 +76,26 @@ _WORKER_LOG_KEEP_BYTES = 4 * 1024 * 1024
 _MAX_SAVED_TASK_BYTES = 100_000
 _MAX_ROUND_DIR_SCAN = 10_000
 _MISSING_COMPLETION_EVIDENCE = "worker reported completion without explicit completion evidence"
+
+
+def _config_worker_memory_max() -> str | None:
+    """The project config's ``worker_memory_max`` key, read defensively.
+
+    The supervisor must never fail to launch because a config file is
+    unreadable or the key is absent; any problem falls back to the module
+    default (or the env override applied by ``resolve_memory_limit``).
+    """
+
+    try:
+        from ..config import PROJECT_CONFIG_PATH, load_run_defaults
+
+        defaults = load_run_defaults(PROJECT_CONFIG_PATH)
+        value = defaults.get("worker_memory_max")
+        return str(value) if value else None
+    except Exception:
+        return None
+
+
 _ROLE_KEYS = ("manager", "executor", "auditor")
 _AGENT_CHOICES = frozenset({"codex", "claude_code", "deepseek_harness", "opencode"})
 
@@ -410,6 +435,16 @@ def _command_fingerprint(command: list[str] | tuple[str, ...] | None) -> str:
     return hashlib.sha256(json.dumps([str(item) for item in command], separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+def _bare_worker_command(command: list[str]) -> list[str]:
+    """Strip a systemd-run scope wrapper, returning the worker argv itself."""
+
+    separator = "--"
+    if separator in command:
+        index = command.index(separator)
+        return command[index + 1 :]
+    return list(command)
+
+
 def _pid_start_identity(pid: int) -> str | None:
     """Return a stable-enough process start marker on the host platform."""
 
@@ -653,6 +688,7 @@ class RunSupervisor:
         workspace_root: str | Path | None = None,
         attached_only: bool = False,
         attached_run_id: str | None = None,
+        worker_memory_max: str | None = None,
     ) -> None:
         self.runs_root = Path(runs_root).expanduser().resolve()
         self.runs_root.mkdir(parents=True, exist_ok=True)
@@ -661,6 +697,17 @@ class RunSupervisor:
         if attached_run_id is not None:
             self._validate_run_id(attached_run_id)
         self.attached_run_id = attached_run_id
+        # TASK 202 + 208: per-worker memory isolation.  The effective limit is
+        # the explicit constructor value (already validated by the caller),
+        # the LH_HARNESS_WORKER_MEMORY_MAX env override, the project config
+        # key, or the default (2G, an RSS bound sized from CT110's measured
+        # 9.27 GiB VmPeak with headroom); see
+        # worker_isolation.resolve_memory_limit.
+        self.worker_memory_max = worker_isolation.resolve_memory_limit(
+            explicit=worker_memory_max,
+            env=os.environ.get(worker_isolation.ENV_WORKER_MEMORY_MAX),
+            config=_config_worker_memory_max(),
+        )
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._commands: dict[str, list[str]] = {}
         self._lifecycle_lock = threading.RLock()
@@ -749,6 +796,113 @@ class RunSupervisor:
         """Persist the worker prompt without putting it in ``ps`` arguments."""
 
         _atomic_bytes_write(path, (task + "\n").encode("utf-8"))
+
+    def _spawn_isolated(
+        self,
+        *,
+        isolation: Any,
+        run_id: str,
+        cwd: str,
+        env: dict[str, str],
+        output_path: Path,
+        output: Any,
+    ) -> tuple[dict[str, Any], subprocess.Popen[bytes]]:
+        """Popen the isolated worker, capturing its launch record.
+
+        Scope launches that never created their cgroup (systemd-run could not
+        reach a manager, was refused, or otherwise died before starting the
+        wrapped command) retry here: the retry prefers the delegated cgroup
+        mechanism (an RSS bound that needs no systemd manager — the only
+        mechanism that works on CT110, which has no polkit daemon and no
+        user manager) and, when the service's cgroup subtree is not
+        delegated either, launches the worker unbounded with a loud log
+        (TASK 208: an address-space rlimit cannot bound a Node 22/V8 agent
+        worker, so no rlimit fallback exists).  The decision is structural —
+        non-zero exit with no scope cgroup — not a stderr phrase match.
+        """
+
+        record = isolation.record()
+        process = subprocess.Popen(
+            isolation.command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+            preexec_fn=isolation.preexec,
+        )
+        record["oom_kill_base"] = None
+        if isolation.mechanism == worker_isolation.MECHANISM_SCOPE:
+            cgroup = worker_isolation.scope_cgroup_for_pid(process.pid, isolation.unit)
+            if cgroup is None:
+                # The launcher may still be dying: settle its exit code before
+                # deciding the launch failed (a live poll() of None is not
+                # proof the scope is coming).
+                returncode = worker_isolation.await_scope_exit(process)
+                tail = self._scope_failure_tail(output_path)
+                if worker_isolation.scope_launch_failed(returncode, tail):
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    process.wait(timeout=10)
+                    fallback = worker_isolation.fallback_plan(
+                        isolation.limit,
+                        # Re-derive the bare worker command from the scope argv.
+                        _bare_worker_command(isolation.command),
+                        run_id,
+                    )
+                    logger.warning(
+                        "worker memory isolation: run %s scope %s did not start; retrying with mechanism=%s",
+                        run_id,
+                        isolation.unit,
+                        fallback.mechanism,
+                    )
+                    process = subprocess.Popen(
+                        fallback.command,
+                        cwd=cwd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=output,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                        env=env,
+                        preexec_fn=fallback.preexec,
+                    )
+                    record = fallback.record()
+                    if fallback.cgroup and worker_isolation.verify_pid_cgroup(
+                        process.pid, fallback.cgroup
+                    ):
+                        # The preexec moved the child into its cgroup; record
+                        # the resolved path and the oom baseline so a later
+                        # death can be attributed to the RSS cap.
+                        record["cgroup"] = fallback.cgroup
+                        record["oom_kill_base"] = worker_isolation.read_scope_oom_kills(
+                            fallback.cgroup
+                        )
+                    elif fallback.cgroup:
+                        # Never record a bound the child is not under.
+                        logger.warning(
+                            "worker memory isolation: run %s child pid %s did not "
+                            "land in its prepared cgroup %s; correcting the record",
+                            run_id,
+                            process.pid,
+                            fallback.cgroup,
+                        )
+                        record["cgroup"] = ""
+                    return record, process
+            record["cgroup"] = cgroup or ""
+            record["oom_kill_base"] = worker_isolation.read_scope_oom_kills(cgroup)
+        return record, process
+
+    def _scope_failure_tail(self, output_path: Path) -> bytes:
+        """Read the first 8 KiB of the worker log to detect scope bootstraps."""
+
+        try:
+            with output_path.open("rb") as handle:
+                return handle.read(8 * 1024)
+        except OSError:
+            return b""
 
     def _existing_run_result(
         self,
@@ -1765,15 +1919,46 @@ class RunSupervisor:
             os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
         )
         worker_env.pop("LH_HARNESS_WEB_TOKEN", None)
+        # TASK 202 + 208: give the worker its own memory boundary so one run's
+        # blowup cannot OOM-kill the shared service cgroup (and every other
+        # live run with it).  The boundary is an RSS cap — a per-episode
+        # child cgroup under the service's delegated subtree (see the
+        # mechanism note in worker_isolation) or a systemd scope — never an
+        # address-space rlimit, which cannot bound a Node 22/V8 agent worker.
+        # The launch record is persisted in the owner so a later death can be
+        # attributed to the limit; see worker_isolation.classify_memory_death.
         try:
-            process = subprocess.Popen(
-                command,
+            isolation = worker_isolation.prepare_launch(
+                command=command,
+                run_id=run_id,
+                memory_max=self.worker_memory_max,
+            )
+        except Exception as exc:
+            output.close()
+            bus.write_status({
+                **bus.read_status(),
+                "status": "failed",
+                "alive": False,
+                "finished_at": time.time(),
+                "failure_reason": f"worker could not be launched: invalid memory limit ({exc})",
+            })
+            raise
+        logger.info(
+            "worker memory isolation: run %s mechanism=%s limit=%s unit=%s cgroup=%s",
+            run_id,
+            isolation.mechanism,
+            isolation.limit,
+            isolation.unit or "-",
+            isolation.cgroup or "-",
+        )
+        try:
+            record, process = self._spawn_isolated(
+                isolation=isolation,
+                run_id=run_id,
                 cwd=str(workspace_path),
-                stdin=subprocess.DEVNULL,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
                 env=worker_env,
+                output_path=output_path,
+                output=output,
             )
         except Exception:
             output.close()
@@ -1795,6 +1980,7 @@ class RunSupervisor:
             "pgid": process.pid,
             "command": command,
             "command_display": shlex.join(command),
+            "memory_isolation": record,
             **_process_identity(process.pid, command),
         }
         starting_status: dict[str, Any] = {

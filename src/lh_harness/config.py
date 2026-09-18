@@ -46,6 +46,7 @@ _RUN_KEYS = {
     "dashboard",
     "dashboard_port",
     "allow_auditor_write_mcp",
+    "worker_memory_max",
     "roles",
     "timeouts",
 }
@@ -106,6 +107,23 @@ mcp_add_dirs = []
 guard_exclude_paths = []
 
 max_rounds = 25
+
+# Per-run worker memory isolation (TASK 202 + 208). Each run's worker is
+# capped at this RESIDENT-memory limit (a per-episode child cgroup's
+# memory.max under the service's delegated cgroup subtree, or a systemd
+# scope's MemoryMax where a manager is reachable) so one run's memory blowup
+# is OOM-killed alone instead of failing the whole lh-harness service. The
+# default (2G) is sized from CT110's measured agent-worker RESIDENT use — VmRSS
+# 0.26 GiB, high-water 0.29 GiB (2026-09-18), against 6.0 GiB of physical RAM —
+# with roughly seven times headroom and still below RAM, which is what lets the
+# cgroup limit fire before the kernel OOM-kills globally. (The 9.27 GiB figure
+# often quoted for these agents is VmPeak, an ADDRESS-SPACE number, and must
+# never size an RSS bound.); a memory.max bound
+# counts resident pages only, never the ~5.3 GiB of address space Node 22/V8
+# reserves before the worker touches a page. The
+# LH_HARNESS_WORKER_MEMORY_MAX environment variable overrides this value.
+# worker_memory_max = "2G"
+
 dashboard = true
 # Embedded dashboards use an OS-assigned port by default so concurrent runs
 # cannot accidentally share or race a fixed listener. Standalone `web` keeps
@@ -318,6 +336,8 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         defaults["allow_auditor_write_mcp"] = _boolean(
             run["allow_auditor_write_mcp"], "run.allow_auditor_write_mcp"
         )
+    if "worker_memory_max" in run:
+        defaults["worker_memory_max"] = _worker_memory_max(run["worker_memory_max"])
 
     roles = run.get("roles", {})
     if not isinstance(roles, dict):
@@ -401,6 +421,15 @@ def _boolean(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
         raise ProjectConfigError(f"{name} must be true or false")
     return value
+
+
+def _worker_memory_max(value: Any) -> str:
+    from .worker_isolation import parse_memory_limit
+
+    try:
+        return parse_memory_limit(value)
+    except ValueError as exc:
+        raise ProjectConfigError(f"run.worker_memory_max: {exc}") from exc
 
 
 def _names(values: set[str]) -> str:
