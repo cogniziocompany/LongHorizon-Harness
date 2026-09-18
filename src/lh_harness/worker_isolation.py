@@ -85,14 +85,20 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-# Sized from the 2026-09-18 CT110 measurements (claude agent processes
-# 260577 / 262081: VmPeak 9.27 GiB, VmSize 5.31 GiB, VmRSS 0.26 GiB) with
-# headroom, NOT from the pre-208 three-gibibyte address-space cap — see the
-# module docstring for why an address-space figure must never drive this
-# value.  ``memory.max`` bounds resident memory; CT110 has 6 GiB of RAM, so
-# by default the effective bound is physical memory plus the per-episode
-# cgroup isolation itself, and operators tighten it via env/config.
-DEFAULT_WORKER_MEMORY_MAX = "12G"
+# Sized from RESIDENT measurements on CT110, 2026-09-18, because this value
+# drives ``memory.max``, which is an RSS bound:
+#   worst resident agent observed : VmRSS 0.29 GiB (claude, ps -eo rss)
+#   live agents during a run      : VmRSS 0.25-0.26 GiB
+#   CT110 physical RAM            : 6.0 GiB
+# 2G leaves roughly seven times the observed resident high-water mark while
+# staying WELL BELOW physical RAM, which is the whole point: a cgroup limit
+# only isolates when it is reached BEFORE the box runs out. The previous 12G
+# default was carried over from the 9.27 GiB VmPeak - an ADDRESS-SPACE figure,
+# the very thing this module's docstring says must never drive this value - and
+# on a 6 GiB box it can never fire: the kernel would OOM-kill globally first,
+# which is exactly the whole-unit failure task 202 exists to prevent.
+# Operators raise it via env/config for a workload that genuinely needs more.
+DEFAULT_WORKER_MEMORY_MAX = "2G"
 ENV_WORKER_MEMORY_MAX = "LH_HARNESS_WORKER_MEMORY_MAX"
 CONFIG_KEY_WORKER_MEMORY_MAX = "worker_memory_max"
 MEMORY_KILL_REASON_TEMPLATE = "memory limit exceeded ({limit})"
