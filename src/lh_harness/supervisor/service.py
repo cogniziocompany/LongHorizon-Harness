@@ -808,9 +808,11 @@ class RunSupervisor:
         """Popen the isolated worker, capturing its launch record.
 
         Scope launches that never created their cgroup (systemd-run could not
-        reach a manager or was refused) fall back to the ``RLIMIT_AS``
-        mechanism here so the run still starts; the recorded mechanism always
-        states what actually bounded the child.
+        reach a manager, was refused, or otherwise died before starting the
+        wrapped command) fall back to the ``RLIMIT_AS`` mechanism here so the
+        run still starts; the recorded mechanism always states what actually
+        bounded the child.  The decision is structural — non-zero exit with
+        no scope cgroup — not a stderr phrase match.
         """
 
         record = isolation.record()
@@ -828,8 +830,12 @@ class RunSupervisor:
         if isolation.mechanism == worker_isolation.MECHANISM_SCOPE:
             cgroup = worker_isolation.scope_cgroup_for_pid(process.pid, isolation.unit)
             if cgroup is None:
+                # The launcher may still be dying: settle its exit code before
+                # deciding the launch failed (a live poll() of None is not
+                # proof the scope is coming).
+                returncode = worker_isolation.await_scope_exit(process)
                 tail = self._scope_failure_tail(output_path)
-                if worker_isolation.scope_launch_failed(process.poll(), tail):
+                if worker_isolation.scope_launch_failed(returncode, tail):
                     try:
                         process.kill()
                     except OSError:

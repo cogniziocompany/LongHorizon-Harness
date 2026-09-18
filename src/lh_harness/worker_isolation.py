@@ -12,10 +12,13 @@ This module gives each run's worker its own memory boundary:
   ``MemoryMax`` cap, so the kernel OOM-kills only the offending run's child;
 - fallback: an ``RLIMIT_AS`` limit applied directly on the child, used when
   ``systemd-run`` is unavailable (non-systemd hosts, missing user manager,
-  containers).  ``RLIMIT_AS`` bounds the child's address space (and that of
-  everything it spawns, since limits are inherited); it is stricter than an
-  RSS cap because it counts virtual mappings, but it is the portable
-  fallback.
+  containers) or when the scope launch itself fails: any non-zero
+  ``systemd-run`` exit while the scope cgroup never appeared means the
+  wrapped command was not started (stderr phrasing varies by failure mode
+  and is kept as a log diagnostic only).  ``RLIMIT_AS`` bounds the child's
+  address space (and that of everything it spawns, since limits are
+  inherited); it is stricter than an RSS cap because it counts virtual
+  mappings, but it is the portable fallback.
 
 The limit comes from (highest precedence first) the
 ``LH_HARNESS_WORKER_MEMORY_MAX`` environment override, the
@@ -32,6 +35,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,11 +61,15 @@ _LIMIT_RE = re.compile(r"^(?P<value>\d+)(?P<suffix>[kKmMgGtTpP])?$")
 _USER_MANAGER_MARKER = "/run/user/{uid}/systemd"
 _SYSTEM_MANAGER_MARKERS = ("/run/systemd/system", "/run/dbus/system_bus_socket")
 
-# Signatures systemd-run writes to stderr when it cannot create the scope
-# (no bus, no authorization, ...).  The wrapped command is not started in
-# that case, so the launch may be retried with the RLIMIT_AS fallback.
+# Signatures systemd-run has been observed to write to stderr when it cannot
+# create the scope (no bus, no authorization, ...).  These are logging
+# diagnostics only: the fallback decision is structural (non-zero exit with
+# no scope cgroup), because the exact wording varies across systemd builds
+# and failure modes (e.g. "Failed to start transient scope unit: Access
+# denied" matches none of these).
 _SCOPE_FAILURE_SIGNATURES = (
     "failed to start transient service unit",
+    "failed to start transient scope unit",
     "failed to connect to bus",
     "failed to allocate",
     "bus connection refused",
@@ -335,12 +343,44 @@ def _log_tail_mentions_memory_error(worker_log: Path | None) -> bool:
 
 
 def scope_launch_failed(returncode: int | None, log_tail: bytes) -> bool:
-    """Did ``systemd-run`` die before creating the scope (no worker ran)?"""
+    """Did ``systemd-run`` die before creating the scope (no worker ran)?
+
+    Structural decision, not a phrase match: with the scope cgroup failed to
+    appear (established by the caller), *any* non-zero ``systemd-run`` exit
+    means the wrapped command was not started, so the RLIMIT_AS fallback
+    applies.  The exact stderr wording varies across systemd builds and
+    failure modes — e.g. polkit refusals surface as "Failed to start
+    transient scope unit: Access denied", which matches none of the legacy
+    signatures — so ``log_tail`` is used only to pick a log diagnostic.
+    """
 
     if returncode is None or returncode == 0:
         return False
     text = log_tail.decode("utf-8", errors="replace").lower()
-    return any(signature in text for signature in _SCOPE_FAILURE_SIGNATURES)
+    matched = [signature for signature in _SCOPE_FAILURE_SIGNATURES if signature in text]
+    logger.warning(
+        "worker memory isolation: systemd-run exited rc=%s without creating its "
+        "scope; failure signature match: %s; log tail: %.512r",
+        returncode,
+        matched or "none",
+        log_tail,
+    )
+    return True
+
+
+def await_scope_exit(process: Any, *, timeout: float = 3.0) -> int | None:
+    """Settle a launcher whose scope cgroup never appeared onto an exit code.
+
+    ``poll()`` may still be ``None`` right after the cgroup wait: the
+    launcher can take a moment to die.  Wait briefly for its exit so the
+    failed-launch decision is made on a settled return code, and report
+    ``None`` only when it is genuinely still running past the grace period.
+    """
+
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return process.poll()
 
 
 # ``signal.SIGKILL`` is the kernel's only tool for an OOM kill; keep the
