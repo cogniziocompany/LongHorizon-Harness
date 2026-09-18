@@ -114,7 +114,11 @@ max_rounds = 25
 # scope's MemoryMax where a manager is reachable) so one run's memory blowup
 # is OOM-killed alone instead of failing the whole lh-harness service. The
 # default (2G) is sized from CT110's measured agent-worker RESIDENT use — VmRSS
-# 9.27 GiB, VmRSS 0.26 GiB (2026-09-18) — with headroom; a memory.max bound
+# 0.26 GiB, high-water 0.29 GiB (2026-09-18), against 6.0 GiB of physical RAM —
+# with roughly seven times headroom and still below RAM, which is what lets the
+# cgroup limit fire before the kernel OOM-kills globally. (The 9.27 GiB figure
+# often quoted for these agents is VmPeak, an ADDRESS-SPACE number, and must
+# never size an RSS bound.); a memory.max bound
 # counts resident pages only, never the ~5.3 GiB of address space Node 22/V8
 # reserves before the worker touches a page. The
 # LH_HARNESS_WORKER_MEMORY_MAX environment variable overrides this value.
