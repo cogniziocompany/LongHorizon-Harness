@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import stat as stat_module
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 import traceback
@@ -297,6 +298,7 @@ async def _run_impl(
             "auditor_budget": _budget_to_dict(auditor_budget),
             "resumed": bool(resume),
             "resumed_rounds": len(rounds),
+            "workspace_round_zero": _workspace_round_zero_record(config.workspace_path),
         },
     )
     if resume:
@@ -2439,6 +2441,115 @@ def _write_local(path: Path, text: str) -> None:
 def _budget_to_dict(budget: EpisodeBudget) -> dict[str, int]:
     return {
         "max_duration_seconds": budget.max_duration_seconds,
+    }
+
+
+def _round_zero_git(workspace_path: str, args: list[str], timeout: float = 10.0) -> str | None:
+    """Run one read-only git query inside the workspace; ``None`` on any failure."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", workspace_path, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout.strip() or None
+
+
+def _round_zero_open_prs(branch: str, timeout: float = 10.0) -> list[dict[str, Any]] | None:
+    """List open PRs whose head is ``branch``.
+
+    ``None`` means the query could not run (no ``gh``, no auth, no network), so
+    an unknown collision is never disguised as a checked-clean one.
+    """
+    try:
+        completed = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "number,title,url",
+                "--limit",
+                "20",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        parsed = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return [
+        {"number": item.get("number"), "title": item.get("title"), "url": item.get("url")}
+        for item in parsed
+        if isinstance(item, dict)
+    ]
+
+
+def _workspace_round_zero_record(
+    workspace_path: str | Path,
+    *,
+    open_prs: Callable[[str], list[dict[str, Any]] | None] | None = None,
+) -> dict[str, Any]:
+    """Observe-only round-zero snapshot of the workspace handed to a run.
+
+    Recorded once into ``role_harness_start`` so a human can later see which
+    branch, HEAD, and dirty state a workspace had at handoff, and whether an
+    open PR already heads that branch (a prelaunch collision).  Every item
+    degrades to ``None``/``[]`` when its query fails; this record must never
+    gate, block, or otherwise alter a launch.
+    """
+    path = str(workspace_path)
+    branch = _round_zero_git(path, ["rev-parse", "--abbrev-ref", "HEAD"])
+    head_sha = _round_zero_git(path, ["rev-parse", "HEAD"])
+
+    ahead_of_remote: bool | None = None
+    uncommitted_paths: list[str] = []
+    if branch is not None and head_sha is not None:
+        upstream = _round_zero_git(
+            path, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]
+        )
+        if upstream:
+            counts = _round_zero_git(
+                path, ["rev-list", "--left-right", "--count", f"{upstream}...HEAD"]
+            )
+            if counts and len(counts.split()) == 2:
+                behind, ahead = (int(value) for value in counts.split())
+                ahead_of_remote = ahead > 0
+        status = _round_zero_git(path, ["status", "--porcelain"])
+        if status:
+            uncommitted_paths = [line[3:] for line in status.splitlines() if len(line) > 3]
+
+    # ``None`` (rather than ``[]``) means the query itself was unavailable, so
+    # an unknown collision is never disguised as a checked-clean one.
+    listed_prs: list[dict[str, Any]] | None = None
+    if branch is not None:
+        query_open_prs = open_prs if open_prs is not None else _round_zero_open_prs
+        try:
+            listed_prs = query_open_prs(branch)
+        except Exception:  # noqa: BLE001 - observation must never raise
+            listed_prs = None
+
+    return {
+        "branch": branch,
+        "head_sha": head_sha,
+        "ahead_of_remote": ahead_of_remote,
+        "uncommitted_paths": uncommitted_paths,
+        "open_prs": listed_prs,
     }
 
 
