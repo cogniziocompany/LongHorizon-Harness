@@ -11,9 +11,26 @@
 # unit must not fail the whole service — systemd leaves the remaining
 # processes of the unit running instead of tearing the unit down (the kernel
 # still kills only the offending process).  Per-run workers additionally get
-# their own memory boundary via systemd-run scopes with MemoryMax, so the
-# offending run's child is the only thing the kernel can kill; see
-# src/lh_harness/worker_isolation.py.  OOMPolicy needs systemd >= 249.
+# their own memory boundary (an RSS cap per episode; see
+# src/lh_harness/worker_isolation.py), so the offending run's child is the
+# only thing the kernel can kill.  OOMPolicy needs systemd >= 249.
+#
+# Delegate=memory pids (TASK 208): the memory boundary for per-run workers
+# must bound RESIDENT memory, and on CT110 the only mechanism the
+# unprivileged harness user can use is a child cgroup under this service's
+# own cgroup — there is no polkit daemon (so `systemd-run --scope` is always
+# refused with "Access denied", task 205) and no user manager (so
+# `systemd-run --user` + linger is impossible too).  Delegating the memory
+# and pids controllers to the service's cgroup makes the service user able
+# to create child cgroups and write memory.max directly: worker code moves
+# each episode's worker into its own child cgroup capped at memory.max.
+# Measured on CT110 2026-09-18: a claude agent worker's child is Node 22,
+# which reserves ~5.3 GiB of virtual address space (peaking at 9.27 GiB)
+# while using 0.26 GiB resident — so the cap MUST count resident pages
+# (memory.max), never address space.  The delegation takes effect at the
+# next deploy window's daemon-reload + service restart; until then workers
+# launch unbounded with a log line saying so (see
+# worker_isolation.unbounded_plan).
 #
 # Secrets are injected through the unit's EnvironmentFile, which must stay out
 # of git (read them on the host with ``systemctl show lh-harness -p
@@ -34,6 +51,12 @@ RestartSec=5s
 # A child OOM kill (e.g. one run's pytest) must not take the unit — and every
 # other live run's worker — down with it (TASK 202).
 OOMPolicy=continue
+# TASK 208: hand the memory and pids controllers to this unit's own cgroup so
+# worker_isolation can create per-episode child cgroups and write memory.max
+# (an RSS bound) directly, with no polkit conversation and no root.  This is
+# the mechanism that makes the RSS bound WORK on CT110 (systemd 255, LXC,
+# no polkit daemon, no user manager).
+Delegate=memory pids
 
 [Install]
 WantedBy=default.target

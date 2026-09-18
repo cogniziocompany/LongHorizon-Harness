@@ -108,12 +108,17 @@ guard_exclude_paths = []
 
 max_rounds = 25
 
-# Per-run worker memory isolation (TASK 202). Each run's worker is launched in
-# its own systemd transient scope with this MemoryMax so one run's memory
-# blowup is OOM-killed alone instead of failing the whole lh-harness service;
-# on hosts without systemd-run the worker gets an RLIMIT_AS cap instead. The
+# Per-run worker memory isolation (TASK 202 + 208). Each run's worker is
+# capped at this RESIDENT-memory limit (a per-episode child cgroup's
+# memory.max under the service's delegated cgroup subtree, or a systemd
+# scope's MemoryMax where a manager is reachable) so one run's memory blowup
+# is OOM-killed alone instead of failing the whole lh-harness service. The
+# default (12G) is sized from CT110's measured agent-worker peak — VmPeak
+# 9.27 GiB, VmRSS 0.26 GiB (2026-09-18) — with headroom; a memory.max bound
+# counts resident pages only, never the ~5.3 GiB of address space Node 22/V8
+# reserves before the worker touches a page. The
 # LH_HARNESS_WORKER_MEMORY_MAX environment variable overrides this value.
-# worker_memory_max = "3G"
+# worker_memory_max = "12G"
 
 dashboard = true
 # Embedded dashboards use an OS-assigned port by default so concurrent runs
