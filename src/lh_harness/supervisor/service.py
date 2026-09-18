@@ -697,10 +697,12 @@ class RunSupervisor:
         if attached_run_id is not None:
             self._validate_run_id(attached_run_id)
         self.attached_run_id = attached_run_id
-        # TASK 202: per-worker memory isolation.  The effective limit is the
-        # explicit constructor value (already validated by the caller),
+        # TASK 202 + 208: per-worker memory isolation.  The effective limit is
+        # the explicit constructor value (already validated by the caller),
         # the LH_HARNESS_WORKER_MEMORY_MAX env override, the project config
-        # key, or the 3G default; see worker_isolation.resolve_memory_limit.
+        # key, or the default (12G, an RSS bound sized from CT110's measured
+        # 9.27 GiB VmPeak with headroom); see
+        # worker_isolation.resolve_memory_limit.
         self.worker_memory_max = worker_isolation.resolve_memory_limit(
             explicit=worker_memory_max,
             env=os.environ.get(worker_isolation.ENV_WORKER_MEMORY_MAX),
@@ -809,10 +811,14 @@ class RunSupervisor:
 
         Scope launches that never created their cgroup (systemd-run could not
         reach a manager, was refused, or otherwise died before starting the
-        wrapped command) fall back to the ``RLIMIT_AS`` mechanism here so the
-        run still starts; the recorded mechanism always states what actually
-        bounded the child.  The decision is structural — non-zero exit with
-        no scope cgroup — not a stderr phrase match.
+        wrapped command) retry here: the retry prefers the delegated cgroup
+        mechanism (an RSS bound that needs no systemd manager — the only
+        mechanism that works on CT110, which has no polkit daemon and no
+        user manager) and, when the service's cgroup subtree is not
+        delegated either, launches the worker unbounded with a loud log
+        (TASK 208: an address-space rlimit cannot bound a Node 22/V8 agent
+        worker, so no rlimit fallback exists).  The decision is structural —
+        non-zero exit with no scope cgroup — not a stderr phrase match.
         """
 
         record = isolation.record()
@@ -841,10 +847,11 @@ class RunSupervisor:
                     except OSError:
                         pass
                     process.wait(timeout=10)
-                    fallback = worker_isolation.rlimit_plan(
+                    fallback = worker_isolation.fallback_plan(
                         isolation.limit,
                         # Re-derive the bare worker command from the scope argv.
                         _bare_worker_command(isolation.command),
+                        run_id,
                     )
                     logger.warning(
                         "worker memory isolation: run %s scope %s did not start; retrying with mechanism=%s",
@@ -862,7 +869,28 @@ class RunSupervisor:
                         env=env,
                         preexec_fn=fallback.preexec,
                     )
-                    return fallback.record(), process
+                    record = fallback.record()
+                    if fallback.cgroup and worker_isolation.verify_pid_cgroup(
+                        process.pid, fallback.cgroup
+                    ):
+                        # The preexec moved the child into its cgroup; record
+                        # the resolved path and the oom baseline so a later
+                        # death can be attributed to the RSS cap.
+                        record["cgroup"] = fallback.cgroup
+                        record["oom_kill_base"] = worker_isolation.read_scope_oom_kills(
+                            fallback.cgroup
+                        )
+                    elif fallback.cgroup:
+                        # Never record a bound the child is not under.
+                        logger.warning(
+                            "worker memory isolation: run %s child pid %s did not "
+                            "land in its prepared cgroup %s; correcting the record",
+                            run_id,
+                            process.pid,
+                            fallback.cgroup,
+                        )
+                        record["cgroup"] = ""
+                    return record, process
             record["cgroup"] = cgroup or ""
             record["oom_kill_base"] = worker_isolation.read_scope_oom_kills(cgroup)
         return record, process
@@ -1891,11 +1919,14 @@ class RunSupervisor:
             os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
         )
         worker_env.pop("LH_HARNESS_WEB_TOKEN", None)
-        # TASK 202: give the worker its own memory boundary so one run's
+        # TASK 202 + 208: give the worker its own memory boundary so one run's
         # blowup cannot OOM-kill the shared service cgroup (and every other
-        # live run with it).  The launch record is persisted in the owner so
-        # a later death can be attributed to the limit; see
-        # worker_isolation.classify_memory_death.
+        # live run with it).  The boundary is an RSS cap — a per-episode
+        # child cgroup under the service's delegated subtree (see the
+        # mechanism note in worker_isolation) or a systemd scope — never an
+        # address-space rlimit, which cannot bound a Node 22/V8 agent worker.
+        # The launch record is persisted in the owner so a later death can be
+        # attributed to the limit; see worker_isolation.classify_memory_death.
         try:
             isolation = worker_isolation.prepare_launch(
                 command=command,
@@ -1913,11 +1944,12 @@ class RunSupervisor:
             })
             raise
         logger.info(
-            "worker memory isolation: run %s mechanism=%s limit=%s unit=%s",
+            "worker memory isolation: run %s mechanism=%s limit=%s unit=%s cgroup=%s",
             run_id,
             isolation.mechanism,
             isolation.limit,
             isolation.unit or "-",
+            isolation.cgroup or "-",
         )
         try:
             record, process = self._spawn_isolated(
