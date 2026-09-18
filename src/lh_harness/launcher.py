@@ -14,12 +14,14 @@ import json
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import PROJECT_CONFIG_PATH, load_run_defaults
 from .queue import QueueEntry, QueueStore, default_queue_config, queue_config_from_config
 from .supervisor.lifecycle import ACTIVE_STATUSES, canonical_lifecycle_status
+from .workspace_guard import WorkspaceBaseError, prepare_workspace_base, probe_open_pr_gh
 
 # ``httpx`` is already a transitive dependency of FastAPI/TestClient, but the
 # launcher must not fail to import when it is absent.
@@ -63,6 +65,7 @@ class Launcher:
         *,
         poll_seconds: float = 15.0,
         queue_config: dict[str, Any] | None = None,
+        probe_open_pr: "Callable[[Path, str], str | None] | None" = probe_open_pr_gh,
     ) -> None:
         self.supervisor = supervisor
         self.queue_store = queue_store
@@ -72,6 +75,12 @@ class Launcher:
         )
         self._task: asyncio.Task | None = None
         self._stopping = False
+        # Workspace branch guard hook: returns a description of an OPEN PR on
+        # the given branch, or None.  DEFAULT-ON: production launches probe
+        # origin for a colliding OPEN PR with no flag or config (deliverable 3
+        # must hold in the default configuration).  Pass ``probe_open_pr=None``
+        # only to disable the probe explicitly (tests and offline runs).
+        self.probe_open_pr = probe_open_pr
         # One launcher instance must never launch two runs into the same
         # workspace across concurrent ticks.  This lock serializes the critical
         # section from eligibility check through store mark_launched.
@@ -308,13 +317,39 @@ class Launcher:
             for role in ("manager", "executor", "auditor")
         }
         run_id: str | None = None
+        # Workspace branch guard: never launch onto another task's branch
+        # (measured defect, 2026-09-16: runs 7784478f under PR #108 and
+        # 96563c4c under PR #154).  A non-default checked-out branch must not
+        # be used as-is; the run gets a base cut fresh from origin's default,
+        # and another task's uncommitted/unpushed work is never destroyed.
+        try:
+            base = prepare_workspace_base(
+                entry.workspace,
+                run_label=f"{entry.trio}-{uuid.uuid4().hex[:8]}",
+                base_root=getattr(self.supervisor, "workspace_root", None),
+                probe_open_pr=self.probe_open_pr,
+            )
+        except WorkspaceBaseError as exc:
+            reason = str(exc)[:_MAX_REASON_LEN]
+            self.queue_store.mark_failed(entry.queue_id, f"workspace base refused: {reason}")
+            self._emit_service_event(
+                "queue.skipped",
+                {
+                    "queue_id": entry.queue_id,
+                    "trio": entry.trio,
+                    "workspace": entry.workspace,
+                    "reason": f"workspace base refused: {reason}",
+                },
+            )
+            return
+        workspace = str(base.workspace if base.mode == "worktree" else entry.workspace)
         try:
             created = self.supervisor.create_run(
                 task=entry.task,
                 agent=agent,
                 model=model,
                 role_configs=role_configs,
-                workspace=entry.workspace,
+                workspace=workspace,
                 max_rounds=entry.max_rounds,
                 prompt_language="en",
                 mcp_profile=mcp_profile,
@@ -342,8 +377,9 @@ class Launcher:
                 "queue_id": entry.queue_id,
                 "run_id": run_id,
                 "trio": entry.trio,
-                "workspace": entry.workspace,
+                "workspace": workspace,
                 "requested_by": entry.requested_by,
+                "workspace_base": base.summary(),
             },
         )
         if launched is not None:
