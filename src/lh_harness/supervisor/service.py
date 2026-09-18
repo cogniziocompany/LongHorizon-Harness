@@ -700,7 +700,7 @@ class RunSupervisor:
         # TASK 202 + 208: per-worker memory isolation.  The effective limit is
         # the explicit constructor value (already validated by the caller),
         # the LH_HARNESS_WORKER_MEMORY_MAX env override, the project config
-        # key, or the default (12G, an RSS bound sized from CT110's measured
+        # key, or the default (2G, an RSS bound sized from CT110's measured
         # 9.27 GiB VmPeak with headroom); see
         # worker_isolation.resolve_memory_limit.
         self.worker_memory_max = worker_isolation.resolve_memory_limit(
