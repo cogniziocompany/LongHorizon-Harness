@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .adapters.base import AgentAdapter
+from .adapters.claude_permissions import is_git_internal_metadata_path
 from .agent_logs import (
     assistant_texts as decode_agent_assistant_texts,
     visible_output as decode_agent_visible_output,
@@ -1865,7 +1866,21 @@ def _hard_runtime_signal_labels(result: EpisodeResult) -> list[str]:
 
 def _workspace_mutation_detected(result: EpisodeResult) -> bool:
     metadata = result.metadata if isinstance(result.metadata, dict) else {}
-    return bool(metadata.get("verifier_workspace_mutation_detected"))
+    if not metadata.get("verifier_workspace_mutation_detected"):
+        return False
+    mutations = metadata.get("verifier_workspace_mutations")
+    if not isinstance(mutations, dict):
+        return True
+    observed: list[str] = []
+    for key in ("added", "changed", "deleted", "type_changed"):
+        value = mutations.get(key)
+        if isinstance(value, list):
+            observed.extend(str(item) for item in value)
+    # Only non-git-internal working files count. Churn confined to
+    # git-internal bookkeeping (index stat caches, .git/worktrees/<name>/
+    # admin files refreshed by read-only git commands) — or no observable
+    # path at all — is not an auditor write and must not gate the manager.
+    return any(not is_git_internal_metadata_path(path) for path in observed)
 
 
 def _save_role_result(
