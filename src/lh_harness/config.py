@@ -113,7 +113,7 @@ max_rounds = 25
 # memory.max under the service's delegated cgroup subtree, or a systemd
 # scope's MemoryMax where a manager is reachable) so one run's memory blowup
 # is OOM-killed alone instead of failing the whole lh-harness service. The
-# default (12G) is sized from CT110's measured agent-worker peak — VmPeak
+# default (2G) is sized from CT110's measured agent-worker RESIDENT use — VmRSS
 # 9.27 GiB, VmRSS 0.26 GiB (2026-09-18) — with headroom; a memory.max bound
 # counts resident pages only, never the ~5.3 GiB of address space Node 22/V8
 # reserves before the worker touches a page. The
