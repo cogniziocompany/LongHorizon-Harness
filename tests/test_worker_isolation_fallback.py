@@ -82,11 +82,16 @@ def test_default_limit_is_rss_sized_not_address_space_sized() -> None:
     """The default must be sized from the measured peak with headroom."""
 
     # CT110, 2026-09-18, live agent runs: VmPeak 9.27 GiB, VmSize 5.31 GiB,
-    # VmRSS 0.26 GiB.  12G admits the measured peak with headroom while
+    # VmRSS 0.26 GiB.  2G admits the measured RESIDENT use with ~7x headroom while
     # staying an RSS bound (memory.max), which never counts the ~5.3 GiB
     # address-space reservation.
-    assert DEFAULT_WORKER_MEMORY_MAX == "12G"
-    assert to_bytes(DEFAULT_WORKER_MEMORY_MAX) > to_bytes("9G")
+    assert DEFAULT_WORKER_MEMORY_MAX == "2G"
+    # The cap must sit BELOW physical RAM (CT110: 6.0 GiB) or the kernel
+    # OOM-kills globally before the cgroup limit is ever reached - the
+    # whole-unit failure task 202 exists to prevent. And it must stay well
+    # above the measured resident high-water mark of a real agent (0.29 GiB).
+    assert to_bytes(DEFAULT_WORKER_MEMORY_MAX) < to_bytes("6G")
+    assert to_bytes(DEFAULT_WORKER_MEMORY_MAX) > to_bytes("1G")
     # And the rejected mechanism's value must never be a limit again.
     assert "3G" != DEFAULT_WORKER_MEMORY_MAX
 
