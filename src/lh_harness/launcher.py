@@ -322,16 +322,32 @@ class Launcher:
         # 96563c4c under PR #154).  A non-default checked-out branch must not
         # be used as-is; the run gets a base cut fresh from origin's default,
         # and another task's uncommitted/unpushed work is never destroyed.
+        #
+        # Continuation opt-in (task 201): an entry with ``branch`` or
+        # ``continue_branch`` set is a continuation task that owns the branch
+        # it names or finds checked out; the guard honours that with mode
+        # "continuation" — no relocation, no stash, no open-PR refusal.  The
+        # default (neither set) keeps the guard's full protection.
+        continuation = bool(getattr(entry, "branch", "") or getattr(entry, "continue_branch", False))
         try:
             base = prepare_workspace_base(
                 entry.workspace,
                 run_label=f"{entry.trio}-{uuid.uuid4().hex[:8]}",
                 base_root=getattr(self.supervisor, "workspace_root", None),
                 probe_open_pr=self.probe_open_pr,
+                continuation=continuation,
+                requested_branch=getattr(entry, "branch", "") or "",
             )
         except WorkspaceBaseError as exc:
             reason = str(exc)[:_MAX_REASON_LEN]
-            self.queue_store.mark_failed(entry.queue_id, f"workspace base refused: {reason}")
+            # A guard refusal is retryable, not terminal (task 201): a dirty
+            # tree or an OPEN PR on the branch is often transient (the other
+            # task merges, the tree is cleaned), so the entry stays pending
+            # with the reason recorded in skip_reasons and is re-attempted on
+            # the next poll instead of becoming a dead row needing hand
+            # requeue.  The same choice as the other skip paths in this
+            # launcher; nothing else about the entry changes.
+            updated = self.queue_store.record_skip(entry.queue_id, f"workspace base refused: {reason}")
             self._emit_service_event(
                 "queue.skipped",
                 {
@@ -341,6 +357,9 @@ class Launcher:
                     "reason": f"workspace base refused: {reason}",
                 },
             )
+            if updated is not None:
+                updated.last_checked_at = _now()
+                self.queue_store.update(updated)
             return
         workspace = str(base.workspace if base.mode == "worktree" else entry.workspace)
         try:
@@ -354,6 +373,8 @@ class Launcher:
                 prompt_language="en",
                 mcp_profile=mcp_profile,
                 base_check=entry.base_check or None,
+                workspace_base_mode=base.mode,
+                workspace_base_summary=base.summary(),
             )
             run_id = str(created.get("id") or "")
         except Exception as exc:

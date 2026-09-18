@@ -120,6 +120,12 @@ class HarnessConfig:
     harness_dir: str = DEFAULT_HARNESS_DIR
     log_dir: str = DEFAULT_LOG_DIR
     runs_root: str = DEFAULT_STATE_ROOT
+    # Task 201: the mode the prelaunch workspace guard chose for this run
+    # ("on-default" / "in-place" / "worktree" / "stash" / "continuation"), set
+    # by the supervisor from the launcher's resolved base and surfaced in the
+    # round-zero record.  None means the launch was not queue-triggered (or the
+    # running harness predates the guard), and the record omits it.
+    workspace_base_mode: str | None = None
     auditor_output_chars: int = 24_000
     role_verified_context_chars: int = 60_000
     role_history_chars: int = 100_000

@@ -180,8 +180,12 @@ def test_dirty_non_default_branch_preserves_foreign_work(tmp_path: Path) -> None
     assert _git(repo, "status", "--porcelain").strip() != ""
 
 
-def test_open_pr_collision_fails_loudly_naming_branch_and_pr(tmp_path: Path) -> None:
-    """Deliverable 3: a colliding OPEN PR produces the loud named failure."""
+def test_open_pr_collision_blocks_retryably_naming_branch_and_pr(tmp_path: Path) -> None:
+    """Deliverable 3: a colliding OPEN PR produces the loud named refusal.
+
+    Task 201: the refusal is retryable — the entry stays ``pending`` with the
+    reason recorded — instead of becoming a terminal ``failed`` row.
+    """
 
     repo = _make_repo(tmp_path)
     _feature_branch(repo)
@@ -194,11 +198,15 @@ def test_open_pr_collision_fails_loudly_naming_branch_and_pr(tmp_path: Path) -> 
     asyncio.run(launcher.tick())
 
     updated = store.get(entry.queue_id)
-    assert updated is not None and updated.status == "failed"
-    reason = updated.reason or ""
+    assert updated is not None and updated.status == "pending", (
+        "a guard refusal is retryable: the entry must stay pending, not fail"
+    )
+    assert updated.skip_reasons, "the refusal reason must be recorded on the entry"
+    reason = updated.skip_reasons[-1]
     assert "feat/other-task" in reason
     assert "#108" in reason and "https://gh.example/pr/108" in reason
     assert "refusing to launch" in reason
+    assert updated.reason is None, "no terminal reason: the entry never failed"
     # Nothing was launched and nothing was touched.
     assert len(supervisor.created) == 0
     assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/other-task"
@@ -228,8 +236,9 @@ def test_default_configuration_probes_open_pr_and_fails_loudly(tmp_path: Path) -
     asyncio.run(launcher.tick())
 
     updated = store.get(entry.queue_id)
-    assert updated is not None and updated.status == "failed"
-    reason = updated.reason or ""
+    assert updated is not None and updated.status == "pending"
+    assert updated.skip_reasons, "the refusal reason must be recorded on the entry"
+    reason = updated.skip_reasons[-1]
     assert "feat/other-task" in reason
     assert "#154" in reason
     assert "https://gh.example/pr/154" in reason
@@ -238,8 +247,8 @@ def test_default_configuration_probes_open_pr_and_fails_loudly(tmp_path: Path) -
     assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/other-task"
 
 
-def test_unresolvable_base_fails_loudly_naming_branch(tmp_path: Path) -> None:
-    """Deliverable 3: no default branch on origin => loud failure, never proceed."""
+def test_unresolvable_base_blocks_retryably_naming_branch(tmp_path: Path) -> None:
+    """Deliverable 3: no default branch on origin => loud retryable refusal."""
 
     repo = _make_repo(tmp_path)
     _feature_branch(repo)
@@ -254,8 +263,9 @@ def test_unresolvable_base_fails_loudly_naming_branch(tmp_path: Path) -> None:
     asyncio.run(launcher.tick())
 
     updated = store.get(entry.queue_id)
-    assert updated is not None and updated.status == "failed"
-    reason = updated.reason or ""
+    assert updated is not None and updated.status == "pending"
+    assert updated.skip_reasons
+    reason = updated.skip_reasons[-1]
     assert "feat/other-task" in reason
     assert "refusing to launch" in reason
     assert len(supervisor.created) == 0
@@ -333,3 +343,189 @@ def test_launcher_defaults_probe_to_real_gh_probe() -> None:
 
     launcher = Launcher(object(), object())  # type: ignore[arg-type]
     assert launcher.probe_open_pr is probe_open_pr_gh
+
+
+# ---------------------------------------------------------------------------
+# Task 201: continuation opt-in (`branch` / `continue_branch`)
+# ---------------------------------------------------------------------------
+
+
+def _entry_with_opt_in(store: QueueStore, workspace: Path, **opt_in: Any) -> Any:
+    body = {
+        "name": "task",
+        "task": "do something",
+        "workspace": str(workspace),
+        "trio": "kimi",
+        "priority": 10,
+        "requested_by": "ci",
+    }
+    body.update(opt_in)
+    return store.create(body)
+
+
+OPEN_PR = "#108 'other task work' https://gh.example/pr/108"
+
+
+def test_continuation_entry_with_open_pr_launches_on_its_branch(tmp_path: Path) -> None:
+    """Task 201 (a): a continuation entry launches on its OPEN-PR branch.
+
+    Under the task 195 guard this shape was refused outright; the opt-in must
+    launch the run on the branch as-is, with no relocation, no stash, and no
+    refusal, and the round-zero mode the guard chose is "continuation".
+    """
+
+    repo = _make_repo(tmp_path)
+    _feature_branch(repo, name="feat/other-task")  # pushed; open PR heads it
+    launcher, store, supervisor = _launcher(
+        tmp_path,
+        probe_open_pr=lambda repo, branch: OPEN_PR,
+    )
+    entry = _entry_with_opt_in(store, repo, branch="feat/other-task")
+
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None and updated.status == "launched"
+    assert len(supervisor.created) == 1
+    # The run stayed on the PR branch in the original workspace.
+    assert Path(supervisor.created[0]["workspace"]).resolve() == repo.resolve()
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/other-task"
+    assert _git(repo, "rev-parse", "HEAD") == _git(repo, "rev-parse", "feat/other-task")
+    # The guard's chosen mode reaches the run so the round-zero record can
+    # name it (deliverable 4).
+    assert supervisor.created[0]["workspace_base_mode"] == "continuation"
+    assert "continuation" in supervisor.created[0]["workspace_base_summary"]
+    # A push from the run would update the PR branch the task was written to
+    # finish: the branch is the one the entry named, unchanged.
+    assert _git(repo, "rev-parse", "feat/other-task") == _git(repo, "rev-parse", "origin/feat/other-task")
+
+
+def test_non_opt_in_entry_on_the_same_branch_is_still_refused(tmp_path: Path) -> None:
+    """Task 201 (b): without the opt-in, the OPEN-PR branch is still refused.
+
+    The default guard must keep its full strength: a plain entry pointing at
+    the same workspace and branch is blocked (retryably) and the run is never
+    relocated onto it.
+    """
+
+    repo = _make_repo(tmp_path)
+    _feature_branch(repo, name="feat/other-task")
+    launcher, store, supervisor = _launcher(
+        tmp_path,
+        probe_open_pr=lambda repo, branch: OPEN_PR,
+    )
+    entry = _entry(store, repo)  # no opt-in of any kind
+
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None and updated.status == "pending"
+    reason = updated.skip_reasons[-1]
+    assert "feat/other-task" in reason and "#108" in reason
+    assert "refusing to launch" in reason
+    # Still refused, not silently relocated.
+    assert len(supervisor.created) == 0
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/other-task"
+    assert updated.reason is None, "the refusal stays retryable, not terminal"
+
+
+def test_continuation_entry_with_dirty_tree_keeps_the_tree(tmp_path: Path) -> None:
+    """Task 201 (c): an opt-in entry launches on a dirty branch without touching it.
+
+    No stash, no worktree, no relocation: the uncommitted work the workspace
+    carries is still there, uncommitted, when the run starts.
+    """
+
+    repo = _make_repo(tmp_path)
+    _feature_branch(repo, name="feat/other-task")
+    foreign = repo / "fleet-admin" / "other-task.txt"
+    foreign.parent.mkdir()
+    foreign.write_text("another task's uncommitted work\n", encoding="utf-8")
+    _git(repo, "add", "fleet-admin")
+    (repo / "tracked_change.txt").write_text("uncommitted tracked edit\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-m", "local-only commit ahead of remote")
+    ahead_sha = _git(repo, "rev-parse", "HEAD")
+    launcher, store, supervisor = _launcher(tmp_path, probe_open_pr=NO_PR)
+    entry = _entry_with_opt_in(store, repo, continue_branch=True)
+
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None and updated.status == "launched"
+    assert len(supervisor.created) == 1
+    assert Path(supervisor.created[0]["workspace"]).resolve() == repo.resolve()
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/other-task"
+    # The tree is exactly as dirty as before: nothing was stashed or moved.
+    assert _git(repo, "rev-parse", "HEAD") == ahead_sha
+    assert foreign.read_text(encoding="utf-8").startswith("another task's")
+    assert (repo / "tracked_change.txt").exists()
+    assert "tracked_change.txt" in _git(repo, "status", "--porcelain")
+    # No stash was created and no run worktree was spawned.
+    assert _git(repo, "stash", "list").strip() == ""
+    assert supervisor.created[0]["workspace_base_mode"] == "continuation"
+
+
+def test_continuation_named_branch_mismatch_blocks_retryably(tmp_path: Path) -> None:
+    """A continuation entry naming a branch the workspace is not on is blocked.
+
+    The guard must not silently launch onto the wrong branch; like every
+    guard refusal (task 201 deliverable 3) the block is retryable: the entry
+    stays pending with the reason naming both branches.
+    """
+
+    repo = _make_repo(tmp_path)
+    _feature_branch(repo, name="feat/other-task")
+    launcher, store, supervisor = _launcher(tmp_path, probe_open_pr=NO_PR)
+    entry = _entry_with_opt_in(store, repo, branch="feat/harness-fleet-report")
+
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None and updated.status == "pending"
+    reason = updated.skip_reasons[-1]
+    assert "feat/harness-fleet-report" in reason and "feat/other-task" in reason
+    assert len(supervisor.created) == 0
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/other-task"
+
+
+def test_guard_unit_continuation_returns_workspace_unchanged(tmp_path: Path) -> None:
+    """Unit: continuation returns the workspace as-is, without resolving origin."""
+
+    repo = _make_repo(tmp_path)
+    _feature_branch(repo, name="feat/other-task")
+    head_before = _git(repo, "rev-parse", "HEAD")
+
+    outcome = prepare_workspace_base(
+        repo,
+        run_label="unit-cont",
+        probe_open_pr=lambda repo, branch: OPEN_PR,  # would refuse without opt-in
+        continuation=True,
+        requested_branch="feat/other-task",
+    )
+
+    assert outcome.mode == "continuation"
+    assert outcome.workspace == repo
+    assert outcome.original_branch == "feat/other-task"
+    assert outcome.run_branch == "feat/other-task"
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/other-task"
+    assert _git(repo, "rev-parse", "HEAD") == head_before
+    assert "base=continuation-branch-as-is" in outcome.summary()
+
+
+def test_guard_unit_continuation_named_branch_mismatch_is_retryable(tmp_path: Path) -> None:
+    """Unit: a requested branch that is not checked out is a loud, retryable block."""
+
+    repo = _make_repo(tmp_path)
+    _feature_branch(repo, name="feat/other-task")
+    with pytest.raises(WorkspaceBaseError) as excinfo:
+        prepare_workspace_base(
+            repo,
+            run_label="unit-mismatch",
+            probe_open_pr=NO_PR,
+            continuation=True,
+            requested_branch="feat/harness-fleet-report",
+        )
+    message = str(excinfo.value)
+    assert "feat/harness-fleet-report" in message
+    assert "feat/other-task" in message
+    assert "checked-out branch 'feat/other-task'" in message

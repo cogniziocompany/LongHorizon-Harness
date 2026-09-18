@@ -515,6 +515,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional base commit or branch guard recorded with the run for queue-triggered launches.",
     )
     run_parser.add_argument(
+        "--workspace-base-mode",
+        default=None,
+        choices=(
+            "on-default",
+            "in-place",
+            "worktree",
+            "stash",
+            "continuation",
+        ),
+        help="Internal: the mode the prelaunch workspace guard chose for this run "
+        "(task 201); recorded in the round-zero workspace record. Set by the "
+        "supervisor for queue-triggered launches.",
+    )
+    run_parser.add_argument(
         "--prompt-language",
         choices=("en", "zh"),
         default=run_default("prompt_language", "en"),
@@ -1701,6 +1715,7 @@ def _run_command(args: argparse.Namespace) -> int:
         harness_dir=harness_dir,
         log_dir=log_dir,
         runs_root=args.runs_root,
+        workspace_base_mode=getattr(args, "workspace_base_mode", None),
         prompt_language=args.prompt_language,
         **context_cap_defaults,
     )

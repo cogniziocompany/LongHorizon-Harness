@@ -221,6 +221,8 @@ async def test_role_harness_start_carries_the_round_zero_record(
     ]
     start = next(item for item in events if item["event"] == "role_harness_start")
     record = start["workspace_round_zero"]
+    # Task 201: the record carries the five observed items; the guard's mode
+    # appears only when the launch supplied one (this launch did not).
     assert set(record) == _RECORD_KEYS, "the record carries exactly the five items"
     assert record["branch"] == _git(workspace, "rev-parse", "--abbrev-ref", "HEAD")
     assert record["head_sha"] == _git(workspace, "rev-parse", "HEAD")
@@ -233,3 +235,74 @@ async def test_role_harness_start_carries_the_round_zero_record(
     assert start["resumed_rounds"] == 0
     assert start["workspace_path"] == str(workspace)
     assert start["task_chars"] == len("observe the workspace")
+
+def test_record_carries_the_guard_mode_when_the_launch_supplied_one(
+    tmp_path: Path,
+) -> None:
+    """Task 201: the round-zero record names the mode the guard chose."""
+
+    workspace, _remote = _git_workspace_with_remote(tmp_path)
+
+    record = _workspace_round_zero_record(
+        workspace,
+        open_prs=lambda _branch: [],
+        workspace_base_mode="continuation",
+    )
+
+    assert record["workspace_base_mode"] == "continuation"
+    assert record["branch"] == _git(workspace, "rev-parse", "--abbrev-ref", "HEAD")
+
+
+def test_record_omits_the_guard_mode_when_the_launch_supplied_none(
+    tmp_path: Path,
+) -> None:
+    """Task 201: a launch without a resolved base omits the mode, never guesses."""
+
+    workspace, _remote = _git_workspace_with_remote(tmp_path)
+
+    record = _workspace_round_zero_record(workspace, open_prs=lambda _branch: [])
+
+    assert "workspace_base_mode" not in record
+
+
+@pytest.mark.asyncio
+async def test_role_harness_start_carries_the_guard_mode_from_the_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 201 (d): a queue-triggered launch's mode reaches the record."""
+
+    workspace, _remote = _git_workspace_with_remote(tmp_path)
+    (workspace / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "lh_harness.manager._round_zero_open_prs", lambda _branch: []
+    )
+
+    config = HarnessConfig(
+        max_total_episodes=1,
+        workspace_path=str(workspace),
+        harness_dir=str(tmp_path / "harness"),
+        log_dir=str(tmp_path / "logs"),
+        workspace_base_mode="worktree",
+    )
+    await run(
+        task="observe the workspace",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=config,
+        agent=DoneAgent(),
+        resume=False,
+    )
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "role_orchestration" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    start = next(item for item in events if item["event"] == "role_harness_start")
+    record = start["workspace_round_zero"]
+    assert record["workspace_base_mode"] == "worktree"
+    # Every pre-existing field survives untouched.
+    assert record["branch"] == _git(workspace, "rev-parse", "--abbrev-ref", "HEAD")
+    assert record["head_sha"] == _git(workspace, "rev-parse", "HEAD")
+    assert record["uncommitted_paths"] == ["uncommitted.txt"]
