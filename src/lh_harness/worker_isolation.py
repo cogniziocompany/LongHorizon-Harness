@@ -57,7 +57,7 @@ in the order ``prepare_launch`` picks them:
 
 The limit comes from (highest precedence first) the
 ``LH_HARNESS_WORKER_MEMORY_MAX`` environment override, the
-``[run] worker_memory_max`` project-config key, and the 12G default —
+``[run] worker_memory_max`` project-config key, and the 2G default —
 sized from the measured 9.27 GiB VmPeak with headroom.  Note the
 difference in kind from the pre-208 cap: this is an RSS bound, so the
 ~5.3 GiB address-space reservation is invisible to it and a real episode
@@ -182,7 +182,7 @@ def resolve_memory_limit(
     env: object = None,
     config: object = None,
 ) -> str:
-    """Effective limit: explicit argument, env override, config key, 12G."""
+    """Effective limit: explicit argument, env override, config key, 2G."""
 
     for source in (explicit, env, config):
         if source is None:
