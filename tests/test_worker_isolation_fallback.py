@@ -16,8 +16,14 @@ import textwrap
 
 import pytest  # noqa: F401  (pytest parametrize)
 
-from lh_harness import worker_isolation
-from lh_harness.worker_isolation import (
+# Exercise the checkout's own src tree, not whatever lh_harness copy a host
+# venv may have installed: a non-editable install predates worker_isolation.
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "src")
+)
+
+from lh_harness import worker_isolation  # noqa: E402
+from lh_harness.worker_isolation import (  # noqa: E402
     DEFAULT_WORKER_MEMORY_MAX,
     ENV_WORKER_MEMORY_MAX,
     MECHANISM_RLIMIT,
