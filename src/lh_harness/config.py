@@ -118,7 +118,7 @@ max_rounds = 25
 # counts resident pages only, never the ~5.3 GiB of address space Node 22/V8
 # reserves before the worker touches a page. The
 # LH_HARNESS_WORKER_MEMORY_MAX environment variable overrides this value.
-# worker_memory_max = "12G"
+# worker_memory_max = "2G"
 
 dashboard = true
 # Embedded dashboards use an OS-assigned port by default so concurrent runs
