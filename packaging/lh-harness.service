@@ -1,0 +1,39 @@
+# LongHorizon-Harness service unit (shipped).
+#
+# The live unit is installed on the CT110 host as ``lh-harness.service`` for
+# user ``harness`` (see docs/release-checklist-ct110.md and
+# cognizioware-how-to.md); this file is the in-repo shipped copy of that unit
+# so deploys do not depend on host-only state.  Edit here, then reload with
+# ``systemctl daemon-reload`` during a deploy window (never touch the running
+# service outside one).
+#
+# OOMPolicy=continue (TASK 202): a single child that is OOM-killed inside the
+# unit must not fail the whole service — systemd leaves the remaining
+# processes of the unit running instead of tearing the unit down (the kernel
+# still kills only the offending process).  Per-run workers additionally get
+# their own memory boundary via systemd-run scopes with MemoryMax, so the
+# offending run's child is the only thing the kernel can kill; see
+# src/lh_harness/worker_isolation.py.  OOMPolicy needs systemd >= 249.
+#
+# Secrets are injected through the unit's EnvironmentFile, which must stay out
+# of git (read them on the host with ``systemctl show lh-harness -p
+# Environment``); the worker env strips LH_HARNESS_WEB_TOKEN itself.
+
+[Unit]
+Description=LongHorizon-Harness service (run supervisor + web API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=harness
+WorkingDirectory=/home/harness/work/LongHorizon-Harness
+ExecStart=/home/harness/work/LongHorizon-Harness/.venv/bin/lh-harness web
+EnvironmentFile=/home/harness/.lh-harness-secrets.env
+Restart=on-failure
+RestartSec=5s
+# A child OOM kill (e.g. one run's pytest) must not take the unit — and every
+# other live run's worker — down with it (TASK 202).
+OOMPolicy=continue
+
+[Install]
+WantedBy=default.target
