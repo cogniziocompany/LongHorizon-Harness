@@ -17,7 +17,11 @@ import pytest
 
 from lh_harness.launcher import Launcher
 from lh_harness.queue import QueueStore, default_queue_config
-from lh_harness.workspace_guard import WorkspaceBaseError, prepare_workspace_base
+from lh_harness.workspace_guard import (
+    WorkspaceBaseError,
+    prepare_workspace_base,
+    probe_open_pr_gh,
+)
 
 GIT_ENV = {
     **os.environ,
@@ -201,6 +205,39 @@ def test_open_pr_collision_fails_loudly_naming_branch_and_pr(tmp_path: Path) -> 
     assert repo.resolve() not in [Path(p).resolve() for p in _git(repo, "worktree", "list", "--porcelain").splitlines() if Path(p).exists()]
 
 
+def test_default_configuration_probes_open_pr_and_fails_loudly(tmp_path: Path) -> None:
+    """Production wiring: no flag/env disables the PR probe (deliverable 3 default-on).
+
+    When ``Launcher`` is constructed without the explicit ``probe_open_pr`` hook
+    used by tests/offline runs, it must default to the real PR probe so a
+    non-default branch with a simulated OPEN PR fails loudly naming both the
+    branch and the PR in plain production configuration.
+    """
+
+    repo = _make_repo(tmp_path)
+    _feature_branch(repo)
+
+    # Simulate the production call site (webapi/server.py): no probe kwarg.
+    launcher, store, supervisor = _launcher(tmp_path)
+    # Override only the gh-probe implementation to avoid needing ``gh`` CLI
+    # and a real GitHub remote; keep the default-on behaviour of the Launcher
+    # wiring (the probe is not explicitly disabled via ``probe_open_pr=None``).
+    launcher.probe_open_pr = lambda repo, branch: "#154 'MCP namespace contract' https://gh.example/pr/154"
+    entry = _entry(store, repo)
+
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None and updated.status == "failed"
+    reason = updated.reason or ""
+    assert "feat/other-task" in reason
+    assert "#154" in reason
+    assert "https://gh.example/pr/154" in reason
+    assert "refusing to launch" in reason
+    assert len(supervisor.created) == 0
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/other-task"
+
+
 def test_unresolvable_base_fails_loudly_naming_branch(tmp_path: Path) -> None:
     """Deliverable 3: no default branch on origin => loud failure, never proceed."""
 
@@ -289,3 +326,10 @@ def test_guard_unit_error_message_names_branch_on_bad_origin(tmp_path: Path) -> 
     message = str(excinfo.value)
     assert "feat/other-task" in message
     assert "refusing to launch" in message
+
+
+def test_launcher_defaults_probe_to_real_gh_probe() -> None:
+    """Default-on wiring: an un-configured Launcher uses the real gh probe."""
+
+    launcher = Launcher(object(), object())  # type: ignore[arg-type]
+    assert launcher.probe_open_pr is probe_open_pr_gh

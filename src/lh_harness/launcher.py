@@ -21,7 +21,7 @@ from typing import Any, Callable
 from .config import PROJECT_CONFIG_PATH, load_run_defaults
 from .queue import QueueEntry, QueueStore, default_queue_config, queue_config_from_config
 from .supervisor.lifecycle import ACTIVE_STATUSES, canonical_lifecycle_status
-from .workspace_guard import WorkspaceBaseError, prepare_workspace_base
+from .workspace_guard import WorkspaceBaseError, prepare_workspace_base, probe_open_pr_gh
 
 # ``httpx`` is already a transitive dependency of FastAPI/TestClient, but the
 # launcher must not fail to import when it is absent.
@@ -65,7 +65,7 @@ class Launcher:
         *,
         poll_seconds: float = 15.0,
         queue_config: dict[str, Any] | None = None,
-        probe_open_pr: "Callable[[Path, str], str | None] | None" = None,
+        probe_open_pr: "Callable[[Path, str], str | None] | None" = probe_open_pr_gh,
     ) -> None:
         self.supervisor = supervisor
         self.queue_store = queue_store
@@ -76,7 +76,10 @@ class Launcher:
         self._task: asyncio.Task | None = None
         self._stopping = False
         # Workspace branch guard hook: returns a description of an OPEN PR on
-        # the given branch, or None.  Injectable for tests and offline runs.
+        # the given branch, or None.  DEFAULT-ON: production launches probe
+        # origin for a colliding OPEN PR with no flag or config (deliverable 3
+        # must hold in the default configuration).  Pass ``probe_open_pr=None``
+        # only to disable the probe explicitly (tests and offline runs).
         self.probe_open_pr = probe_open_pr
         # One launcher instance must never launch two runs into the same
         # workspace across concurrent ticks.  This lock serializes the critical
