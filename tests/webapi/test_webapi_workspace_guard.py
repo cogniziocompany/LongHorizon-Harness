@@ -101,6 +101,7 @@ class FakeSupervisor:
         self.runs_root = runs_root
         self.workspace_root = workspace_root
         self.created: list[dict[str, Any]] = []
+        self._processes: list = []
 
     def list_run_items(self) -> list[dict[str, Any]]:
         return []
@@ -131,6 +132,38 @@ def _client(tmp_path: Path, probe_open_pr: Any = NO_PR) -> tuple[TestClient, Fak
 def _run_events(root: Path, run_id: str) -> str:
     path = root / run_id / "lh_harness" / "role_orchestration" / "events.jsonl"
     return path.read_text(encoding="utf-8")
+
+
+def test_non_git_workspace_passes_through_and_creates_the_run(tmp_path: Path) -> None:
+    """A workspace that is not a git repo is launchable as-is, at both paths.
+
+    A plain directory (fresh workspace root, no ``.git`` of any form) is not
+    something the branch guard protects: the run is created in it unchanged,
+    the guard records the ``not-a-repo`` pass-through in the provenance
+    event, and nothing ever spawns ``git`` (the supervisor API tests stub
+    ``subprocess.Popen``, so a guard that shelled out here would blow up
+    with a TypeError mapped to HTTP 400 — the regression this test pins).
+    """
+
+    plain = tmp_path / "ws-plain"
+    plain.mkdir()
+    client, supervisor, root = _client(tmp_path)
+
+    response = client.post(
+        "/api/runs",
+        json={"task": "guard me", "workspace": str(plain), "max_rounds": 2},
+    )
+
+    assert response.status_code == 200
+    assert len(supervisor.created) == 1
+    assert Path(supervisor.created[0]["workspace"]).resolve() == plain.resolve()
+    # The pass-through is recorded in the run-created provenance event.
+    events = _run_events(root, response.json()["run"]["id"])
+    assert "run.created" in events
+    assert '"workspace_base": "mode=not-a-repo' in events
+    # The guard cut no run branch and created no worktree.
+    assert plain.resolve() == Path(supervisor.created[0]["workspace"]).resolve()
+    assert set(tmp_path.glob("ws-plain.run-*")) == set()
 
 
 def test_clean_default_branch_creates_run_unchanged_with_base_summary(tmp_path: Path) -> None:

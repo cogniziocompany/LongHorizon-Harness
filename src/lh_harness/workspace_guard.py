@@ -191,7 +191,12 @@ def prepare_workspace_base(
         repo = (Path(base_root) if base_root else Path.cwd()) / repo
     repo = Path(os.path.normpath(str(repo)))
 
-    is_repo = (repo / ".git").exists() or _git_soft(repo, "rev-parse", "--git-dir") is not None
+    # ".git" exists in every checkout form (repo dir, linked-worktree file,
+    # submodule file), so when it is absent the workspace is not a git repo
+    # and the guard must pass through without ever touching subprocess — a
+    # caller whose ``subprocess`` is stubbed (supervisor API tests) must get
+    # the same launchable base, not a tooling error.
+    is_repo = (repo / ".git").exists()
     if not repo.is_dir() or not is_repo:
         # Not a git checkout (e.g. a fresh workspace root): nothing to guard.
         return WorkspaceBase(
