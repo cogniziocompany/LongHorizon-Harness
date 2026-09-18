@@ -33,6 +33,80 @@ except ImportError:  # pragma: no cover
 
 _MAX_REASON_LEN = 4_000
 
+# Failure causes that must never trigger a requeue.  Matched against the
+# launch-failure exception text and the terminal run report's
+# abort_reason/failure_reason.  Checked BEFORE the retryable patterns: a
+# message that contains both (e.g. a transport error wrapping a validation
+# sentence) stays non-retryable because the task itself is broken.
+_NON_RETRYABLE_CAUSE_SIGNATURES = (
+    # invalid task
+    "task must be a string",
+    "task is required",
+    "task is too large",
+    "contains a nul byte",
+    # workspace missing / outside the boundary
+    "invalid workspace path",
+    "workspace must be inside",
+    "workspace does not exist",
+    # structural create_run rejections
+    "agent must be",
+    "max_rounds must be",
+    "prompt_language must be",
+    "model must be",
+    "does not accept a reasoning effort",
+    "run already exists",
+    "cannot create runs",
+    "idempotency-key",
+    "request is already being created",
+    # exhausted / human stop
+    "max_retries",
+    "exceeded max_retries",
+    "max_rounds_exhausted",
+    "needs_human_input",
+    "user_cancelled",
+    "manager_blocked",
+    "worker_cancelled",
+)
+
+# Retryable causes, in the order they are tried: provider rate limiting,
+# episode timeouts (executor/auditor), stalled-episode detection, and
+# transport-class launch failures.
+_RETRYABLE_CAUSE_SIGNATURES = (
+    "provider_rate_limit",
+    "429",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "provider_timeout",
+    "timed out",
+    "timeout",
+    "provider_stall",
+    "stalled_execution",
+    "no_output_stall",
+    "stalled episode",
+)
+
+
+def _classify_failure_cause(text: str) -> str | None:
+    """Return a canonical retryable cause label for a failure, or None.
+
+    ``None`` means the cause is explicitly non-retryable (invalid task,
+    workspace missing, max_retries exhausted, human stop) or unclassifiable;
+    the launcher must then let the entry stay failed instead of requeueing.
+    """
+
+    lowered = (text or "").lower()
+    if not lowered:
+        return None
+    if any(sig in lowered for sig in _NON_RETRYABLE_CAUSE_SIGNATURES):
+        return None
+    for sig in _RETRYABLE_CAUSE_SIGNATURES:
+        if sig in lowered:
+            return "provider_rate_limit" if "rate" in sig or sig == "429" else (
+                "provider_stall" if "stall" in sig or "no_output" in sig else "episode_timeout"
+            )
+    return None
+
 
 def _now() -> float:
     return time.time()
@@ -197,8 +271,9 @@ class Launcher:
                     },
                 )
             else:
+                cause = self._reconcile_failure_cause(run_id, f"run {run_status}")
                 updated = self.queue_store.mark_failed(
-                    entry.queue_id, reason=f"run {run_status}"
+                    entry.queue_id, reason=cause[:_MAX_REASON_LEN]
                 )
                 self._emit_run_event(
                     run_id,
@@ -211,6 +286,10 @@ class Launcher:
                         "run_status": run_status,
                     },
                 )
+                # Retry only genuinely retryable backend faults; human stops,
+                # max_rounds and invalid tasks stay failed with no successor.
+                if updated is not None and self._is_retryable_cause(cause):
+                    self._handle_retry(updated, cause)
             if updated is not None:
                 updated.last_checked_at = _now()
                 self.queue_store.update(updated)
@@ -357,17 +436,27 @@ class Launcher:
             )
             run_id = str(created.get("id") or "")
         except Exception as exc:
-            self.queue_store.mark_failed(entry.queue_id, f"launch failed: {exc}")
+            failure_reason = f"launch failed: {exc}"
+            updated = self.queue_store.mark_failed(entry.queue_id, failure_reason)
             self._emit_service_event(
                 "queue.skipped",
                 {
                     "queue_id": entry.queue_id,
-                    "reason": f"launch failed: {exc}",
+                    "reason": failure_reason,
                 },
             )
+            # Only transport-class launch failures requeue; a create_run
+            # validation error (invalid task, workspace outside the root)
+            # would reproduce identically on a successor, so it stays failed.
+            if updated is not None and self._is_retryable_cause(failure_reason):
+                self._handle_retry(updated, failure_reason)
             return
         if not run_id:
-            self.queue_store.mark_failed(entry.queue_id, "launch returned no run id")
+            failure_reason = "launch returned no run id"
+            updated = self.queue_store.mark_failed(entry.queue_id, failure_reason)
+            # Handle retry for retryable causes
+            if updated is not None and self._is_retryable_cause(failure_reason):
+                self._handle_retry(updated, failure_reason)
             return
         launched = self.queue_store.mark_launched(entry.queue_id, run_id)
         self._emit_run_event(
@@ -431,6 +520,72 @@ class Launcher:
             "payload": payload,
         }
         self._append_jsonl(self.queue_store._root / "service_events.jsonl", record)
+
+    def _is_retryable_cause(self, cause: str) -> bool:
+        """True when a failure cause should spawn a retry (successor entry).
+
+        Retryable: provider rate limiting (429/rate limit), executor/auditor
+        episode timeouts, stalled-episode detection (provider_stall), and
+        "launch failed" transport errors.  NOT retryable: invalid task,
+        workspace missing, max_retries exhausted, human stop -- anything the
+        requeue would just repeat forever.  `_classify_failure_cause` checks
+        the non-retryable signatures first, so a transport message that merely
+        wraps a validation error stays failed.
+        """
+        return _classify_failure_cause(cause) is not None
+
+    def _reconcile_failure_cause(self, run_id: str, reason: str) -> str:
+        """Build the cause text for a terminated run from its durable report.
+
+        The report's abort_reason/failure_reason carry the actionable cause
+        (provider_rate_limit, provider_stall, episode timeout); the plain
+        "run <status>" text alone cannot distinguish a retryable backend
+        fault from a human stop.
+        """
+
+        report = self._read_run_report(run_id)
+        parts = [str(report.get("abort_reason") or "").strip()]
+        parts.append(str(report.get("failure_reason") or "").strip())
+        signals = report.get("runtime_signals")
+        if isinstance(signals, list):
+            for item in signals:
+                if isinstance(item, dict):
+                    label = str(item.get("signal") or "").strip()
+                    if label:
+                        parts.append(label)
+        parts.append(reason)
+        return " | ".join(part for part in parts if part)
+
+    def _handle_retry(self, failed_entry: QueueEntry, cause: str) -> None:
+        """Create a successor entry for a retryably-failed entry.
+
+        The successor inherits the original's task/workspace/trio/priority and
+        attempt+1, with dedup_key cleared (a retry must not collide with the
+        original's dedup id).  A refused requeue (cap reached) is logged as a
+        service event, never raised into the launcher tick.
+        """
+        try:
+            successor = self.queue_store.requeue(failed_entry.queue_id, cause)
+            if successor is not None:
+                # Emit queue.requeued event
+                self._emit_service_event(
+                    "queue.requeued",
+                    {
+                        "original": failed_entry.queue_id,
+                        "successor": successor.queue_id,
+                        "cause": cause,
+                        "attempt": successor.attempt,
+                    },
+                )
+        except ValueError as exc:
+            # Log but don't fail the launcher tick
+            self._emit_service_event(
+                "queue.requeue_error",
+                {
+                    "queue_id": failed_entry.queue_id,
+                    "error": str(exc)[:200],
+                },
+            )
 
     def _append_jsonl(self, path: Path, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"

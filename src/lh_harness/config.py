@@ -56,6 +56,7 @@ _QUEUE_CAPACITY_KEYS = {
     "min_healthy_keys",
     "key_health_url",
     "poll_seconds",
+    "max_retries",
 }
 _STRING_KEYS = {
     "model",
@@ -170,6 +171,7 @@ auditor = 300
 # min_healthy_keys = 2  # healthy Ollama Cloud keys required before kimi launches
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
+# max_retries = 2       # maximum number of retry attempts for failed entries
 """
 
 
@@ -260,6 +262,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
+        "max_retries": 2,
     }
     if isinstance(capacity.get("kimi_max"), int):
         normalized_capacity["kimi_max"] = max(0, capacity["kimi_max"])
@@ -271,6 +274,14 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["key_health_url"] = capacity["key_health_url"].strip()
     if isinstance(capacity.get("poll_seconds"), (int, float)):
         normalized_capacity["poll_seconds"] = max(1.0, float(capacity["poll_seconds"]))
+    if isinstance(capacity.get("max_retries"), int):
+        if capacity["max_retries"] < 0:
+            raise ProjectConfigError("[queue.capacity].max_retries must be non-negative")
+        normalized_capacity["max_retries"] = capacity["max_retries"]
+    else:
+        # If present but not int, raise error
+        if "max_retries" in capacity:
+            raise ProjectConfigError("[queue.capacity].max_retries must be an integer")
     return {"trios": normalized_trios, "capacity": normalized_capacity}
 
 
