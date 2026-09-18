@@ -750,6 +750,203 @@ class RunSupervisor:
 
         _atomic_bytes_write(path, (task + "\n").encode("utf-8"))
 
+    def create_review_run(self, *, spec: dict[str, Any], run_id: str | None = None) -> dict[str, Any]:
+        """Create and launch one single-role PR review run (kind="review").
+
+        The review contract is enforced here, at the launch boundary, before
+        any worker exists: ``max_rounds`` is structurally 1, the reviewer
+        timeout is the ``[run.timeouts] reviewer`` budget, and the request
+        body cannot reshape the run. The review workspace is prepared under
+        ``<runs_root>/review/<repo>/<pr>/`` from a read-only fetch; a failed
+        preparation is not fatal — it becomes the run's ``cannot_review``
+        verdict.
+        """
+
+        from ..review import (
+            REVIEW_MAX_ROUNDS,
+            REVIEW_RUN_KIND,
+            parse_review_spec,
+            resolve_reviewer_timeout,
+            review_workspace_path,
+        )
+
+        try:
+            parsed = parse_review_spec(spec)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from None
+        reviewer_timeout = resolve_reviewer_timeout(self._run_defaults())
+        spec_path = self.runs_root / "review" / ".specs" / f"review-{parsed.pr_number}-{parsed.head_sha[:12]}-{uuid.uuid4().hex[:8]}.json"
+        spec_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_bytes_write(
+            spec_path, (json.dumps(parsed.to_dict(), sort_keys=True) + "\n").encode("utf-8")
+        )
+        run_id = run_id or f"review-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
+        run_dir = self._run_dir(run_id)
+        try:
+            run_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            raise ValueError(f"run already exists: {run_id}") from None
+        workspace_path = review_workspace_path(self.runs_root, parsed)
+        # The worker is launched with the review checkout as its cwd, so the
+        # directory must exist before the spawn; the worker itself then
+        # rebuilds it (fetch + verify) through prepare_review_workspace.
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        reservation = {
+            "run_id": run_id,
+            "state": "creating",
+            "supervisor_pid": os.getpid(),
+            "started_at": time.time(),
+            "task": f"Review {parsed.repo}#{parsed.pr_number} ({parsed.base_ref} -> {parsed.head_sha})",
+            "run_kind": REVIEW_RUN_KIND,
+            "agent": "review_worker",
+            "model": None,
+            "max_rounds": REVIEW_MAX_ROUNDS,
+            "prompt_language": "en",
+            "review_spec": parsed.to_dict(),
+            "reviewer_timeout_s": reviewer_timeout,
+            "workspace": str(workspace_path),
+        }
+        bus = ControlBus(run_dir)
+        bus.write_owner(reservation)
+        bus.write_status({
+            "run_id": run_id,
+            "status": "creating",
+            "started_at": reservation["started_at"],
+            "workspace": str(workspace_path),
+            "alive": False,
+        })
+        command = [
+            sys.executable,
+            "-m",
+            "lh_harness.review",
+            f"--spec={spec_path}",
+            f"--run-id={run_id}",
+            f"--runs-root={self.runs_root}",
+            f"--reviewer-timeout={reviewer_timeout}",
+        ]
+        try:
+            process = self._spawn_review_worker(
+                run_id=run_id,
+                run_dir=run_dir,
+                command=command,
+                workspace=str(workspace_path),
+                reviewer_timeout=reviewer_timeout,
+            )
+        except Exception as exc:
+            bus.write_status({
+                "run_id": run_id,
+                "status": "failed",
+                "alive": False,
+                "finished_at": time.time(),
+                "failure_reason": f"review worker could not be launched: {exc}",
+            })
+            raise
+        owner = {
+            **reservation,
+            "state": "running",
+            "pid": process.pid,
+            "pgid": process.pid,
+            "command": command,
+            "command_display": shlex.join(command),
+        }
+        bus.write_owner(owner)
+        bus.write_status({
+            "run_id": run_id,
+            "status": "starting",
+            "pid": process.pid,
+            "started_at": reservation["started_at"],
+            "workspace": str(workspace_path),
+            "alive": True,
+        })
+        return {
+            "id": run_id,
+            "task": reservation["task"],
+            "status": "starting",
+            "run_kind": REVIEW_RUN_KIND,
+            "review_spec": parsed.to_dict(),
+            "owner": {k: owner[k] for k in ("run_id", "state", "pid", "workspace", "max_rounds", "run_kind", "reviewer_timeout_s") if k in owner},
+        }
+
+    def _run_defaults(self) -> dict[str, Any]:
+        """Best-effort flattened project run defaults for review budgets."""
+
+        try:
+            from ..config import PROJECT_CONFIG_PATH, load_run_defaults
+
+            return load_run_defaults(PROJECT_CONFIG_PATH)
+        except Exception:
+            return {}
+
+    def _spawn_review_worker(
+        self,
+        *,
+        run_id: str,
+        run_dir: Path,
+        command: list[str],
+        workspace: str,
+        reviewer_timeout: int,
+    ) -> subprocess.Popen:
+        """Spawn the review worker with a reviewer-budget kill watchdog."""
+
+        output_path = run_dir / "worker.log"
+        output = _open_worker_log(output_path)
+        worker_env = os.environ.copy()
+        package_root = str(Path(__file__).resolve().parents[2])
+        inherited_pythonpath = worker_env.get("PYTHONPATH", "")
+        worker_env["PYTHONPATH"] = package_root + (
+            os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
+        )
+        worker_env.pop("LH_HARNESS_WEB_TOKEN", None)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(workspace),
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=worker_env,
+            )
+        finally:
+            output.close()
+        self._processes[run_id] = process
+
+        def _reap() -> None:
+            try:
+                returncode = process.wait(timeout=reviewer_timeout + 60)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    returncode = process.wait()
+                except Exception:
+                    returncode = 1
+            except Exception:
+                returncode = 1
+            try:
+                self._processes.pop(run_id, None)
+            except Exception:
+                pass
+            try:
+                report = _read_json(self._run_logs_dir(run_id) / "report.json")
+                lifecycle, _ = _terminal_status_for_exit(
+                    report=report, returncode=returncode
+                )
+                ControlBus(self._run_dir(run_id)).write_status({
+                    "run_id": run_id,
+                    "status": lifecycle,
+                    "alive": False,
+                    "finished_at": time.time(),
+                    "exit_code": returncode,
+                })
+            except Exception:
+                pass
+
+        threading.Thread(target=_reap, name=f"review-reap-{run_id}", daemon=True).start()
+        return process
+
     def _existing_run_result(
         self,
         run_id: str,

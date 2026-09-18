@@ -23,8 +23,11 @@ _ROLE_NAMES = {
     "gui_auditor",
     "cli_auditor",
     "final_response",
+    # The single-role reviewer seat of a kind="review" run. It follows the
+    # auditor prompt family; there is no manager/executor in a review run.
+    "reviewer",
 }
-_TIMEOUT_NAMES = {"manager", "gui_executor", "cli_executor", "auditor"}
+_TIMEOUT_NAMES = {"manager", "gui_executor", "cli_executor", "auditor", "reviewer"}
 _RUN_KEYS = {
     "agent",
     "model",
@@ -117,6 +120,7 @@ manager = 300
 gui_executor = 1800
 cli_executor = 1800
 auditor = 300
+reviewer = 900
 
 [run.roles.manager]
 # agent = "codex"
@@ -151,6 +155,13 @@ auditor = 300
 [run.roles.final_response]
 # agent = "codex"
 # model = "gpt-5.6-sol"
+
+# The single reviewer seat of a kind="review" run. Its [run.timeouts] reviewer
+# entry (900 s) is the review-run budget; POST /api/runs callers cannot
+# override it through the request body.
+# [run.roles.reviewer]
+# agent = "claude_code"
+# model = "kimi-k3:synthetic-anthropic"
 
 # Fleet queue configuration. Trios are named server-side so clients only ask
 # for "kimi" or "qwen"; the service resolves the actual agent/model/profile.
