@@ -220,31 +220,17 @@ bearer/secret, so it does not match the credential-value regexes.
 | Skill | copies | endpoint-host (occ / lines, each) | remote-exec (occ / lines, each) | cred-mention (occ / lines, each) | Notable |
 |---|---|---|---|---|---|
 | `mcp-gateway-ops` (`.claude/skills/`) | 11 | 20 / 16 | 19 / 13 | 24 / 18 | names `https://ptait09.easybutt0n.ai/exec` verbatim; litellm-gateway endpoints; env names `MCP_API_KEY`, `LITELLM_MASTER_KEY`, `LITELLM_MCP_SESSION_PRIVATE_KEY`, `CLOUDFLARE_MCP_TOKEN` — 0 literal values |
-| `graphify` (`.claude/skills/` / `.agents/skills/`) | 19 (+11 under `.agents/skills/`, same counts) | 2 / 1 | 0 | 51 / 31 | credential *names* only (`GOOGLE_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`); 0 literal values; sole endpoint mention is a `ptait09-easybutt0n-ai` repo name in a fleet-scripts note |
+| `graphify` (`.claude/skills/` / `.agents/skills/`) | 30 | 2 / 1 | 0 / 0 | 51 / 31 | credential *names* only (`GOOGLE_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`); 0 literal values; sole endpoint mention is a `ptait09-easybutt0n-ai` repo name in a fleet-scripts note |
 | `remote-pc` (`infrastructure/docker/gateway-skills-mcp/skills/`) | 12 | 55 / 35 | 7 / 7 | 36 / 31 | the same per-host `/exec` runner route as the installed skill, shipped as gateway payload inside 11 cognizioware-mcp-tools-family checkouts + the ptait09 checkout (2 content variants, same counts); 0 literal values, 0 UUIDs |
-| `litellm-gateway-quickstart` (`infrastructure/docker/gateway-skills-mcp/skills/`) | 11 | 1 / 1 | 0 | 1 / 1 | 11 byte-identical mcp-tools-family copies; endpoint mention only, no credentials |
+| `litellm-gateway-quickstart` (`infrastructure/docker/gateway-skills-mcp/skills/`) | 11 | 1 / 1 | 0 / 0 | 1 / 1 | 11 byte-identical mcp-tools-family copies; endpoint mention only, no credentials |
 | `e2e` (`.cursor/skills/`) | 7 | 11 / 5 | 3 / 2 | 1 / 1 | 7 byte-identical mcp-cognizioware-family copies; **1 literal credential value per copy** — a 64-hex `AuthToken` (non-UUID, no match in the live env or secrets files, value hashed and discarded) inside a `pwsh … -SshHost "root@192.168.21.110"` example that also shows `ssh root@192.168.21.110 'pct exec 100 -- docker …'` |
-| `dynamics-ce-api` (`openclaw-workspace/skills/`) | 7 | 1 / 1 | 0 | 11 / 8 | 7 byte-identical mcp-cognizioware-family copies; 4 UUID-shaped tokens per copy, all Dataverse example record IDs / a well-known first-party App ID — identifiers, not credentials |
-| `cognizioware-swarms` (`openclaw-workspace/skills/`) | 7 | 2 / 2 | 0 | 1 / 1 | endpoint names only |
-| `ruflo` (`openclaw-workspace/skills/`) | 7 | 6 / 6 | 0 | 0 | endpoint names only |
+| `dynamics-ce-api` (`openclaw-workspace/skills/`) | 7 | 1 / 1 | 0 / 0 | 11 / 8 | 7 byte-identical mcp-cognizioware-family copies; 4 UUID-shaped tokens per copy, all Dataverse example record IDs / a well-known first-party App ID — identifiers, not credentials |
+| `cognizioware-swarms` (`openclaw-workspace/skills/`) | 7 | 2 / 2 | 0 / 0 | 1 / 1 | endpoint names only |
+| `ruflo` (`openclaw-workspace/skills/`) | 7 | 6 / 6 | 0 / 0 | 0 / 0 | endpoint names only |
 
-Census: 349 `SKILL.md` files under `/home/harness/work/` (pruned), 110 of them
-endpoint-bearing, distributed as the 8 families above (all copies within one
-skill+directory row are byte-identical or count-identical unless noted). All 11
-`mcp-gateway-ops` copies are byte-identical in counts (they live only in
-cognizioware-mcp-tools-family checkouts, including one nested
-`.claude/worktrees/model-usage-audit` copy); all `graphify` copies are likewise
-identical in counts between the two directory variants. This repo's own tracked
-`SKILL.md` files (18 vendored eval copies + 1 venv copy) carry 0 endpoint
-matches.
+Census: 352 `SKILL.md` files under `/home/harness/work/` (pruned), 110 of them endpoint-bearing, distributed as the 8 families above (all copies within one skill+directory row are byte-identical or count-identical unless noted). All 11 `mcp-gateway-ops` copies are byte-identical in counts (they live only in cognizioware-mcp-tools-family checkouts, including one nested `.claude/worktrees/model-usage-audit` copy); all `graphify` copies are likewise identical in counts between the two directory variants. This repo's own tracked `SKILL.md` files (18 vendored eval copies + 1 venv copy) carry 0 endpoint matches.
 
-(The installed-session skill list is the union of A and F: `remote-pc` at user level,
-plus — depending on which checkout a run opens — `mcp-gateway-ops`/`graphify`
-under `.claude/skills/`, a second `remote-pc` and `litellm-gateway-quickstart`
-under `infrastructure/docker/gateway-skills-mcp/skills/`, `e2e` under
-`.cursor/skills/`, and `dynamics-ce-api`/`cognizioware-swarms`/`ruflo` under
-`openclaw-workspace/skills/`.)
-
+(The installed-session skill list is the union of A and F: `remote-pc` at user level, plus — depending on which checkout a run opens — `mcp-gateway-ops`/`graphify` under `.claude/skills/`, a second `remote-pc` and `litellm-gateway-quickstart` under `infrastructure/docker/gateway-skills-mcp/skills/`, `e2e` under `.cursor/skills/`, and `dynamics-ce-api`/`cognizioware-swarms`/`ruflo` under `openclaw-workspace/skills/`.)
 ### G. Skill distribution source — `/home/harness/work/ptait09-easybutt0n-ai/created-skills/`
 
 This tree seeds the installed skills; every file here is one `install.sh` away from a
@@ -329,69 +315,6 @@ settings.
 
 ### K. Totals
 
-* Remote-exec endpoint routes visible to a run: the installed `remote-pc` skill
-  (7 named runner / gateway endpoints + 6 literal bearer-value occurrences, 3
-  distinct values, across `SKILL.md` and its bridge) and 12 further workspace
-  `remote-pc` skill copies (F), 20 workspace CLAUDE.md copies naming fleet hosts
-  (of 42, including 1 with a literal bearer — E), 11 copies of the
-  `mcp-gateway-ops` skill naming the `/exec` proxy plus 8 further endpoint-bearing
-  skill families totalling 110 endpoint-bearing workspace SKILL.md copies of 349
-  (F), 6 skill-distribution SKILL.md files (G, + 12 per-host variant SKILL.md
-  files in the `_w185` created-skills copy), plus SSH root aliases for 5 hosts
-  and 7 credential-valued env vars.
-* Credential carriers (files/vars with non-empty values): 1 live + 5 backup secrets-env
-  files (36 assignments total), 1 QA deploy env (9), 121 checkout/deployment `.env`
-  files (1012 assignments; 135 env-named files enumerated), 7 env vars, 2 SSH private
-  keys, 3 distinct in-skill bearer values (6 occurrences), 1 workspace
-  `CLAUDE.md` path with a literal bearer (6 of its 7 family copies carry the
-  value; the main checkout copy is redacted — E), and a 64-hex `AuthToken`
-  literal in 7 `e2e` skill copies (F).
-* Locations with endpoint names but no credentials: cognizioware-mcp-tools CLAUDE.md
-  family (UUID is an Entra app ID, not a credential), ptait09-easybutt0n-ai docs,
-  `graphify`, repo `cognizioware-how-to.md`,
-  powerplatform `deployments/ssh/config` (routes only).
-
-## Deliverable 3 — recommendation (doc only; nothing applied)
-
-Grounded strictly in the counts above, the harness user on CT110 should **not carry**:
-
-1. **`remote-pc`** — remove from `/home/harness/.claude/skills/`. It is the only
-   user-level skill, it embeds 3 live per-host bearer values across 6 textual
-   positions (`SKILL.md` rows + the bridge's `host_key()` fallbacks — A), it documents
-   the `/exec` route used in the task-191 defect, and the bridge forwards model
-   credentials to remote hosts. This single removal cuts the run-visible surface from
-   "complete lateral-access kit" to "no fleet route, no fleet credential" — but see
-   the workspace copy caveat in item 2.
-2. **workspace skill copies that re-import the same routes** — `mcp-gateway-ops`
-   (11 copies today, F) names the same `/exec` endpoint and its admin key names;
-   even without literal values it is an executable roadmap once a gateway key is
-   in the env (B/C). Additionally the same `remote-pc` skill ships inside 12
-   `infrastructure/docker/gateway-skills-mcp/skills/` copies in work checkouts
-   (F), and the `.cursor/skills/e2e` skill (7 copies) carries a literal 64-hex
-   `AuthToken` plus an `ssh root@192.168.21.110` / `pct exec` worked example.
-   These three workspace families should not be present in any checkout a run
-   may open (the doc's D2 guard can only flag them; removal is a repo-side
-   action for the owning repos).
-3. **`proxmox-*` / `cognizioware-litellm-admin` / `cognizioware-mcp-gateway`** — the
-   `created-skills` G set; none is installed today, and the recommendation is that they
-   never be installed for the harness user (ptait01/ptait07/pve151 targets, PVE root
-   tokens).
-4. Not skills but load-bearing for the same route, for the guard's author:
-   * the 5 `.lh-harness-secrets.env.bak-*` copies should not remain readable next to
-     the live file (C);
-   * `deployments/ssh/config` root aliases (D) should not be reachable from a run's
-     `~/.ssh/config` include path;
-   * `LH_HARNESS_FLEET_KEY` / `LH_HARNESS_MCP_GATEWAY_KEY` / `GH_TOKEN` /
-     `ANTHROPIC_*` in the run env (B) are what make A/F/G actionable; scoping them to
-     the roles that need them is the companion measure.
-
-This section is a recommendation only. No skill, CLAUDE.md, env var, secret file, SSH
-config, or any harness-user configuration outside this repo was modified by this task.
-
-## Residual risk (non-blocking)
-
-Claude Code session records excluded above (`projects/`, `sessions/`, `tasks/`,
-`telemetry/`) are not enumerated; past sessions plausibly contain copied bearer values
-from the same files, so removing the skills does not remove every historical copy.
-Enumerating them was out of scope (they are run records, not run configuration) and is
-left to a dedicated credential-rotation task.
+* Remote-exec endpoint routes visible to a run: the installed `remote-pc` skill (7 named runner / gateway endpoints + 6 literal bearer-value occurrences, 3 distinct values, across `SKILL.md` and its bridge) and 12 further workspace `remote-pc` skill copies (F), 20 workspace CLAUDE.md copies naming fleet hosts (of 42, including 1 with a literal bearer — E), 110 endpoint-bearing workspace SKILL.md copies of 352 (F) (which include 11 copies of `mcp-gateway-ops`, 30 of `graphify`, 12 of `remote-pc`, 11 of `litellm-gateway-quickstart`, 7 of `e2e`, 7 of `dynamics-ce-api`, 7 of `cognizioware-swarms`, and 7 of `ruflo`), 6 skill-distribution SKILL.md files (G, + 12 per-host variant SKILL.md files in the `_w185` created-skills copy), plus SSH root aliases for 5 hosts and 7 credential-valued env vars.
+* Credential carriers (files/vars with non-empty values): 1 live + 5 backup secrets-env files (36 assignments total), 1 QA deploy env (9), 121 checkout/deployment `.env` files (1012 assignments; 135 env-named files enumerated), 7 env vars, 2 SSH private keys, 3 distinct in-skill bearer values (6 occurrences), 1 workspace `CLAUDE.md` path with a literal bearer (6 of its 7 family copies carry the value; the main checkout copy is redacted — E), and a 64-hex `AuthToken` literal in 7 `e2e` skill copies (F).
+* Locations with endpoint names but no credentials: cognizioware-mcp-tools CLAUDE.md family (UUID is an Entra app ID, not a credential), ptait09-easybutt0n-ai docs, `graphify`, repo `cognizioware-how-to.md`, powerplatform `deployments/ssh/config` (routes only).
