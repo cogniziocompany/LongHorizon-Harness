@@ -244,6 +244,127 @@ def test_env_override_name_unchanged() -> None:
     assert ENV_WORKER_MEMORY_MAX == "LH_HARNESS_WORKER_MEMORY_MAX"
 
 
+# --- self-relocation tests ---------------------------------------------------
+
+def test_self_relocation_happens_once_and_updates_parent(tmp_path, monkeypatch) -> None:
+    """Test that self-relocation moves the PID into a leaf cgroup and remembers the parent."""
+    # Reset the module's relocation state
+    worker_isolation._RELOCATED = False
+    worker_isolation._WORKER_PARENT_CGROUP = None
+
+    fake_root = tmp_path / "cgroup"
+    # Initial cgroup where the process resides
+    own = "/test.slice/fake.service"
+    base = fake_root / own.strip("/")
+    base.mkdir(parents=True)
+    (base / "cgroup.controllers").write_text("memory pids\n")
+    (base / "cgroup.subtree_control").write_text("")
+    (base / "cgroup.procs").write_text("123\n")  # pretend we're PID 123
+    # Leaf cgroup that will be created for relocation
+    leaf = base / "main"
+    leaf.mkdir()
+    (leaf / "cgroup.procs").write_text("")
+
+    monkeypatch.setattr(worker_isolation, "own_cgroup_path", lambda: own)
+    monkeypatch.setattr(os, "getpid", lambda: 123)
+
+    # First call should attempt relocation
+    worker_isolation._attempt_relocation(root=fake_root)
+    assert worker_isolation._RELOCATED is True
+    assert worker_isolation._WORKER_PARENT_CGROUP == own
+    # Verify the PID moved to the leaf cgroup
+    assert (leaf / "cgroup.procs").read_text().strip() == "123"
+    # Original cgroup should now be empty of processes (simulate the move)
+    (base / "cgroup.procs").write_text("")
+    assert (base / "cgroup.procs").read_text().strip() == ""
+
+    # Second call should be idempotent and not move anything
+    worker_isolation._attempt_relocation(root=fake_root)
+    assert worker_isolation._RELOCATED is True  # still True
+    assert worker_isolation._WORKER_PARENT_CGROUP == own
+    # PID still in leaf
+    assert (leaf / "cgroup.procs").read_text().strip() == "123"
+
+
+def test_self_relocation_fails_gracefully(tmp_path, monkeypatch) -> None:
+    """Test that when relocation fails (e.g., permission denied), it continues without relocating."""
+    # Reset the module's relocation state
+    worker_isolation._RELOCATED = False
+    worker_isolation._WORKER_PARENT_CGROUP = None
+
+    fake_root = tmp_path / "cgroup"
+    own = "/test.slice/fake.service"
+    base = fake_root / own.strip("/")
+    base.mkdir(parents=True)
+    (base / "cgroup.controllers").write_text("memory pids\n")
+    (base / "cgroup.subtree_control").write_text("")
+    (base / "cgroup.procs").write_text("123\n")
+    # Make the leaf cgroup directory read-only so mkdir fails
+    leaf = base / "main"
+    leaf.mkdir()
+    leaf.chmod(0o444)  # read-only
+
+    monkeypatch.setattr(worker_isolation, "own_cgroup_path", lambda: own)
+    monkeypatch.setattr(os, "getpid", lambda: 123)
+    monkeypatch.setattr(worker_isolation, "CGROUP_ROOT", fake_root)
+
+    # Relocation should fail but not raise
+    worker_isolation._attempt_relocation()
+    assert worker_isolation._RELOCATED is False  # still False
+    assert worker_isolation._WORKER_PARENT_CGROUP is None
+    # PID should still be in original cgroup
+    assert (base / "cgroup.procs").read_text().strip() == "123"
+
+
+def test_prepare_child_cgroup_uses_parent_after_relocation(tmp_path, monkeypatch) -> None:
+    """Test that after relocation, child cgroups are created under the parent cgroup."""
+    # Reset the module's relocation state
+    worker_isolation._RELOCATED = False
+    worker_isolation._WORKER_PARENT_CGROUP = None
+
+    fake_root = tmp_path / "cgroup"
+    # Initial cgroup where the process resides
+    own = "/test.slice/fake.service"
+    base = fake_root / own.strip("/")
+    base.mkdir(parents=True)
+    (base / "cgroup.controllers").write_text("memory pids\n")
+    (base / "cgroup.subtree_control").write_text("")
+    (base / "cgroup.procs").write_text("")
+    # Leaf cgroup for relocation
+    leaf = base / "main"
+    leaf.mkdir()
+    (leaf / "cgroup.procs").write_text("")
+
+    monkeypatch.setattr(worker_isolation, "own_cgroup_path", lambda: own)
+    monkeypatch.setattr(os, "getpid", lambda: 999)
+
+    # Trigger relocation
+    worker_isolation._attempt_relocation(root=fake_root)
+    assert worker_isolation._RELOCATED is True
+    assert worker_isolation._WORKER_PARENT_CGROUP == own
+
+    # Now prepare a child cgroup - it should be under the parent (own), not the leaf
+    plan = worker_isolation.prepare_launch(
+        command=[sys.executable, "-c", "print('worker')"],
+        run_id="run-relocated",
+        memory_max="256M",
+        probe=_PROBE_NONE,
+        cgroup_writable=lambda: True,
+        cgroup_root=fake_root,
+    )
+
+    assert plan.mechanism == worker_isolation.MECHANISM_CGROUP
+    # The cgroup path should be under the parent cgroup (own), not the leaf
+    assert plan.cgroup.startswith(own.rstrip("/") + "/worker-")
+    # Verify the child cgroup directory was created under the parent
+    child_dir = fake_root / plan.cgroup.strip("/")
+    assert child_dir.is_dir()
+    assert (child_dir / "memory.max").read_text() == str(worker_isolation.to_bytes("256M"))
+    # Controllers should be enabled on the parent cgroup for children
+    subtree = (base / "cgroup.subtree_control").read_text()
+    assert "+memory" in subtree and "+pids" in subtree
+
+
 @pytest.mark.parametrize(
     ("explicit", "env", "config", "expected"),
     [

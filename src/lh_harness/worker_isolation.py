@@ -261,11 +261,16 @@ def _prepare_child_cgroup(run_id: str, limit: str, *, root: Path | None = None) 
     same convention ``/proc/<pid>/cgroup`` uses).  ``memory.max`` is an RSS
     cap: pages actually charged, not address space reserved.
     """
-
-    own = own_cgroup_path()
-    if not own:
-        raise OSError("no cgroup v2 path for this process in /proc/self/cgroup")
-    base = (root or CGROUP_ROOT) / own.strip("/")
+    _attempt_relocation(root=root)
+    # Determine the base cgroup: if we have relocated, use the parent (original) cgroup;
+    # otherwise, use the current cgroup.
+    if _WORKER_PARENT_CGROUP is not None:
+        base_cgroup = _WORKER_PARENT_CGROUP
+    else:
+        base_cgroup = own_cgroup_path()
+        if not base_cgroup:
+            raise OSError("no cgroup v2 path for this process in /proc/self/cgroup")
+    base = (root or CGROUP_ROOT) / base_cgroup.strip("/")
     controllers = (base / "cgroup.controllers").read_text().split()
     wanted = [name for name in CGROUP_CONTROLLERS_NEEDED if name in controllers]
     current = (base / "cgroup.subtree_control").read_text().split()
@@ -286,7 +291,7 @@ def _prepare_child_cgroup(run_id: str, limit: str, *, root: Path | None = None) 
     child = base / f"worker-{_scope_unit_name(run_id).removeprefix('lh-worker-')}"
     child.mkdir()
     (child / "memory.max").write_text(str(to_bytes(limit)))
-    return f"{own.rstrip('/')}/{child.name}"
+    return f"{base_cgroup.rstrip('/')}/{child.name}"
 
 
 def _enter_cgroup(child_cgroup: str, *, root: Path | None = None) -> None:
@@ -593,6 +598,61 @@ def _log_tail_mentions_memory_error(worker_log: Path | None) -> bool:
     except OSError:
         return False
     return b"MemoryError" in tail
+
+
+# One-time self-relocation of the service's own PID into a leaf cgroup
+# to allow enabling subtree_control on the parent cgroup.
+_RELOCATED = False
+_WORKER_PARENT_CGROUP = None
+
+
+def _attempt_relocation(*, root: Path | None = None) -> None:
+    """Attempt to relocate the current process into a leaf cgroup under its
+    current cgroup, so the current cgroup becomes empty of processes
+    and can have subtree_control enabled for children.
+    """
+    global _RELOCATED, _WORKER_PARENT_CGROUP
+    if _RELOCATED:
+        return
+    current = own_cgroup_path()
+    if not current:
+        return
+    effective_root = root if root is not None else CGROUP_ROOT
+    current_cgroup_path = effective_root / current.strip("/")
+    try:
+        with open(current_cgroup_path / "cgroup.procs", "r") as f:
+            pids = f.read().split()
+    except OSError:
+        # Cannot read the cgroup.procs, give up on relocation.
+        return
+    # If there are no processes in the current cgroup, we are already
+    # "relocated" (the cgroup is empty). Record that we have relocated
+    # so that future calls use this cgroup as the base for child cgroups.
+    if not pids:
+        _RELOCATED = True
+        _WORKER_PARENT_CGROUP = current
+        return
+    # Otherwise, try to move the current process to a leaf cgroup named "main"
+    leaf = current.rstrip("/") + "/main"
+    leaf_path = effective_root / leaf.strip("/")
+    try:
+        leaf_path.mkdir(parents=True, exist_ok=True)
+        current_pid = str(os.getpid())
+        # Move the current process into the leaf cgroup.
+        with open(leaf_path / "cgroup.procs", "w") as f:
+            f.write(current_pid + "\n")
+        # Remove the current process from the current cgroup.
+        new_pids = [pid for pid in pids if pid != current_pid]
+        with open(current_cgroup_path / "cgroup.procs", "w") as f:
+            for pid in new_pids:
+                f.write(pid + "\n")
+        _WORKER_PARENT_CGROUP = current
+        _RELOCATED = True
+    except OSError as e:
+        logger.warning(
+            f"worker memory isolation: failed to self-relocate into cgroup {leaf}: {e}"
+        )
+        # Leave _RELOCATED as False and _WORKER_PARENT_CGROUP as None.
 
 
 def scope_launch_failed(returncode: int | None, log_tail: bytes) -> bool:
