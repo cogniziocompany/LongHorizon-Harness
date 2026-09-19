@@ -219,6 +219,18 @@ class IsolationPlan:
 CGROUP_CONTROLLERS_NEEDED = ("memory", "pids")
 
 
+def _worker_cgroup_base() -> str | None:
+    """The cgroup child cgroups are created under (TASK 211).
+
+    Before self-relocation this is simply this process's own cgroup — the
+    delegated top-level one, which the caller occupies.  After relocation
+    the caller lives in the leaf ``main`` cgroup and workers must be created
+    under its parent, recorded by ``_attempt_relocation``.
+    """
+
+    return _WORKER_PARENT_CGROUP if _WORKER_PARENT_CGROUP else own_cgroup_path()
+
+
 def own_cgroup_path() -> str | None:
     """This process's cgroup v2 path, as written in ``/proc/self/cgroup``."""
 
@@ -237,9 +249,18 @@ def cgroup_subtree_writable(
     ``Delegate=memory pids`` in ``packaging/lh-harness.service`` grants —
     without it (pre-deploy CT110, ad-hoc pytest runs) this returns False and
     the launch falls back to ``unbounded_plan``.
+
+    TASK 211: once the service's PID has self-relocated into its leaf
+    ``main`` cgroup, the cgroup workers are created under is the relocated
+    process's *parent* (``_WORKER_PARENT_CGROUP``) — probing the caller's
+    own cgroup would now inspect that leaf, whose ``cgroup.controllers`` is
+    empty until the parent's ``subtree_control`` has been enabled (which
+    happens inside ``_prepare_child_cgroup``, only reached through this
+    check) — so the probe must follow the worker parent, or every launch
+    would fall back to unbounded despite a successful relocation.
     """
 
-    cgroup = cgroup_path if cgroup_path is not None else own_cgroup_path()
+    cgroup = cgroup_path if cgroup_path is not None else _worker_cgroup_base()
     if not cgroup:
         return False
     base = (root or CGROUP_ROOT) / cgroup.strip("/")
@@ -261,11 +282,15 @@ def _prepare_child_cgroup(run_id: str, limit: str, *, root: Path | None = None) 
     same convention ``/proc/<pid>/cgroup`` uses).  ``memory.max`` is an RSS
     cap: pages actually charged, not address space reserved.
     """
-
-    own = own_cgroup_path()
-    if not own:
+    _attempt_relocation(root=root)
+    # TASK 211: after self-relocation, the worker parent is the relocated
+    # process's parent (the delegated top-level cgroup); before it, there is
+    # no relocation yet and the worker parent is simply the caller's own
+    # cgroup.  One helper keeps this and the writability probe consistent.
+    base_cgroup = _worker_cgroup_base()
+    if not base_cgroup:
         raise OSError("no cgroup v2 path for this process in /proc/self/cgroup")
-    base = (root or CGROUP_ROOT) / own.strip("/")
+    base = (root or CGROUP_ROOT) / base_cgroup.strip("/")
     controllers = (base / "cgroup.controllers").read_text().split()
     wanted = [name for name in CGROUP_CONTROLLERS_NEEDED if name in controllers]
     current = (base / "cgroup.subtree_control").read_text().split()
@@ -286,7 +311,7 @@ def _prepare_child_cgroup(run_id: str, limit: str, *, root: Path | None = None) 
     child = base / f"worker-{_scope_unit_name(run_id).removeprefix('lh-worker-')}"
     child.mkdir()
     (child / "memory.max").write_text(str(to_bytes(limit)))
-    return f"{own.rstrip('/')}/{child.name}"
+    return f"{base_cgroup.rstrip('/')}/{child.name}"
 
 
 def _enter_cgroup(child_cgroup: str, *, root: Path | None = None) -> None:
@@ -593,6 +618,99 @@ def _log_tail_mentions_memory_error(worker_log: Path | None) -> bool:
     except OSError:
         return False
     return b"MemoryError" in tail
+
+
+# One-time self-relocation of the service's own PID into a leaf cgroup
+# to allow enabling subtree_control on the parent cgroup.
+_RELOCATED = False
+_WORKER_PARENT_CGROUP = None
+
+
+def ensure_service_relocated(*, root: Path | None = None) -> None:
+    """Move this process into its leaf ``main`` cgroup, once, up front.
+
+    cgroup v2 will not enable controllers on a cgroup that still holds
+    processes (EBUSY), so the delegated cgroup can take ``+memory +pids``
+    only after the service's own PID has left it.  Do that eagerly — at
+    supervisor construction, i.e. at service startup, while this process is
+    the unambiguous sole resident of the top-level delegated cgroup — rather
+    than lazily at the first worker launch, when the launch's own forked
+    children may already be residents and the move can no longer be made
+    cleanly.  ``_prepare_child_cgroup`` still retries it (it is idempotent),
+    but the top-level cgroup is empty before any ``worker-*`` child is
+    created, which is what the memory.max cap depends on.
+    """
+
+    _attempt_relocation(root=root)
+
+
+def _attempt_relocation(*, root: Path | None = None) -> None:
+    """Attempt to relocate the current process into a leaf cgroup under its
+    current cgroup, so the current cgroup becomes empty of processes
+    and can have subtree_control enabled for children.
+
+    The move is only made when this process is the *sole* resident: then
+    relocating it provably empties the top-level cgroup (the precondition for
+    ``cgroup.subtree_control``), and we never disturb unrelated residents —
+    an ad-hoc process sharing the cgroup (a pytest run under the service's
+    own cgroup, say) is left where it is and the worker cgroups simply do
+    not get prepared (the OSError falls through to the unbounded plan).
+    """
+    global _RELOCATED, _WORKER_PARENT_CGROUP
+    if _RELOCATED:
+        return
+    current = own_cgroup_path()
+    if not current:
+        return
+    effective_root = root if root is not None else CGROUP_ROOT
+    current_cgroup_path = effective_root / current.strip("/")
+    try:
+        with open(current_cgroup_path / "cgroup.procs", "r") as f:
+            pids = f.read().split()
+    except OSError:
+        # Cannot read the cgroup.procs, give up on relocation.
+        return
+    # If there are no processes in the current cgroup, we are already
+    # "relocated" (the cgroup is empty). Record that we have relocated
+    # so that future calls use this cgroup as the base for child cgroups.
+    if not pids:
+        _RELOCATED = True
+        _WORKER_PARENT_CGROUP = current
+        return
+    # Only move when we are the sole resident: any other resident would be
+    # left behind, and a cgroup that still holds processes cannot take
+    # subtree_control — so the relocation would not buy anything anyway.
+    current_pid = str(os.getpid())
+    if pids != [current_pid]:
+        return
+    # Otherwise, try to move the current process to a leaf cgroup named "main"
+    leaf = current.rstrip("/") + "/main"
+    leaf_path = effective_root / leaf.strip("/")
+    try:
+        leaf_path.mkdir(parents=True, exist_ok=True)
+        # Move the current process into the leaf cgroup.  On a real cgroupfs
+        # this single write relocates the process — the source cgroup loses
+        # the PID automatically — leaving the top-level cgroup empty of
+        # processes, which is exactly the precondition for enabling
+        # subtree_control on it.
+        with open(leaf_path / "cgroup.procs", "w") as f:
+            f.write(current_pid + "\n")
+        _WORKER_PARENT_CGROUP = current
+        _RELOCATED = True
+        # Emptying the parent is the whole point: subtree_control can now be
+        # enabled, which the very next worker cgroup preparation depends on.
+        logger.info(
+            "worker memory isolation: service PID %s relocated into %s; the "
+            "delegated cgroup is now empty of processes and can take "
+            "subtree_control",
+            current_pid,
+            leaf,
+        )
+    except OSError as e:
+        logger.warning(
+            f"worker memory isolation: failed to self-relocate into cgroup {leaf}: {e}"
+        )
+        # Leave _RELOCATED as False and _WORKER_PARENT_CGROUP as None.
 
 
 def scope_launch_failed(returncode: int | None, log_tail: bytes) -> bool:

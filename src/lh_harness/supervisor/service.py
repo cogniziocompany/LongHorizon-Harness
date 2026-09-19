@@ -708,6 +708,23 @@ class RunSupervisor:
             env=os.environ.get(worker_isolation.ENV_WORKER_MEMORY_MAX),
             config=_config_worker_memory_max(),
         )
+        # TASK 211: relocate this process out of the top-level delegated
+        # cgroup *at startup*, while it is still the unambiguous sole
+        # resident — cgroup v2 refuses subtree_control on a cgroup holding
+        # processes (EBUSY), and doing it lazily at the first worker launch
+        # would race the launch's own forked children.  The cgroup the
+        # workers are capped under is the one the delegation named; this
+        # must be set up before any ``worker-*`` child is created.  A failure
+        # is only logged by the isolation module — the supervisor still starts.
+        try:
+            worker_isolation.ensure_service_relocated()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "worker memory isolation: startup self-relocation failed "
+                "unexpectedly (%s: %s); worker cgroups may be unavailable",
+                type(exc).__name__,
+                exc,
+            )
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._commands: dict[str, list[str]] = {}
         self._lifecycle_lock = threading.RLock()

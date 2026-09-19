@@ -44,6 +44,7 @@ from lh_harness.worker_isolation import (  # noqa: E402
     MECHANISM_UNBOUNDED,
     await_scope_exit,
     classify_memory_death,
+    ensure_service_relocated,
     fallback_plan,
     prepare_launch,
     scope_launch_failed,
@@ -242,6 +243,273 @@ def test_fallback_plan_prefers_cgroup_then_logs(tmp_path, monkeypatch) -> None:
 
 def test_env_override_name_unchanged() -> None:
     assert ENV_WORKER_MEMORY_MAX == "LH_HARNESS_WORKER_MEMORY_MAX"
+
+
+# --- self-relocation tests ---------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _reset_relocation_state():
+    """Each test starts from un-relocated module state (the process restarts
+    per test run in production, so no relocation may leak between tests)."""
+
+    was_relocated = worker_isolation._RELOCATED
+    was_parent = worker_isolation._WORKER_PARENT_CGROUP
+    worker_isolation._RELOCATED = False
+    worker_isolation._WORKER_PARENT_CGROUP = None
+    yield
+    worker_isolation._RELOCATED = was_relocated
+    worker_isolation._WORKER_PARENT_CGROUP = was_parent
+
+
+def _fake_delegated_cgroup(root, own="/test.slice/fake.service", *, procs=""):
+    """A fake delegated service cgroup (the shape ``Delegate=memory pids``
+    produces), with the calling process resident and the leaf ``main`` not
+    yet created."""
+
+    base = root / own.strip("/")
+    base.mkdir(parents=True)
+    (base / "cgroup.controllers").write_text("memory pids\n")
+    (base / "cgroup.subtree_control").write_text("")
+    (base / "cgroup.procs").write_text(procs)
+    return base
+
+
+def test_self_relocation_happens_once_and_updates_parent(tmp_path, monkeypatch) -> None:
+    """Test that self-relocation moves the PID into a leaf cgroup and remembers the parent."""
+
+    fake_root = tmp_path / "cgroup"
+    # Initial cgroup where the process resides
+    own = "/test.slice/fake.service"
+    base = _fake_delegated_cgroup(fake_root, own, procs="123\n")
+    # Leaf cgroup that will be created for relocation
+    leaf = base / "main"
+    leaf.mkdir()
+    (leaf / "cgroup.procs").write_text("")
+
+    monkeypatch.setattr(worker_isolation, "own_cgroup_path", lambda: own)
+    monkeypatch.setattr(os, "getpid", lambda: 123)
+
+    # First call should attempt relocation
+    worker_isolation._attempt_relocation(root=fake_root)
+    assert worker_isolation._RELOCATED is True
+    assert worker_isolation._WORKER_PARENT_CGROUP == own
+    # Verify the PID moved to the leaf cgroup
+    assert (leaf / "cgroup.procs").read_text().strip() == "123"
+    # Original cgroup should now be empty of processes (simulate the move)
+    (base / "cgroup.procs").write_text("")
+    assert (base / "cgroup.procs").read_text().strip() == ""
+
+    # Second call should be idempotent and not move anything
+    worker_isolation._attempt_relocation(root=fake_root)
+    assert worker_isolation._RELOCATED is True  # still True
+    assert worker_isolation._WORKER_PARENT_CGROUP == own
+    # PID still in leaf
+    assert (leaf / "cgroup.procs").read_text().strip() == "123"
+
+
+def test_self_relocation_fails_gracefully(tmp_path, monkeypatch) -> None:
+    """When the leaf's cgroup.procs cannot be written, relocation gives up.
+
+    (A read-only leaf file models the real failure mode — an EACCES from
+    cgroupfs — without touching directory permissions that would break
+    tmp_path cleanup.)
+    """
+
+    fake_root = tmp_path / "cgroup"
+    own = "/test.slice/fake.service"
+    base = _fake_delegated_cgroup(fake_root, own, procs="123\n")
+    # The ``main`` leaf exists but refuses the move: its cgroup.procs is
+    # read-only, the way cgroupfs rejects a write it will not honour.
+    leaf = base / "main"
+    leaf.mkdir()
+    (leaf / "cgroup.procs").write_text("")
+    (leaf / "cgroup.procs").chmod(0o444)
+
+    monkeypatch.setattr(worker_isolation, "own_cgroup_path", lambda: own)
+    monkeypatch.setattr(os, "getpid", lambda: 123)
+    monkeypatch.setattr(worker_isolation, "CGROUP_ROOT", fake_root)
+
+    # Relocation should fail but not raise
+    worker_isolation._attempt_relocation()
+    assert worker_isolation._RELOCATED is False  # still False
+    assert worker_isolation._WORKER_PARENT_CGROUP is None
+    # PID should still be in original cgroup
+    assert (base / "cgroup.procs").read_text().strip() == "123"
+
+
+def test_prepare_child_cgroup_uses_parent_after_relocation(tmp_path, monkeypatch) -> None:
+    """Test that after relocation, child cgroups are created under the parent cgroup."""
+
+    fake_root = tmp_path / "cgroup"
+    # Initial cgroup where the process resides, as the sole resident — the
+    # real relocation shape (the move itself is exercised, not pre-empted).
+    own = "/test.slice/fake.service"
+    base = _fake_delegated_cgroup(fake_root, own, procs="999\n")
+
+    monkeypatch.setattr(worker_isolation, "own_cgroup_path", lambda: own)
+    monkeypatch.setattr(os, "getpid", lambda: 999)
+
+    # Trigger relocation
+    worker_isolation._attempt_relocation(root=fake_root)
+    assert worker_isolation._RELOCATED is True
+    assert worker_isolation._WORKER_PARENT_CGROUP == own
+    # The move itself happened: the process's pid is in the leaf.
+    leaf = base / "main"
+    assert leaf.is_dir()
+    assert (leaf / "cgroup.procs").read_text().strip() == "999"
+
+    # Now prepare a child cgroup - it should be under the parent (own), not the leaf
+    plan = worker_isolation.prepare_launch(
+        command=[sys.executable, "-c", "print('worker')"],
+        run_id="run-relocated",
+        memory_max="256M",
+        probe=_PROBE_NONE,
+        cgroup_writable=lambda: True,
+        cgroup_root=fake_root,
+    )
+
+    assert plan.mechanism == worker_isolation.MECHANISM_CGROUP
+    # The cgroup path should be under the parent cgroup (own), not the leaf
+    assert plan.cgroup.startswith(own.rstrip("/") + "/worker-")
+    # Verify the child cgroup directory was created under the parent
+    child_dir = fake_root / plan.cgroup.strip("/")
+    assert child_dir.is_dir()
+    assert (child_dir / "memory.max").read_text() == str(worker_isolation.to_bytes("256M"))
+    # Controllers should be enabled on the parent cgroup for children
+    subtree = (base / "cgroup.subtree_control").read_text()
+    assert "+memory" in subtree and "+pids" in subtree
+
+
+def test_ensure_service_relocated_moves_the_pid_and_is_idempotent(
+    tmp_path, monkeypatch
+) -> None:
+    """The startup entry point the supervisor calls does the real move.
+
+    This is the function ``RunSupervisor.__init__`` invokes at service
+    startup (TASK 211): it must relocate the process's own PID into the
+    ``main`` leaf against a fake cgroupfs, record the parent for worker
+    creation, and be a no-op on the second call.
+    """
+
+    fake_root = tmp_path / "cgroup"
+    own = "/system.slice/fake.service"
+    base = _fake_delegated_cgroup(fake_root, own, procs="4242\n")
+
+    monkeypatch.setattr(worker_isolation, "own_cgroup_path", lambda: own)
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+
+    worker_isolation.ensure_service_relocated(root=fake_root)
+
+    assert worker_isolation._RELOCATED is True
+    assert worker_isolation._WORKER_PARENT_CGROUP == own
+    # The process's own PID now lives in the leaf.  (On a real cgroupfs the
+    # single write to the leaf's cgroup.procs relocates the process, so the
+    # delegated cgroup loses the PID automatically — the empty-parent
+    # property belongs to cgroupfs, not to a second write of ours.)
+    leaf = base / "main"
+    assert (leaf / "cgroup.procs").read_text().split() == ["4242"]
+    # The relocation made exactly one write: the parent's cgroup.procs was
+    # not rewritten by the code (the fake cannot mirror the move itself).
+    assert (base / "cgroup.procs").read_text().split() == ["4242"]
+
+    # Idempotent: a second startup-shaped call must not touch anything.
+    worker_isolation.ensure_service_relocated(root=fake_root)
+    assert (leaf / "cgroup.procs").read_text().split() == ["4242"]
+    assert (base / "cgroup.procs").read_text().split() == ["4242"]
+
+
+def test_ensure_service_relocated_skips_when_not_sole_resident(
+    tmp_path, monkeypatch
+) -> None:
+    """A shared cgroup is never disturbed: no move, no worker parent.
+
+    The reproduction method for the live proof drops a pytest process into
+    the real service cgroup alongside the service's own PID.  Moving only
+    when this process is the sole resident means the ad-hoc pytest process
+    (and any real co-resident) is left where it is and the launch falls
+    through to the unbounded plan — instead of relocating and leaving the
+    top-level cgroup occupied (which would reintroduce the EBUSY).
+    """
+
+    fake_root = tmp_path / "cgroup"
+    own = "/system.slice/fake.service"
+    base = _fake_delegated_cgroup(fake_root, own, procs="77 4242\n")  # co-resident
+
+    monkeypatch.setattr(worker_isolation, "own_cgroup_path", lambda: own)
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+
+    worker_isolation.ensure_service_relocated(root=fake_root)
+
+    assert worker_isolation._RELOCATED is False
+    assert worker_isolation._WORKER_PARENT_CGROUP is None
+    # Nobody moved, nothing was created.
+    assert not (base / "main").exists()
+    assert (base / "cgroup.procs").read_text().split() == ["77", "4242"]
+
+
+def test_relocated_process_uses_the_parent_for_worker_probing(
+    tmp_path, monkeypatch
+) -> None:
+    """After relocation the writability probe must target the parent, not the leaf.
+
+    The leaf ``main`` cgroup a freshly relocated process lives in has an
+    empty ``cgroup.controllers`` until the parent's ``subtree_control`` is
+    enabled — which happens later, inside ``_prepare_child_cgroup``.  If the
+    probe (``cgroup_subtree_writable`` with no explicit cgroup) still looked
+    at the caller's own cgroup, every post-relocation launch would see
+    "not delegated" and fall to the unbounded plan: the RSS bound would be
+    dead despite a successful relocation.
+    """
+
+    fake_root = tmp_path / "cgroup"
+    own = "/system.slice/fake.service"
+    base = _fake_delegated_cgroup(fake_root, own, procs="4242\n")
+
+    monkeypatch.setattr(worker_isolation, "own_cgroup_path", lambda: own)
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+
+    worker_isolation.ensure_service_relocated(root=fake_root)
+    # The caller now lives in the leaf, whose controllers are empty.
+    leaf = base / "main"
+    (leaf / "cgroup.controllers").write_text("")  # fresh child cgroup shape
+    assert (leaf / "cgroup.controllers").read_text() == ""
+
+    # The no-argument probe follows the worker parent, so the delegated
+    # parent — not the empty leaf — decides the mechanism.
+    assert worker_isolation.cgroup_subtree_writable(root=fake_root) is True
+    # And an explicitly requested cgroup still probes itself (unchanged).
+    assert worker_isolation.cgroup_subtree_writable(
+        cgroup_path=own + "/main", root=fake_root
+    ) is False
+
+
+def test_supervisor_startup_relocates_the_service_pid(tmp_path, monkeypatch) -> None:
+    """Constructing RunSupervisor performs the relocation, at startup.
+
+    The relocation must happen while the service is the unambiguous sole
+    resident of the delegated cgroup — i.e. from supervisor construction,
+    not lazily at the first worker launch — so the top-level cgroup is
+    provably empty before any ``worker-*`` child is created.
+    """
+
+    from lh_harness.supervisor.service import RunSupervisor
+
+    fake_root = tmp_path / "cgroup"
+    own = "/system.slice/fake.service"
+    base = _fake_delegated_cgroup(fake_root, own, procs="4242\n")
+
+    monkeypatch.setattr(worker_isolation, "own_cgroup_path", lambda: own)
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+    monkeypatch.setattr(worker_isolation, "CGROUP_ROOT", fake_root)
+
+    RunSupervisor(tmp_path / "runs", workspace_root=tmp_path)
+
+    assert worker_isolation._RELOCATED is True
+    assert worker_isolation._WORKER_PARENT_CGROUP == own
+    assert (base / "main" / "cgroup.procs").read_text().split() == ["4242"]
+    # The move was a single write into the leaf (cgroupfs itself empties the
+    # parent on the real host); the code did not rewrite the parent's file.
+    assert (base / "cgroup.procs").read_text().split() == ["4242"]
 
 
 @pytest.mark.parametrize(
