@@ -611,6 +611,54 @@ def test_pg_store_requeue_preserves_fields(tmp_path: Path) -> None:
     assert successor.failure_cause == "executor timeout"
 
 
+def test_pg_store_requeue_creates_queue_events_row(tmp_path: Path) -> None:
+    """Test that requeue creates a queue_events row for the enqueue event."""
+    store = _require_backend(tmp_path)
+
+    # Create a failed entry to retry
+    original = store.create(
+        {
+            "name": "requeue me",
+            "task": "sleep",
+            "workspace": "./workspace",
+            "max_rounds": 1,
+            "trio": "kimi",
+            "priority": 5,
+            "requested_by": "pytest",
+        }
+    )
+    store.mark_failed(original.queue_id, "original failure")
+
+    # Requeue it
+    successor = store.requeue(original.queue_id, "executor timeout")
+    assert successor is not None
+
+    # Verify a queue_events row was inserted for the enqueue event
+    with store._txn() as txn:
+        txn.execute(
+            "SELECT host, queue_id, ts, event, actor, rationale, payload "
+            "FROM harness.queue_events "
+            "WHERE queue_id = %s AND event = 'enqueue' "
+            "ORDER BY ts DESC LIMIT 1",
+            (successor.queue_id,),
+        )
+        row = txn.fetchone()
+        assert row is not None
+        host, queue_id, ts, event, actor, rationale, payload = row
+        assert queue_id == successor.queue_id
+        assert event == "enqueue"
+        assert actor == ""
+        assert rationale == "executor timeout"
+        # Check that the payload matches the successor entry (minus queue_id and created_at)
+        import json
+        payload_data = json.loads(payload)
+        # The payload should have all the fields of the successor except queue_id and created_at
+        expected = successor.to_dict()
+        expected.pop('queue_id', None)
+        expected.pop('created_at', None)
+        assert payload_data == expected
+
+
 def test_pg_store_record_block_and_unblock(tmp_path: Path) -> None:
     """Test that record_block and record_unblock work correctly."""
     store = _require_backend(tmp_path)

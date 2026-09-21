@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -513,7 +514,7 @@ def _read_migrations() -> list[str]:
             dedup_key=None  # retries must not collide with original dedup_key
         )
 
-        # Insert the successor entry
+        # Insert the successor entry and an audit event
         try:
             with self._txn() as txn:
                 values: list[Any] = [
@@ -539,6 +540,20 @@ def _read_migrations() -> list[str]:
                 txn.execute(
                     "INSERT INTO harness.queue (" + ", ".join(_QUEUE_COLUMNS) + ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     values,
+                )
+                # Insert queue_events row for the enqueue event
+                try:
+                    host = socket.gethostname()
+                except Exception:
+                    host = ''
+                # Prepare payload: successor entry data without queue_id and created_at (to avoid duplication with columns)
+                succ_data = successor.to_dict()
+                succ_data.pop('queue_id', None)
+                succ_data.pop('created_at', None)
+                payload_json = json.dumps(succ_data)
+                txn.execute(
+                    "INSERT INTO harness.queue_events (host, queue_id, ts, event, actor, rationale, payload) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (host, successor.queue_id, successor.created_at, "enqueue", "", cause, payload_json),
                 )
                 txn.commit()
         except Exception as exc:
