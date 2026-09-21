@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from .queue import QueueEntry, _NON_TERMINAL_STATUS, _VALID_STATUS, _normalize_request
+from .queue import QueueEntry, _NON_TERMINAL_STATUS, _VALID_STATUS, _normalize_request, _is_valid_transition
 
 # Column names mirror QueueEntry.to_dict() field-for-field; see docs/queue.md.
 _COLUMN_QUEUE_ID = "queue_id"
@@ -417,6 +417,42 @@ def _read_migrations() -> list[str]:
         if entry.status != "pending":
             return None
         entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
+        return self.update(entry)
+
+    def record_block(self, queue_id: str) -> QueueEntry | None:
+        """Transition an entry from pending to blocked.
+
+        Args:
+            queue_id: The ID of the entry to block
+
+        Returns:
+            The updated QueueEntry, or None if the entry not found
+            or if the transition is invalid
+        """
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if not _is_valid_transition(entry.status, "blocked"):
+            return None
+        entry.status = "blocked"
+        return self.update(entry)
+
+    def record_unblock(self, queue_id: str) -> QueueEntry | None:
+        """Transition an entry from blocked to pending.
+
+        Args:
+            queue_id: The ID of the entry to unblock
+
+        Returns:
+            The updated QueueEntry, or None if the entry not found
+            or if the transition is invalid
+        """
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if not _is_valid_transition(entry.status, "pending"):
+            return None
+        entry.status = "pending"
         return self.update(entry)
 
     def requeue(self, queue_id: str, cause: str) -> QueueEntry | None:

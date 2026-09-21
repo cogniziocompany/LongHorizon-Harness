@@ -531,7 +531,7 @@ class QueueStore:
 
     def _is_valid_transition(self, from_status: str, to_status: str) -> bool:
         """Check if a status transition is valid according to the transition table."""
-        return to_status in _VALID_TRANSITIONS.get(from_status, set())
+        return (from_status, to_status) in _QUEUE_TRANSITIONS
 
     def update(self, entry: QueueEntry) -> QueueEntry:
         entry.updated_at = _now()
@@ -597,6 +597,42 @@ class QueueStore:
         if entry.status not in ("pending", "failed"):
             return None
         entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
+        return self.update(entry)
+
+    def record_block(self, queue_id: str) -> QueueEntry | None:
+        """Transition an entry from pending to blocked.
+
+        Args:
+            queue_id: The ID of the entry to block
+
+        Returns:
+            The updated QueueEntry, or None if the entry not found
+            or if the transition is invalid
+        """
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if not self._is_valid_transition(entry.status, "blocked"):
+            return None
+        entry.status = "blocked"
+        return self.update(entry)
+
+    def record_unblock(self, queue_id: str) -> QueueEntry | None:
+        """Transition an entry from blocked to pending.
+
+        Args:
+            queue_id: The ID of the entry to unblock
+
+        Returns:
+            The updated QueueEntry, or None if the entry not found
+            or if the transition is invalid
+        """
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if not self._is_valid_transition(entry.status, "pending"):
+            return None
+        entry.status = "pending"
         return self.update(entry)
 
     def requeue(self, queue_id: str, cause: str) -> QueueEntry | None:

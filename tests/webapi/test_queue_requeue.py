@@ -481,5 +481,44 @@ def test_launcher_does_not_requeue_human_stop(tmp_path: Path) -> None:
     assert store.counts()["failed"] == 3
 
 
+def test_queue_store_blocked_unblock_launch(tmp_path: Path) -> None:
+    """Test that a blocked entry can unblock and then launch."""
+    root = _fixture(tmp_path)
+    store = QueueStore(root)
+
+    # Create a pending entry
+    entry = store.create(
+        {
+            "name": "test task",
+            "task": "do something",
+            "workspace": "./workspace",
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 10,
+            "requested_by": "ci",
+        }
+    )
+    assert entry.status == "pending"
+
+    # Block the entry (pending -> blocked)
+    blocked = store.record_block(entry.queue_id)
+    assert blocked is not None
+    assert blocked.status == "blocked"
+    assert store.get(entry.queue_id).status == "blocked"
+
+    # Unblock the entry (blocked -> pending)
+    unblocked = store.record_unblock(entry.queue_id)
+    assert unblocked is not None
+    assert unblocked.status == "pending"
+    assert store.get(entry.queue_id).status == "pending"
+
+    # Launch the entry (pending -> launched)
+    launched = store.mark_launched(entry.queue_id, "run-123")
+    assert launched is not None
+    assert launched.status == "launched"
+    assert launched.run_id == "run-123"
+    assert store.get(entry.queue_id).status == "launched"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

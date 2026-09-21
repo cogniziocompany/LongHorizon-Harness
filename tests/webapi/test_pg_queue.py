@@ -611,5 +611,94 @@ def test_pg_store_requeue_preserves_fields(tmp_path: Path) -> None:
     assert successor.failure_cause == "executor timeout"
 
 
+def test_pg_store_record_block_and_unblock(tmp_path: Path) -> None:
+    """Test that record_block and record_unblock work correctly."""
+    store = _require_backend(tmp_path)
+
+    # Create a pending entry
+    entry = store.create(
+        {
+            "name": "test task",
+            "task": "do something",
+            "workspace": "./workspace",
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 10,
+            "requested_by": "ci",
+        }
+    )
+    assert entry.status == "pending"
+
+    # Block the entry
+    blocked = store.record_block(entry.queue_id)
+    assert blocked is not None
+    assert blocked.status == "blocked"
+    assert store.get(entry.queue_id).status == "blocked"
+
+    # Try to block again (should not change status)
+    blocked_again = store.record_block(entry.queue_id)
+    assert blocked_again is not None
+    assert blocked_again.status == "blocked"
+
+    # Unblock the entry
+    unblocked = store.record_unblock(entry.queue_id)
+    assert unblocked is not None
+    assert unblocked.status == "pending"
+    assert store.get(entry.queue_id).status == "pending"
+
+    # Try to unblock again (should not change status)
+    unblocked_again = store.record_unblock(entry.queue_id)
+    assert unblocked_again is not None
+    assert unblocked_again.status == "pending"
+
+    # Test invalid transitions
+    # Mark as launched and try to block (should fail)
+    launched = store.mark_launched(entry.queue_id, "run-123")
+    assert launched is not None
+    assert launched.status == "launched"
+    blocked_from_launched = store.record_block(launched.queue_id)
+    assert blocked_from_launched is None  # Cannot block from launched
+    assert store.get(launched.queue_id).status == "launched"  # Status unchanged
+
+    # Mark as done and try to unblock (should fail)
+    done = store.mark_done(entry.queue_id, reason="completed")
+    assert done is not None
+    assert done.status == "done"
+    unblocked_from_done = store.record_unblock(done.queue_id)
+    assert unblocked_from_done is None  # Cannot unblock from done
+    assert store.get(done.queue_id).status == "done"  # Status unchanged
+
+
+def test_pg_store_blocked_to_launched_transition(tmp_path: Path) -> None:
+    """Test that a blocked entry can transition to launched via mark_launched."""
+    store = _require_backend(tmp_path)
+
+    # Create a pending entry
+    entry = store.create(
+        {
+            "name": "test task",
+            "task": "do something",
+            "workspace": "./workspace",
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 10,
+            "requested_by": "ci",
+        }
+    )
+    assert entry.status == "pending"
+
+    # Block the entry
+    blocked = store.record_block(entry.queue_id)
+    assert blocked is not None
+    assert blocked.status == "blocked"
+
+    # Launch from blocked state
+    launched = store.mark_launched(entry.queue_id, "run-456")
+    assert launched is not None
+    assert launched.status == "launched"
+    assert launched.run_id == "run-456"
+    assert store.get(entry.queue_id).status == "launched"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
