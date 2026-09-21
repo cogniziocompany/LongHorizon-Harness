@@ -246,7 +246,11 @@ def _list_queue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any
         return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
     status = _bounded(arguments.get("status"), field="status", max_chars=32) or None
     entries = queue_store.list()
-    valid_statuses = {"pending", "launched", "done", "failed"}
+    # The status set is canonical in queue.py; "blocked" is a fifth, non-terminal
+    # queue state (the PC queue's parked state) surfaced here as its own group.
+    from .queue import _VALID_STATUS
+
+    valid_statuses = set(_VALID_STATUS)
     filtered = entries
     if status is not None and status in valid_statuses:
         filtered = [item for item in entries if item.status == status]

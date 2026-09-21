@@ -865,10 +865,8 @@ def create_app(
     token = _configured_token(auth_token)
     origins = {str(item).rstrip("/") for item in (allowed_origins or ()) if str(item).strip()}
     queue_store: QueueStore | None = None
-    if runs_root is not None:
-        queue_store = QueueStore(runs_root)
     queue_config = default_queue_config()
-    if queue_store is not None:
+    if runs_root is not None:
         try:
             from ..config import PROJECT_CONFIG_PATH, load_run_defaults
 
@@ -878,8 +876,9 @@ def create_app(
             project = load_run_defaults(config_path)
             if isinstance(project.get("queue"), dict):
                 queue_config = queue_config_from_config(project)
+            queue_store = _select_queue_store(runs_root, project)
         except Exception:
-            pass
+            queue_store = QueueStore(runs_root)
     launcher: Launcher | None = None
     if supervisor is not None and queue_store is not None:
         launcher = Launcher(supervisor, queue_store, queue_config=queue_config)
@@ -1050,7 +1049,9 @@ def create_app(
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
         entries = queue_store.list()
-        valid_statuses = {"pending", "launched", "done", "failed"}
+        # The status set is canonical in queue.py; a "blocked" entry (the PC
+        # queue's fifth state) is surfaced as its own group, not a failure.
+        valid_statuses = {"pending", "launched", "done", "failed", "blocked"}
         filtered = entries
         if status is not None:
             if status not in valid_statuses:
@@ -1061,6 +1062,7 @@ def create_app(
             "launched": [],
             "done": [],
             "failed": [],
+            "blocked": [],
         }
         for item in entries:
             groups[item.status].append(item.to_dict())
