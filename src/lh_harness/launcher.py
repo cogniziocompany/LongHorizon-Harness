@@ -14,12 +14,16 @@ import json
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import PROJECT_CONFIG_PATH, load_run_defaults
+from .contention import ContentionGroup, detect_contention, groups_to_json
 from .queue import QueueEntry, QueueStore, default_queue_config, queue_config_from_config
 from .supervisor.lifecycle import ACTIVE_STATUSES, canonical_lifecycle_status
+from .workspace_guard import WorkspaceBaseError, prepare_workspace_base, probe_open_pr_gh
+from .workspace_identity import resolve_many
 
 # ``httpx`` is already a transitive dependency of FastAPI/TestClient, but the
 # launcher must not fail to import when it is absent.
@@ -113,7 +117,7 @@ def _now() -> float:
 def _normalize_workspace(value: str) -> str:
     """Return a stable absolute form for workspace-path comparison."""
 
-    return os.path.normpath(os.path.abspath(str(value or "")))
+    return os.path.normcase(os.path.normpath(os.path.abspath(str(value or ""))))
 
 
 def _read_report_json(path: Path) -> dict[str, Any]:
@@ -137,6 +141,8 @@ class Launcher:
         *,
         poll_seconds: float = 15.0,
         queue_config: dict[str, Any] | None = None,
+        probe_open_pr: "Callable[[Path, str], str | None] | None" = probe_open_pr_gh,
+        min_emit_severity: str = "same_repo",
     ) -> None:
         self.supervisor = supervisor
         self.queue_store = queue_store
@@ -146,10 +152,18 @@ class Launcher:
         )
         self._task: asyncio.Task | None = None
         self._stopping = False
+        # Workspace branch guard hook: returns a description of an OPEN PR on
+        # the given branch, or None.  DEFAULT-ON: production launches probe
+        # origin for a colliding OPEN PR with no flag or config (deliverable 3
+        # must hold in the default configuration).  Pass ``probe_open_pr=None``
+        # only to disable the probe explicitly (tests and offline runs).
+        self.probe_open_pr = probe_open_pr
         # One launcher instance must never launch two runs into the same
         # workspace across concurrent ticks.  This lock serializes the critical
         # section from eligibility check through store mark_launched.
         self._launch_lock = threading.Lock()
+        self._contentions: dict[str, ContentionGroup] = {}
+        self._min_emit_severity = min_emit_severity
 
     @staticmethod
     def _load_project_queue_config() -> dict[str, Any]:
@@ -199,6 +213,12 @@ class Launcher:
         entries = self.queue_store.list()
         active = self._active_runs()
         self._update_launched_entries(active)
+        # Contention visibility is warn-only.  A git failure must never abort
+        # the launch pass, so the bare except is deliberate.
+        try:
+            self._check_contention(active)
+        except Exception as exc:
+            self._emit_service_event("queue.error", {"error": f"contention check failed: {exc}"[:200]})
         capacities = self._remaining_capacity(active)
         launched = False
         for entry in entries:
@@ -348,6 +368,116 @@ class Launcher:
             )
         return healthy >= min_healthy
 
+    def _check_contention(
+        self,
+        active: dict[str, dict[str, Any]],
+    ) -> None:
+        """Detect workspace overlap among active runs and emit change events."""
+
+        participants = {
+            run_id: str(info.get("owner", {}).get("workspace", ""))
+            for run_id, info in active.items()
+        }
+        # Drop runs with no workspace; they cannot contend.
+        workspaces = [
+            workspace for workspace in participants.values() if workspace
+        ]
+        identities = resolve_many(workspaces, budget_seconds=3.0)
+        active_identities: dict[str, Any] = {}
+        for run_id, workspace in participants.items():
+            if not workspace:
+                continue
+            identity = identities.get(workspace)
+            if identity is None:
+                identity = identities.get(os.path.abspath(workspace))
+            if identity is not None:
+                active_identities[run_id] = identity
+
+        groups = detect_contention(
+            active_identities,
+            min_emit_severity=self._min_emit_severity,
+        )
+        next_contentions: dict[str, ContentionGroup] = {
+            group.contention_id: group for group in groups
+        }
+        previous_ids = set(self._contentions)
+        next_ids = set(next_contentions)
+        cleared = previous_ids - next_ids
+        detected = next_ids - previous_ids
+
+        for contention_id in cleared:
+            group = self._contentions[contention_id]
+            self._emit_contention(group, "fleet.contention.cleared")
+        for contention_id in detected:
+            group = next_contentions[contention_id]
+            self._emit_contention(group, "fleet.contention.detected")
+
+        self._contentions = next_contentions
+        self._persist_contention(groups)
+
+    def _persist_contention(self, groups: list[ContentionGroup]) -> None:
+        """Write the current contention picture atomically for the read path."""
+
+        runs_root = getattr(self.supervisor, "runs_root", None)
+        if runs_root is None:
+            return
+        path = Path(runs_root) / "queue" / "contention.json"
+        payload = json.dumps(
+            {
+                "ok": True,
+                "available": True,
+                "contentions": groups_to_json(groups),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        )
+        self._atomic_write(path, payload.encode("utf-8"))
+
+    def _emit_contention(self, group: ContentionGroup, event_type: str) -> None:
+        """Emit one run event per member plus a service event."""
+
+        for member in group.members:
+            self._emit_run_event(
+                member.run_id,
+                event_type,
+                {
+                    "contention_id": group.contention_id,
+                    "severity": group.severity,
+                    "group_key": group.group_key,
+                    "peers": [
+                        {
+                            "run_id": peer.run_id,
+                            "workspace": peer.workspace,
+                            "branch": peer.branch,
+                        }
+                        for peer in group.members
+                        if peer.run_id != member.run_id
+                    ],
+                },
+            )
+        self._emit_service_event(
+            event_type,
+            {
+                "contention_id": group.contention_id,
+                "severity": group.severity,
+                "group_key": group.group_key,
+                "members": [
+                    {"run_id": member.run_id, "workspace": member.workspace, "branch": member.branch}
+                    for member in group.members
+                ],
+                "truncated": group.truncated,
+            },
+        )
+
+    def _atomic_write(self, path: Path, payload: bytes) -> None:
+        from .supervisor.control_bus import _atomic_bytes_write
+
+        try:
+            _atomic_bytes_write(path, payload)
+        except OSError:
+            pass
+
     def _remaining_capacity(self, active: dict[str, dict[str, Any]]) -> dict[str, int]:
         capacity = self._config.get("capacity", {})
         trios = self._config.get("trios", {})
@@ -387,17 +517,64 @@ class Launcher:
             for role in ("manager", "executor", "auditor")
         }
         run_id: str | None = None
+        # Workspace branch guard: never launch onto another task's branch
+        # (measured defect, 2026-09-16: runs 7784478f under PR #108 and
+        # 96563c4c under PR #154).  A non-default checked-out branch must not
+        # be used as-is; the run gets a base cut fresh from origin's default,
+        # and another task's uncommitted/unpushed work is never destroyed.
+        #
+        # Continuation opt-in (task 201): an entry with ``branch`` or
+        # ``continue_branch`` set is a continuation task that owns the branch
+        # it names or finds checked out; the guard honours that with mode
+        # "continuation" — no relocation, no stash, no open-PR refusal.  The
+        # default (neither set) keeps the guard's full protection.
+        continuation = bool(getattr(entry, "branch", "") or getattr(entry, "continue_branch", False))
+        try:
+            base = prepare_workspace_base(
+                entry.workspace,
+                run_label=f"{entry.trio}-{uuid.uuid4().hex[:8]}",
+                base_root=getattr(self.supervisor, "workspace_root", None),
+                probe_open_pr=self.probe_open_pr,
+                continuation=continuation,
+                requested_branch=getattr(entry, "branch", "") or "",
+            )
+        except WorkspaceBaseError as exc:
+            reason = str(exc)[:_MAX_REASON_LEN]
+            # A guard refusal is retryable, not terminal (task 201): a dirty
+            # tree or an OPEN PR on the branch is often transient (the other
+            # task merges, the tree is cleaned), so the entry stays pending
+            # with the reason recorded in skip_reasons and is re-attempted on
+            # the next poll instead of becoming a dead row needing hand
+            # requeue.  The same choice as the other skip paths in this
+            # launcher; nothing else about the entry changes.
+            updated = self.queue_store.record_skip(entry.queue_id, f"workspace base refused: {reason}")
+            self._emit_service_event(
+                "queue.skipped",
+                {
+                    "queue_id": entry.queue_id,
+                    "trio": entry.trio,
+                    "workspace": entry.workspace,
+                    "reason": f"workspace base refused: {reason}",
+                },
+            )
+            if updated is not None:
+                updated.last_checked_at = _now()
+                self.queue_store.update(updated)
+            return
+        workspace = str(base.workspace if base.mode == "worktree" else entry.workspace)
         try:
             created = self.supervisor.create_run(
                 task=entry.task,
                 agent=agent,
                 model=model,
                 role_configs=role_configs,
-                workspace=entry.workspace,
+                workspace=workspace,
                 max_rounds=entry.max_rounds,
                 prompt_language="en",
                 mcp_profile=mcp_profile,
                 base_check=entry.base_check or None,
+                workspace_base_mode=base.mode,
+                workspace_base_summary=base.summary(),
             )
             run_id = str(created.get("id") or "")
         except Exception as exc:
@@ -431,8 +608,9 @@ class Launcher:
                 "queue_id": entry.queue_id,
                 "run_id": run_id,
                 "trio": entry.trio,
-                "workspace": entry.workspace,
+                "workspace": workspace,
                 "requested_by": entry.requested_by,
+                "workspace_base": base.summary(),
             },
         )
         if launched is not None:

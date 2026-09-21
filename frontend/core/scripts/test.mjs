@@ -5,7 +5,6 @@ import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 
 const directory = await mkdtemp(join(tmpdir(), 'lh-harness-core-test-'));
-const outfile = join(directory, 'runFeed.test.mjs');
 const localRequire = createRequire(import.meta.url);
 let build;
 try {
@@ -17,15 +16,19 @@ try {
 
 try {
   await build({
-    entryPoints: [resolve('test/runFeed.test.ts')],
+    entryPoints: [resolve('test/runFeed.test.ts'), resolve('test/contention.test.ts')],
     bundle: true,
     platform: 'node',
     format: 'esm',
     target: 'node20',
-    outfile,
+    outdir: directory,
   });
   await new Promise((resolveRun, rejectRun) => {
-    const child = spawn(process.execPath, ['--test', outfile], { stdio: 'inherit' });
+    const child = spawn(
+      process.execPath,
+      ['--test', join(directory, 'runFeed.test.js'), join(directory, 'contention.test.js')],
+      { stdio: 'inherit' },
+    );
     child.on('error', rejectRun);
     child.on('exit', (code) => code === 0 ? resolveRun() : rejectRun(new Error(`node --test exited with ${code}`)));
   });

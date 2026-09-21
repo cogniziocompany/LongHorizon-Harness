@@ -20,30 +20,50 @@ from typing import Any
 from .supervisor.control_bus import _atomic_bytes_write
 from .types import DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 
+try:  # Imported lazily so PgQueueStore is optional for the file store.
+    from .pg_queue import PgQueueStore  # noqa: F401
+except Exception:  # pragma: no cover - driver or schema missing
+    PgQueueStore = None  # type: ignore[assignment]
+
 _QUEUE_DIR = "queue"
 _MAX_QUEUE_ID_CHARS = 128
 _MAX_QUEUE_TASK_CHARS = 100_000
 _MAX_QUEUE_REASON_CHARS = 4_000
 _MAX_QUEUE_DEDUP_CHARS = 256
-_VALID_STATUS = frozenset({"pending", "launched", "done", "failed"})
-# Non-terminal entries are still waiting to be, or being, launched. A dedup key
-# is considered "in use" only while its entry is in one of these states; once an
-# entry reaches ``done``/``failed`` the key is free for a fresh (retry) entry.
-_NON_TERMINAL_STATUS = frozenset({"pending", "launched"})
-
-# Transition table: {from_status: {to_status: set}, ...}
-# A pending entry can fail directly when its launch attempt raises (the
-# launcher marks the never-launched entry failed before creating a successor).
-# "failed -> pending" happens only through requeue creating a *new* successor;
-# it is listed so `record_skip`-style helpers accept failed entries and so the
-# table documents the only path back to pending.
-_VALID_TRANSITIONS = {
-    "pending": {"launched", "failed"},
-    "launched": {"done", "failed"},
-    "done": set(),  # terminal
-    "failed": {"pending"},  # only via requeue (successor)
-}
+# ``blocked`` is the PC queue's fifth state: an entry is parked while it waits on
+# something outside the launcher (a missing dependency, a gate, a resource). It
+# is a non-terminal state -- a blocked entry is still parked work, so its dedup
+# key stays "in use" and a fresh enqueue with the same key does not fork a second
+# entry. It resumes through ``blocked`` -> ``pending`` (record_unblock) or
+# ``blocked`` -> ``launched`` (mark_launched).
+_VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked"})
+# Non-terminal entries are still waiting to be, or being, launched, or parked. A
+# dedup key is considered "in use" only while its entry is in one of these states;
+# once an entry reaches a terminal state (``done``/``failed``) the key is free for
+# a fresh (retry) entry.
+_NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
 _VALID_TRIOS = frozenset({"kimi", "qwen"})
+
+# Allowed queue-entry state transitions. Keyed by (from, to); the value is the
+# operation that performs the move. Read-only edges ("update (record_...)") are
+# not a first-class QueueStore method: they are applied by the launcher by
+# mutating the entry's status and calling ``update``. The terminal edges (done,
+# failed) have no outgoing edge -- a terminal entry cannot leave its state.
+_QUEUE_TRANSITIONS: dict[tuple[str, str], str] = {
+    ("pending", "launched"): "mark_launched",
+    ("pending", "done"): "mark_done",
+    ("pending", "failed"): "mark_failed",
+    ("pending", "blocked"): "update (record_block)",
+    ("launched", "done"): "mark_done",
+    ("launched", "failed"): "mark_failed",
+    ("blocked", "pending"): "update (record_unblock)",
+    ("blocked", "launched"): "mark_launched",
+}
+
+
+def _valid_transition(from_status: str, to_status: str) -> bool:
+    """Return True if ``from_status`` -> ``to_status`` is an allowed transition."""
+    return (from_status, to_status) in _QUEUE_TRANSITIONS
 
 
 def _safe_queue_id(value: str) -> bool:
@@ -64,6 +84,33 @@ def _queue_dir(runs_root: str | Path) -> Path:
     return path
 
 
+def _select_queue_store(
+    runs_root: str | Path | None, project: dict[str, Any] | None
+) -> QueueStore | PgQueueStore | None:
+    """Pick the queue store backend.
+
+    The file store is the default and stays hermetic. Only ``queue_backend="postgres"``
+    plus a ``database_url`` in the project config reaches ``PgQueueStore``; every
+    other configuration (including no config at all) yields the file-backed store.
+    """
+    if runs_root is None:
+        return None
+    if project is None:
+        return QueueStore(runs_root)
+    queue = project.get("queue", {})
+    if not isinstance(queue, dict):
+        return QueueStore(runs_root)
+    backend = str(queue.get("backend", "file")).strip().lower()
+    if backend not in {"file", "postgres"}:
+        raise ValueError(f"unknown queue backend: {backend!r}")
+    if backend != "postgres":
+        return QueueStore(runs_root)
+    database_url = str(queue.get("database_url", "")).strip()
+    if not database_url:
+        raise ValueError("queue_backend=postgres requires queue.database_url")
+    return PgQueueStore(database_url)
+
+
 def _queue_path(runs_root: str | Path, queue_id: str) -> Path:
     return _queue_dir(runs_root) / f"{queue_id}.json"
 
@@ -80,6 +127,14 @@ class QueueEntry:
     trio: str
     priority: int
     requested_by: str
+    # Workspace-guard continuation opt-in (task 201).  ``branch`` names a
+    # specific branch to use as-is; ``continue_branch`` accepts whatever branch
+    # the workspace currently has checked out.  When either is set the
+    # launcher's workspace guard leaves the workspace untouched (mode
+    # "continuation"): no relocation, no stash, and no open-PR refusal.  The
+    # default (both unset) keeps the guard's full protection.
+    branch: str = ""
+    continue_branch: bool = False
     base_check: str = ""
     status: str = "pending"
     run_id: str | None = None
@@ -114,6 +169,8 @@ class QueueEntry:
             "trio",
             "priority",
             "requested_by",
+            "branch",
+            "continue_branch",
             "base_check",
             "status",
             "run_id",
@@ -245,6 +302,35 @@ def _validate_dedup_key(value: Any) -> str | None:
     return text
 
 
+def _validate_branch(value: Any) -> str:
+    """Validate the continuation opt-in ``branch`` name (task 201)."""
+
+    if value is None:
+        return ""
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError("branch must be a string")
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) > 256:
+        raise ValueError("branch is too long")
+    if "\x00" in text or ".." in text:
+        raise ValueError("branch contains an invalid sequence")
+    if text.startswith("-"):
+        raise ValueError("branch must not start with '-'")
+    return text
+
+
+def _validate_continue_branch(value: Any) -> bool:
+    """Validate the continuation opt-in ``continue_branch`` flag (task 201)."""
+
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError("continue_branch must be a boolean")
+    return value
+
+
 def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
     """Convert a POST /api/queue body into validated launch parameters."""
 
@@ -260,6 +346,13 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
     task_text = _validate_task(task)
 
     trio = body.get("roles") if "roles" in body else body.get("trio")
+    branch = _validate_branch(body.get("branch"))
+    continue_branch = _validate_continue_branch(body.get("continue_branch"))
+    if branch and continue_branch:
+        # Both opt-ins name the same decision ("use the existing branch as-is")
+        # at different specificity; accepting both would leave the launcher's
+        # behaviour ambiguous, so the enqueue is rejected instead.
+        raise ValueError("set branch or continue_branch, not both")
     return {
         "name": _validate_name(body.get("name")),
         "task": task_text,
@@ -267,6 +360,8 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "max_rounds": _validate_max_rounds(body.get("max_rounds")),
         "trio": _validate_trio(trio),
         "priority": _validate_priority(body.get("priority")),
+        "branch": branch,
+        "continue_branch": continue_branch,
         "base_check": _validate_base_check(body.get("base_check")),
         "requested_by": _validate_requested_by(body.get("requested_by")),
         "dedup_key": _validate_dedup_key(body.get("dedup_key")),
