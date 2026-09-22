@@ -449,12 +449,20 @@ class FleetReporter:
         url = f"{self._url}{endpoint}"
         body = json.dumps(payload, ensure_ascii=False, default=_json_default).encode("utf-8")
         original_size = len(body)
+        # Sign the JSON bytes, never the compressed wire bytes: fleet-admin's
+        # express.json ``verify`` hands the HMAC the INFLATED body, so a
+        # signature over the gzip stream can never match (9,098 consecutive
+        # ``harness_bad_sig`` rejections for ct110 before this was measured,
+        # 2026-09-22; proven by a probe that signed plaintext and got 200).
+        sign_bytes = body
         if gzip_body:
             body = __import__("gzip").compress(body)
         attempt = 0
         last_error: Exception | None = None
         while attempt < _MAX_RETRIES:
-            req = self._build_request(url, body, gzip_body=gzip_body, original_size=original_size)
+            req = self._build_request(
+                url, body, sign_bytes=sign_bytes, gzip_body=gzip_body, original_size=original_size
+            )
             try:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     resp.read()
@@ -482,12 +490,13 @@ class FleetReporter:
         url: str,
         body: bytes,
         *,
+        sign_bytes: bytes | None = None,
         gzip_body: bool,
         original_size: int,
     ) -> urllib.request.Request:
         signature = hmac.new(
             self._key.encode("utf-8"),
-            body,
+            body if sign_bytes is None else sign_bytes,
             hashlib.sha256,
         ).hexdigest()
         headers = {

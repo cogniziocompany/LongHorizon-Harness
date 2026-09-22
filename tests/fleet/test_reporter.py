@@ -216,7 +216,13 @@ def test_configured_false_warns_only_missing_when_partial(_isolate_reporter, cap
 
 
 def test_hmac_signature_correct(http_server, _isolate_reporter):
-    """Requests carry HMAC-SHA256 over the raw (gzipped) body."""
+    """Requests carry HMAC-SHA256 over the JSON body (what fleet-admin verifies).
+
+    fleet-admin inflates a gzip body before its HMAC check (express.json
+    ``verify`` receives the decoded buffer), so the signature must cover the
+    JSON bytes, not the compressed stream. A signature over the gzip bytes is
+    exactly the bug that produced 9,098 ``bad signature`` rejections.
+    """
     _setenv(http_server, "test-node", "secret-key", None)
     reporter = get_reporter(reset=True)
     assert reporter.enabled
@@ -228,8 +234,11 @@ def test_hmac_signature_correct(http_server, _isolate_reporter):
     assert _StubHandler.requests, "request should have reached stub"
     req = _StubHandler.requests[0]
     assert req["path"] == "/harness/heartbeat"
-    assert _hmac_match(req["raw"], req["headers"], "secret-key", "test-node")
     assert req["headers"].get("Content-Encoding") == "gzip"
+    inflated = gzip.decompress(req["raw"])
+    assert _hmac_match(inflated, req["headers"], "secret-key", "test-node")
+    # And explicitly NOT over the wire bytes (the pre-fix behaviour).
+    assert not _hmac_match(req["raw"], req["headers"], "secret-key", "test-node")
 
 
 def test_batching_groups_events(http_server, _isolate_reporter):
