@@ -185,15 +185,27 @@ def test_select_queue_store_file_is_default(tmp_path: Path) -> None:
     assert not isinstance(store, PgQueueStore)
 
 
-def test_real_project_config_loads_without_error() -> None:
-    """Guard rail: the real config loader keeps parsing a well-formed project
-    config (the deployment path create_app depends on). Runs against the
-    packaged default path; asserts nothing about secret values."""
-    try:
-        project = real_load_run_defaults(real_load_run_defaults.__defaults__[0])
-    except Exception:
-        pytest.skip("no project config available in this environment")
+def test_real_loader_parses_fixture_config(tmp_path: Path) -> None:
+    """Guard rail: the real config loader parses a well-formed project config
+    (the deployment path create_app depends on). Runs against a fixture file
+    in tmp_path -- never against the packaged default config path, which may
+    belong to a harness deployment, and asserts nothing about secret values."""
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "\n".join(
+            [
+                "[run]",
+                'model = "codex"',
+                "",
+                "[queue]",
+                'backend = "file"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    project = real_load_run_defaults(config)
     assert isinstance(project, dict)
+    assert project.get("queue", {}).get("backend") == "file"
 
 
 def test_real_config_flattener_drops_database_url(tmp_path: Path) -> None:
