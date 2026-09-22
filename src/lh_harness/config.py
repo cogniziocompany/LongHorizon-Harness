@@ -190,6 +190,20 @@ auditor = 300
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
 # max_retries = 2       # maximum number of retry attempts for failed entries
+
+# [queue]
+# observe = false       # shadow (observe) mode: the launcher computes the full
+#                       # launch decision but starts NOTHING -- it appends
+#                       # queue.shadow_launch / queue.shadow_skip records to
+#                       # runs_root/queue/shadow.jsonl and leaves every entry
+#                       # pending. Flip to false to promote the launcher; that
+#                       # is the whole code change (migration §5 Step 2).
+# occupancy_ignore_dirty = false
+#                       # Set true to stop treating a dirty tree (git status
+#                       # --porcelain non-empty) or a local branch with commits
+#                       # not on origin/main as an OCCUPIED workspace. Per-
+#                       # environment overseer override; active-run ownership
+#                       # always applies.
 """
 
 
@@ -241,6 +255,30 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     unknown_trios = set(trios) - _QUEUE_TRIOS
     if unknown_trios:
         raise ProjectConfigError(f"unknown queue trio(s): {_names(unknown_trios)}")
+    # ``database_url`` is a legitimate key (``queue.py`` reads it to build the
+    # PgQueueStore), so the validator must accept it even though the flattened
+    # result deliberately does not carry it onward yet — threading the DSN
+    # through the loader is the documented cutover step.
+    unknown_queue_keys = set(queue) - {
+        "trios",
+        "capacity",
+        "backend",
+        "observe",
+        "occupancy_ignore_dirty",
+        "database_url",
+    }
+    if unknown_queue_keys:
+        raise ProjectConfigError(f"unknown [queue] key(s): {_names(unknown_queue_keys)}")
+    observe = queue.get("observe", False)
+    if not isinstance(observe, bool):
+        raise ProjectConfigError("[queue].observe must be a boolean")
+    # Occupancy override (task 173, scope 4): some environments (e.g. one
+    # workspace shared by sequential operators) legitimately keep dirty trees;
+    # the overseer flips this to true to disable only the dirty-tree and
+    # unpushed-branch occupancy probes, never the active-run rule.
+    occupancy_ignore_dirty = queue.get("occupancy_ignore_dirty", False)
+    if not isinstance(occupancy_ignore_dirty, bool):
+        raise ProjectConfigError("[queue].occupancy_ignore_dirty must be a boolean")
 
     # ``backend`` selects the storage engine. The file store is the default and
     # stays hermetic; only ``postgres`` reaches PgQueueStore.
@@ -308,7 +346,13 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         # If present but not int, raise error
         if "max_retries" in capacity:
             raise ProjectConfigError("[queue.capacity].max_retries must be an integer")
-    return {"trios": normalized_trios, "capacity": normalized_capacity, "backend": normalized_backend}
+    return {
+        "trios": normalized_trios,
+        "capacity": normalized_capacity,
+        "backend": normalized_backend,
+        "observe": observe,
+        "occupancy_ignore_dirty": occupancy_ignore_dirty,
+    }
 
 
 def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:

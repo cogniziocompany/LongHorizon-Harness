@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import subprocess
 import threading
 import time
 import uuid
@@ -20,7 +22,14 @@ from typing import Any, Callable
 
 from .config import PROJECT_CONFIG_PATH, load_run_defaults
 from .contention import ContentionGroup, detect_contention, groups_to_json
-from .queue import QueueEntry, QueueStore, default_queue_config, queue_config_from_config
+from .queue import (
+    QueueEntry,
+    QueueStore,
+    acquire_lease,
+    default_queue_config,
+    queue_config_from_config,
+    read_lease,
+)
 from .supervisor.lifecycle import ACTIVE_STATUSES, canonical_lifecycle_status
 from .workspace_guard import WorkspaceBaseError, prepare_workspace_base, probe_open_pr_gh
 from .workspace_identity import resolve_many
@@ -34,6 +43,8 @@ except ImportError:  # pragma: no cover
 
 
 _MAX_REASON_LEN = 4_000
+
+logger = logging.getLogger(__name__)
 
 # Failure causes that must never trigger a requeue.  Matched against the
 # launch-failure exception text and the terminal run report's
@@ -131,6 +142,82 @@ def _read_report_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+# Occupancy probes (task 173, scope 4 / migration doc workspace-collision
+# finding, 2026-09-14): an active run is not the only reason a workspace is
+# unsafe to launch into.  A dirty tree means another task's uncommitted work
+# sits in it, and a local branch carrying commits that never reached
+# origin/main means another task's committed work does.  Both are OCCUPIED.
+_GIT_OCCUPANCY_TIMEOUT = 30
+
+
+def _git_occupancy(repo: Path, *args: str) -> str | None:
+    """Run one read-only git probe in ``repo``; None on any failure."""
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_OCCUPANCY_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _dirty_workspace_occupied(workspace: str) -> bool:
+    """True when ``git status --porcelain`` in the workspace is non-empty.
+
+    Any failure (not a repo, git unavailable, timeout) reads as clean — the
+    active-run rule and the workspace guard still protect the launch; this
+    probe only ever adds a skip, never manufactures one out of an error.
+    """
+
+    repo = Path(workspace)
+    if not repo.is_dir():
+        return False
+    status = _git_occupancy(repo, "status", "--porcelain")
+    return bool(status)
+
+
+def _unpushed_branch_occupied(workspace: str) -> bool:
+    """True when the checked-out branch has no upstream AND carries commits
+    not on origin's default branch (origin/main in the task's wording).
+
+    The 2026-09-14 collisions were all "a run started on top of another task's
+    unpushed branch work".  A branch with an upstream is not occupied by this
+    rule even when it is ahead of that upstream — the open-PR probe and the
+    ahead-of-upstream relocation in ``prepare_workspace_base`` cover those at
+    launch time.  Anything unreadable reads as clean: this probe only ever
+    adds a skip, never manufactures one out of an error.
+    """
+
+    repo = Path(workspace)
+    if not repo.is_dir():
+        return False
+    if _git_occupancy(repo, "rev-parse", "--is-inside-work-tree") != "true":
+        return False
+    branch = _git_occupancy(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if not branch or branch == "HEAD":
+        # Detached HEAD: no branch work to protect beyond the dirty-tree rule.
+        return False
+    upstream = _git_occupancy(repo, "rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}")
+    if upstream:
+        return False
+    origin_main = _git_occupancy(
+        repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"
+    )
+    if not origin_main:
+        # No origin/main ref: commits-not-on-origin/main is undecidable here
+        # (no remote, or an unusual remote layout); the launch-time guard still
+        # runs, so this stays fail-open rather than blocking every workspace.
+        return False
+    count = _git_occupancy(repo, "rev-list", "--count", f"refs/remotes/origin/main..{branch}")
+    return bool(count and count != "0")
+
+
 class Launcher:
     """Poll the queue and launch eligible entries through the supervisor."""
 
@@ -147,6 +234,12 @@ class Launcher:
         self.supervisor = supervisor
         self.queue_store = queue_store
         self._config = queue_config or self._load_project_queue_config()
+        # Observe (shadow) mode — task 173 / migration §5 Step 2: when true the
+        # launcher computes the full launch decision but starts NOTHING; it
+        # appends one shadow record per decision to
+        # runs_root/queue/shadow.jsonl and leaves every entry pending. The PC
+        # launcher stays the sole authoritative launcher while this is on.
+        self._observe = bool(self._config.get("observe", False))
         self._poll_seconds = float(
             self._config.get("capacity", {}).get("poll_seconds", poll_seconds)
         )
@@ -164,6 +257,14 @@ class Launcher:
         self._launch_lock = threading.Lock()
         self._contentions: dict[str, ContentionGroup] = {}
         self._min_emit_severity = min_emit_severity
+        # Cross-process lease (task 173, scope 5 / migration §4.2): the file
+        # store's floor for the single-orchestrator guarantee.  Taken/refreshed
+        # at the start of every pass; a second launcher process on the same
+        # runs_root sees the live lease held elsewhere, logs, and idles for the
+        # pass.  ``None`` once we hold it, re-acquired each pass.
+        self._lease: dict[str, Any] | None = None
+        self._lease_logged = False
+        self._lease_unavailable_logged = False
 
     @staticmethod
     def _load_project_queue_config() -> dict[str, Any]:
@@ -205,9 +306,67 @@ class Launcher:
     def _tick_sync(self) -> None:
         try:
             with self._launch_lock:
+                if not self._acquire_lease():
+                    return
                 self._run_pass()
         except Exception as exc:
             self._emit_service_event("queue.error", {"error": str(exc)[:200]})
+
+    # ------------------------------------------------------------------
+    # Cross-process lease — task 173, scope 5 / migration doc §4.2.
+    #
+    # Taken at the top of every pass, before any queue read: the holder
+    # refreshes it, everyone else logs once and idles.  Liveness: the lease
+    # record itself (and the heartbeat's ``launcher_tick_at`` /
+    # ``lease_holder``) is what the fleet window reads to see the launcher
+    # working.
+    # ------------------------------------------------------------------
+
+    def _lease_interval(self) -> float:
+        return float(
+            self._config.get("capacity", {}).get("poll_seconds", self._poll_seconds)
+        )
+
+    def _acquire_lease(self) -> bool:
+        """Take/refresh the lease; False (log + idle) when another holder has it."""
+
+        runs_root = getattr(self.queue_store, "runs_root", None)
+        if runs_root is None:
+            # No file root (the PG backend, task 134's row lock): the file
+            # lease has nothing to attach to; the pass proceeds unchanged.
+            return True
+        try:
+            record = acquire_lease(runs_root, interval_seconds=self._lease_interval())
+        except OSError as exc:
+            # The lease MECHANISM is unavailable (e.g. the secure control-bus
+            # write needs O_NOFOLLOW/O_DIRECTORY, which no Windows host has).
+            # That is not "someone else holds it": failing closed here would
+            # abort every pass, so the launcher would silently stop launching
+            # anything.  Fail open onto the pre-lease behaviour instead — one
+            # warning, then run the pass without a lease.
+            if not self._lease_unavailable_logged:
+                logger.warning(
+                    "launcher lease unavailable on this platform (%s); "
+                    "running passes without the cross-process lease",
+                    exc,
+                )
+                self._lease_unavailable_logged = True
+            self._lease = None
+            return True
+        if record is None:
+            holder = read_lease(runs_root)
+            if not self._lease_logged:
+                logger.warning(
+                    "launcher lease held elsewhere (pid=%s host=%s); idling this pass",
+                    (holder or {}).get("pid"),
+                    (holder or {}).get("host"),
+                )
+                self._lease_logged = True
+            self._lease = None
+            return False
+        self._lease = record
+        self._lease_logged = False
+        return True
 
     def _run_pass(self) -> None:
         entries = self.queue_store.list()
@@ -231,13 +390,32 @@ class Launcher:
                 skip_reason = self._capacity_reason(entry, capacities)
                 if skip_reason is None:
                     skip_reason = "launch batch already consumed capacity"
+                if self._observe:
+                    self._shadow_skip(entry, skip_reason)
+                    continue
                 self._skip(entry, skip_reason)
                 continue
             skip_reason = self._check_eligibility(entry, active, capacities)
             if skip_reason is None:
+                if self._observe:
+                    # Observe (shadow) mode, task 173 / migration §5 Step 2:
+                    # the full decision (eligibility, capacity, key health and
+                    # now the trio resolve) is computed, then — immediately
+                    # before the launch point, never inside the eligibility
+                    # gate — the pass short-circuits and records what WOULD
+                    # have happened.  The entry stays pending; create_run is
+                    # never called.  The batch bookkeeping still runs so later
+                    # entries see exactly the skip reasons a real launch would
+                    # have produced.
+                    self._shadow_launch_decision(entry)
+                    launched = True
+                    capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
+                    continue
                 self._launch(entry)
                 launched = True
                 capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
+            elif self._observe:
+                self._shadow_skip(entry, skip_reason)
             else:
                 self._skip(entry, skip_reason)
 
@@ -338,6 +516,28 @@ class Launcher:
             workspace = _normalize_workspace(owner.get("workspace", ""))
             if workspace and workspace == entry_workspace:
                 return f"workspace {entry.workspace} has active run {run_id}"
+        # Occupancy (task 173, scope 4): beyond an active run, a workspace is
+        # OCCUPIED when another task's uncommitted work sits in it (dirty
+        # tree) or when the checked-out branch carries unpushed work with no
+        # upstream to push it to.  Each skip reason names which condition
+        # fired.  ``occupancy_ignore_dirty`` (per-environment overseer
+        # override) disables only these two probes; the active-run rule above
+        # always applies.  A continuation entry (task 201 ``branch`` /
+        # ``continue_branch``) explicitly owns the workspace it names, dirty
+        # branch included, so the two dirty-work probes do not apply to it.
+        if not bool(self._config.get("occupancy_ignore_dirty", False)) and not bool(
+            getattr(entry, "branch", "") or getattr(entry, "continue_branch", False)
+        ):
+            if _dirty_workspace_occupied(entry.workspace):
+                return (
+                    f"workspace {entry.workspace} occupied: dirty tree "
+                    "(git status --porcelain non-empty)"
+                )
+            if _unpushed_branch_occupied(entry.workspace):
+                return (
+                    f"workspace {entry.workspace} occupied: checked-out branch "
+                    "has no upstream and carries commits not on origin/main"
+                )
         return None
 
     def _key_health_ok(self, url: str, min_healthy: int) -> bool:
@@ -632,6 +832,88 @@ class Launcher:
             updated.last_checked_at = _now()
             self.queue_store.update(updated)
 
+    # ------------------------------------------------------------------
+    # Observe (shadow) mode — task 173 / migration §5 Step 2.
+    #
+    # Shadow decisions are recorded BOTH as durable service events (the fleet
+    # event stream) AND as one JSON line each in runs_root/queue/shadow.jsonl
+    # (the comparison stream scripts/compare_shadow.py reads).  The entry
+    # stays pending in every path; no run is created and no capacity is
+    # permanently consumed beyond the in-pass batch bookkeeping.
+    # ------------------------------------------------------------------
+
+    def _shadow_launch_decision(self, entry: QueueEntry) -> None:
+        """Record a would-launch decision without calling create_run.
+
+        Resolves the trio exactly as ``_launch`` would (so an unknown trio is
+        a shadow skip, not a crash), then emits ``queue.shadow_launch`` with
+        the would-be launch fields.  The entry is left pending.
+        """
+
+        trio = self._config.get("trios", {}).get(entry.trio)
+        if trio is None:
+            self._shadow_skip(entry, f"unknown trio {entry.trio}")
+            return
+        agent = trio.get("agent", "codex")
+        model = trio.get("model")
+        mcp_profile = trio.get("mcp_profile")
+        roles = {
+            role: {"agent": agent, "model": model, "mcp_profile": mcp_profile}
+            for role in ("manager", "executor", "auditor")
+        }
+        self._shadow_record(
+            entry,
+            "queue.shadow_launch",
+            trio=entry.trio,
+            roles=roles,
+            would_run_at=_now(),
+        )
+
+    def _shadow_skip(self, entry: QueueEntry, reason: str) -> None:
+        self._shadow_record(entry, "queue.shadow_skip", reason=reason)
+
+    def _shadow_record(
+        self,
+        entry: QueueEntry,
+        event_type: str,
+        *,
+        reason: str | None = None,
+        trio: str | None = None,
+        roles: dict[str, Any] | None = None,
+        would_run_at: float | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "queue_id": entry.queue_id,
+            "trio": trio if trio is not None else entry.trio,
+            "workspace": entry.workspace,
+        }
+        if roles is not None:
+            payload["roles"] = roles
+        if reason is not None:
+            payload["reason"] = reason
+        if would_run_at is not None:
+            payload["would_run_at"] = would_run_at
+        self._emit_service_event(event_type, payload)
+        self._append_shadow_log(event_type, payload)
+
+    def _append_shadow_log(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Append one shadow decision line to runs_root/queue/shadow.jsonl."""
+
+        append = getattr(self.queue_store, "append_shadow_record", None)
+        if append is None:
+            # A store without the shadow log (e.g. the PG backend before its
+            # mirror lands) still emits the service event; nothing is lost
+            # from the fleet event stream.
+            return
+        append(
+            {
+                "schema_version": 2,
+                "type": event_type,
+                "ts": _now(),
+                "payload": payload,
+            }
+        )
+
     def _run_role_dir(self, run_id: str) -> Path | None:
         try:
             logs = self.supervisor._run_logs_dir(run_id)
@@ -654,6 +936,12 @@ class Launcher:
         self._append_jsonl(role_dir / "events.jsonl", record)
 
     def _emit_service_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        # A store without a file root (the PG backend) has no service event
+        # log to append to; the launcher stays read-only there rather than
+        # aborting the pass.
+        root = getattr(self.queue_store, "_root", None)
+        if root is None:
+            return
         record = {
             "schema_version": 2,
             "event_id": f"queue-{_now():.6f}",

@@ -39,12 +39,18 @@ from ..queue import (
     QueueStore,
     default_queue_config,
     queue_config_from_config,
+    read_lease,
     _select_queue_store,
 )
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
+
+import logging
+
 from .events import EventTailer
+
+logger = logging.getLogger(__name__)
 
 # The standalone workbench has no project ``config.toml`` of its own (one
 # server can host runs across many workspaces), so the New Task form's
@@ -662,10 +668,16 @@ def _maybe_start_fleet_reporter(
     # Capacity is best-effort: count the workers this supervisor already owns.
     active_cap = 0 if supervisor is None else max(1, len(supervisor._processes))
 
-    def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int]:
+    def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int, float | None, dict[str, Any] | None]:
         runs: list[dict[str, Any]] = []
         active = 0
         queue_len = 0
+        # Orchestrator liveness (task 173, scope 6 / migration doc §4.3): the
+        # launcher lease is refreshed on every pass, so its ts is the
+        # launcher's last tick and its pid/host identify the holder.  Absent
+        # lease -> None, the fleet window reads that as "no launcher".
+        launcher_tick_at: float | None = None
+        lease_holder: dict[str, Any] | None = None
         try:
             for item in registry.run_items():
                 run_id = str(item.get("id") or "")
@@ -683,9 +695,17 @@ def _maybe_start_fleet_reporter(
             if queue_store is not None:
                 counts = queue_store.counts()
                 queue_len = counts.get("pending", 0) + counts.get("launched", 0)
+            runs_root = getattr(queue_store, "runs_root", None)
+            if runs_root is not None:
+                lease = read_lease(runs_root)
+                if lease is not None:
+                    ts = lease.get("ts")
+                    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                        launcher_tick_at = float(ts)
+                    lease_holder = {"pid": lease.get("pid"), "host": lease.get("host")}
         except Exception:
             logger.exception("fleet heartbeat callback failed")
-        return runs, active, active_cap, queue_len
+        return runs, active, active_cap, queue_len, launcher_tick_at, lease_holder
 
     reporter = get_reporter(version=version, capacity=active_cap)
     if reporter is not None and reporter.enabled:
@@ -1167,6 +1187,52 @@ def create_app(
         except Exception:
             pass
         return effective
+
+    @app.get("/api/queue/shadow")
+    def queue_shadow_events(since: str | None = None) -> dict[str, Any]:
+        """Shadow (observe-mode) decisions over a fleet window (task 173).
+
+        One record per would-launch / would-skip decision, read from the
+        durable shadow log (``runs_root/queue/shadow.jsonl`` plus its daily
+        rotations).  ``since`` accepts epoch seconds or an ISO-8601 timestamp
+        and filters on the record ``ts``.
+
+        Only the file-backed store carries the shadow log.  A store without
+        ``read_shadow_records`` (``PgQueueStore`` under ``[queue] backend =
+        "postgres"``) gets an explicit 501 naming the store — never an
+        AttributeError/500 (task 220).
+        """
+
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        since_ts: float | None = None
+        if since is not None and since.strip():
+            raw = since.strip()
+            try:
+                since_ts = float(raw)
+            except ValueError:
+                try:
+                    from datetime import datetime, timezone
+
+                    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    since_ts = parsed.timestamp()
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="since must be epoch seconds or an ISO-8601 timestamp",
+                    ) from exc
+        if not hasattr(queue_store, "read_shadow_records"):
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "shadow records are not available for the "
+                    f"{type(queue_store).__name__} queue store"
+                ),
+            )
+        records = queue_store.read_shadow_records(since=since_ts)
+        return {"ok": True, "count": len(records), "events": records}
 
     @app.get("/api/fleet/contentions")
     def fleet_contentions() -> dict[str, Any]:

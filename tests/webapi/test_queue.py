@@ -259,11 +259,18 @@ def test_api_queue_status_filter(tmp_path: Path) -> None:
 
 def test_default_queue_config_shape() -> None:
     config = default_queue_config()
-    assert set(config) == {"trios", "capacity"}
+    assert set(config) == {"trios", "capacity", "observe", "occupancy_ignore_dirty"}
     assert set(config["trios"]) == {"kimi", "qwen"}
     assert config["capacity"]["kimi_max"] == 3
     assert config["capacity"]["qwen_max"] == 1
     assert config["capacity"]["min_healthy_keys"] == 2
+    # Shadow (observe) mode is off by default: today's launch behaviour is
+    # byte-for-byte unchanged until the flag is flipped (task 173).
+    assert config["observe"] is False
+    # Occupancy is on by default (task 173 scope 4): dirty trees and
+    # upstream-less unpushed branches count as occupied unless the overseer
+    # flips the per-environment override.
+    assert config["occupancy_ignore_dirty"] is False
 
 
 def test_queue_config_from_project_config() -> None:
@@ -282,6 +289,7 @@ def test_queue_config_from_project_config() -> None:
     assert config["capacity"]["kimi_max"] == 2
     assert config["capacity"]["qwen_max"] == 0
     assert config["capacity"]["poll_seconds"] == 5
+    assert config["observe"] is False
 
 
 def test_api_queue_config_endpoint(tmp_path: Path) -> None:
@@ -292,6 +300,28 @@ def test_api_queue_config_endpoint(tmp_path: Path) -> None:
     assert response.status_code == 200
     data = response.json()
     assert data["capacity"]["kimi_max"] == 3
+
+
+
+
+def test_project_config_queue_observe_flag(tmp_path: Path) -> None:
+    """``[queue] observe`` round-trips through load_run_defaults (task 173)."""
+
+    from lh_harness.config import ProjectConfigError, load_run_defaults
+
+    config = tmp_path / "config.toml"
+    config.write_text("[queue]\nobserve = true\n", encoding="utf-8")
+    assert load_run_defaults(config)["queue"]["observe"] is True
+
+    # Default stays false with no observe key at all.
+    config2 = tmp_path / "config2.toml"
+    config2.write_text("[queue.capacity]\npoll_seconds = 5\n", encoding="utf-8")
+    assert load_run_defaults(config2)["queue"]["observe"] is False
+
+    config3 = tmp_path / "config3.toml"
+    config3.write_text("[queue]\nobserve = \"yes\"\n", encoding="utf-8")
+    with pytest.raises(ProjectConfigError, match="observe"):
+        load_run_defaults(config3)
 
 
 def test_api_queue_requires_json_content_type(tmp_path: Path) -> None:
