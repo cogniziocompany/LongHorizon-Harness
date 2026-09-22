@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -441,6 +442,173 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def default_queue_config() -> dict[str, Any]:
     return queue_config_from_config({})
+
+
+# ----------------------------------------------------------------------
+# Cross-process launcher lease — task 173, scope 5 / migration doc §4.2
+# ("single-orchestrator guarantee" at the file-store level).
+#
+# ``runs_root/queue/.lease`` holds one JSON object ``{pid, host, ts}`` naming
+# the single launcher process that may run passes against this runs root.  It
+# is created with O_EXCL (exactly one process can mint it), refreshed with a
+# fresh ``ts`` on every pass the holder runs, and considered stale after
+# ``LEASE_STALE_INTERVALS`` missed intervals (interval = the launcher's poll
+# interval) so a crashed holder's lease is reclaimable.  A second launcher
+# that finds a live lease it does not own logs and idles for that pass.
+#
+# Residual (documented, accepted): this is the file-store floor.  The
+# unlink-and-O_EXCL reclaim has a tiny race window, and there is no fencing
+# token on ``mark_launched``; the store's pending-guard and the eligibility
+# gate still bound the damage of a lost race.  The Postgres backend mirrors
+# the guarantee with a row lock instead (task 134).
+# ----------------------------------------------------------------------
+
+_LEASE_FILE = ".lease"
+_LEASE_STALE_INTERVALS = 3
+
+
+def _lease_path(runs_root: str | Path) -> Path:
+    """Return ``runs_root/queue/.lease`` for a runs root."""
+
+    path = Path(runs_root).expanduser().resolve() / _QUEUE_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path / _LEASE_FILE
+
+
+def _lease_stale_after(interval_seconds: float) -> float:
+    """Seconds after which an unrefreshed lease is stale (3 missed intervals)."""
+
+    return max(float(interval_seconds), 0.0) * _LEASE_STALE_INTERVALS
+
+
+def read_lease(runs_root: str | Path) -> dict[str, Any] | None:
+    """Read the current lease record, or None when absent/unreadable."""
+
+    path = Path(runs_root).expanduser().resolve() / _QUEUE_DIR / _LEASE_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _lease_record(pid: int, host: str, ts: float) -> dict[str, Any]:
+    return {"pid": int(pid), "host": str(host), "ts": float(ts)}
+
+
+def _lease_held_by(record: dict[str, Any], pid: int, host: str) -> bool:
+    try:
+        return int(record.get("pid", -1)) == int(pid) and str(record.get("host", "")) == host
+    except (TypeError, ValueError):
+        return False
+
+
+def _lease_stale(record: dict[str, Any], now: float, interval_seconds: float) -> bool:
+    """True when ``record`` has not been refreshed for 3 missed intervals.
+
+    An unparseable/missing ``ts`` reads as maximally stale: a lease whose
+    timestamp cannot be trusted cannot defend its holder.
+    """
+
+    try:
+        ts = float(record.get("ts"))
+    except (TypeError, ValueError):
+        return True
+    return (now - ts) >= _lease_stale_after(interval_seconds)
+
+
+def _create_lease_excl(path: Path, record: dict[str, Any]) -> None:
+    """Create the lease file with O_EXCL so exactly one contender wins."""
+
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def acquire_lease(
+    runs_root: str | Path,
+    *,
+    interval_seconds: float = 15.0,
+    pid: int | None = None,
+    host: str | None = None,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    """Take or refresh the launcher lease for ``runs_root``.
+
+    Returns the caller's lease record when this process may run the pass
+    (freshly minted, refreshed because it already owned the lease, or
+    reclaimed from a stale holder), and ``None`` when a live lease owned by
+    another process blocks it — the caller must log and idle.
+
+    Refreshes rewrite the record atomically (``_atomic_bytes_write``); only a
+    first take or a stale reclaim goes through O_EXCL, so exactly one
+    contender can mint a lease out of nothing.
+    """
+
+    path = _lease_path(runs_root)
+    effective_pid = os.getpid() if pid is None else int(pid)
+    effective_host = socket.gethostname() if host is None else str(host)
+    now_ts = time.time() if now is None else float(now)
+    record = _lease_record(effective_pid, effective_host, now_ts)
+
+    existing = read_lease(runs_root)
+    if existing is not None and not _lease_stale(existing, now_ts, interval_seconds):
+        if _lease_held_by(existing, effective_pid, effective_host):
+            # Ours: refresh the timestamp for this pass.
+            _atomic_bytes_write(path, json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+            return record
+        return None
+
+    if existing is None:
+        # No readable lease: mint one with O_EXCL.  Losing the race to a
+        # simultaneous contender is re-read and re-evaluated once.
+        try:
+            _create_lease_excl(path, record)
+            return record
+        except FileExistsError:
+            existing = read_lease(runs_root)
+            if existing is not None and not _lease_stale(existing, now_ts, interval_seconds):
+                return None
+
+    # Stale (or unreadable-timestamp) lease: reclaim it.  Only unlink when the
+    # record on disk is still stale at the moment of the unlink, so a holder
+    # that managed a refresh in between keeps its lease; the O_EXCL re-create
+    # serializes two simultaneous reclaimers.
+    current = read_lease(runs_root)
+    if current is not None and not _lease_stale(current, now_ts, interval_seconds):
+        return None
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Un-unlinkable (permissions, read-only root): refuse rather than
+        # assume exclusivity we could not establish.
+        return None
+    try:
+        _create_lease_excl(path, record)
+        return record
+    except FileExistsError:
+        return None
+    except OSError:
+        return None
 
 
 class QueueStore:

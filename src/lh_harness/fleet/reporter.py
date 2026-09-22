@@ -146,7 +146,11 @@ class FleetReporter:
             self._thread: threading.Thread | None = None
             self._queue: queue.Queue[_PendingItem | None] | None = None
             self._stop_event: threading.Event | None = None
-            self._heartbeat_callback: Callable[[], tuple[list[dict[str, Any]], int, int, int]] | None = None
+            self._heartbeat_callback: Callable[
+                [],
+                tuple[list[dict[str, Any]], int, int, int]
+                | tuple[list[dict[str, Any]], int, int, int, float | None, dict[str, Any] | None],
+            ] | None = None
             return
 
         self._enabled = True
@@ -162,7 +166,11 @@ class FleetReporter:
         self._stop_event = threading.Event()
         self._last_warned: float = 0.0
         self._warned_lock = threading.Lock()
-        self._heartbeat_callback: Callable[[], tuple[list[dict[str, Any]], int, int, int]] | None = None
+        self._heartbeat_callback: Callable[
+            [],
+            tuple[list[dict[str, Any]], int, int, int]
+            | tuple[list[dict[str, Any]], int, int, int, float | None, dict[str, Any] | None],
+        ] | None = None
         self._heartbeat_interval = _HEARTBEAT_INTERVAL_SECONDS
         self._last_heartbeat = 0.0
         self._thread = threading.Thread(target=self._worker, name="fleet-reporter", daemon=True)
@@ -224,8 +232,16 @@ class FleetReporter:
         active: int,
         cap: int,
         queue_len: int = 0,
+        launcher_tick_at: float | None = None,
+        lease_holder: dict[str, Any] | None = None,
     ) -> None:
-        """Enqueue a periodic heartbeat describing this node."""
+        """Enqueue a periodic heartbeat describing this node.
+
+        ``launcher_tick_at``/``lease_holder`` carry the orchestrator liveness
+        signal (task 173, scope 6): the launcher lease's last refresh time and
+        the pid/host currently holding it.  ``None`` means the node exposes no
+        launcher lease and the fleet window reads that as "no launcher".
+        """
         if not self._enabled:
             return
         body = {
@@ -253,6 +269,10 @@ class FleetReporter:
             ],
             "capacity": {"active": active, "cap": cap},
             "queueLen": queue_len,
+            "liveness": {
+                "launcher_tick_at": launcher_tick_at,
+                "lease_holder": lease_holder,
+            },
         }
         self._post("/harness/heartbeat", body, gzip_body=True)
 
@@ -281,12 +301,19 @@ class FleetReporter:
 
     def register_heartbeat(
         self,
-        callback: Callable[[], tuple[list[dict[str, Any]], int, int, int]],
+        callback: Callable[
+            [],
+            tuple[list[dict[str, Any]], int, int, int]
+            | tuple[list[dict[str, Any]], int, int, int, "float | None", "dict[str, Any] | None"],
+        ],
     ) -> None:
         """Register a callback that produces heartbeat data every 30 s.
 
-        The callback must return ``(runs, active, cap, queue_len)``.  It is
-        invoked on the reporter daemon thread; keep it fast and exception-free.
+        The callback must return ``(runs, active, cap, queue_len)`` or, when
+        the node exposes a launcher lease, the extended
+        ``(runs, active, cap, queue_len, launcher_tick_at, lease_holder)``.  It
+        is invoked on the reporter daemon thread; keep it fast and
+        exception-free.
         """
         if not self._enabled:
             return
@@ -352,8 +379,17 @@ class FleetReporter:
                     and now - self._last_heartbeat >= self._heartbeat_interval
                 ):
                     try:
-                        runs, active, cap, queue_len = self._heartbeat_callback()
-                        self.queue_heartbeat(runs, active, cap, queue_len)
+                        result = self._heartbeat_callback()
+                        if len(result) == 6:
+                            runs, active, cap, queue_len, launcher_tick_at, lease_holder = result
+                            self.queue_heartbeat(
+                                runs, active, cap, queue_len,
+                                launcher_tick_at=launcher_tick_at,
+                                lease_holder=lease_holder,
+                            )
+                        else:
+                            runs, active, cap, queue_len = result
+                            self.queue_heartbeat(runs, active, cap, queue_len)
                     except Exception:
                         logger.exception("fleet reporter heartbeat callback failed")
                     self._last_heartbeat = now

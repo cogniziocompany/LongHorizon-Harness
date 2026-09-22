@@ -34,11 +34,16 @@ from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
 from ..supervisor.control_bus import CommandConflict, RevisionConflict
 from ..fleet import get_reporter
-from ..queue import QueueStore, default_queue_config, queue_config_from_config
+from ..queue import QueueStore, default_queue_config, queue_config_from_config, read_lease
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
+
+import logging
+
 from .events import EventTailer
+
+logger = logging.getLogger(__name__)
 
 # The standalone workbench has no project ``config.toml`` of its own (one
 # server can host runs across many workspaces), so the New Task form's
@@ -656,10 +661,16 @@ def _maybe_start_fleet_reporter(
     # Capacity is best-effort: count the workers this supervisor already owns.
     active_cap = 0 if supervisor is None else max(1, len(supervisor._processes))
 
-    def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int]:
+    def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int, float | None, dict[str, Any] | None]:
         runs: list[dict[str, Any]] = []
         active = 0
         queue_len = 0
+        # Orchestrator liveness (task 173, scope 6 / migration doc §4.3): the
+        # launcher lease is refreshed on every pass, so its ts is the
+        # launcher's last tick and its pid/host identify the holder.  Absent
+        # lease -> None, the fleet window reads that as "no launcher".
+        launcher_tick_at: float | None = None
+        lease_holder: dict[str, Any] | None = None
         try:
             for item in registry.run_items():
                 run_id = str(item.get("id") or "")
@@ -677,9 +688,17 @@ def _maybe_start_fleet_reporter(
             if queue_store is not None:
                 counts = queue_store.counts()
                 queue_len = counts.get("pending", 0) + counts.get("launched", 0)
+            runs_root = getattr(queue_store, "runs_root", None)
+            if runs_root is not None:
+                lease = read_lease(runs_root)
+                if lease is not None:
+                    ts = lease.get("ts")
+                    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                        launcher_tick_at = float(ts)
+                    lease_holder = {"pid": lease.get("pid"), "host": lease.get("host")}
         except Exception:
             logger.exception("fleet heartbeat callback failed")
-        return runs, active, active_cap, queue_len
+        return runs, active, active_cap, queue_len, launcher_tick_at, lease_holder
 
     reporter = get_reporter(version=version, capacity=active_cap)
     if reporter is not None and reporter.enabled:

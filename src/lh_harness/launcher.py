@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import threading
@@ -21,7 +22,14 @@ from typing import Any, Callable
 
 from .config import PROJECT_CONFIG_PATH, load_run_defaults
 from .contention import ContentionGroup, detect_contention, groups_to_json
-from .queue import QueueEntry, QueueStore, default_queue_config, queue_config_from_config
+from .queue import (
+    QueueEntry,
+    QueueStore,
+    acquire_lease,
+    default_queue_config,
+    queue_config_from_config,
+    read_lease,
+)
 from .supervisor.lifecycle import ACTIVE_STATUSES, canonical_lifecycle_status
 from .workspace_guard import WorkspaceBaseError, prepare_workspace_base, probe_open_pr_gh
 from .workspace_identity import resolve_many
@@ -35,6 +43,8 @@ except ImportError:  # pragma: no cover
 
 
 _MAX_REASON_LEN = 4_000
+
+logger = logging.getLogger(__name__)
 
 # Failure causes that must never trigger a requeue.  Matched against the
 # launch-failure exception text and the terminal run report's
@@ -247,6 +257,13 @@ class Launcher:
         self._launch_lock = threading.Lock()
         self._contentions: dict[str, ContentionGroup] = {}
         self._min_emit_severity = min_emit_severity
+        # Cross-process lease (task 173, scope 5 / migration §4.2): the file
+        # store's floor for the single-orchestrator guarantee.  Taken/refreshed
+        # at the start of every pass; a second launcher process on the same
+        # runs_root sees the live lease held elsewhere, logs, and idles for the
+        # pass.  ``None`` once we hold it, re-acquired each pass.
+        self._lease: dict[str, Any] | None = None
+        self._lease_logged = False
 
     @staticmethod
     def _load_project_queue_config() -> dict[str, Any]:
@@ -288,9 +305,50 @@ class Launcher:
     def _tick_sync(self) -> None:
         try:
             with self._launch_lock:
+                if not self._acquire_lease():
+                    return
                 self._run_pass()
         except Exception as exc:
             self._emit_service_event("queue.error", {"error": str(exc)[:200]})
+
+    # ------------------------------------------------------------------
+    # Cross-process lease — task 173, scope 5 / migration doc §4.2.
+    #
+    # Taken at the top of every pass, before any queue read: the holder
+    # refreshes it, everyone else logs once and idles.  Liveness: the lease
+    # record itself (and the heartbeat's ``launcher_tick_at`` /
+    # ``lease_holder``) is what the fleet window reads to see the launcher
+    # working.
+    # ------------------------------------------------------------------
+
+    def _lease_interval(self) -> float:
+        return float(
+            self._config.get("capacity", {}).get("poll_seconds", self._poll_seconds)
+        )
+
+    def _acquire_lease(self) -> bool:
+        """Take/refresh the lease; False (log + idle) when another holder has it."""
+
+        runs_root = getattr(self.queue_store, "runs_root", None)
+        if runs_root is None:
+            # No file root (the PG backend, task 134's row lock): the file
+            # lease has nothing to attach to; the pass proceeds unchanged.
+            return True
+        record = acquire_lease(runs_root, interval_seconds=self._lease_interval())
+        if record is None:
+            holder = read_lease(runs_root)
+            if not self._lease_logged:
+                logger.warning(
+                    "launcher lease held elsewhere (pid=%s host=%s); idling this pass",
+                    (holder or {}).get("pid"),
+                    (holder or {}).get("host"),
+                )
+                self._lease_logged = True
+            self._lease = None
+            return False
+        self._lease = record
+        self._lease_logged = False
+        return True
 
     def _run_pass(self) -> None:
         entries = self.queue_store.list()
