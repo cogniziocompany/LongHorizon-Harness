@@ -78,6 +78,34 @@ Tool descriptions carry the operating rules:
 - `harness_resolve_gate` rejects any `user_input` that contains non-ASCII
   characters.
 
+## Storage backend
+
+The queue's storage engine is selected under `[queue]`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `backend` | `"file"` | `"file"` (default) or `"postgres"`; anything else fails at service startup |
+| `database_url` | — (required when `backend = "postgres"`) | Postgres DSN the service connects to; missing with `backend = "postgres"` also fails at startup |
+
+With `backend = "postgres"` the service stores queue entries through
+`PgQueueStore` (`src/lh_harness/pg_queue.py`) instead of the default file
+store; the file store stays the default and remains fully hermetic. Two
+prerequisites apply before `backend = "postgres"` can work:
+
+1. **Migrations 001 and 002 must exist first** — `migrations/001_harness_queue.sql`
+   (the `harness.queue` table) and `migrations/002_harness_queue_events.sql`
+   (the `harness.queue_events` audit log). `PgQueueStore` applies them
+   idempotently on first connect, but the files themselves must be present.
+2. **`LH_HARNESS_DB_PASSWORD`** — the Postgres credential is supplied through
+   this environment variable name (its value is set in the deployment
+   environment only, never in config, a migration, a fixture, or a commit).
+   A password already embedded in `database_url` wins over the env variable.
+
+Note: the service's config flattener currently carries `backend` but not
+`database_url`, so a `postgres` deployment reaches the loud startup failure
+described above rather than silently running on the file store; cutover
+requires threading the DSN through the config loader.
+
 ## Capacity rules
 
 Capacity is configured under `[queue.capacity]`:
