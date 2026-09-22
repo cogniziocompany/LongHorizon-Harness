@@ -23,8 +23,22 @@ CREATE INDEX IF NOT EXISTS harness_queue_events_order_idx
     ON harness.queue_events (ts, host, queue_id);
 
 -- queue_id references harness.queue; a deleted entry leaves its events in place
--- so the audit trail survives.
-ALTER TABLE harness.queue_events
-    ADD CONSTRAINT harness_queue_events_queue_id_fkey
-        FOREIGN KEY (queue_id) REFERENCES harness.queue (queue_id)
-        ON DELETE CASCADE;
+-- so the audit trail survives.  ALTER TABLE ... ADD CONSTRAINT has no
+-- "IF NOT EXISTS", so the constraint is added inside a DO block that checks
+-- pg_constraint; once the constraint exists the block does nothing and the
+-- file can be re-run safely.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint con
+                   JOIN pg_class rel ON rel.oid = con.conrelid
+                   JOIN pg_namespace n ON n.oid = rel.relnamespace
+                   WHERE con.conname = 'harness_queue_events_queue_id_fkey'
+                     AND rel.relname = 'queue_events'
+                     AND n.nspname = 'harness') THEN
+        ALTER TABLE harness.queue_events
+            ADD CONSTRAINT harness_queue_events_queue_id_fkey
+                FOREIGN KEY (queue_id) REFERENCES harness.queue (queue_id)
+                ON DELETE CASCADE;
+    END IF;
+END
+$$;

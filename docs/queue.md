@@ -78,6 +78,34 @@ Tool descriptions carry the operating rules:
 - `harness_resolve_gate` rejects any `user_input` that contains non-ASCII
   characters.
 
+## Storage backend
+
+The queue's storage engine is selected under `[queue]`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `backend` | `"file"` | `"file"` (default) or `"postgres"`; anything else fails at service startup |
+| `database_url` | — (required when `backend = "postgres"`) | Postgres DSN the service connects to; missing with `backend = "postgres"` also fails at startup |
+
+With `backend = "postgres"` the service stores queue entries through
+`PgQueueStore` (`src/lh_harness/pg_queue.py`) instead of the default file
+store; the file store stays the default and remains fully hermetic. Two
+prerequisites apply before `backend = "postgres"` can work:
+
+1. **Migrations 001 and 002 must exist first** — `migrations/001_harness_queue.sql`
+   (the `harness.queue` table) and `migrations/002_harness_queue_events.sql`
+   (the `harness.queue_events` audit log). `PgQueueStore` applies them
+   idempotently on first connect, but the files themselves must be present.
+2. **`LH_HARNESS_DB_PASSWORD`** — the Postgres credential is supplied through
+   this environment variable name (its value is set in the deployment
+   environment only, never in config, a migration, a fixture, or a commit).
+   A password already embedded in `database_url` wins over the env variable.
+
+Note: the service's config flattener currently carries `backend` but not
+`database_url`, so a `postgres` deployment reaches the loud startup failure
+described above rather than silently running on the file store; cutover
+requires threading the DSN through the config loader.
+
 ## Capacity rules
 
 Capacity is configured under `[queue.capacity]`:
@@ -242,6 +270,44 @@ test `test_api_dedup_key_passes_through` (`tests/webapi/test_queue_dedup.py`)
 proves behavioral forwarding end-to-end — two `POST /api/queue` calls with the
 same key yield one entry and a single pending count — but does not assert the
 key appears in any response or audit field.
+
+## Postgres backend and migration order
+
+The file store (atomic JSON files under the runs root) is the default. Setting
+`queue_backend="postgres"` plus a `database_url` in the project config selects
+`PgQueueStore` (`src/lh_harness/pg_queue.py`), which applies the schema
+migrations on first connect. The password is never stored in config or in a
+migration file: it comes from the `LH_HARNESS_DB_PASSWORD` environment variable
+at connect time.
+
+The migrations live under `migrations/` at the repository root and are applied
+in filename order (`001_harness_queue.sql` then `002_harness_queue_events.sql`)
+inside one transaction by `PgQueueStore._migrate` (`pg_queue.py:128`–`142`), so
+a partial file never leaves the schema half-applied.
+
+Every migration file is safe on both ends of that order:
+
+- **Fresh database** — each file applies cleanly to an empty schema owned by a
+  non-superuser role. `001` creates the `harness.queue_status` enum *before*
+  the `queue` table and declares `status` as that enum with a
+  `'pending'` default directly in `CREATE TABLE`; it never converts an existing
+  `VARCHAR` column with a default (that was the shape that failed on a fresh
+  database with `ERROR: default for column "status" cannot be cast
+  automatically to type queue_status`). `002`'s foreign key is added inside a
+  `DO` block that checks `pg_constraint`, because `ADD CONSTRAINT` has no
+  `IF NOT EXISTS`.
+- **Already-migrated schema** — re-running either file is a no-op: `CREATE
+  TYPE` is guarded by a `pg_type` check inside a `DO` block (Postgres has no
+  `CREATE TYPE IF NOT EXISTS`), the tables and indexes use `IF NOT EXISTS`, and
+  re-running the whole order changes no object definition.
+
+The fresh-apply / re-apply contract is asserted by
+`tests/webapi/test_pg_migrations.py`, which applies both files to an empty
+scratch database and asserts the final shape (enum `harness.queue_status`,
+`status` default `'pending'`, index `harness_queue_dedup_key_idx`), then
+re-applies both files and asserts nothing changed. It runs whenever
+`LH_HARNESS_DB_URL` names an empty scratch database and skips cleanly
+otherwise; the module docstring documents how to run it locally.
 
 ## Liveness (queue depth)
 

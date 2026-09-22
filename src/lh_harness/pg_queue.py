@@ -19,10 +19,14 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from .queue import QueueEntry, _NON_TERMINAL_STATUS, _VALID_STATUS, _normalize_request, _is_valid_transition
+if TYPE_CHECKING:
+    # Import cycle: lh_harness.queue selects PgQueueStore lazily (see
+    # _select_queue_store), so this module must not import from .queue at
+    # module level. Runtime uses below import the shared names lazily instead.
+    from .queue import QueueEntry
 
 # Column names mirror QueueEntry.to_dict() field-for-field; see docs/queue.md.
 _COLUMN_QUEUE_ID = "queue_id"
@@ -182,6 +186,8 @@ def _read_migrations() -> list[str]:
 
     def _row_to_entry(self, row: tuple[Any, ...]) -> QueueEntry | None:
         """Build a QueueEntry from a fetched row, rejecting anything malformed."""
+        from .queue import QueueEntry, _VALID_STATUS  # lazy: see TYPE_CHECKING note
+
         values = [self._cast(row[index], column) for index, column in enumerate(_QUEUE_COLUMNS)]
         try:
             entry = QueueEntry.from_dict(dict(zip(_QUEUE_COLUMNS, values)))
@@ -198,6 +204,8 @@ def _read_migrations() -> list[str]:
 
         Idempotent-enqueue semantics mirror the file store exactly.
         """
+        from .queue import _normalize_request  # lazy: see TYPE_CHECKING note
+
         params = _normalize_request(body)
         dedup_key = params.get("dedup_key")
         now = time.time()
@@ -235,6 +243,8 @@ def _read_migrations() -> list[str]:
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"could not create queue entry: {exc}") from exc
+        from .queue import QueueEntry  # lazy: see TYPE_CHECKING note
+
         return QueueEntry.from_dict(
             {
                 "queue_id": queue_id,
@@ -252,6 +262,8 @@ def _read_migrations() -> list[str]:
         A non-terminal entry is one whose dedup key stays "in use" -- pending,
         launched, or blocked (see ``_NON_TERMINAL_STATUS`` in queue.py).
         """
+        from .queue import QueueEntry  # lazy: see TYPE_CHECKING note
+
         try:
             with self._txn() as txn:
                 txn.execute(
@@ -262,6 +274,8 @@ def _read_migrations() -> list[str]:
                 rows = txn.fetchall()
         except Exception as exc:
             raise OperationalError(f"could not look up dedup entry: {exc}") from exc
+        from .queue import _NON_TERMINAL_STATUS  # lazy: see TYPE_CHECKING note
+
         for row in rows:
             if row[1] in _NON_TERMINAL_STATUS:
                 return QueueEntry.from_dict(
@@ -395,6 +409,8 @@ def _read_migrations() -> list[str]:
         return self.update(entry)
 
     def mark_done(self, queue_id: str, *, reason: str | None = None) -> QueueEntry | None:
+        from .queue import _MAX_QUEUE_REASON_CHARS  # lazy: see TYPE_CHECKING note
+
         entry = self.get(queue_id)
         if entry is None:
             return None
@@ -404,6 +420,8 @@ def _read_migrations() -> list[str]:
         return self.update(entry)
 
     def mark_failed(self, queue_id: str, reason: str) -> QueueEntry | None:
+        from .queue import _MAX_QUEUE_REASON_CHARS  # lazy: see TYPE_CHECKING note
+
         entry = self.get(queue_id)
         if entry is None:
             return None
@@ -412,6 +430,8 @@ def _read_migrations() -> list[str]:
         return self.update(entry)
 
     def record_skip(self, queue_id: str, reason: str) -> QueueEntry | None:
+        from .queue import _MAX_QUEUE_REASON_CHARS  # lazy: see TYPE_CHECKING note
+
         entry = self.get(queue_id)
         if entry is None:
             return None
@@ -433,7 +453,9 @@ def _read_migrations() -> list[str]:
         entry = self.get(queue_id)
         if entry is None:
             return None
-        if not _is_valid_transition(entry.status, "blocked"):
+        from .queue import _valid_transition  # lazy: see TYPE_CHECKING note
+
+        if not _valid_transition(entry.status, "blocked"):
             return None
         entry.status = "blocked"
         return self.update(entry)
@@ -451,7 +473,9 @@ def _read_migrations() -> list[str]:
         entry = self.get(queue_id)
         if entry is None:
             return None
-        if not _is_valid_transition(entry.status, "pending"):
+        from .queue import _valid_transition  # lazy: see TYPE_CHECKING note
+
+        if not _valid_transition(entry.status, "pending"):
             return None
         entry.status = "pending"
         return self.update(entry)
@@ -495,6 +519,8 @@ def _read_migrations() -> list[str]:
             raise ValueError("can only requeue failed entries")
 
         # Create successor entry
+        from .queue import QueueEntry  # lazy: see TYPE_CHECKING note
+
         successor = QueueEntry(
             queue_id=f"q-{uuid.uuid4().hex[:16]}",
             name=entry.name,
@@ -562,6 +588,8 @@ def _read_migrations() -> list[str]:
         return successor
 
     def counts(self) -> dict[str, int]:
+        from .queue import _VALID_STATUS  # lazy: see TYPE_CHECKING note
+
         counts: dict[str, int] = {status: 0 for status in _VALID_STATUS}
         for entry in self.list():
             counts[entry.status] = counts.get(entry.status, 0) + 1
