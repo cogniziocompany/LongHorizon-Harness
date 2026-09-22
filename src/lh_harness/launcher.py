@@ -661,7 +661,12 @@ class Launcher:
             "ts": _now(),
             "payload": payload,
         }
-        self._append_jsonl(self.queue_store._root / "service_events.jsonl", record)
+        # ``_root`` is the file store's queue directory; PgQueueStore has no
+        # on-disk queue directory, so its service events have no file home.
+        queue_root = getattr(self.queue_store, "_root", None)
+        if queue_root is None:
+            return
+        self._append_jsonl(queue_root / "service_events.jsonl", record)
 
     def _is_retryable_cause(self, cause: str) -> bool:
         """True when a failure cause should spawn a retry (successor entry).

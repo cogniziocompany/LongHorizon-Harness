@@ -440,9 +440,8 @@ def test_pg_create_without_driver_raises(tmp_path: Path) -> None:
     """Constructing PgQueueStore with a bad URL fails at connect, not import."""
     if PgQueueStore is None:
         pytest.skip("psycopg not installed; PgQueueStore import fell back to None")
-    store = PgQueueStore("postgresql://user:pass@127.0.0.1:1/missing?connect_timeout=1")
     with pytest.raises(Exception):
-        store.counts()
+        PgQueueStore("postgresql://user:pass@127.0.0.1:1/missing?connect_timeout=1")
 
 
 def test_pg_empty_store_counts(tmp_path: Path) -> None:
