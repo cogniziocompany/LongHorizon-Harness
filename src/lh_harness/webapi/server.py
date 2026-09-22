@@ -1195,6 +1195,11 @@ def create_app(
         durable shadow log (``runs_root/queue/shadow.jsonl`` plus its daily
         rotations).  ``since`` accepts epoch seconds or an ISO-8601 timestamp
         and filters on the record ``ts``.
+
+        Only the file-backed store carries the shadow log.  A store without
+        ``read_shadow_records`` (``PgQueueStore`` under ``[queue] backend =
+        "postgres"``) gets an explicit 501 naming the store — never an
+        AttributeError/500 (task 220).
         """
 
         if queue_store is None:
@@ -1217,6 +1222,14 @@ def create_app(
                         status_code=422,
                         detail="since must be epoch seconds or an ISO-8601 timestamp",
                     ) from exc
+        if not hasattr(queue_store, "read_shadow_records"):
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "shadow records are not available for the "
+                    f"{type(queue_store).__name__} queue store"
+                ),
+            )
         records = queue_store.read_shadow_records(since=since_ts)
         return {"ok": True, "count": len(records), "events": records}
 
