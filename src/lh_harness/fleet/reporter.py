@@ -42,6 +42,11 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF_SECONDS = (0.0, 1.0, 2.0)
 _WARN_ONCE_INTERVAL_SECONDS = 300.0
 _MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
+# Heartbeat bounding: the heartbeat sends only non-terminal runs (the ones a
+# remote operator can act on) plus aggregate counts for the rest.  The active
+# list itself is hard-capped so a node with a very large live backlog stays
+# well under any plausible proxy body limit for the heartbeat route.
+_MAX_ACTIVE_RUNS_PER_HEARTBEAT = 200
 _MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 _TRAJECTORY_ROLES = (
     "manager",
@@ -237,13 +242,54 @@ class FleetReporter:
     ) -> None:
         """Enqueue a periodic heartbeat describing this node.
 
-        ``launcher_tick_at``/``lease_holder`` carry the orchestrator liveness
-        signal (task 173, scope 6): the launcher lease's last refresh time and
-        the pid/host currently holding it.  ``None`` means the node exposes no
-        launcher lease and the fleet window reads that as "no launcher".
+        The heartbeat carries only the node's *non-terminal* runs in
+        ``runs[]`` — the ones a remote operator can act on — plus aggregate
+        counts for the whole store (``runsTotal``, ``runsByStatus``) and a
+        ``runsTruncated`` flag when the active list itself is capped.  A
+        long-lived node accumulates hundreds of completed runs whose per-run
+        summaries dominate the payload (measured ~10 KB per run; a 532-run
+        store produced a 5.47 MB body that the fleet plane rejected with
+        HTTP 413), so the full run list must never be sent.
         """
         if not self._enabled:
             return
+        # Imported lazily: supervisor/__init__ eagerly pulls in control_bus,
+        # which imports this module, so a module-level import would create a
+        # circular import for anything loading fleet.reporter first.
+        from lh_harness.supervisor.lifecycle import (
+            TERMINAL_STATUSES,
+            canonical_lifecycle_status,
+        )
+        # Aggregate over the whole run list first: every run is counted by
+        # status, but only non-terminal runs are serialized into ``runs[]``.
+        # Unknown/blank statuses canonicalize to "idle" (non-terminal), so a
+        # malformed record is reported, never silently dropped.
+        runs_total = len(runs)
+        runs_by_status: dict[str, int] = {}
+        active_runs: list[dict[str, Any]] = []
+        for run in runs:
+            status = canonical_lifecycle_status(run.get("status"))
+            runs_by_status[status] = runs_by_status.get(status, 0) + 1
+            if status not in TERMINAL_STATUSES:
+                active_runs.append(run)
+        # Hard cap on the active list itself (most recent first by the
+        # summary's ``updated_at``; the raw registry ``mtime`` is the
+        # fallback).  Live runs are bounded in practice by the node's
+        # capacity; the cap keeps a pathological store or a misbehaving
+        # heartbeat callback from re-inflating the payload.
+        runs_truncated = len(active_runs) > _MAX_ACTIVE_RUNS_PER_HEARTBEAT
+        if runs_truncated:
+            active_before_cap = len(active_runs)
+            active_runs = sorted(
+                active_runs,
+                key=lambda r: r.get("updated_at", r.get("mtime", 0)),
+                reverse=True,
+            )[:_MAX_ACTIVE_RUNS_PER_HEARTBEAT]
+            logger.info(
+                "fleet reporter heartbeat: capping active runs from "
+                f"{active_before_cap} to {_MAX_ACTIVE_RUNS_PER_HEARTBEAT} most recent; "
+                "aggregate counts still cover every run"
+            )
         body = {
             "node": {
                 "name": self._node,
@@ -265,14 +311,13 @@ class FleetReporter:
                     "youtrackIssueId": run.get("youtrack_issue_id"),
                     "summary": {k: v for k, v in run.items() if k not in {"id", "status"}},
                 }
-                for run in runs
+                for run in active_runs
             ],
             "capacity": {"active": active, "cap": cap},
             "queueLen": queue_len,
-            "liveness": {
-                "launcher_tick_at": launcher_tick_at,
-                "lease_holder": lease_holder,
-            },
+            "runsTotal": runs_total,
+            "runsByStatus": dict(sorted(runs_by_status.items())),
+            "runsTruncated": runs_truncated,
         }
         self._post("/harness/heartbeat", body, gzip_body=True)
 
@@ -304,7 +349,7 @@ class FleetReporter:
         callback: Callable[
             [],
             tuple[list[dict[str, Any]], int, int, int]
-            | tuple[list[dict[str, Any]], int, int, int, "float | None", "dict[str, Any] | None"],
+            | tuple[list[dict[str, Any]], int, int, int, float | None, dict[str, Any] | None],
         ],
     ) -> None:
         """Register a callback that produces heartbeat data every 30 s.
@@ -430,12 +475,20 @@ class FleetReporter:
         url = f"{self._url}{endpoint}"
         body = json.dumps(payload, ensure_ascii=False, default=_json_default).encode("utf-8")
         original_size = len(body)
+        # Sign the JSON bytes, never the compressed wire bytes: fleet-admin's
+        # express.json ``verify`` hands the HMAC the INFLATED body, so a
+        # signature over the gzip stream can never match (9,098 consecutive
+        # ``harness_bad_sig`` rejections for ct110 before this was measured,
+        # 2026-09-22; proven by a probe that signed plaintext and got 200).
+        sign_bytes = body
         if gzip_body:
             body = __import__("gzip").compress(body)
         attempt = 0
         last_error: Exception | None = None
         while attempt < _MAX_RETRIES:
-            req = self._build_request(url, body, gzip_body=gzip_body, original_size=original_size)
+            req = self._build_request(
+                url, body, sign_bytes=sign_bytes, gzip_body=gzip_body, original_size=original_size
+            )
             try:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     resp.read()
@@ -463,12 +516,13 @@ class FleetReporter:
         url: str,
         body: bytes,
         *,
+        sign_bytes: bytes | None = None,
         gzip_body: bool,
         original_size: int,
     ) -> urllib.request.Request:
         signature = hmac.new(
             self._key.encode("utf-8"),
-            body,
+            body if sign_bytes is None else sign_bytes,
             hashlib.sha256,
         ).hexdigest()
         headers = {
