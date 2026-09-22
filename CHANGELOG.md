@@ -49,3 +49,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Race where two queue entries for the same workspace could be launched across concurrent ticks is now prevented by a launch lock and active-run re-check.
+- `migrations/001_harness_queue.sql` now applies cleanly to a fresh database as
+  a non-superuser role owner. It previously failed under `ON_ERROR_STOP=1` with
+  `ERROR: default for column "status" cannot be cast automatically to type
+  queue_status` because it created `status` as `VARCHAR NOT NULL DEFAULT
+  'pending'` and only converted the column afterwards. The `queue_status` enum
+  is now created first (guarded by a `pg_type` check so re-running is a no-op)
+  and `status` is declared as that enum with the `'pending'` default directly
+  in `CREATE TABLE`. `002_harness_queue_events.sql`'s foreign key is likewise
+  guarded, so re-running either file on an already-migrated schema is a clean
+  no-op. Covered by `tests/webapi/test_pg_migrations.py` (fresh apply +
+  double-apply) and documented in `docs/queue.md` (Postgres backend and
+  migration order).
