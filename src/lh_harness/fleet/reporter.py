@@ -27,8 +27,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from lh_harness.supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status
-
 logger = logging.getLogger(__name__)
 
 _ENV_URL = "LH_HARNESS_FLEET_URL"
@@ -245,6 +243,13 @@ class FleetReporter:
         """
         if not self._enabled:
             return
+        # Imported lazily: supervisor/__init__ eagerly pulls in control_bus,
+        # which imports this module, so a module-level import would create a
+        # circular import for anything loading fleet.reporter first.
+        from lh_harness.supervisor.lifecycle import (
+            TERMINAL_STATUSES,
+            canonical_lifecycle_status,
+        )
         # Aggregate over the whole run list first: every run is counted by
         # status, but only non-terminal runs are serialized into ``runs[]``.
         # Unknown/blank statuses canonicalize to "idle" (non-terminal), so a
