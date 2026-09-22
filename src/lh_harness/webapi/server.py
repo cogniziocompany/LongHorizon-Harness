@@ -865,8 +865,8 @@ def create_app(
     token = _configured_token(auth_token)
     origins = {str(item).rstrip("/") for item in (allowed_origins or ()) if str(item).strip()}
     queue_store: QueueStore | None = None
-    queue_config = default_queue_config()
     if runs_root is not None:
+        queue_config = default_queue_config()
         try:
             from ..config import PROJECT_CONFIG_PATH, load_run_defaults
 
@@ -876,9 +876,9 @@ def create_app(
             project = load_run_defaults(config_path)
             if isinstance(project.get("queue"), dict):
                 queue_config = queue_config_from_config(project)
-            queue_store = _select_queue_store(runs_root, project)
         except Exception:
-            queue_store = QueueStore(runs_root)
+            pass  # Keep default queue_config
+        queue_store = QueueStore(runs_root, queue_config)
     launcher: Launcher | None = None
     if supervisor is not None and queue_store is not None:
         launcher = Launcher(supervisor, queue_store, queue_config=queue_config)

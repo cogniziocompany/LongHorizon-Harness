@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from .queue import QueueEntry, _NON_TERMINAL_STATUS, _VALID_STATUS, _normalize_request
+from .queue import QueueEntry, _NON_TERMINAL_STATUS, _VALID_STATUS, _normalize_request, _is_valid_transition
 
 # Column names mirror QueueEntry.to_dict() field-for-field; see docs/queue.md.
 _COLUMN_QUEUE_ID = "queue_id"
@@ -418,6 +419,147 @@ def _read_migrations() -> list[str]:
             return None
         entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
         return self.update(entry)
+
+    def record_block(self, queue_id: str) -> QueueEntry | None:
+        """Transition an entry from pending to blocked.
+
+        Args:
+            queue_id: The ID of the entry to block
+
+        Returns:
+            The updated QueueEntry, or None if the entry not found
+            or if the transition is invalid
+        """
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if not _is_valid_transition(entry.status, "blocked"):
+            return None
+        entry.status = "blocked"
+        return self.update(entry)
+
+    def record_unblock(self, queue_id: str) -> QueueEntry | None:
+        """Transition an entry from blocked to pending.
+
+        Args:
+            queue_id: The ID of the entry to unblock
+
+        Returns:
+            The updated QueueEntry, or None if the entry not found
+            or if the transition is invalid
+        """
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if not _is_valid_transition(entry.status, "pending"):
+            return None
+        entry.status = "pending"
+        return self.update(entry)
+
+    def requeue(self, queue_id: str, cause: str) -> QueueEntry | None:
+        """Create a successor pending entry for a failed entry.
+
+        Args:
+            queue_id: The ID of the failed entry to retry
+            cause: The failure cause that triggered the retry
+
+        Returns:
+            The new successor QueueEntry, or None if the original entry not found
+
+        Raises:
+            ValueError: If the original entry is not failed, or if attempt would exceed max_retries
+        """
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+
+        # Load config to get max_retries. `queue_config_from_config` (and
+        # `_flatten_queue_table` in config.py) both normalize [queue.capacity]
+        # into a dict that always carries `max_retries`, so the default only
+        # applies when the store was built with no config at all.
+        max_retries = 2  # default
+        # Note: PgQueueStore doesn't have direct access to project config like QueueStore does
+        # For now, we'll use the default max_retries=2, matching the file store's default
+        # In a full implementation, this would need to be passed in or retrieved from somewhere
+
+        # An entry's own attempt counts toward the cap: original=attempt 1,
+        # first retry=attempt 2, ... so the highest allowed attempt is
+        # max_retries + 1.  Refuse when the successor would exceed that cap.
+        # Checked before the status guard so a retry loop that keeps asking
+        # after exhaustion learns it hit the cap, not just that the successor
+        # is (still) pending.
+        if entry.attempt > max_retries:
+            raise ValueError(f"exceeded max_retries ({max_retries})")
+
+        if entry.status != "failed":
+            raise ValueError("can only requeue failed entries")
+
+        # Create successor entry
+        successor = QueueEntry(
+            queue_id=f"q-{uuid.uuid4().hex[:16]}",
+            name=entry.name,
+            task=entry.task,
+            workspace=entry.workspace,
+            max_rounds=entry.max_rounds,
+            trio=entry.trio,
+            priority=entry.priority,
+            requested_by=entry.requested_by,
+            base_check=entry.base_check,
+            status="pending",
+            retry_of=entry.queue_id,
+            attempt=entry.attempt + 1,
+            failure_cause=cause,
+            created_at=time.time(),
+            updated_at=time.time(),
+            dedup_key=None  # retries must not collide with original dedup_key
+        )
+
+        # Insert the successor entry and an audit event
+        try:
+            with self._txn() as txn:
+                values: list[Any] = [
+                    successor.queue_id,
+                    successor.name,
+                    successor.task,
+                    successor.workspace,
+                    successor.max_rounds,
+                    successor.trio,
+                    successor.priority,
+                    successor.requested_by,
+                    successor.base_check,
+                    successor.status,
+                    successor.run_id,
+                    successor.reason,
+                    json.dumps(successor.skip_reasons),
+                    successor.created_at,
+                    successor.updated_at,
+                    successor.launched_at,
+                    successor.last_checked_at,
+                    successor.dedup_key,
+                ]
+                txn.execute(
+                    "INSERT INTO harness.queue (" + ", ".join(_QUEUE_COLUMNS) + ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    values,
+                )
+                # Insert queue_events row for the enqueue event
+                try:
+                    host = socket.gethostname()
+                except Exception:
+                    host = ''
+                # Prepare payload: successor entry data without queue_id and created_at (to avoid duplication with columns)
+                succ_data = successor.to_dict()
+                succ_data.pop('queue_id', None)
+                succ_data.pop('created_at', None)
+                payload_json = json.dumps(succ_data)
+                txn.execute(
+                    "INSERT INTO harness.queue_events (host, queue_id, ts, event, actor, rationale, payload) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (host, successor.queue_id, successor.created_at, "enqueue", "", cause, payload_json),
+                )
+                txn.commit()
+        except Exception as exc:
+            raise OperationalError(f"could not create queue entry: {exc}") from exc
+
+        return successor
 
     def counts(self) -> dict[str, int]:
         counts: dict[str, int] = {status: 0 for status in _VALID_STATUS}

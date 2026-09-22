@@ -462,3 +462,291 @@ def test_pg_store_update_roundtrip(tmp_path: Path) -> None:
     )
     assert store.get(entry.queue_id) is not None
     assert store.counts()["pending"] == 1
+
+
+def test_pg_store_requeue_creates_successor(tmp_path: Path) -> None:
+    """Test that requeue creates a successor entry with correct fields."""
+    store = _require_backend(tmp_path)
+
+    # Create original failed entry
+    original = store.create(
+        {
+            "name": "test task",
+            "task": "do something",
+            "workspace": "./workspace",
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 10,
+            "requested_by": "ci",
+        }
+    )
+    store.mark_failed(original.queue_id, "provider_rate_limit")
+
+    # Requeue the failed entry
+    successor = store.requeue(original.queue_id, "provider_rate_limit")
+
+    assert successor is not None
+    assert successor.queue_id != original.queue_id
+    assert successor.status == "pending"
+    assert successor.name == original.name
+    assert successor.task == original.task
+    assert successor.workspace == original.workspace
+    assert successor.max_rounds == original.max_rounds
+    assert successor.trio == original.trio
+    assert successor.priority == original.priority
+    assert successor.requested_by == original.requested_by
+    assert successor.base_check == original.base_check
+    assert successor.retry_of == original.queue_id
+    assert successor.attempt == 2  # original attempt was 1
+    assert successor.failure_cause == "provider_rate_limit"
+    assert successor.dedup_key is None  # retries must not collide with original dedup_key
+
+
+def test_pg_store_requeue_exceeds_max_retries(tmp_path: Path) -> None:
+    """Test that requeue fails when attempt would exceed max_retries.
+    Note: PgQueueStore uses a hardcoded max_retries=2 (same as file store default).
+    """
+    store = _require_backend(tmp_path)
+
+    # Create original failed entry (attempt=1)
+    original = store.create(
+        {
+            "name": "test task",
+            "task": "do something",
+            "workspace": "./workspace",
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 10,
+            "requested_by": "ci",
+        }
+    )
+    store.mark_failed(original.queue_id, "provider_rate_limit")
+
+    # First requeue should succeed (attempt=2)
+    successor1 = store.requeue(original.queue_id, "provider_rate_limit")
+    assert successor1 is not None
+    assert successor1.attempt == 2
+
+    # Mark the first successor as failed
+    store.mark_failed(successor1.queue_id, "provider_rate_limit")
+
+    # Second requeue should succeed (attempt=3)
+    successor2 = store.requeue(successor1.queue_id, "provider_rate_limit")
+    assert successor2 is not None
+    assert successor2.attempt == 3
+
+    # Mark the second successor as failed
+    store.mark_failed(successor2.queue_id, "provider_rate_limit")
+
+    # Third requeue should fail (would be attempt=4 > max_retries=2)
+    with pytest.raises(ValueError, match="exceeded max_retries"):
+        store.requeue(successor2.queue_id, "provider_rate_limit")
+
+
+def test_pg_store_requeue_non_failed_entry(tmp_path: Path) -> None:
+    """Test that requeue fails for non-failed entries."""
+    store = _require_backend(tmp_path)
+
+    # Create pending entry
+    pending = store.create(
+        {
+            "name": "test task",
+            "task": "do something",
+            "workspace": "./workspace",
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 10,
+            "requested_by": "ci",
+        }
+    )
+
+    # Try to requeue pending entry
+    with pytest.raises(ValueError, match="can only requeue failed entries"):
+        store.requeue(pending.queue_id, "provider_rate_limit")
+
+    # Mark as done (via the transition table: pending -> launched -> done)
+    # and try again
+    store.mark_launched(pending.queue_id, "run-1")
+    store.mark_done(pending.queue_id, reason="completed")
+    with pytest.raises(ValueError, match="can only requeue failed entries"):
+        store.requeue(pending.queue_id, "provider_rate_limit")
+
+
+def test_pg_store_requeue_preserves_fields(tmp_path: Path) -> None:
+    """Test that requeue preserves all relevant fields from original."""
+    store = _require_backend(tmp_path)
+
+    # Create original failed entry with all fields
+    original_data = {
+        "name": "complex task",
+        "task": "do something complex with ${VAR}",
+        "workspace": "/tmp/workspace",
+        "max_rounds": 10,
+        "trio": "qwen",
+        "priority": 5,
+        "requested_by": "user123",
+        "base_check": "origin/main",
+        "dedup_key": "original-key-123",
+    }
+    original = store.create(original_data)
+    store.mark_failed(original.queue_id, "executor timeout")
+
+    # Requeue
+    successor = store.requeue(original.queue_id, "executor timeout")
+
+    assert successor is not None
+    assert successor.name == original_data["name"]
+    assert successor.task == original_data["task"]
+    assert successor.workspace == original_data["workspace"]
+    assert successor.max_rounds == original_data["max_rounds"]
+    assert successor.trio == original_data["trio"]
+    assert successor.priority == original_data["priority"]
+    assert successor.requested_by == original_data["requested_by"]
+    assert successor.base_check == original_data["base_check"]
+    # dedup_key should be None for retry
+    assert successor.dedup_key is None
+    # retry fields
+    assert successor.retry_of == original.queue_id
+    assert successor.attempt == 2
+    assert successor.failure_cause == "executor timeout"
+
+
+def test_pg_store_requeue_creates_queue_events_row(tmp_path: Path) -> None:
+    """Test that requeue creates a queue_events row for the enqueue event."""
+    store = _require_backend(tmp_path)
+
+    # Create a failed entry to retry
+    original = store.create(
+        {
+            "name": "requeue me",
+            "task": "sleep",
+            "workspace": "./workspace",
+            "max_rounds": 1,
+            "trio": "kimi",
+            "priority": 5,
+            "requested_by": "pytest",
+        }
+    )
+    store.mark_failed(original.queue_id, "original failure")
+
+    # Requeue it
+    successor = store.requeue(original.queue_id, "executor timeout")
+    assert successor is not None
+
+    # Verify a queue_events row was inserted for the enqueue event
+    with store._txn() as txn:
+        txn.execute(
+            "SELECT host, queue_id, ts, event, actor, rationale, payload "
+            "FROM harness.queue_events "
+            "WHERE queue_id = %s AND event = 'enqueue' "
+            "ORDER BY ts DESC LIMIT 1",
+            (successor.queue_id,),
+        )
+        row = txn.fetchone()
+        assert row is not None
+        host, queue_id, ts, event, actor, rationale, payload = row
+        assert queue_id == successor.queue_id
+        assert event == "enqueue"
+        assert actor == ""
+        assert rationale == "executor timeout"
+        # Check that the payload matches the successor entry (minus queue_id and created_at)
+        import json
+        payload_data = json.loads(payload)
+        # The payload should have all the fields of the successor except queue_id and created_at
+        expected = successor.to_dict()
+        expected.pop('queue_id', None)
+        expected.pop('created_at', None)
+        assert payload_data == expected
+
+
+def test_pg_store_record_block_and_unblock(tmp_path: Path) -> None:
+    """Test that record_block and record_unblock work correctly."""
+    store = _require_backend(tmp_path)
+
+    # Create a pending entry
+    entry = store.create(
+        {
+            "name": "test task",
+            "task": "do something",
+            "workspace": "./workspace",
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 10,
+            "requested_by": "ci",
+        }
+    )
+    assert entry.status == "pending"
+
+    # Block the entry
+    blocked = store.record_block(entry.queue_id)
+    assert blocked is not None
+    assert blocked.status == "blocked"
+    assert store.get(entry.queue_id).status == "blocked"
+
+    # Try to block again (should not change status)
+    blocked_again = store.record_block(entry.queue_id)
+    assert blocked_again is not None
+    assert blocked_again.status == "blocked"
+
+    # Unblock the entry
+    unblocked = store.record_unblock(entry.queue_id)
+    assert unblocked is not None
+    assert unblocked.status == "pending"
+    assert store.get(entry.queue_id).status == "pending"
+
+    # Try to unblock again (should not change status)
+    unblocked_again = store.record_unblock(entry.queue_id)
+    assert unblocked_again is not None
+    assert unblocked_again.status == "pending"
+
+    # Test invalid transitions
+    # Mark as launched and try to block (should fail)
+    launched = store.mark_launched(entry.queue_id, "run-123")
+    assert launched is not None
+    assert launched.status == "launched"
+    blocked_from_launched = store.record_block(launched.queue_id)
+    assert blocked_from_launched is None  # Cannot block from launched
+    assert store.get(launched.queue_id).status == "launched"  # Status unchanged
+
+    # Mark as done and try to unblock (should fail)
+    done = store.mark_done(entry.queue_id, reason="completed")
+    assert done is not None
+    assert done.status == "done"
+    unblocked_from_done = store.record_unblock(done.queue_id)
+    assert unblocked_from_done is None  # Cannot unblock from done
+    assert store.get(done.queue_id).status == "done"  # Status unchanged
+
+
+def test_pg_store_blocked_to_launched_transition(tmp_path: Path) -> None:
+    """Test that a blocked entry can transition to launched via mark_launched."""
+    store = _require_backend(tmp_path)
+
+    # Create a pending entry
+    entry = store.create(
+        {
+            "name": "test task",
+            "task": "do something",
+            "workspace": "./workspace",
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 10,
+            "requested_by": "ci",
+        }
+    )
+    assert entry.status == "pending"
+
+    # Block the entry
+    blocked = store.record_block(entry.queue_id)
+    assert blocked is not None
+    assert blocked.status == "blocked"
+
+    # Launch from blocked state
+    launched = store.mark_launched(entry.queue_id, "run-456")
+    assert launched is not None
+    assert launched.status == "launched"
+    assert launched.run_id == "run-456"
+    assert store.get(entry.queue_id).status == "launched"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
