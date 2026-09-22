@@ -66,10 +66,6 @@ def _valid_transition(from_status: str, to_status: str) -> bool:
     return (from_status, to_status) in _QUEUE_TRANSITIONS
 
 
-# Module-level alias for backward compatibility with pg_queue.is_valid_transition
-_is_valid_transition = _valid_transition
-
-
 def _safe_queue_id(value: str) -> bool:
     if not isinstance(value, str) or not value:
         return False
