@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -251,3 +252,65 @@ def test_api_queue_shadow_endpoint(tmp_path: Path) -> None:
     assert iso.json()["count"] == 1
     bad = client.get("/api/queue/shadow", params={"since": "not-a-time"})
     assert bad.status_code == 422
+
+def _git_init_with_remote(path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "remote", "add", "origin", "https://github.com/org/repo"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "-C", str(path), "checkout", "-q", "-b", "main"], check=True, capture_output=True)
+
+
+def test_shadow_launch_decision_survives_contention_finding(tmp_path: Path) -> None:
+    """A contention/shadow finding never blocks a launch decision.
+
+    Two active runs share one repo, so ``_check_contention`` detects a
+    same-repo contention group and emits ``fleet.contention.detected``.
+    Contention is warn-only (launcher.py: ``_run_pass`` isolates the check
+    in its own try/except and ``_check_eligibility`` never consults
+    ``self._contentions``), so under ``observe=true`` the tick must still
+    reach the shadow launch point: the entry gets a full
+    ``queue.shadow_launch`` record instead of a skip, and no
+    contention-derived skip reason ever appears on the entry.
+    """
+    root, store, supervisor = _fixture(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_with_remote(repo)
+
+    peer_repo = tmp_path / "repo-peer"
+    peer_repo.mkdir()
+    _git_init_with_remote(peer_repo)
+    # Both active runs sit on the same repo path -> guaranteed contention group.
+    supervisor.add_run("run-a", str(repo), status="running")
+    supervisor.add_run("run-b", str(repo), status="running")
+
+    entry = store.create(_base_entry(trio="kimi", workspace=str(tmp_path / "ws")))
+    launcher = Launcher(supervisor, store, queue_config=_observe_config())
+    asyncio.run(launcher.tick())
+
+    # A contention group was actually detected for the shared repo.
+    assert any(
+        member.run_id in {"run-a", "run-b"}
+        for group in launcher._contentions.values()
+        for member in group.members
+    )
+
+    # The launch decision still happened: full shadow launch record, not a skip.
+    lines = _shadow_lines(root)
+    assert lines and lines[0]["type"] == "queue.shadow_launch"
+    assert lines[0]["payload"]["queue_id"] == entry.queue_id
+    assert not any(
+        record["type"] == "queue.shadow_skip" for record in lines
+    )
+
+    # The entry stays pending (observe mode never launches) and carries no
+    # contention-derived skip reason.
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "pending"
+    assert not any(
+        "contention" in reason for reason in updated.skip_reasons
+    )
