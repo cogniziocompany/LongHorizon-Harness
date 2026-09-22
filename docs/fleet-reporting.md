@@ -73,15 +73,45 @@ Every 30 seconds the reporter POSTs one heartbeat to
     }
   ],
   "capacity": {"active": 1, "cap": 1},
-  "queueLen": 0
+  "queueLen": 0,
+  "runsTotal": 532,
+  "runsByStatus": {"running": 1, "completed": 530, "failed": 1},
+  "runsTruncated": false
 }
 ```
 
-**Payload bounding**: To prevent exceeding the fleet plane's request-size limit (10 MB), the heartbeat payload is bounded to include only the 500 most recent runs by `updated_at` (mtime). If a node has more than 500 runs, older runs are omitted from the heartbeat. An informational log message is emitted when truncation occurs:
+**Payload bounding**: A long-lived node accumulates hundreds of completed
+runs whose per-run summaries dominate the heartbeat (measured on CT110,
+2026-09-22: ~10 KB per run; a 532-run store produced a 5.47 MB JSON body /
+1.62 MB gzipped that the fleet plane rejected with HTTP 413).  The heartbeat
+therefore never carries the full run list:
 
-```
-fleet reporter heartbeat: truncating runs from X to 500 most recent
-```
+- `runs[]` contains only **non-terminal** runs (the ones a remote operator
+  can act on; terminal = `completed`, `failed`, `cancelled`, `blocked`,
+  `incomplete` per `supervisor.lifecycle.TERMINAL_STATUSES`).
+- `runsTotal` and `runsByStatus` aggregate over the **entire** run store, so
+  the fleet still sees the full picture.  Unknown/blank statuses
+  canonicalize (via `canonical_lifecycle_status`) to `idle` or the raw
+  value, are counted, and are treated as non-terminal — never silently
+  dropped.
+- `runs[]` itself is hard-capped to the **200 most recent active runs** (by
+  `updated_at`, falling back to the registry `mtime`).  Live runs are
+  bounded by node capacity in practice; the cap only guards a pathological
+  store.  When the cap engages, `runsTruncated` is `true` and an INFO log
+  line is emitted:
+
+  ```
+  fleet reporter heartbeat: capping active runs from X to 200 most recent; aggregate counts still cover every run
+  ```
+
+With this shape a 532-run store serializes to ~21 KB JSON / ~510 B gzipped —
+roughly 0.03% of the rejected body.  The exact request-size limit for the
+`/harness/heartbeat` route on the fleet plane (cognizioware-hydra fleet API
+behind Caddy) is not known to this repo; per
+`tasks/harness-fleet-window-2026-09-07.md:67` the **10 MB** `express.json`
+limit belongs to the `/harness/rounds` route only.  The bounding here is
+designed to stay far below any plausible limit; the heartbeat route's limit
+is tracked as an open question with the fleet-plane maintainers.
 
 ### 3. Round content
 
