@@ -255,7 +255,18 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     unknown_trios = set(trios) - _QUEUE_TRIOS
     if unknown_trios:
         raise ProjectConfigError(f"unknown queue trio(s): {_names(unknown_trios)}")
-    unknown_queue_keys = set(queue) - {"trios", "capacity", "backend", "observe", "occupancy_ignore_dirty"}
+    # ``database_url`` is a legitimate key (``queue.py`` reads it to build the
+    # PgQueueStore), so the validator must accept it even though the flattened
+    # result deliberately does not carry it onward yet — threading the DSN
+    # through the loader is the documented cutover step.
+    unknown_queue_keys = set(queue) - {
+        "trios",
+        "capacity",
+        "backend",
+        "observe",
+        "occupancy_ignore_dirty",
+        "database_url",
+    }
     if unknown_queue_keys:
         raise ProjectConfigError(f"unknown [queue] key(s): {_names(unknown_queue_keys)}")
     observe = queue.get("observe", False)

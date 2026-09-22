@@ -264,6 +264,7 @@ class Launcher:
         # pass.  ``None`` once we hold it, re-acquired each pass.
         self._lease: dict[str, Any] | None = None
         self._lease_logged = False
+        self._lease_unavailable_logged = False
 
     @staticmethod
     def _load_project_queue_config() -> dict[str, Any]:
@@ -334,7 +335,24 @@ class Launcher:
             # No file root (the PG backend, task 134's row lock): the file
             # lease has nothing to attach to; the pass proceeds unchanged.
             return True
-        record = acquire_lease(runs_root, interval_seconds=self._lease_interval())
+        try:
+            record = acquire_lease(runs_root, interval_seconds=self._lease_interval())
+        except OSError as exc:
+            # The lease MECHANISM is unavailable (e.g. the secure control-bus
+            # write needs O_NOFOLLOW/O_DIRECTORY, which no Windows host has).
+            # That is not "someone else holds it": failing closed here would
+            # abort every pass, so the launcher would silently stop launching
+            # anything.  Fail open onto the pre-lease behaviour instead — one
+            # warning, then run the pass without a lease.
+            if not self._lease_unavailable_logged:
+                logger.warning(
+                    "launcher lease unavailable on this platform (%s); "
+                    "running passes without the cross-process lease",
+                    exc,
+                )
+                self._lease_unavailable_logged = True
+            self._lease = None
+            return True
         if record is None:
             holder = read_lease(runs_root)
             if not self._lease_logged:
