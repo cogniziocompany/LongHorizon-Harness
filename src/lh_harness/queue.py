@@ -10,6 +10,7 @@ same code path as ``POST /api/runs``.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import uuid
@@ -374,6 +375,9 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
     queue = config.get("queue", {}) if isinstance(config, dict) else {}
     trios = queue.get("trios", {}) if isinstance(queue, dict) else {}
     capacity = queue.get("capacity", {}) if isinstance(queue, dict) else {}
+    observe = queue.get("observe", False) if isinstance(queue, dict) else False
+    if not isinstance(observe, bool):
+        observe = False
     if not isinstance(trios, dict):
         trios = {}
     if not isinstance(capacity, dict):
@@ -422,7 +426,7 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         # `requeue` reads this so a configured cap actually bounds retries;
         # dropping it here would silently reset every deployment to the default.
         normalized_capacity["max_retries"] = max(0, capacity["max_retries"])
-    return {"trios": normalized_trios, "capacity": normalized_capacity}
+    return {"trios": normalized_trios, "capacity": normalized_capacity, "observe": observe}
 
 
 def default_queue_config() -> dict[str, Any]:
@@ -701,3 +705,86 @@ class QueueStore:
         for entry in self.list():
             counts[entry.status] = counts.get(entry.status, 0) + 1
         return counts
+
+    # ------------------------------------------------------------------
+    # Shadow (observe) log — task 173.
+    #
+    # One JSON line per shadow decision, appended to
+    # ``runs_root/queue/shadow.jsonl``, rotated daily: once the current day
+    # rolls over, the previous day's full file is renamed to
+    # ``shadow-<YYYYMMDD>.jsonl`` (UTC, the log is a fleet-wide evidence
+    # stream, not a local one) and a fresh ``shadow.jsonl`` starts. The
+    # rename happens on append by whichever launcher process observes the
+    # day change; the only failure mode is an extra record on the old file,
+    # never data loss.
+    # ------------------------------------------------------------------
+
+    _SHADOW_LOG = "shadow.jsonl"
+
+    def _rotate_shadow_log(self, today: str) -> None:
+        """Rename yesterday's ``shadow.jsonl`` to ``shadow-<day>.jsonl``."""
+
+        current = self._root / self._SHADOW_LOG
+        if not current.exists():
+            return
+        stamp = time.strftime("%Y%m%d", time.gmtime(os.path.getmtime(current)))
+        if stamp == today:
+            return
+        rotated = self._root / f"shadow-{stamp}.jsonl"
+        if rotated.exists():
+            # A rotated file for that day already exists: append instead of
+            # clobbering an evidence stream.
+            with current.open("rb") as src, rotated.open("ab") as dst:
+                dst.write(src.read())
+            current.unlink()
+            return
+        os.replace(current, rotated)
+
+    def append_shadow_record(self, record: dict[str, Any]) -> None:
+        """Append one shadow decision as a single JSON line, rotating daily."""
+
+        today = time.strftime("%Y%m%d", time.gmtime())
+        try:
+            self._rotate_shadow_log(today)
+            line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+            path = self._root / self._SHADOW_LOG
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def read_shadow_records(self, since: float | None = None) -> list[dict[str, Any]]:
+        """Return shadow records with ``ts >= since`` (today's + rotated files).
+
+        Rotated files are named ``shadow-<YYYYMMDD>.jsonl`` and are ordered
+        oldest-first by name; today's ``shadow.jsonl`` is last.
+        """
+
+        records: list[dict[str, Any]] = []
+        candidates = sorted(self._root.glob("shadow-*.jsonl")) + [self._root / self._SHADOW_LOG]
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if not isinstance(record, dict):
+                            continue
+                        if since is not None and float(record.get("ts", 0.0)) < since:
+                            continue
+                        records.append(record)
+            except OSError:
+                continue
+        return records

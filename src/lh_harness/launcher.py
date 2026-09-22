@@ -147,6 +147,12 @@ class Launcher:
         self.supervisor = supervisor
         self.queue_store = queue_store
         self._config = queue_config or self._load_project_queue_config()
+        # Observe (shadow) mode — task 173 / migration §5 Step 2: when true the
+        # launcher computes the full launch decision but starts NOTHING; it
+        # appends one shadow record per decision to
+        # runs_root/queue/shadow.jsonl and leaves every entry pending. The PC
+        # launcher stays the sole authoritative launcher while this is on.
+        self._observe = bool(self._config.get("observe", False))
         self._poll_seconds = float(
             self._config.get("capacity", {}).get("poll_seconds", poll_seconds)
         )
@@ -231,13 +237,32 @@ class Launcher:
                 skip_reason = self._capacity_reason(entry, capacities)
                 if skip_reason is None:
                     skip_reason = "launch batch already consumed capacity"
+                if self._observe:
+                    self._shadow_skip(entry, skip_reason)
+                    continue
                 self._skip(entry, skip_reason)
                 continue
             skip_reason = self._check_eligibility(entry, active, capacities)
             if skip_reason is None:
+                if self._observe:
+                    # Observe (shadow) mode, task 173 / migration §5 Step 2:
+                    # the full decision (eligibility, capacity, key health and
+                    # now the trio resolve) is computed, then — immediately
+                    # before the launch point, never inside the eligibility
+                    # gate — the pass short-circuits and records what WOULD
+                    # have happened.  The entry stays pending; create_run is
+                    # never called.  The batch bookkeeping still runs so later
+                    # entries see exactly the skip reasons a real launch would
+                    # have produced.
+                    self._shadow_launch_decision(entry)
+                    launched = True
+                    capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
+                    continue
                 self._launch(entry)
                 launched = True
                 capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
+            elif self._observe:
+                self._shadow_skip(entry, skip_reason)
             else:
                 self._skip(entry, skip_reason)
 
@@ -632,6 +657,88 @@ class Launcher:
             updated.last_checked_at = _now()
             self.queue_store.update(updated)
 
+    # ------------------------------------------------------------------
+    # Observe (shadow) mode — task 173 / migration §5 Step 2.
+    #
+    # Shadow decisions are recorded BOTH as durable service events (the fleet
+    # event stream) AND as one JSON line each in runs_root/queue/shadow.jsonl
+    # (the comparison stream scripts/compare_shadow.py reads).  The entry
+    # stays pending in every path; no run is created and no capacity is
+    # permanently consumed beyond the in-pass batch bookkeeping.
+    # ------------------------------------------------------------------
+
+    def _shadow_launch_decision(self, entry: QueueEntry) -> None:
+        """Record a would-launch decision without calling create_run.
+
+        Resolves the trio exactly as ``_launch`` would (so an unknown trio is
+        a shadow skip, not a crash), then emits ``queue.shadow_launch`` with
+        the would-be launch fields.  The entry is left pending.
+        """
+
+        trio = self._config.get("trios", {}).get(entry.trio)
+        if trio is None:
+            self._shadow_skip(entry, f"unknown trio {entry.trio}")
+            return
+        agent = trio.get("agent", "codex")
+        model = trio.get("model")
+        mcp_profile = trio.get("mcp_profile")
+        roles = {
+            role: {"agent": agent, "model": model, "mcp_profile": mcp_profile}
+            for role in ("manager", "executor", "auditor")
+        }
+        self._shadow_record(
+            entry,
+            "queue.shadow_launch",
+            trio=entry.trio,
+            roles=roles,
+            would_run_at=_now(),
+        )
+
+    def _shadow_skip(self, entry: QueueEntry, reason: str) -> None:
+        self._shadow_record(entry, "queue.shadow_skip", reason=reason)
+
+    def _shadow_record(
+        self,
+        entry: QueueEntry,
+        event_type: str,
+        *,
+        reason: str | None = None,
+        trio: str | None = None,
+        roles: dict[str, Any] | None = None,
+        would_run_at: float | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "queue_id": entry.queue_id,
+            "trio": trio if trio is not None else entry.trio,
+            "workspace": entry.workspace,
+        }
+        if roles is not None:
+            payload["roles"] = roles
+        if reason is not None:
+            payload["reason"] = reason
+        if would_run_at is not None:
+            payload["would_run_at"] = would_run_at
+        self._emit_service_event(event_type, payload)
+        self._append_shadow_log(event_type, payload)
+
+    def _append_shadow_log(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Append one shadow decision line to runs_root/queue/shadow.jsonl."""
+
+        append = getattr(self.queue_store, "append_shadow_record", None)
+        if append is None:
+            # A store without the shadow log (e.g. the PG backend before its
+            # mirror lands) still emits the service event; nothing is lost
+            # from the fleet event stream.
+            return
+        append(
+            {
+                "schema_version": 2,
+                "type": event_type,
+                "ts": _now(),
+                "payload": payload,
+            }
+        )
+
     def _run_role_dir(self, run_id: str) -> Path | None:
         try:
             logs = self.supervisor._run_logs_dir(run_id)
@@ -654,6 +761,12 @@ class Launcher:
         self._append_jsonl(role_dir / "events.jsonl", record)
 
     def _emit_service_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        # A store without a file root (the PG backend) has no service event
+        # log to append to; the launcher stays read-only there rather than
+        # aborting the pass.
+        root = getattr(self.queue_store, "_root", None)
+        if root is None:
+            return
         record = {
             "schema_version": 2,
             "event_id": f"queue-{_now():.6f}",
@@ -661,7 +774,7 @@ class Launcher:
             "ts": _now(),
             "payload": payload,
         }
-        self._append_jsonl(self.queue_store._root / "service_events.jsonl", record)
+        self._append_jsonl(Path(root) / "service_events.jsonl", record)
 
     def _is_retryable_cause(self, cause: str) -> bool:
         """True when a failure cause should spawn a retry (successor entry).

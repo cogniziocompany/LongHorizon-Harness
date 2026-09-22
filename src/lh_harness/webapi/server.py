@@ -1146,6 +1146,39 @@ def create_app(
             pass
         return effective
 
+    @app.get("/api/queue/shadow")
+    def queue_shadow_events(since: str | None = None) -> dict[str, Any]:
+        """Shadow (observe-mode) decisions over a fleet window (task 173).
+
+        One record per would-launch / would-skip decision, read from the
+        durable shadow log (``runs_root/queue/shadow.jsonl`` plus its daily
+        rotations).  ``since`` accepts epoch seconds or an ISO-8601 timestamp
+        and filters on the record ``ts``.
+        """
+
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        since_ts: float | None = None
+        if since is not None and since.strip():
+            raw = since.strip()
+            try:
+                since_ts = float(raw)
+            except ValueError:
+                try:
+                    from datetime import datetime, timezone
+
+                    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    since_ts = parsed.timestamp()
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="since must be epoch seconds or an ISO-8601 timestamp",
+                    ) from exc
+        records = queue_store.read_shadow_records(since=since_ts)
+        return {"ok": True, "count": len(records), "events": records}
+
     @app.get("/api/fleet/contentions")
     def fleet_contentions() -> dict[str, Any]:
         if runs_root is None:
