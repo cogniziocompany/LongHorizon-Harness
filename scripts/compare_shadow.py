@@ -155,7 +155,8 @@ def parse_pc_log(
     # ``emit-probe <name> [trio N]`` to the LAUNCHED/HOLD entry with the
     # same name and reports the PC trio INDEX alongside the shadow trio
     # NAME; a trio-family verdict is only determinable when the operator
-    # maps PC indexes to CT110 trio names (``--pc-trio-map``).
+    # maps PC indexes to CT110 trio names (operator-supplied); until that map is
+    # available the PC trio family is not determinable and is reported honestly.
     pc_trio_by_name: dict[str, str] = {}
     prev_ts: float | None = None
     for lineno, line in enumerate(lines, 1):
@@ -616,8 +617,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--pc-date",
-        default="2026-09-18",
-        help="calendar date the PC log's bare HH:MM stamps belong to (default 2026-09-18, the sample's final day)",
+        default="2026-09-17",
+        help=(
+            "calendar date the PC log's FIRST segment belongs to "
+            "(default 2026-09-17: the real overseer sample's first PC-local day, "
+            "verified entry-by-entry against every LAUNCHED run_id's own UTC stamp)"
+        ),
     )
     parser.add_argument(
         "--out",
