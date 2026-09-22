@@ -378,6 +378,11 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
     observe = queue.get("observe", False) if isinstance(queue, dict) else False
     if not isinstance(observe, bool):
         observe = False
+    occupancy_ignore_dirty = (
+        queue.get("occupancy_ignore_dirty", False) if isinstance(queue, dict) else False
+    )
+    if not isinstance(occupancy_ignore_dirty, bool):
+        occupancy_ignore_dirty = False
     if not isinstance(trios, dict):
         trios = {}
     if not isinstance(capacity, dict):
@@ -426,7 +431,12 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         # `requeue` reads this so a configured cap actually bounds retries;
         # dropping it here would silently reset every deployment to the default.
         normalized_capacity["max_retries"] = max(0, capacity["max_retries"])
-    return {"trios": normalized_trios, "capacity": normalized_capacity, "observe": observe}
+    return {
+        "trios": normalized_trios,
+        "capacity": normalized_capacity,
+        "observe": observe,
+        "occupancy_ignore_dirty": occupancy_ignore_dirty,
+    }
 
 
 def default_queue_config() -> dict[str, Any]:

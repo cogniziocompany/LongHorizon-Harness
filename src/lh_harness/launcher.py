@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import threading
 import time
 import uuid
@@ -129,6 +130,82 @@ def _read_report_json(path: Path) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+# Occupancy probes (task 173, scope 4 / migration doc workspace-collision
+# finding, 2026-09-14): an active run is not the only reason a workspace is
+# unsafe to launch into.  A dirty tree means another task's uncommitted work
+# sits in it, and a local branch carrying commits that never reached
+# origin/main means another task's committed work does.  Both are OCCUPIED.
+_GIT_OCCUPANCY_TIMEOUT = 30
+
+
+def _git_occupancy(repo: Path, *args: str) -> str | None:
+    """Run one read-only git probe in ``repo``; None on any failure."""
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_OCCUPANCY_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _dirty_workspace_occupied(workspace: str) -> bool:
+    """True when ``git status --porcelain`` in the workspace is non-empty.
+
+    Any failure (not a repo, git unavailable, timeout) reads as clean — the
+    active-run rule and the workspace guard still protect the launch; this
+    probe only ever adds a skip, never manufactures one out of an error.
+    """
+
+    repo = Path(workspace)
+    if not repo.is_dir():
+        return False
+    status = _git_occupancy(repo, "status", "--porcelain")
+    return bool(status)
+
+
+def _unpushed_branch_occupied(workspace: str) -> bool:
+    """True when the checked-out branch has no upstream AND carries commits
+    not on origin's default branch (origin/main in the task's wording).
+
+    The 2026-09-14 collisions were all "a run started on top of another task's
+    unpushed branch work".  A branch with an upstream is not occupied by this
+    rule even when it is ahead of that upstream — the open-PR probe and the
+    ahead-of-upstream relocation in ``prepare_workspace_base`` cover those at
+    launch time.  Anything unreadable reads as clean: this probe only ever
+    adds a skip, never manufactures one out of an error.
+    """
+
+    repo = Path(workspace)
+    if not repo.is_dir():
+        return False
+    if _git_occupancy(repo, "rev-parse", "--is-inside-work-tree") != "true":
+        return False
+    branch = _git_occupancy(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if not branch or branch == "HEAD":
+        # Detached HEAD: no branch work to protect beyond the dirty-tree rule.
+        return False
+    upstream = _git_occupancy(repo, "rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}")
+    if upstream:
+        return False
+    origin_main = _git_occupancy(
+        repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"
+    )
+    if not origin_main:
+        # No origin/main ref: commits-not-on-origin/main is undecidable here
+        # (no remote, or an unusual remote layout); the launch-time guard still
+        # runs, so this stays fail-open rather than blocking every workspace.
+        return False
+    count = _git_occupancy(repo, "rev-list", "--count", f"refs/remotes/origin/main..{branch}")
+    return bool(count and count != "0")
 
 
 class Launcher:
@@ -363,6 +440,28 @@ class Launcher:
             workspace = _normalize_workspace(owner.get("workspace", ""))
             if workspace and workspace == entry_workspace:
                 return f"workspace {entry.workspace} has active run {run_id}"
+        # Occupancy (task 173, scope 4): beyond an active run, a workspace is
+        # OCCUPIED when another task's uncommitted work sits in it (dirty
+        # tree) or when the checked-out branch carries unpushed work with no
+        # upstream to push it to.  Each skip reason names which condition
+        # fired.  ``occupancy_ignore_dirty`` (per-environment overseer
+        # override) disables only these two probes; the active-run rule above
+        # always applies.  A continuation entry (task 201 ``branch`` /
+        # ``continue_branch``) explicitly owns the workspace it names, dirty
+        # branch included, so the two dirty-work probes do not apply to it.
+        if not bool(self._config.get("occupancy_ignore_dirty", False)) and not bool(
+            getattr(entry, "branch", "") or getattr(entry, "continue_branch", False)
+        ):
+            if _dirty_workspace_occupied(entry.workspace):
+                return (
+                    f"workspace {entry.workspace} occupied: dirty tree "
+                    "(git status --porcelain non-empty)"
+                )
+            if _unpushed_branch_occupied(entry.workspace):
+                return (
+                    f"workspace {entry.workspace} occupied: checked-out branch "
+                    "has no upstream and carries commits not on origin/main"
+                )
         return None
 
     def _key_health_ok(self, url: str, min_healthy: int) -> bool:

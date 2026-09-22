@@ -259,7 +259,7 @@ def test_api_queue_status_filter(tmp_path: Path) -> None:
 
 def test_default_queue_config_shape() -> None:
     config = default_queue_config()
-    assert set(config) == {"trios", "capacity", "observe"}
+    assert set(config) == {"trios", "capacity", "observe", "occupancy_ignore_dirty"}
     assert set(config["trios"]) == {"kimi", "qwen"}
     assert config["capacity"]["kimi_max"] == 3
     assert config["capacity"]["qwen_max"] == 1
@@ -267,6 +267,10 @@ def test_default_queue_config_shape() -> None:
     # Shadow (observe) mode is off by default: today's launch behaviour is
     # byte-for-byte unchanged until the flag is flipped (task 173).
     assert config["observe"] is False
+    # Occupancy is on by default (task 173 scope 4): dirty trees and
+    # upstream-less unpushed branches count as occupied unless the overseer
+    # flips the per-environment override.
+    assert config["occupancy_ignore_dirty"] is False
 
 
 def test_queue_config_from_project_config() -> None:

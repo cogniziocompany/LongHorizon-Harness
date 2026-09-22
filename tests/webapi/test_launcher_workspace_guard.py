@@ -93,13 +93,23 @@ class FakeSupervisor:
         return result
 
 
-def _launcher(tmp_path: Path, probe_open_pr=None) -> tuple[Launcher, QueueStore, FakeSupervisor]:
+def _launcher(
+    tmp_path: Path,
+    probe_open_pr=None,
+    *,
+    occupancy_ignore_dirty: bool = False,
+) -> tuple[Launcher, QueueStore, FakeSupervisor]:
     root = tmp_path / "runs"
     root.mkdir(parents=True)
     supervisor = FakeSupervisor(root)
     store = QueueStore(root)
     config = default_queue_config()
     config["capacity"]["kimi_max"] = 1
+    # Task 173 scope 4: a dirty tree is an OCCUPIED workspace in the default
+    # configuration, so guard tests whose fixtures carry foreign uncommitted
+    # work opt the environment out of the occupancy probes to reach the guard
+    # layer under test (that override is the documented overseer switch).
+    config["occupancy_ignore_dirty"] = occupancy_ignore_dirty
     launcher = Launcher(supervisor, store, queue_config=config, probe_open_pr=probe_open_pr)
     return launcher, store, supervisor
 
@@ -156,7 +166,11 @@ def test_dirty_non_default_branch_preserves_foreign_work(tmp_path: Path) -> None
     # An ahead-of-remote commit on top of the pushed branch.
     _git(repo, "commit", "-q", "-m", "local-only commit ahead of remote")
     ahead_sha = _git(repo, "rev-parse", "HEAD")
-    launcher, store, supervisor = _launcher(tmp_path, probe_open_pr=NO_PR)
+    # The tree here is deliberately dirty (that is the scenario), so this test
+    # uses the occupancy override to reach the guard layer (task 173 scope 4).
+    launcher, store, supervisor = _launcher(
+        tmp_path, probe_open_pr=NO_PR, occupancy_ignore_dirty=True
+    )
     entry = _entry(store, repo)
 
     asyncio.run(launcher.tick())
