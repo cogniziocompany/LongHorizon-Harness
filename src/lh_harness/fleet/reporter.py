@@ -315,6 +315,14 @@ class FleetReporter:
             ],
             "capacity": {"active": active, "cap": cap},
             "queueLen": queue_len,
+            # Launcher liveness (task 173, scope 6): the lease's last refresh
+            # and its holder.  Both are None when no lease exists, which is the
+            # fleet window's "no launcher" signal -- so the block is always
+            # present and never omitted.
+            "liveness": {
+                "launcher_tick_at": launcher_tick_at,
+                "lease_holder": lease_holder,
+            },
             "runsTotal": runs_total,
             "runsByStatus": dict(sorted(runs_by_status.items())),
             "runsTruncated": runs_truncated,
