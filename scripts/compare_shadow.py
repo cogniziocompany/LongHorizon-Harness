@@ -57,6 +57,13 @@ from typing import Any
 # state and are therefore comparable.
 DEFAULT_CYCLE_SECONDS = 900
 
+# A backward wall-clock jump larger than one launcher cycle is not a decision
+# lag — it is the overseer sample's next PC launcher invocation (a new
+# PC-local day) or, inside one invocation, a genuine midnight roll.  Either
+# way the calendar anchor moves forward by one day; the monotonic day-roll
+# inside ``_resolve_stamp`` only handles the within-invocation case.
+_PC_DAY_ROLL_THRESHOLD = DEFAULT_CYCLE_SECONDS * 2
+
 # The PC launcher logs bare wall-clock times (no date, no seconds) in its own
 # local zone.  The overseer's PC fleet runs America/Los_Angeles: the sample's
 # run_id UTC stamps (``20260917T103931Z`` on a ``03:39`` line) confirm UTC-7
@@ -80,6 +87,7 @@ _PC_LINE = re.compile(r"^(?P<hhmm>\d{2}:\d{2})(?P<sep> +)(?P<body>\S.*?)\s*$")
 _PC_LAUNCHED = re.compile(r"^LAUNCHED (?P<name>\S+) (?P<run_id>\S+)$")
 _PC_HOLD = re.compile(r"^HOLD (?P<name>\S+) - (?P<reason>.+)$")
 _PC_TRIO = re.compile(r"^TRIO SELECT (?P<rest>.+)$")
+_PC_PROBE = re.compile(r"^emit-probe (?P<name>\S+) \[trio (?P<idx>\d+)\]")
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +105,7 @@ class PCDecision:
     reason: str = ""
     run_id: str = ""
     raw: str = ""
+    trio_index: str = ""  # PC trio INDEX from the most recent emit-probe, if any
 
 
 def parse_pc_log(
@@ -104,13 +113,22 @@ def parse_pc_log(
 ) -> tuple[list[PCDecision], dict[str, int]]:
     """Parse the PC launcher log into decisions and honest parse counts.
 
-    ``log_date`` pins the calendar date the bare ``HH:MM`` stamps belong to
-    (default: 2026-09-18, the final day the sampled log covers).  Times are
-    interpreted in ``PC_TZ`` per the operator's format notes — cross-checked
-    against the run_id stamps (``20260917T103931Z`` = 03:39 local), which put
-    the PC log at UTC-7 exactly.  A stamp that would land in the future
-    relative to the log date is rolled back a day, which keeps a log that
-    crosses midnight monotonic.
+    The real sample is the overseer's PC ``launch_queue.log``: a concatenation
+    of five PC launcher invocations, one per PC-local day 2026-09-17 .. 09-21
+    (each invocation restarts its wall clock; the boundaries are the four
+    backward wall-clock jumps larger than a launcher cycle).  A single
+    ``--pc-date`` would therefore mis-stamp four of the five segments by
+    whole days, so the parser re-anchors ``log_date`` at every backward jump
+    larger than ``_PC_DAY_ROLL_THRESHOLD`` (which also covers a genuine
+    midnight crossing inside one invocation).  ``log_date`` stays the anchor
+    for the FIRST segment, so explicit ``--pc-date`` still wins there.
+
+    Times are interpreted in ``PC_TZ`` per the operator's format notes —
+    cross-checked against the sample's own run_id stamps (every LAUNCHED
+    entry's run_id minute-of-day matches its wall-clock stamp within one
+    minute at UTC-7 for all five segments).  A stamp that would land in the
+    future relative to the running previous stamp is rolled back a day,
+    which keeps a log that crosses midnight monotonic.
     """
 
     if log_date is None:
@@ -127,7 +145,18 @@ def parse_pc_log(
         "trio_select": 0,
         "other_timestamped": 0,
         "unparsed": 0,
+        "segments": 1,
     }
+    # PC trio family: the PC launcher logs a trio INDEX (``[trio N]``) on its
+    # emit-probe lines.  Its pool backend check (``trio N OK``) shows the
+    # probe set per index but no role/model names, so the PC-side trio
+    # family is only recoverable as the index itself — the CT110 trio name
+    # (``kimi``/``qwen``) is NOT in the PC log.  The comparison joins
+    # ``emit-probe <name> [trio N]`` to the LAUNCHED/HOLD entry with the
+    # same name and reports the PC trio INDEX alongside the shadow trio
+    # NAME; a trio-family verdict is only determinable when the operator
+    # maps PC indexes to CT110 trio names (``--pc-trio-map``).
+    pc_trio_by_name: dict[str, str] = {}
     prev_ts: float | None = None
     for lineno, line in enumerate(lines, 1):
         if not line.strip():
@@ -145,28 +174,70 @@ def parse_pc_log(
         except ValueError:
             counts["unparsed"] += 1
             continue
-        ts = _resolve_stamp(log_date, hour, minute, prev_ts)
+        if prev_ts is not None and prev_ts - _naive_stamp_ts(
+            log_date, hour, minute
+        ) > _PC_DAY_ROLL_THRESHOLD:
+            # Backward jump larger than one launcher cycle: this is the
+            # overseer sample's next PC launcher invocation (a new PC-local
+            # day), not a midnight roll — re-anchor the calendar date.
+            log_date = log_date + timedelta(days=1)
+            counts["segments"] += 1
+            # The first stamp of the new segment is anchored directly on the
+            # new log_date; _resolve_stamp's forward day-roll must NOT undo
+            # it (the gap back to the previous segment's last stamp is
+            # necessarily > 12 h, which is exactly what that roll keys on).
+            ts = _naive_stamp_ts(log_date, hour, minute)
+        else:
+            ts = _resolve_stamp(log_date, hour, minute, prev_ts)
         prev_ts = ts
         body = m.group("body")
         lm = _PC_LAUNCHED.match(body)
         if lm:
             counts["launched"] += 1
             decisions.append(
-                PCDecision("launch", lm.group("name"), ts, run_id=lm.group("run_id"), raw=line)
+                PCDecision(
+                    "launch",
+                    lm.group("name"),
+                    ts,
+                    run_id=lm.group("run_id"),
+                    raw=line,
+                    trio_index=pc_trio_by_name.get(lm.group("name"), ""),
+                )
             )
             continue
         hm = _PC_HOLD.match(body)
         if hm:
             counts["hold"] += 1
             decisions.append(
-                PCDecision("hold", hm.group("name"), ts, reason=hm.group("reason"), raw=line)
+                PCDecision(
+                    "hold",
+                    hm.group("name"),
+                    ts,
+                    reason=hm.group("reason"),
+                    raw=line,
+                    trio_index=pc_trio_by_name.get(hm.group("name"), ""),
+                )
             )
+            continue
+        pm = _PC_PROBE.match(body)
+        if pm:
+            # emit-probe <name> [trio N]: the PC-side trio index for this
+            # entry's most recent probe (context, not a decision).
+            pc_trio_by_name[pm.group("name")] = pm.group("idx")
+            counts["other_timestamped"] += 1
             continue
         if _PC_TRIO.match(body):
             counts["trio_select"] += 1
             continue
         counts["other_timestamped"] += 1
     return decisions, counts
+
+
+def _naive_stamp_ts(log_date: datetime, hour: int, minute: int) -> float:
+    """Epoch of a bare ``HH:MM`` on ``log_date`` without any day-rolling."""
+
+    stamp = log_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return stamp.timestamp()
 
 
 def _resolve_stamp(log_date: datetime, hour: int, minute: int, prev_ts: float | None) -> float:
@@ -199,8 +270,16 @@ class ShadowDecision:
     would_run_at: float | None = None
 
 
-def parse_shadow_log(path: Path) -> tuple[list[ShadowDecision], dict[str, int]]:
-    """Parse ``shadow.jsonl`` (one JSON line per decision) into decisions."""
+def parse_shadow_log(
+    path: Path, *, queue_names: dict[str, str] | None = None
+) -> tuple[list[ShadowDecision], dict[str, int]]:
+    """Parse ``shadow.jsonl`` (one JSON line per decision) into decisions.
+
+    ``queue_names`` maps queue_id -> queue-entry name (from the runs_root's
+    ``queue/q-*.json`` files); when supplied it overrides the workspace
+    basename the shadow record carries, so the PC and shadow sides join on
+    the same identity the launcher's queue uses.
+    """
 
     counts = {"lines": 0, "records": 0, "shadow_launch": 0, "shadow_skip": 0, "malformed": 0}
     decisions: list[ShadowDecision] = []
@@ -227,13 +306,18 @@ def parse_shadow_log(path: Path) -> tuple[list[ShadowDecision], dict[str, int]]:
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
         ts = float(record.get("ts", 0.0) or 0.0)
         queue_id = str(payload.get("queue_id", ""))
+        name = ""
+        if queue_names and queue_id in queue_names:
+            name = queue_names[queue_id]
+        else:
+            name = _name_from_payload(payload)
         if rtype == "queue.shadow_launch":
             counts["shadow_launch"] += 1
             decisions.append(
                 ShadowDecision(
                     "launch",
                     queue_id,
-                    _name_from_payload(payload),
+                    name,
                     ts,
                     trio=str(payload.get("trio", "")),
                     would_run_at=payload.get("would_run_at"),
@@ -246,7 +330,7 @@ def parse_shadow_log(path: Path) -> tuple[list[ShadowDecision], dict[str, int]]:
                 ShadowDecision(
                     "skip",
                     queue_id,
-                    _name_from_payload(payload),
+                    name,
                     ts,
                     trio=str(payload.get("trio", "")),
                     reason=str(payload.get("reason", "")),
@@ -288,12 +372,13 @@ class EntryReport:
     pc_ts: float | None
     pc_reason: str
     pc_run_id: str
-    shadow_decision: str  # "launch" | "skip" | "absent"
-    shadow_ts: float | None
-    shadow_reason: str
-    shadow_trio: str
-    verdict: str  # agree | trio-differ | phantom | missed | pc-only | shadow-only
-    detail: str
+    pc_trio_index: str = ""  # PC-side trio INDEX from emit-probe ("" when not determinable)
+    shadow_decision: str = "absent"  # "launch" | "skip" | "absent"
+    shadow_ts: float | None = None
+    shadow_reason: str = ""
+    shadow_trio: str = ""
+    verdict: str = ""  # agree | trio-differ | phantom | missed | pc-only | shadow-only
+    detail: str = ""
 
 
 def _pc_decisions_by_name(decisions: list[PCDecision]) -> dict[str, list[PCDecision]]:
@@ -347,6 +432,7 @@ def compare_streams(
             pc_ts=pc_latest.ts if pc_latest else None,
             pc_reason=pc_latest.reason if pc_latest else "",
             pc_run_id=pc_latest.run_id if pc_latest else "",
+            pc_trio_index=pc_latest.trio_index if pc_latest else "",
             shadow_decision=sh_kind,
             shadow_ts=sh_latest.ts if sh_latest else None,
             shadow_reason=sh_latest.reason if sh_latest else "",
@@ -365,6 +451,21 @@ def _latest_final(events: list[Any]) -> Any | None:
     if not events:
         return None
     return max(events, key=lambda d: d.ts)
+
+
+def _trio_note(report: EntryReport) -> str:
+    """Honest trio-family note for the detail column.
+
+    The PC log carries a trio INDEX (``emit-probe <name> [trio N]``); the
+    shadow log carries the CT110 trio NAME (``kimi``/``qwen``).  Without an
+    operator-supplied PC index → CT110 name map the two are NOT comparable,
+    so the note states exactly what each side resolved to ("" when the PC
+    index is unknown, which reads as a dash in the trio column).
+    """
+
+    pc = f"PC trio={report.pc_trio_index}" if report.pc_trio_index else "PC trio index unknown"
+    sh = f"shadow trio={report.shadow_trio}" if report.shadow_trio else "shadow trio unknown"
+    return f" [{pc}; {sh}]"
 
 
 def _classify(report: EntryReport, cycle_seconds: float) -> None:
@@ -390,26 +491,27 @@ def _classify(report: EntryReport, cycle_seconds: float) -> None:
             report.detail = f"PC hold ({report.pc_reason}); no shadow record for this entry"
         return
     if pc == "launch" and sh == "launch":
+        trio_note = _trio_note(report)
         if report.shadow_ts is None or report.pc_ts is None:
             report.verdict = "agree"
-            report.detail = "both would launch"
+            report.detail = f"both would launch{trio_note}"
             return
         delta = abs(report.shadow_ts - report.pc_ts)
         if delta <= cycle_seconds:
             report.verdict = "agree"
-            report.detail = f"both launch within one cycle (|Δ| = {delta:.0f}s)"
+            report.detail = f"both launch within one cycle (|Δ| = {delta:.0f}s){trio_note}"
         else:
             report.verdict = "agree"
             report.detail = (
                 f"both launch but {delta:.0f}s apart (> {cycle_seconds:.0f}s cycle; "
-                "different cycles in the sample window)"
+                f"different cycles in the sample window){trio_note}"
             )
         return
     if pc == "hold" and sh == "skip":
         report.verdict = "agree"
         report.detail = (
             f"both hold/skip — PC: {report.pc_reason[:80]!r}; "
-            f"shadow: {report.shadow_reason[:120]!r}"
+            f"shadow: {report.shadow_reason[:120]!r}{_trio_note(report)}"
         )
         return
     if pc == "launch" and sh == "skip":
@@ -418,7 +520,7 @@ def _classify(report: EntryReport, cycle_seconds: float) -> None:
         return
     # pc == "hold" and sh == "launch"
     report.verdict = "phantom"
-    report.detail = f"shadow would launch; PC held: {report.pc_reason}"
+    report.detail = f"shadow would launch; PC held: {report.pc_reason}{_trio_note(report)}"
 
 
 def _format_ts(ts: float | None) -> str:
@@ -434,7 +536,8 @@ def render_table(reports: list[EntryReport]) -> str:
         "pc_time",
         "shadow",
         "shadow_time",
-        "trio",
+        "pc_trio",
+        "shadow_trio",
         "verdict",
         "detail",
     )
@@ -447,6 +550,7 @@ def render_table(reports: list[EntryReport]) -> str:
                 _format_ts(r.pc_ts),
                 r.shadow_decision,
                 _format_ts(r.shadow_ts),
+                r.pc_trio_index or "-",
                 r.shadow_trio or "-",
                 r.verdict,
                 r.detail,
@@ -515,7 +619,17 @@ def main(argv: list[str] | None = None) -> int:
         default="2026-09-18",
         help="calendar date the PC log's bare HH:MM stamps belong to (default 2026-09-18, the sample's final day)",
     )
-    parser.add_argument("--out", help="write the per-entry table as JSON to this path")
+    parser.add_argument(
+        "--out",
+        help="write the per-entry table as JSON to this path",
+    )
+    parser.add_argument(
+        "--queue-names",
+        help=(
+            "JSON file mapping queue_id -> queue-entry name (from the runs_root's "
+            "queue/q-*.json files) so the PC and shadow sides join on the same identity"
+        ),
+    )
     args = parser.parse_args(argv)
 
     pc_path = Path(args.pc_log)
@@ -527,6 +641,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: shadow log not found: {shadow_path}", file=sys.stderr)
         return 2
 
+    queue_names: dict[str, str] | None = None
+    if args.queue_names:
+        qn_path = Path(args.queue_names)
+        if not qn_path.is_file():
+            print(f"error: queue-names file not found: {qn_path}", file=sys.stderr)
+            return 2
+        try:
+            queue_names = {str(k): str(v) for k, v in json.loads(qn_path.read_text(encoding="utf-8")).items()}
+        except (json.JSONDecodeError, ValueError, AttributeError) as exc:
+            print(f"error: --queue-names must be a JSON object of queue_id -> name: {exc}", file=sys.stderr)
+            return 2
+
     try:
         pc_date = datetime.strptime(args.pc_date, "%Y-%m-%d").replace(tzinfo=PC_TZ)
     except ValueError:
@@ -534,7 +660,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     pc_decisions, pc_counts = parse_pc_log(pc_path, log_date=pc_date)
-    shadow_decisions, shadow_counts = parse_shadow_log(shadow_path)
+    shadow_decisions, shadow_counts = parse_shadow_log(shadow_path, queue_names=queue_names)
 
     if pc_counts["launched"] == 0:
         print("error: no LAUNCHED lines parsed from the PC log — refusing to guess", file=sys.stderr)
@@ -577,6 +703,7 @@ def main(argv: list[str] | None = None) -> int:
                     "pc_ts": r.pc_ts,
                     "pc_reason": r.pc_reason,
                     "pc_run_id": r.pc_run_id,
+                    "pc_trio_index": r.pc_trio_index,
                     "shadow_decision": r.shadow_decision,
                     "shadow_ts": r.shadow_ts,
                     "shadow_reason": r.shadow_reason,
