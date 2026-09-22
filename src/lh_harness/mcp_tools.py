@@ -20,6 +20,18 @@ import os
 import re
 from typing import Any
 
+from .caller_auth import (
+    ANON_CALLER,
+    RESOLVE_TOOL,
+    caller_configs_or_defaults,
+    emit_refusal_audit,
+    enqueue_rate_violation,
+    resolve_mcp_caller,
+    rounds_clamp_violation,
+    strip_caller_arguments,
+    tool_allowed,
+)
+from .config import _MCP_TOOL_NAMES as _KNOWN_TOOLS
 from .contention import detect_contention, groups_to_json
 from .workspace_identity import resolve_many
 
@@ -116,7 +128,10 @@ def tools_manifest() -> list[dict[str, Any]]:
                 "max_rounds": _integer_param("Maximum harness rounds.", default=25),
                 "priority": _integer_param("Higher number = earlier launch within the same trio.", default=0),
                 "base_check": _string_param("Optional base commit/branch check guard.", required=False),
-                "requested_by": _string_param("Fleet client identity, e.g. 'openwebui' or 'hydra'.", required=True),
+                "requested_by": _string_param(
+                    "Deprecated: stamped server-side from your verified caller identity.",
+                    required=False,
+                ),
             },
         ),
         _tool_spec(
@@ -161,19 +176,55 @@ def dispatch(
     supervisor: Any,
     auth_token: str | None,
     request_token: str | None,
+    caller_configs: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run one MCP tool call and return a JSON-RPC style result.
 
     ``arguments`` is the tool's input object.  The dispatcher reuses the same
     validation and business logic as the REST routes, so clients get identical
     behavior whether they call via MCP, HTTP, or curl.
+
+    Beyond the bearer-parity check, every call is attributed to a caller: the
+    arguments carry ``caller``/``caller_ts``/``caller_sig`` and the HMAC over
+    ``(caller, ts)`` is verified against the per-caller secret named in
+    ``caller_configs`` (task 174).  Missing or bad identity resolves to the
+    reserved ``"anon"`` caller -- 401 on every tool; a verified caller outside
+    its allowlist gets 403, and a refused gate resolution also emits an audit
+    event with ``{caller, tool, run_id, decision}``.
     """
     # Auth parity with the REST boundary.
     if auth_token is not None and auth_token != (request_token or ""):
         return {"ok": False, "error": "invalid or missing bearer token", "code": 401}
 
+    # A name that is not a tool at all stays 404 regardless of identity: the
+    # allowlist decides refusal for tools that exist, and an unknown name has
+    # nothing to authorize.
+    if tool_name not in _KNOWN_TOOLS:
+        return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
+
+    specs = caller_configs_or_defaults(caller_configs)
+    caller = resolve_mcp_caller(arguments, specs)
+    arguments = strip_caller_arguments(arguments)
+    if caller == ANON_CALLER:
+        return {"ok": False, "error": "invalid or missing caller identity", "code": 401}
+    if not tool_allowed(caller, tool_name, specs):
+        if tool_name == RESOLVE_TOOL:
+            emit_refusal_audit(
+                _runs_root(registry, supervisor),
+                caller=caller,
+                tool=tool_name,
+                run_id=str(arguments.get("run_id") or "") or None,
+            )
+        return {
+            "ok": False,
+            "error": f"caller {caller!r} is not allowed to invoke {tool_name}",
+            "code": 403,
+        }
+
     if tool_name == "harness_enqueue_task":
-        return _enqueue(arguments, queue_store=queue_store)
+        return _enqueue(
+            arguments, queue_store=queue_store, caller=caller, spec=specs.get(caller)
+        )
     if tool_name == "harness_list_queue":
         return _list_queue(arguments, queue_store=queue_store)
     if tool_name == "harness_run_status":
@@ -182,6 +233,8 @@ def dispatch(
         return _resolve_gate(arguments, registry=registry, supervisor=supervisor)
     if tool_name == "harness_list_contentions":
         return _list_contentions(runs_root=_runs_root(registry, supervisor))
+    # Unreachable: every allowlisted tool is dispatched above (the config
+    # loader validates ``tools`` against this same surface).
     return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
 
 
@@ -213,9 +266,25 @@ def _bounded(value: Any, *, field: str, max_chars: int = 4096, required: bool = 
     return text
 
 
-def _enqueue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any]:
+def _enqueue(
+    arguments: dict[str, Any],
+    *,
+    queue_store: Any,
+    caller: str,
+    spec: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if queue_store is None:
         return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
+    # Budget ceilings (task 174, section 3.5) run before any validation of the
+    # payload: a caller at its hourly cap gets 429 with a retry hint, and a
+    # max_rounds over the caller's clamp gets 422 with the refusal spelled out
+    # -- never a silently truncated entry.
+    rate = enqueue_rate_violation(spec, queue_store, caller)
+    if rate is not None:
+        return {"ok": False, "error": rate["error"], "code": 429, "retry_after": rate["retry_after"]}
+    clamp_reason = rounds_clamp_violation(spec, arguments.get("max_rounds"))
+    if clamp_reason is not None:
+        return {"ok": False, "error": clamp_reason, "code": 422}
     body = {
         "name": _bounded(arguments.get("name"), field="name", max_chars=256, required=True),
         "task": _bounded(arguments.get("task"), field="task", max_chars=100_000, required=True),
@@ -224,7 +293,11 @@ def _enqueue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any]:
         "max_rounds": arguments.get("max_rounds", 25),
         "priority": arguments.get("priority", 0),
         "base_check": _bounded(arguments.get("base_check"), field="base_check", max_chars=4096),
-        "requested_by": _bounded(arguments.get("requested_by"), field="requested_by", max_chars=256, required=True),
+        # requested_by comes from the VERIFIED caller identity, not from the
+        # client: the stamp is the ownership proof for the DELETE rule and the
+        # hourly ceiling, so a client cannot forge it by passing the field
+        # (task 174 scope item 3).
+        "requested_by": caller,
     }
     try:
         entry = queue_store.create(body)

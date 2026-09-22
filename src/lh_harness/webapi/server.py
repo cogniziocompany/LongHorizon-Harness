@@ -28,6 +28,18 @@ from starlette.middleware.gzip import GZipMiddleware
 from ..dashboard.state import DashboardState
 from ..launcher import Launcher
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
+from ..caller_auth import (
+    ANON_CALLER,
+    RESOLVE_TOOL,
+    caller_configs_or_defaults,
+    emit_refusal_audit,
+    enqueue_rate_violation,
+    may_delete_entry,
+    resolve_rest_caller,
+    rounds_clamp_violation,
+    run_control_allowed,
+    tool_allowed,
+)
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
@@ -194,6 +206,35 @@ def _bearer_matches(value: str | None, token: str | None) -> bool:
         return False
     supplied = value.removeprefix("Bearer ").strip()
     return bool(supplied) and hmac.compare_digest(supplied, token)
+
+
+def _load_caller_specs(
+    runs_root: str | Path | None,
+) -> dict[str, dict[str, Any]]:
+    """Load the [callers] table for per-caller scoping (task 174).
+
+    Prefers the project config next to the runs root, falls back to the CWD
+    config, and finally to the pure migration-doc defaults when no config file
+    exists.  Any malformed config degrades to the defaults rather than taking
+    the whole API down; an audit-visible misconfiguration is the launcher's
+    concern, not the API's availability.
+    """
+    try:
+        from ..config import PROJECT_CONFIG_PATH, load_caller_configs, load_run_defaults
+    except ImportError:  # pragma: no cover - config always present in-tree
+        return caller_configs_or_defaults(None)
+    config_path: Path | None = None
+    if runs_root is not None:
+        try:
+            config_path = _runs_root_config_path(runs_root)
+        except Exception:
+            config_path = None
+    try:
+        if config_path is not None and Path(config_path).is_file():
+            return caller_configs_or_defaults(load_run_defaults(config_path)["callers"])
+        return caller_configs_or_defaults(load_caller_configs(PROJECT_CONFIG_PATH))
+    except Exception:
+        return caller_configs_or_defaults(None)
 
 
 def _decode_ws_token_protocol(value: str) -> str | None:
@@ -848,6 +889,7 @@ def create_app(
     auth_token: str | None = None,
     allowed_origins: set[str] | list[str] | tuple[str, ...] | None = None,
     bind_host: str = "127.0.0.1",
+    caller_configs: dict[str, dict[str, Any]] | None = None,
 ) -> FastAPI:
     """Create an API app over a live shared state or a historical runs root."""
 
@@ -864,6 +906,57 @@ def create_app(
     )
     token = _configured_token(auth_token)
     origins = {str(item).rstrip("/") for item in (allowed_origins or ()) if str(item).strip()}
+    # Per-caller scoping (task 174): the caller table comes from [callers] in
+    # the project config next to the runs root (falling back to the CWD
+    # config), merged over the migration-doc defaults.  Tests (and embedded
+    # service processes) may inject ``caller_configs`` directly, which skips
+    # the CWD config lookup entirely and keeps the app hermetic.
+    if caller_configs is None:
+        caller_specs = _load_caller_specs(runs_root)
+    else:
+        caller_specs = caller_configs_or_defaults(caller_configs)
+
+    def _scoped_caller(request: Request, tool: str, run_id: str | None = None) -> str:
+        """Resolve and authorize the REST caller for scoped routes (task 174).
+
+        Raises 401 for an unverifiable identity (anon) and 403 when the
+        verified caller's allowlist does not name ``tool``.  Refused
+        gate-resolution attempts emit the audit event
+        ``{caller, tool, run_id, decision}`` -- including the anon case, since
+        a bearer with no caller headers trying to resolve a gate is exactly
+        the leak this scoping exists to catch (migration doc 3.4).
+        """
+        caller = resolve_rest_caller(request.headers, caller_specs)
+        if caller == ANON_CALLER:
+            if tool == RESOLVE_TOOL:
+                emit_refusal_audit(runs_root, caller=caller, tool=tool, run_id=run_id)
+            raise HTTPException(status_code=401, detail="invalid or missing caller identity")
+        if not tool_allowed(caller, tool, caller_specs):
+            if tool == RESOLVE_TOOL:
+                emit_refusal_audit(
+                    runs_root,
+                    caller=caller,
+                    tool=tool,
+                    run_id=run_id,
+                )
+            raise HTTPException(
+                status_code=403,
+                detail=f"caller '{caller}' is not allowed to use '{tool}'",
+            )
+        return caller
+
+    def _run_control_caller(request: Request) -> str:
+        """401/403 gate for the overseer-only REST run-control routes."""
+        caller = resolve_rest_caller(request.headers, caller_specs)
+        if caller == ANON_CALLER:
+            raise HTTPException(status_code=401, detail="invalid or missing caller identity")
+        if not run_control_allowed(caller, caller_specs):
+            raise HTTPException(
+                status_code=403,
+                detail=f"caller '{caller}' is not allowed to control runs",
+            )
+        return caller
+
     queue_store: QueueStore | None = None
     if runs_root is not None:
         queue_config = default_queue_config()
@@ -1036,18 +1129,40 @@ def create_app(
     def create_queue_entry(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        caller = _scoped_caller(request, "harness_enqueue_task")
+        spec = caller_specs.get(caller)
+        # Budget ceilings (task 174, section 3.5) run before payload validation:
+        # the hourly ceiling answers 429 with a Retry-After hint, the rounds
+        # clamp answers 422 and the request is refused -- never truncated.
+        rate = enqueue_rate_violation(spec, queue_store, caller)
+        if rate is not None:
+            raise HTTPException(
+                status_code=429,
+                detail=rate["error"],
+                headers={"Retry-After": str(rate["retry_after"])},
+            )
+        clamp_reason = rounds_clamp_violation(spec, body.get("max_rounds"))
+        if clamp_reason is not None:
+            raise HTTPException(status_code=422, detail=clamp_reason)
+        # requested_by is stamped from the VERIFIED caller identity; a client
+        # value is overridden so the ownership proof cannot be forged
+        # (task 174 scope item 3).
+        stamped = dict(body)
+        stamped["requested_by"] = caller
         try:
-            entry = queue_store.create(body)
+            entry = queue_store.create(stamped)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {"ok": True, "queue_id": entry.queue_id}
+        return {"ok": True, "queue_id": entry.queue_id, "requested_by": caller}
 
     @app.get("/api/queue")
     def list_queue(
+        request: Request,
         status: str | None = None,
     ) -> dict[str, Any]:
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        _scoped_caller(request, "harness_list_queue")
         entries = queue_store.list()
         # The status set is canonical in queue.py; a "blocked" entry (the PC
         # queue's fifth state) is surfaced as its own group, not a failure.
@@ -1073,14 +1188,21 @@ def create_app(
         }
 
     @app.delete("/api/queue/{queue_id}")
-    def delete_queue_entry(queue_id: str) -> dict[str, Any]:
+    def delete_queue_entry(queue_id: str, request: Request) -> dict[str, Any]:
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        caller = _scoped_caller(request, "harness_list_queue")
         entry = queue_store.get(queue_id)
         if entry is None:
             raise HTTPException(status_code=404, detail="queue entry not found")
         if entry.status != "pending":
             raise HTTPException(status_code=409, detail=f"cannot delete entry with status {entry.status}")
+        spec = caller_specs.get(caller)
+        if not may_delete_entry(caller, spec, entry):
+            raise HTTPException(
+                status_code=403,
+                detail=f"caller '{caller}' may not delete entry '{queue_id}' created by '{entry.requested_by}'",
+            )
         removed = queue_store.delete(queue_id)
         if removed is None:
             raise HTTPException(status_code=404, detail="queue entry not found")
@@ -1104,10 +1226,20 @@ def create_app(
             supervisor=supervisor,
             auth_token=token,
             request_token=normalize_request_token(request.headers.get("authorization")),
+            caller_configs=caller_specs,
         )
         status = result.get("code", 200)
         if status == 401:
             return JSONResponse(result, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+        if status == 429:
+            # MCP is not a native HTTP transport, but REST-style callers still
+            # expect a Retry-After on the 429 envelope; gateways strip unknown
+            # fields unless they are in the standard response.
+            return JSONResponse(
+                result,
+                status_code=429,
+                headers={"Retry-After": str(result.get("retry_after", 60))},
+            )
         if status == 404:
             return JSONResponse(result, status_code=404)
         if status >= 400:
@@ -1213,6 +1345,7 @@ def create_app(
 
     @app.post("/api/runs")
     def create_run(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        _run_control_caller(request)
         if supervisor is None or bool(getattr(supervisor, "attached_only", False)):
             raise HTTPException(status_code=501, detail="run creation requires the standalone Web supervisor")
         try:
@@ -1581,6 +1714,10 @@ def create_app(
         request: Request,
         body: dict[str, Any] = Body(default_factory=dict),
     ) -> dict[str, Any]:
+        # Task 174: gate resolution follows the harness_resolve_gate allowlist
+        # entry -- the single bearer is no longer sufficient (a leaked bearer
+        # must not be able to resolve gates, migration doc 3.4).
+        _scoped_caller(request, RESOLVE_TOOL, run_id=run_id)
         state_for_run = _state_or_404(registry, run_id)
         if supervisor is not None and not supervisor.can_control(run_id):
             raise HTTPException(status_code=409, detail="run is not accepting approvals")
@@ -1617,7 +1754,8 @@ def create_app(
         }
 
     @app.post("/api/runs/{run_id}/abort")
-    def abort(run_id: str) -> dict[str, Any]:
+    def abort(run_id: str, request: Request) -> dict[str, Any]:
+        _run_control_caller(request)
         _state_or_404(registry, run_id)
         if supervisor is None:
             raise HTTPException(status_code=501, detail="abort requires the standalone Web supervisor")
@@ -1627,7 +1765,8 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/stop")
-    def stop(run_id: str) -> dict[str, Any]:
+    def stop(run_id: str, request: Request) -> dict[str, Any]:
+        _run_control_caller(request)
         _state_or_404(registry, run_id)
         if supervisor is None:
             raise HTTPException(status_code=501, detail="stop requires the standalone Web supervisor")
@@ -1642,6 +1781,7 @@ def create_app(
         request: Request,
         body: dict[str, Any] = Body(default_factory=dict),
     ) -> dict[str, Any]:
+        _run_control_caller(request)
         _state_or_404(registry, run_id)
         if supervisor is None or bool(getattr(supervisor, "attached_only", False)):
             raise HTTPException(status_code=501, detail="resume requires the standalone Web supervisor")
@@ -1664,7 +1804,10 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/runs/{run_id}/status")
-    def run_status(run_id: str) -> dict[str, Any]:
+    def run_status(run_id: str, request: Request) -> dict[str, Any]:
+        # Task 174: the REST twin of harness_run_status follows the tool
+        # allowlist (chat-agent's third queue tool).
+        _scoped_caller(request, "harness_run_status", run_id=run_id)
         _state_or_404(registry, run_id)
         if supervisor is None:
             return {"run_id": run_id, "status": "attached", "managed": False}
