@@ -34,7 +34,13 @@ from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
 from ..supervisor.control_bus import CommandConflict, RevisionConflict
 from ..fleet import get_reporter
-from ..queue import QueueStore, default_queue_config, queue_config_from_config, _select_queue_store
+from ..queue import (
+    PgQueueStore,
+    QueueStore,
+    default_queue_config,
+    queue_config_from_config,
+    _select_queue_store,
+)
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
@@ -632,7 +638,7 @@ def _snapshot_for(registry: StateRegistry, state: DashboardState, run_id: str) -
 def _maybe_start_fleet_reporter(
     registry: StateRegistry,
     supervisor: RunSupervisor | None,
-    queue_store: QueueStore | None = None,
+    queue_store: QueueStore | PgQueueStore | None = None,
 ) -> None:
     """Start the fleet reporter when LH_HARNESS_FLEET_URL is configured.
 
@@ -864,7 +870,10 @@ def create_app(
     )
     token = _configured_token(auth_token)
     origins = {str(item).rstrip("/") for item in (allowed_origins or ()) if str(item).strip()}
-    queue_store: QueueStore | None = None
+    # Bound before the try/except so the Launcher path below always has the
+    # default config even when a non-ValueError config error skips the stores.
+    queue_config = default_queue_config()
+    queue_store: QueueStore | PgQueueStore | None = None
     if runs_root is not None:
         try:
             from ..config import PROJECT_CONFIG_PATH, load_run_defaults
@@ -873,24 +882,24 @@ def create_app(
             # current working directory so existing deployments keep working.
             config_path = _runs_root_config_path(runs_root) or PROJECT_CONFIG_PATH
             project = load_run_defaults(config_path)
-            queue_store = _select_queue_store(runs_root, project)
+            # An unknown backend name raises out of _select_queue_store so a
+            # misconfigured deployment fails at startup instead of silently
+            # running on the file store.
+            selected = _select_queue_store(runs_root, project)
+            if isinstance(project.get("queue"), dict):
+                queue_config = queue_config_from_config(project)
+            if isinstance(selected, QueueStore):
+                # The selector builds the file store bare; rebuild it with the
+                # queue_config derived above so the file-store path stays
+                # byte-for-byte the construction it replaces.
+                selected = QueueStore(runs_root, queue_config)
         except ValueError:
-            # Re-raise ValueError from _select_queue_store or load_run_defaults to fail loudly on bad backend
             raise
         except Exception:
-            # Keep default queue_config behavior on config loading or other errors
-            queue_config = default_queue_config()
-            try:
-                from ..config import PROJECT_CONFIG_PATH, load_run_defaults
-
-                # Prefer a project config next to the runs root; fall back to the
-                # current working directory so existing deployments keep working.
-                config_path = _runs_root_config_path(runs_root) or PROJECT_CONFIG_PATH
-                project = load_run_defaults(config_path)
-                if isinstance(project.get("queue"), dict):
-                    queue_config = queue_config_from_config(project)
-            except Exception:
-                pass  # Keep default queue_config
+            pass  # Keep default queue_config
+        else:
+            queue_store = selected
+        if queue_store is None:
             queue_store = QueueStore(runs_root, queue_config)
     launcher: Launcher | None = None
     if supervisor is not None and queue_store is not None:
