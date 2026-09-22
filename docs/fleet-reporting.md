@@ -77,6 +77,12 @@ Every 30 seconds the reporter POSTs one heartbeat to
 }
 ```
 
+**Payload bounding**: To prevent exceeding the fleet plane's request-size limit (10 MB), the heartbeat payload is bounded to include only the 500 most recent runs by `updated_at` (mtime). If a node has more than 500 runs, older runs are omitted from the heartbeat. An informational log message is emitted when truncation occurs:
+
+```
+fleet reporter heartbeat: truncating runs from X to 500 most recent
+```
+
 ### 3. Round content
 
 After each round is recorded, the reporter reads the validated round directory

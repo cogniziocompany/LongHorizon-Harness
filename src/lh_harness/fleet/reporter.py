@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from lh_harness.supervisor.lifecycle import TERMINAL_STATUSES
+
 logger = logging.getLogger(__name__)
 
 _ENV_URL = "LH_HARNESS_FLEET_URL"
@@ -228,6 +230,15 @@ class FleetReporter:
         """Enqueue a periodic heartbeat describing this node."""
         if not self._enabled:
             return
+        # Bound the number of runs to stay under the fleet plane's request-size limit.
+        # Sort by mtime (updated_at) descending and keep the most recent runs.
+        MAX_RUNS_PER_HEARTBEAT = 500
+        if len(runs) > MAX_RUNS_PER_HEARTBEAT:
+            runs_sorted = sorted(runs, key=lambda r: r.get("mtime", 0), reverse=True)
+            runs = runs_sorted[:MAX_RUNS_PER_HEARTBEAT]
+            logger.info(
+                f"fleet reporter heartbeat: truncating runs from {len(runs_sorted)} to {MAX_RUNS_PER_HEARTBEAT} most recent"
+            )
         body = {
             "node": {
                 "name": self._node,

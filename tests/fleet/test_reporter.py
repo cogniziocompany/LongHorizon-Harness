@@ -521,6 +521,59 @@ def test_parse_labels():
     assert _parse_labels("no-equals") == {}
 
 
+def test_heartbeat_truncates_runs(http_server, _isolate_reporter):
+    """Heartbeat truncates runs to MAX_RUNS_PER_HEARTBEAT most recent when exceeding limit."""
+    _setenv(http_server, "trunc-node", "trunc-key", "kind=test")
+    # Debug: check environment variables
+    print("Environment after _setenv:")
+    for var in ["LH_HARNESS_FLEET_URL", "LH_HARNESS_FLEET_NODE", "LH_HARNESS_FLEET_KEY", "LH_HARNESS_FLEET_LABELS"]:
+        print(f"  {var}: {os.environ.get(var)}")
+    reporter = get_reporter(version="1.0.0", capacity=5, reset=True)
+    assert reporter.enabled, f"Reporter should be enabled. Missing env: {reporter.missing_env}"
+
+    # Prepare more than MAX_RUNS_PER_HEARTBEAT runs, with distinct mtime.
+    # We'll create a list of run dicts with increasing mtime (so later ones are more recent).
+    max_runs = 500  # This is the constant we defined in reporter.py
+    total_runs = max_runs + 10  # 510 runs
+    runs = []
+    for i in range(total_runs):
+        # mtime: larger i means more recent
+        runs.append({
+            "id": f"run-{i:03d}",
+            "status": "running",
+            "active_round": i % 10,
+            "active_role": "executor",
+            "model": "test-model",
+            "repo": "test-repo",
+            "workspace": f"/workspace/{i}",
+            "youtrack_issue_id": None,
+            "mtime": float(i),  # use i as mtime for sorting
+        })
+
+    def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int]:
+        # Return the runs, active=0, cap=5, queue_len=0
+        return runs, 0, 5, 0
+
+    reporter.register_heartbeat(_heartbeat)
+    # Set an interval and sleep for a little more than one interval to ensure we get exactly one heartbeat.
+    reporter._heartbeat_interval = 0.1
+    time.sleep(0.12)  # Wait for a little more than one interval so we get exactly one heartbeat.
+    reporter.stop(timeout=5.0)
+
+    # Verify that exactly one heartbeat was sent and that it truncates runs
+    heartbeat_requests = [r for r in _StubHandler.requests if r["path"] == "/harness/heartbeat"]
+    assert len(heartbeat_requests) == 1, f"Expected 1 heartbeat request, got {len(heartbeat_requests)}. Requests: {_StubHandler.requests}"
+    body = heartbeat_requests[0]["body"]
+    sent_runs = body["runs"]
+    assert len(sent_runs) == max_runs, f"Expected {max_runs} runs in heartbeat, got {len(sent_runs)}"
+    # Verify that the sent runs are the most recent ones (highest mtime)
+    # Since we sorted by mtime descending and took first max_runs,
+    # the sent runs should have ids from run-{total_runs-max_runs:03d} to run={total_runs-1:03d}
+    expected_ids = {f"run-{i:03d}" for i in range(total_runs - max_runs, total_runs)}
+    sent_ids = {run["runId"] for run in sent_runs}
+    assert sent_ids == expected_ids, f"Sent run IDs {sent_ids} do not match expected IDs {expected_ids}"
+
+
 def test_round_content_path_traversal(tmp_path):
     """Round content collection must stay inside the validated run directory."""
     runs_root = tmp_path / "runs"
