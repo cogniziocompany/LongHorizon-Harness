@@ -101,10 +101,35 @@ prerequisites apply before `backend = "postgres"` can work:
    environment only, never in config, a migration, a fixture, or a commit).
    A password already embedded in `database_url` wins over the env variable.
 
-Note: the service's config flattener currently carries `backend` but not
-`database_url`, so a `postgres` deployment reaches the loud startup failure
-described above rather than silently running on the file store; cutover
-requires threading the DSN through the config loader.
+### Postgres cutover
+
+To switch a deployment from the file store to Postgres, add the following
+`[queue]` block to `config.toml`. Use the deployment's own user, host, and
+database **name** for the placeholders; do not put a password in the URL and do
+not copy any real host, user, or database value into the example.
+
+```toml
+[queue]
+backend = "postgres"
+database_url = "postgresql://<user>@<db-host>:5432/<database>"
+```
+
+Set the password through the environment variable **name**
+`LH_HARNESS_DB_PASSWORD` (its value is configured in the deployment
+environment only; it never belongs in `config.toml`, a migration, a fixture, or
+a commit). Before starting the service, make sure the migration files are
+present:
+
+- `migrations/001_harness_queue.sql` — creates the `harness.queue` table and its
+  enum.
+- `migrations/002_harness_queue_events.sql` — creates the
+  `harness.queue_events` audit log.
+
+`PgQueueStore` applies both migrations idempotently on first connect, but the
+files must exist before the service boots.
+
+If `database_url` is missing while `backend = "postgres"`, the service fails
+loudly at startup rather than silently falling back to the file store.
 
 ## Capacity rules
 
