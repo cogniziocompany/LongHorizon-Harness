@@ -401,6 +401,7 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
             "agent": agent,
             "model": model,
             "mcp_profile": mcp_profile,
+            "auditor_mcp_profile": str(spec.get("auditor_mcp_profile", "")).strip() or None,
         }
     for required in _VALID_TRIOS:
         if required not in normalized_trios:
