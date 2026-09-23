@@ -342,9 +342,9 @@ def test_launch_role_configs_omit_unset_and_keep_auditor_read_only(tmp_path: Pat
     assert updated is not None and updated.status == "launched"
     owner = supervisor.created[-1]["owner"]
     roles = owner["role_configs"]
-    assert roles["manager"] == {"agent": "claude_code", "model": "kimi-k3", "mcp_profile": "default"}
-    assert roles["executor"] == {"agent": "claude_code", "model": "kimi-k3", "mcp_profile": "default"}
-    assert roles["auditor"] == {"agent": "claude_code", "model": "kimi-k3"}
+    # No mcp_profile in any role spec: the worker cannot round-trip it and
+    # would reject its own reservation (2026-09-23, runs 7164fbff/70ed3e28).
+    assert all(spec == {"agent": "claude_code", "model": "kimi-k3"} for spec in roles.values())
     assert owner["mcp_profile"] is None
     assert "None" not in json.dumps(roles)
 

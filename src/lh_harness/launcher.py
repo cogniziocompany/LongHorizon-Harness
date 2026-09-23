@@ -124,25 +124,27 @@ def _classify_failure_cause(text: str) -> str | None:
 def _role_configs(
     agent: str,
     model: str | None,
-    mcp_profile: str | None,
+    mcp_profile: str | None = None,
     auditor_mcp_profile: str | None = None,
 ) -> dict[str, dict[str, str]]:
-    """Role specs for a queue launch, with unset fields left out.
+    """Role specs for a queue launch: agent, plus model only when set.
 
-    A None model or profile must be omitted, not stringified: the worker
-    command renders ``--<role>-model=None`` and the run dies on its own
-    reservation check (cutover 168, 2026-09-23). The trio's mcp_profile goes
-    to manager and executor only; the auditor takes ``auditor_mcp_profile``
-    when configured, else the service's read-only default.
+    A None model must be omitted, not stringified: the worker command would
+    render ``--<role>-model=None`` and the run dies on its reservation check
+    (cutover 168, 2026-09-23). MCP profiles are deliberately NOT put in role
+    specs: the worker rebuilds its roles from agent/model/reasoning_effort
+    only (cli._public_role_configs_from_args), so a spec carrying
+    mcp_profile can never equal its reservation and every run dies at
+    start. Runs therefore take the service's per-role default profiles, as
+    POST /api/runs launches always have. The profile arguments are accepted
+    and ignored until the worker round-trips them.
     """
+    del mcp_profile, auditor_mcp_profile
     configs: dict[str, dict[str, str]] = {}
     for role in ("manager", "executor", "auditor"):
         spec: dict[str, str] = {"agent": agent}
         if model:
             spec["model"] = model
-        profile = auditor_mcp_profile if role == "auditor" else mcp_profile
-        if profile:
-            spec["mcp_profile"] = profile
         configs[role] = spec
     return configs
 
