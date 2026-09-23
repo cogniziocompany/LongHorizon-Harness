@@ -270,7 +270,10 @@ No big-bang switch. The new orchestrator runs **observed but not authoritative**
 
 ### Step 4 — Promote the launcher to authoritative (the handoff)
 - **Promotion evidence (all must hold over the shadow window, e.g. 7 days):**
-  1. **Decision agreement.** The shadow launcher's would-launch decisions agree with the PC script's actual launches on every entry: same entry selected, same trio, same skip reasons. Zero unexplained divergence.
+  1. **Decision agreement.** The shadow launcher's would-launch decisions agree with the PC script's actual launches on every entry: same entry selected, same launch/skip decision. Zero unexplained divergence.
+     - *Amended 2026-09-23 (Paxton's decision, OPEN-ASKS row closed; ACK PAX-DECISIONS-20260923-LAST3):* scoring is **entry selection and launch/skip only**. Trio agreement is **out of scope**: the PC log records only a trio index while CT110 names a trio family, so the two are not comparable. `scripts/compare_shadow.py` reports the trio side by side for information only.
+     - A shadow skip on a workspace safety check (dirty tree, unpushed/no-upstream branch) where the PC launched is agreement-in-intent, not divergence. An entry the PC launched before the shadow's first pass is *unobserved*, not divergence. Both are listed under evidence item 3.
+     - The 7-day window started when the first real LHH entry queued normally: 2026-09-23 00:19 PT (`9999zs-218-queue-task-validator`), so it ends about 2026-09-30 00:19 PT.
   2. **Zero phantom launches.** The shadow launcher created no runs during the shadow period.
   3. **Zero missed launches.** No entry the PC launched that the shadow would have skipped without a recorded capacity/workspace/key reason; and no entry the shadow would have launched that the PC dropped.
   4. **Liveness through the PC's failure modes.** The launcher tick signal stayed green (age `< 2 × poll_seconds`) across at least one CT110 reboot and one network blip — proving the workstation-sleep/reboot/network stall is gone.
