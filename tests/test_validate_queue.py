@@ -288,6 +288,9 @@ def test_module_entry_point_exit_semantics(tmp_path: Path):
         "QUEUE_DIR": str(queue),
         "HARNESS_SRC": str(tmp_path),
         "PATH": "/usr/bin:/bin",
+        # Path.home() needs one of these on Windows (Linux falls back to pwd).
+        "HOME": str(tmp_path),
+        "USERPROFILE": str(tmp_path),
         # Point the child interpreter at this checkout's src tree so it imports
         # the same module the tests do, not a possibly-stale installed copy.
         "PYTHONPATH": str(SRC_DIR.parent),
