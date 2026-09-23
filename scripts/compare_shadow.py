@@ -20,6 +20,11 @@ evidence items like this:
   trio-differ       — same decision but the resolved trio family differs
   phantom           — shadow said launch, the PC launcher did not (item 2)
   missed            — the PC launcher launched, shadow skipped (item 2)
+  shadow-more-conservative — the PC launcher launched and the shadow's latest
+                      AT-OR-BEFORE-launch decision was a skip on a workspace
+                      SAFETY CHECK — dirty tree, unpushed branch, or occupancy
+                      by a run OTHER than this entry's own PC run: agreement in
+                      intent, never scored as a missed (task 222 FIX 5)
   self-occupied     — the shadow's skip names the very run the PC launcher
                       created for this same entry: the shadow correctly
                       observing the PC's own launch, neither agree nor missed
@@ -133,6 +138,15 @@ _PC_RUN_STAMP = re.compile(r"^(?P<stamp>\d{8}T\d{6})Z")
 # A shadow skip whose reason names the occupying run: the CT110 launcher's
 # occupancy skip reads ``workspace <ws> has active run <run_id>``.
 _SHADOW_SKIP_RUN = re.compile(r"has active run\s+(?P<run_id>\S+)")
+# Workspace SAFETY-CHECK skip reasons (task 222 FIX 5): the CT110 launcher
+# refuses to launch onto an unsafe workspace.  ``occupied: dirty tree`` names a
+# dirty worktree (a pre-launch safety gate), NOT run occupancy — the run-
+# occupancy skip instead reads ``workspace <ws> has active run <run_id>``.
+_SHADOW_SKIP_SAFETY = re.compile(
+    r"dirty tree|dirty worktree|uncommitted|unpushed|not pushed|ahead of|"
+    r"occupied:\s*dirty|occupied:\s*unpushed|occupied:\s*uncommitted",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +517,26 @@ def _run_id_from_skip_reason(reason: str) -> str:
     return m.group("run_id") if m else ""
 
 
+def _is_safety_skip(reason: str, occupier: str) -> bool:
+    """Task 222 FIX 5: is this shadow skip a workspace SAFETY CHECK?
+
+    A safety check is a dirty worktree, an unpushed branch, or occupancy by a
+    run OTHER than this entry's own PC run (the caller has already returned the
+    self-occupied case where the occupier IS the entry's own PC run).  Beware
+    the real task-204 reason — ``workspace LongHorizon-Harness occupied:
+    dirty tree`` — which contains the word ``occupied`` but names NO run under
+    the ``has active run <run_id>`` occupancy grammar: it is a dirty-tree
+    check, not run-occupancy, and must classify as a safety check.
+    """
+
+    if _SHADOW_SKIP_SAFETY.search(reason):
+        return True
+    # Non-empty occupier here means a ``has active run <run_id>`` skip whose run
+    # is NOT this entry's own PC run — occupancy by another run while the PC
+    # launched anyway is the shadow's occupancy safety gate, not agreement.
+    return bool(occupier)
+
+
 # ---------------------------------------------------------------------------
 # Agreement
 # ---------------------------------------------------------------------------
@@ -520,11 +554,12 @@ class EntryReport:
     shadow_ts: float | None = None
     shadow_reason: str = ""
     shadow_trio: str = ""
+    shadow_queue_id: str = ""  # queue_id of the JUDGED basis shadow record (FIX 5 instance listing)
     # Count of later shadow skips whose occupying run is the PC's own run for
     # this entry (expected shadow-mode output after the PC launch; context).
     self_occupied_after: int = 0
     probe: bool = False
-    verdict: str = ""  # agree | trio-differ | phantom | missed | self-occupied | unobserved-race | pc-only | shadow-only | probe
+    verdict: str = ""  # agree | trio-differ | phantom | missed | shadow-more-conservative | self-occupied | unobserved-race | pc-only | shadow-only | probe
     detail: str = ""
 
 
@@ -676,6 +711,7 @@ def _classify(
         report.shadow_ts = basis.ts
         report.shadow_reason = basis.reason
         report.shadow_trio = basis.trio
+        report.shadow_queue_id = basis.queue_id
     elif sh_events:
         # The PC decided before the CT110 launcher's first pass for this
         # entry: the shadow never observed the entry pre-launch, so agreement
@@ -739,6 +775,19 @@ def _classify(
                 "launch, neither agree nor missed"
             )
             return
+        if _is_safety_skip(report.shadow_reason, occupier):
+            # Task 222 FIX 5: the shadow's latest at-or-before-launch decision was
+            # a skip on a workspace safety check (dirty tree, unpushed branch, or
+            # occupancy by a run OTHER than this entry's own PC run) while the PC
+            # launched — agreement in intent, never a missed.
+            report.verdict = "shadow-more-conservative"
+            report.detail = (
+                f"PC launched {report.pc_run_id}; shadow skipped on a workspace safety "
+                f"check ({report.shadow_reason[:160]}) — agreement-in-intent: the CT110 "
+                "launcher wanted the same launch but its safety gate held it back; "
+                "NEVER a missed (not evidence item 2)"
+            )
+            return
         report.verdict = "missed"
         report.detail = f"PC launched {report.pc_run_id}; shadow skipped: {report.shadow_reason}"
         return
@@ -796,6 +845,7 @@ _VERDICT_ORDER = (
     "trio-differ",
     "phantom",
     "missed",
+    "shadow-more-conservative",
     "self-occupied",
     "unobserved-race",
     "pc-only",
@@ -852,6 +902,18 @@ EVIDENCE_LEGEND: tuple[tuple[str, str], ...] = (
         "would have skipped; a day-7 promotion blocker until explained.",
     ),
     (
+        "shadow-more-conservative",
+        "counts as AGREEMENT-IN-INTENT, NOT evidence item 2 — the PC launcher launched and the "
+        "shadow's latest at-or-before-launch decision was a skip on a workspace safety check "
+        "(dirty tree, unpushed branch, or occupancy by a run OTHER than this entry's own PC "
+        "run): the CT110 launcher wanted the same launch but its safety gate held it back, so "
+        "it is NEVER scored as missed or as a promotion failure. Excluded from the strict "
+        "item-1 agreement denominator (it is not a same-decision launch). Item 3: every "
+        "instance is listed individually (entry, queue id, PC run id, reason, timestamps) so "
+        "the day-7 report shows which safety gates fired; at day 7, count them as "
+        "agreement-in-intent, not against item 1 or item 2.",
+    ),
+    (
         "self-occupied",
         "NEITHER evidence item 1 nor 2 — the shadow's skip names the very run the PC launcher "
         "created for this same entry, i.e. the shadow correctly observing the PC's own launch "
@@ -894,6 +956,23 @@ def print_legend(counts: dict[str, int]) -> None:
           "2 disagreement, 3 observability):")
     for verdict, text in EVIDENCE_LEGEND:
         print(f"  {verdict} ({counts.get(verdict, 0)}): {text}")
+
+
+def print_shadow_more_conservative(reports: list[EntryReport]) -> None:
+    """FIX 5: list every shadow-more-conservative instance individually."""
+
+    instances = [r for r in reports if r.verdict == "shadow-more-conservative"]
+    if not instances:
+        return
+    print()
+    print("shadow-more-conservative instances (agreement-in-intent, NOT a disagreement; "
+          "every instance listed per task 222 FIX 5):")
+    for r in instances:
+        print(
+            f"  entry={r.name}  queue_id={r.shadow_queue_id or '-'}  "
+            f"pc_run_id={r.pc_run_id or '-'}  pc_time={_format_ts(r.pc_ts)}  "
+            f"shadow_skip_at={_format_ts(r.shadow_ts)}  reason={r.shadow_reason}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1151,7 @@ def main(argv: list[str] | None = None) -> int:
     print(summarize(reports))
     print()
     print_legend(counts)
+    print_shadow_more_conservative(reports)
 
     if args.out:
         out = {
@@ -1094,6 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
                     "shadow_ts": r.shadow_ts,
                     "shadow_reason": r.shadow_reason,
                     "shadow_trio": r.shadow_trio,
+                    "shadow_queue_id": r.shadow_queue_id,
                     "self_occupied_after": r.self_occupied_after,
                     "probe": r.probe,
                     "verdict": r.verdict,

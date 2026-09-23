@@ -83,6 +83,16 @@ CASE_230_WORKSPACE = "/work/some-service"
 CASE_230_SHADOW_LAUNCH = _utc("2026-09-23T08:04:00")  # 01:04 PT = 08:04Z
 CASE_230_PC_HOLD = _utc("2026-09-23T08:05:00")  # 01:05 PT = 08:05Z
 
+# Task-204 (overseer FIX 5, exact values): the shadow's only pre-launch decision
+# was a dirty-tree safety skip at the same second the PC launched.
+CASE_204_NAME = "9999zv-204-memory-death-reason"
+CASE_204_QID = "q-5573d2ee7cb64715"
+CASE_204_RUN = "20260923T005453Z_c1724ef3"
+CASE_204_WORKSPACE = "/work/LongHorizon-Harness"
+CASE_204_REASON = "workspace LongHorizon-Harness occupied: dirty tree"
+CASE_204_PC_EXACT = _utc("2026-09-23T00:54:53")  # 17:54 PT on 09-22 = 00:54:53Z on 09-23
+CASE_204_SHADOW_SKIP = _utc("2026-09-23T00:54:53")
+
 PROBE_NAME = "__tick1558-workspace-does-not-exist__"
 PROBE_QID = "q-eee555feed1234abc"
 PROBE_RUN = "tickprobe99"
@@ -128,6 +138,24 @@ def _shadow_skip(queue_id: str, name: str, workspace: str, ts: float, *, run_id:
     }
 
 
+def _shadow_skip_reason(
+    queue_id: str, name: str, workspace: str, ts: float, *, reason: str
+) -> dict[str, Any]:
+    """A shadow skip carrying its own reason (safety-check shape, FIX 5)."""
+
+    return {
+        "schema_version": 2,
+        "type": "queue.shadow_skip",
+        "ts": ts,
+        "payload": {
+            "queue_id": queue_id,
+            "trio": "kimi",
+            "workspace": workspace,
+            "reason": reason,
+        },
+    }
+
+
 def _write_shadow_log(path: Path) -> None:
     records = [
         _shadow_launch(CASE_221_QID, CASE_221_NAME, CASE_221_WORKSPACE, CASE_221_SHADOW_LAUNCH),
@@ -137,6 +165,17 @@ def _write_shadow_log(path: Path) -> None:
         _shadow_skip(CASE_218_QID, CASE_218_NAME, CASE_218_WORKSPACE, CASE_218_SKIP, run_id=CASE_218_RUN),
         _shadow_skip(CASE_217_QID, CASE_217_NAME, CASE_217_WORKSPACE, CASE_217_SHADOW_SKIP, run_id=CASE_217_RUN),
         _shadow_launch(CASE_230_QID, CASE_230_NAME, CASE_230_WORKSPACE, CASE_230_SHADOW_LAUNCH),
+        # Task-204: the shadow's ONLY pre-launch decision is the dirty-tree
+        # safety skip at 00:54:53Z — the same second the PC launched.  This is
+        # not run-occupancy (no run_id in the reason): FIX 5's
+        # shadow-more-conservative bucket.
+        _shadow_skip_reason(
+            CASE_204_QID,
+            CASE_204_NAME,
+            CASE_204_WORKSPACE,
+            CASE_204_SHADOW_SKIP,
+            reason=CASE_204_REASON,
+        ),
         _shadow_launch(PROBE_QID, PROBE_NAME, PROBE_WORKSPACE, PROBE_SHADOW_LAUNCH),
     ]
     path.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in records), encoding="utf-8")
@@ -158,6 +197,8 @@ def _pc_log_real_slice() -> str:
         f"00:41 LAUNCHED {PROBE_NAME} {PROBE_RUN}\n"
         f"01:04 shadow-filed {CASE_230_NAME}.json {CASE_230_QID}\n"
         f"01:05   HOLD {CASE_230_NAME} - kimi at capacity\n"
+        f"17:54 shadow-filed {CASE_204_NAME}.json {CASE_204_QID}\n"
+        f"17:54 LAUNCHED {CASE_204_NAME} {CASE_204_RUN}\n"
     )
 
 
@@ -233,7 +274,31 @@ def test_exact_real_cases_verdicts(tmp_path: Path):
 
     assert by_name[PROBE_NAME]["verdict"] == "probe", by_name[PROBE_NAME]
 
-    assert data["summary"] == "entries=5  agree=2  phantom=1  unobserved-race=1  probe=1  observable-agreement=2/3"
+    # FIX 5 / task-204: dirty-tree safety skip at-or-before the PC launch —
+    # agreement-in-intent, never scored as missed.
+    entry_204 = by_name[CASE_204_NAME]
+    assert entry_204["verdict"] == "shadow-more-conservative", entry_204
+    assert entry_204["pc_run_id"] == CASE_204_RUN
+    # pc_ts is the log's minute stamp (17:54 PT 09-22 = 00:54Z 09-23, seconds 0);
+    # the run_id's exact 00:54:53Z stamp is the compare instant.
+    assert entry_204["pc_ts"] == _utc("2026-09-23T00:54:00")
+    assert entry_204["shadow_ts"] == CASE_204_SHADOW_SKIP  # the same second as the launch
+    assert entry_204["shadow_reason"] == CASE_204_REASON
+    assert entry_204["shadow_queue_id"] == CASE_204_QID
+    assert "safety check" in entry_204["detail"]
+    assert "agreement-in-intent" in entry_204["detail"]
+    # It must never be folded into missed/shadow-only/agreement tallies:
+    assert data["summary"] == (
+        "entries=6  agree=2  phantom=1  shadow-more-conservative=1  "
+        "unobserved-race=1  probe=1  observable-agreement=2/3"
+    ), data["summary"]
+
+    # Every instance listed individually by the FIX 5 instance printer:
+    assert "shadow-more-conservative instances" in output
+    assert f"entry={CASE_204_NAME}" in output
+    assert f"queue_id={CASE_204_QID}" in output
+    assert f"pc_run_id={CASE_204_RUN}" in output
+    assert CASE_204_REASON in output
 
 
 def test_queue_name_map_defaults_to_pc_log_shadow_filed_lines(tmp_path: Path):
@@ -246,6 +311,7 @@ def test_queue_name_map_defaults_to_pc_log_shadow_filed_lines(tmp_path: Path):
         CASE_217_QID: CASE_217_NAME,
         PROBE_QID: PROBE_NAME,
         CASE_230_QID: CASE_230_NAME,
+        CASE_204_QID: CASE_204_NAME,
     }
     by_name = {e["name"]: e for e in data["entries"]}
     # Joining by PC-log-derived names means the real cases connect:
@@ -331,6 +397,62 @@ def test_probe_never_scores_phantom_or_missed(tmp_path: Path):
     assert "observable-agreement=2/3" in data["summary"]
 
 
+def test_task_204_safety_skip_is_shadow_more_conservative(tmp_path: Path):
+    """Task-204 (overseer FIX 5, exact values): PC run 20260923T005453Z_c1724ef3
+    launched 00:54:53Z; the shadow's only pre-launch decision is
+    'workspace LongHorizon-Harness occupied: dirty tree' at 00:54:53Z.
+
+    The reason contains the word ``occupied`` but names NO run — it is a
+    dirty-tree safety check, not run-occupancy — so a naive run-id match would
+    mis-bucket it.  It must classify as ``shadow-more-conservative``:
+    agreement-in-intent, never missed, never shadow-only.
+    """
+    pc_log = (
+        "17:54 shadow-filed 9999zv-204-memory-death-reason.json q-5573d2ee7cb64715\n"
+        "17:54 LAUNCHED 9999zv-204-memory-death-reason 20260923T005453Z_c1724ef3\n"
+    )
+    shadow_records = [
+        _shadow_skip_reason(
+            "q-5573d2ee7cb64715",
+            "9999zv-204-memory-death-reason",
+            "/work/LongHorizon-Harness",
+            _utc("2026-09-23T00:54:53"),
+            reason="workspace LongHorizon-Harness occupied: dirty tree",
+        ),
+    ]
+    pc_path = tmp_path / "pc.log"
+    pc_path.write_text(pc_log, encoding="utf-8")
+    shadow_path = tmp_path / "shadow.jsonl"
+    shadow_path.write_text(
+        "".join(json.dumps(r, sort_keys=True) + "\n" for r in shadow_records), encoding="utf-8"
+    )
+
+    pc_decisions, _, _ = cs.parse_pc_log(pc_path, log_date=datetime(2026, 9, 22, tzinfo=cs.PC_TZ))
+    shadow_decisions, _ = cs.parse_shadow_log(
+        shadow_path, queue_names={"q-5573d2ee7cb64715": "9999zv-204-memory-death-reason"}
+    )
+    reports = cs.compare_streams(pc_decisions, shadow_decisions)
+    assert len(reports) == 1
+    r = reports[0]
+    assert r.verdict == "shadow-more-conservative", r
+    assert r.pc_run_id == "20260923T005453Z_c1724ef3"
+    assert r.pc_ts == _utc("2026-09-23T00:54:00")
+    assert r.shadow_ts == _utc("2026-09-23T00:54:53")
+    assert r.shadow_reason == "workspace LongHorizon-Harness occupied: dirty tree"
+    assert r.shadow_queue_id == "q-5573d2ee7cb64715"
+    # Not folded into the other buckets' semantics:
+    assert r.verdict not in ("missed", "self-occupied", "agree", "shadow-only")
+
+
+def test_legend_states_shadow_more_conservative_meaning(tmp_path: Path):
+    code, output, data = _run_main(tmp_path, _pc_log_real_slice(), extra_args=["--pc-date", "2026-09-22"])
+    assert code == 0, output
+    assert "shadow-more-conservative (1):" in output
+    assert "AGREEMENT-IN-INTENT" in output
+    assert "safety check" in output
+    assert "NEVER" in output
+
+
 def test_self_occupied_skip_is_never_missed(tmp_path: Path):
     """A shadow skip naming the PC's own run for the same entry is
     self-occupied, even when it lands within the PC-minute tolerance."""
@@ -355,8 +477,11 @@ def test_self_occupied_skip_is_never_missed(tmp_path: Path):
     assert "same run" in reports[0].detail
 
 
-def test_foreign_occupied_skip_is_missed(tmp_path: Path):
-    """A shadow skip naming a DIFFERENT run is a genuine missed launch."""
+def test_foreign_occupied_skip_is_shadow_more_conservative(tmp_path: Path):
+    """FIX 5: a shadow skip naming a DIFFERENT run is occupancy by a run other
+    than this entry's own PC run — a workspace safety check — so it is
+    shadow-more-conservative (agreement-in-intent), no longer missed (the FIX 5
+    spec supersedes the pre-FIX-5 classification)."""
     pc_run_id = "pcrun123"
     foreign_run_id = "foreignrun999"
     pc_log = (
@@ -365,6 +490,39 @@ def test_foreign_occupied_skip_is_missed(tmp_path: Path):
     )
     shadow_records = [
         _shadow_skip("q-abc123def4567890", "missed-test", "/work/missed-test", _utc("2026-09-23T03:01:30"), run_id=foreign_run_id),
+    ]
+    pc_path = tmp_path / "pc.log"
+    pc_path.write_text(pc_log, encoding="utf-8")
+    shadow_path = tmp_path / "shadow.jsonl"
+    shadow_path.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in shadow_records), encoding="utf-8")
+
+    pc_decisions, _, _ = cs.parse_pc_log(pc_path, log_date=datetime(2026, 9, 22, tzinfo=cs.PC_TZ))
+    shadow_decisions, _ = cs.parse_shadow_log(shadow_path, queue_names={"q-abc123def4567890": "missed-test"})
+    reports = cs.compare_streams(pc_decisions, shadow_decisions)
+    assert reports[0].verdict == "shadow-more-conservative"
+    assert "safety check" in reports[0].detail
+
+
+def test_genuine_non_safety_skip_is_missed(tmp_path: Path):
+    """A shadow skip whose reason is NOT a safety check (no dirty tree, no
+    unpushed branch, no run occupancy at all) remains a genuine missed."""
+    pc_run_id = "pcrun123"
+    pc_log = (
+        "20:00 shadow-filed missed-test.json q-abc123def4567890\n"
+        f"20:01 LAUNCHED missed-test {pc_run_id}\n"
+    )
+    shadow_records = [
+        {
+            "schema_version": 2,
+            "type": "queue.shadow_skip",
+            "ts": _utc("2026-09-23T03:01:30"),
+            "payload": {
+                "queue_id": "q-abc123def4567890",
+                "trio": "kimi",
+                "workspace": "/work/missed-test",
+                "reason": "kimi at capacity",
+            },
+        },
     ]
     pc_path = tmp_path / "pc.log"
     pc_path.write_text(pc_log, encoding="utf-8")
