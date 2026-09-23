@@ -256,9 +256,12 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     if unknown_trios:
         raise ProjectConfigError(f"unknown queue trio(s): {_names(unknown_trios)}")
     # ``database_url`` is a legitimate key (``queue.py`` reads it to build the
-    # PgQueueStore), so the validator must accept it even though the flattened
-    # result deliberately does not carry it onward yet — threading the DSN
-    # through the loader is the documented cutover step.
+    # PgQueueStore) and the flattened result carries it onward so
+    # ``_select_queue_store`` receives the DSN. The URL itself never contains
+    # the password: deployments supply it out-of-band via the
+    # ``LH_HARNESS_DB_PASSWORD`` environment variable (name only, never a
+    # value), which ``pg_queue._resolve_connection_url`` appends at connect
+    # time.
     unknown_queue_keys = set(queue) - {
         "trios",
         "capacity",
@@ -346,12 +349,16 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         # If present but not int, raise error
         if "max_retries" in capacity:
             raise ProjectConfigError("[queue.capacity].max_retries must be an integer")
+    database_url = queue.get("database_url", "")
+    if not isinstance(database_url, str):
+        raise ProjectConfigError("[queue].database_url must be a string")
     return {
         "trios": normalized_trios,
         "capacity": normalized_capacity,
         "backend": normalized_backend,
         "observe": observe,
         "occupancy_ignore_dirty": occupancy_ignore_dirty,
+        "database_url": database_url.strip(),
     }
 
 

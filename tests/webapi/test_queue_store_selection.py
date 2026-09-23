@@ -208,12 +208,14 @@ def test_real_loader_parses_fixture_config(tmp_path: Path) -> None:
     assert project.get("queue", {}).get("backend") == "file"
 
 
-def test_real_config_flattener_drops_database_url(tmp_path: Path) -> None:
-    """Documented wiring gap: the flattened ``project`` config carries the
-    ``backend`` choice but not ``database_url``, so a real deployment with
-    ``backend = "postgres"`` would fail loudly at startup (never silently fall
-    back to the file store). The selector still needs the DSN, so cutover
-    requires threading the URL through the config loader."""
+def test_real_config_flattener_carries_database_url(tmp_path: Path) -> None:
+    """Inverse of the old gap test: the real loader now threads ``database_url``
+    through ``_flatten_queue_table`` into the flattened ``project`` config, so a
+    real deployment with ``backend = "postgres"`` reaches
+    ``_select_queue_store`` with the DSN and gets a ``PgQueueStore``. The DSN
+    here is synthetic (``FAKE_DSN``, loopback) and the connection underneath is
+    mocked -- no live database is ever contacted; the password always comes
+    from the ``LH_HARNESS_DB_PASSWORD`` env NAME, never a value in config."""
     config = tmp_path / "config.toml"
     config.write_text(
         "\n".join(
@@ -228,4 +230,9 @@ def test_real_config_flattener_drops_database_url(tmp_path: Path) -> None:
     project = real_load_run_defaults(config)
     queue = project.get("queue", {})
     assert queue.get("backend") == "postgres"
-    assert "database_url" not in queue
+    assert queue.get("database_url") == FAKE_DSN
+    conn_patch, migrate_patch = _pg_conn_patches()
+    with conn_patch, migrate_patch:
+        store = _select_queue_store(tmp_path / "runs", project)
+    assert isinstance(store, PgQueueStore)
+    assert store.database_url == FAKE_DSN
