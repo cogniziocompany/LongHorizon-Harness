@@ -1574,12 +1574,9 @@ class RunSupervisor:
             spec = (role_configs or {}).get(role)
             if not spec:
                 continue
-            command.extend(
-                [
-                    f"--{role}-agent={spec['agent']}",
-                    f"--{role}-model={spec['model']}",
-                ]
-            )
+            command.append(f"--{role}-agent={spec['agent']}")
+            if spec.get("model"):
+                command.append(f"--{role}-model={spec['model']}")
             if spec.get("reasoning_effort"):
                 command.append(f"--{role}-reasoning-effort={spec['reasoning_effort']}")
             if spec.get("mcp_profile"):

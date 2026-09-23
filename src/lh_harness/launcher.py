@@ -121,6 +121,32 @@ def _classify_failure_cause(text: str) -> str | None:
     return None
 
 
+def _role_configs(
+    agent: str,
+    model: str | None,
+    mcp_profile: str | None,
+    auditor_mcp_profile: str | None = None,
+) -> dict[str, dict[str, str]]:
+    """Role specs for a queue launch, with unset fields left out.
+
+    A None model or profile must be omitted, not stringified: the worker
+    command renders ``--<role>-model=None`` and the run dies on its own
+    reservation check (cutover 168, 2026-09-23). The trio's mcp_profile goes
+    to manager and executor only; the auditor takes ``auditor_mcp_profile``
+    when configured, else the service's read-only default.
+    """
+    configs: dict[str, dict[str, str]] = {}
+    for role in ("manager", "executor", "auditor"):
+        spec: dict[str, str] = {"agent": agent}
+        if model:
+            spec["model"] = model
+        profile = auditor_mcp_profile if role == "auditor" else mcp_profile
+        if profile:
+            spec["mcp_profile"] = profile
+        configs[role] = spec
+    return configs
+
+
 def _now() -> float:
     return time.time()
 
@@ -712,10 +738,7 @@ class Launcher:
         agent = trio.get("agent", "codex")
         model = trio.get("model")
         mcp_profile = trio.get("mcp_profile")
-        role_configs = {
-            role: {"agent": agent, "model": model, "mcp_profile": mcp_profile}
-            for role in ("manager", "executor", "auditor")
-        }
+        role_configs = _role_configs(agent, model, mcp_profile, trio.get("auditor_mcp_profile"))
         run_id: str | None = None
         # Workspace branch guard: never launch onto another task's branch
         # (measured defect, 2026-09-16: runs 7784478f under PR #108 and
@@ -771,7 +794,9 @@ class Launcher:
                 workspace=workspace,
                 max_rounds=entry.max_rounds,
                 prompt_language="en",
-                mcp_profile=mcp_profile,
+                # Per-role profiles live in role_configs; a run-wide profile
+                # would also land on the auditor, which must stay read-only.
+                mcp_profile=None,
                 base_check=entry.base_check or None,
                 workspace_base_mode=base.mode,
                 workspace_base_summary=base.summary(),
