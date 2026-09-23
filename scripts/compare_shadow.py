@@ -144,6 +144,7 @@ _SHADOW_SKIP_RUN = re.compile(r"has active run\s+(?P<run_id>\S+)")
 # occupancy skip instead reads ``workspace <ws> has active run <run_id>``.
 _SHADOW_SKIP_SAFETY = re.compile(
     r"dirty tree|dirty worktree|uncommitted|unpushed|not pushed|ahead of|"
+    r"no upstream|commits not on|"
     r"occupied:\s*dirty|occupied:\s*unpushed|occupied:\s*uncommitted",
     re.IGNORECASE,
 )
@@ -257,6 +258,12 @@ def parse_pc_log(
                 seen_since = True
             else:
                 counts["before_since"] += 1
+                # The name map is log-wide: an entry is shadow-filed a few
+                # lines before its LAUNCHED line, which may be the anchor.
+                pm_line = _PC_LINE.match(line)
+                sm = _PC_SHADOW_FILED.match(pm_line.group("body")) if pm_line else None
+                if sm:
+                    queue_names[sm.group("qid")] = sm.group("name")
                 continue
         m = _PC_LINE.match(line)
         if m is None:

@@ -545,3 +545,25 @@ def test_legend_prints_evidence_meaning(tmp_path: Path):
     assert "UNOBSERVED" in output
     assert "NEVER counted against evidence item 2" in output
     assert "self-occupied" in output
+
+
+def test_since_anchor_on_launched_line_keeps_earlier_shadow_filed_name(tmp_path: Path):
+    # Real window: the entry is shadow-filed a few lines BEFORE its LAUNCHED
+    # line, so anchoring --since on the LAUNCHED line must not drop its name.
+    code, output, data = _run_main(
+        tmp_path,
+        _pc_log_with_stale_head(),
+        extra_args=["--since", f"LAUNCHED {CASE_221_NAME}", "--since-date", "2026-09-22"],
+    )
+    assert code == 0, output
+    by_name = {e["name"]: e for e in data["entries"]}
+    assert by_name[CASE_221_NAME]["verdict"] == "agree"
+
+
+def test_no_upstream_unpushed_skip_is_a_safety_check():
+    # Real CT110 skip reason seen for 222 on 2026-09-23 08:51Z.
+    reason = (
+        "workspace /home/harness/work/LongHorizon-Harness occupied: checked-out "
+        "branch has no upstream and carries commits not on origin/main"
+    )
+    assert cs._SHADOW_SKIP_SAFETY.search(reason)
