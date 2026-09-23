@@ -1371,13 +1371,28 @@ class RunSupervisor:
                 if lifecycle == "failed" and (
                     report_reason or not report or _missing_completion_evidence(report, report_status)
                 ):
-                    reason = (
-                        report_reason
-                        if report_reason
-                        else _MISSING_COMPLETION_EVIDENCE
-                        if report
-                        else "worker disappeared without a final report"
-                    )
+                    if report_reason:
+                        reason = report_reason
+                    elif report and _missing_completion_evidence(report, report_status):
+                        reason = _MISSING_COMPLETION_EVIDENCE
+                    else:
+                        # No report and no report_reason: try to attribute the
+                        # death to the memory limit.  The worker log is the
+                        # run-local stream the launch itself opened (see
+                        # ``_launch_worker``), not a file under the result-log
+                        # directory.
+                        worker_log = self._run_dir(run_id) / "worker.log"
+                        owner = bus.read_owner()
+                        isolation_record = owner.get("memory_isolation") if owner else None
+                        memory_reason = worker_isolation.classify_memory_death(
+                            isolation_record,
+                            worker_log=worker_log,
+                            returncode=None
+                        )
+                        if memory_reason is not None:
+                            reason = memory_reason
+                        else:
+                            reason = "worker disappeared without a final report"
                     status["failure_reason"] = reason
             elif old_status not in TERMINAL_STATUSES:
                 # Historical/non-supervised runs have no owner status file.
@@ -1398,7 +1413,18 @@ class RunSupervisor:
             status = bus.update_status(
                 lambda current: _merge_lifecycle_status(current, status)
             )
-            if status.get("status") == "failed" and status.get("failure_reason") == "worker disappeared without a final report":
+            # Persist the supervisor crash report for the two death kinds this
+            # reconciliation attributes itself: a disappearance with no report
+            # at all, and a memory kill (whose reason is produced by
+            # ``worker_isolation.classify_memory_death`` — recognized here via
+            # ``is_memory_kill_reason`` rather than a second literal compare).
+            # Other failure reasons keep the main-only behavior: the durable
+            # report.json, when one exists, is the artifact of record and must
+            # not be overwritten by a synthesized one.
+            if status.get("status") == "failed" and (
+                status.get("failure_reason") == "worker disappeared without a final report"
+                or worker_isolation.is_memory_kill_reason(status.get("failure_reason"))
+            ):
                 self._persist_failure_report(
                     run_id,
                     status=status,
