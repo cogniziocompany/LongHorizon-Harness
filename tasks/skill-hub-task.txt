@@ -1,0 +1,156 @@
+BUILD + TEST (code; the overseer runs the live registration and deploys via the runner-v2 lane): populate LiteLLM's Skill Hub (new in v1.100.0, /claude-code/plugins + /claude-code/marketplace.json) as a SECOND publication channel for the four canonical skills that the gateway-skills-mcp already serves as MCP prompts (skills-skill-<name>). Decision confirmed by Paxton: run BOTH channels, do NOT migrate; the MCP-prompt catalog stays the source of truth for every client; the Hub is an additional Claude Code-facing view. Work ONLY in /home/harness/work/ptait09-easybutt0n-ai on branch feat/skill-hub-publish (run `git fetch origin && git checkout -B feat/skill-hub-publish origin/easybutt0n-runner-v2` first); plain git; commit by EXPLICIT PATH; no push; no live calls to the gateway (fixtures; the overseer runs the baseline + registration live); no secrets (env names only: LITELLM_MASTER_KEY, LITELLM_API_KEY, SKILL_HUB_BASE_URL, SKILL_HUB_SOURCE_URL). You MAY READ /home/harness/work/cognizioware-mcp-tools (infrastructure/docker/gateway-skills-mcp/skills/*/SKILL.md, infrastructure/litellm-config.yaml lines ~101 and ~421-432, skills/README.md) - never write there; the one doc change it needs (gateway-skill-authoring/SKILL.md gains the Hub step) is delivered as a ready-to-apply patch file docs/patches/mcp-tools-skill-authoring-hub-step.patch.
+SLICES (one per round; code + tests + explicit-path commit each):
+ (1) scripts/publish-skill-hub.mjs - idempotent: reads the SAME skills/<name>/SKILL.md frontmatter the MCP server reads (name, description, version, category, keywords - never re-authored), builds the Hub entry {name, source:{source:"git-subdir", url: SKILL_HUB_SOURCE_URL, path: "<skills dir>/<name>"}, description, version, category, keywords}, POST /claude-code/plugins with master-key auth (create or update - detect existing by name, compare, skip when equal), then POST /claude-code/plugins/{name}/enable; `--dry-run` prints the plan; `--check` exits non-zero if the Hub differs from the catalog. Unit tests with a fake HTTP server + fixture SKILL.md files (create, update, no-op, enable, dry-run).
+ (2) e2e/fleet-e2e.mjs: add a `skill:hub` row beside skill:published (L211-233 pattern, add(name,status,msg), warn-level): fetch /claude-code/marketplace.json and assert every catalog skill appears; degrade to warn/skip when unreachable, with row text that says so. Test with a fixture.
+ (3) scripts/export-skills.mjs: exports the secret-free SKILL.md set (re-running the same secret scan skill:secret-free uses) into a flat layout for the PRIVATE repo cogniziocompany/cognizioware-skills (exists, README only; Paxton 2026-09-07 19:50 PT: NOTHING internal is public). Consumers clone it with a read-only deploy token: document SKILL_HUB_SOURCE_URL as https://github.com/cogniziocompany/cognizioware-skills and the per-device token env name SKILLS_REPO_TOKEN injected via git credential helper / URL rewrite in the onboarding step (scripts/onboard-device.*) and the /remote-pc skill; never commit a token. The overseer pushes the exported files to that repo and creates the deploy token.
+ (4) docs: docs/HANDOFF-LITELLM-FLEET-SKILL.md gets a "Two channels" section (MCP prompts = source of truth for all clients; Hub = Claude Code view; publish = both; drift gate rows), the operator runbook (baseline checks: GET /claude-code/marketplace.json no-auth, GET /claude-code/plugins with master key; run publish; verify /ui/skills/ shows four public skills; `/plugin marketplace add <base>/claude-code/marketplace.json` on a clean machine and install remote-pc; regression: prompts/get skills-skill-remote-pc unchanged), and the patch file for the mcp-tools authoring skill.
+HARD RULES: additive only - never touch the serving path of gateway_skills_mcp or litellm-config.yaml; no key material; explicit-path commits; no push. Completion = commits, diff stat, unit tests, the exact live commands the overseer runs on CT202 (via pct exec, never direct SSH) and the exact onboarding change that injects SKILLS_REPO_TOKEN. Auditor: no git fetch; verify names/descriptions come only from frontmatter, idempotency (second run = no-op), and the drift row is warn-level.
+
+
+
+ADDITION (Paxton 17:30 PT): the cognizioware-qa admin-config parity gate (task 11) will snapshot /claude-code/marketplace.json, /claude-code/plugins and the skills prompts/list for UAT-vs-PROD and golden parity; keep the Hub entry fields deterministic (stable ordering, no timestamps in the registered payload beyond what LiteLLM adds) and document in the handoff which fields the gate treats as equal vs differ.
+
+=== PLAN (verbatim, C:/Users/PaxtonTait/.claude/plans/adaptive-inventing-stonebraker.md, session 9db55f21) ===
+# Populate LiteLLM's Skill Hub alongside the existing MCP-prompt catalog
+
+## Handoff header — for the expert picking this up
+
+| Field | Value |
+|---|---|
+| Session ID | `9db55f21-13ac-4a93-bd73-bdc25ac7c787` |
+| Plan file | `C:\Users\PaxtonTait\.claude\plans\adaptive-inventing-stonebraker.md` |
+| Repo / working dir | `c:\Users\PaxtonTait\source\ptait09-easybutt0n-ai` |
+| Branch @ plan time | `easybutt0n-runner-v2` @ `55c667c` (16 uncommitted entries, all untracked: `logs/`, `graphify-out/`, `.vscode/pty-mcp-server/`, `.env.bak-relay`, `openwebui/mcpo.config.json.bak-fleetchat`) |
+| Sibling repo (primary edit target) | `c:\Users\PaxtonTait\source\cognizioware-mcp-tools` — `cogniziocompany/cognizioware-mcp-tools` (**private**) |
+| Authored | 2026-09-07 15:58 PDT |
+| Author host / user | `PTAIT09` / `PaxtonTait` (prax211) |
+| Scratchpad | `C:\Users\PAXTON~1\AppData\Local\Temp\claude\c--Users-PaxtonTait-source-ptait09-easybutt0n-ai\9db55f21-13ac-4a93-bd73-bdc25ac7c787\scratchpad` |
+| Gateway target | CT202 `192.168.21.161:4000` on ptait01 (`192.168.21.110`), `/opt/cognizioware-mcp-tools` |
+| Gateway routes | `https://litellm.easybutt0n.ai` (grey-cloud direct) and `https://litellm-gateway-api.cognizioware.com:4000` — **same box** |
+| LiteLLM version | v1.100.0 (upgraded from 1.93.0 on **2026-09-07** — see plan `plan-to-get-this-vast-rivest.md`) |
+| Access to prod | SSH `root@192.168.21.110` → `pct exec 202` (never direct-SSH CT202) |
+| Blast radius | `litellm-config.yaml` and the MCP aggregate are fleet-wide. Gateway down = fleet down. This plan is **additive** and must not touch the serving path of `gateway_skills_mcp`. |
+| Status | Ready for handoff. Research complete; decision confirmed with user (run both channels, do **not** migrate). |
+
+**Operator ground rules (from repo CLAUDE.md + prior incidents):**
+- Never `docker compose up` without `--env-file mcp-tools.env` (bare up → empty `DATABASE_URL` → LiteLLM boots broken).
+- Never `docker compose down -v`.
+- `access_groups` on a prompts-only MCP server is load-bearing — omit it and the server is silently filtered out of the aggregate for group-scoped keys (`litellm-config.yaml:418`).
+- Skills are hard-gated secret-free. Never put a key in a SKILL.md; reference env-var names only.
+- `created-skills/fleet/remote-pc/SKILL.md` in *this* repo is canonical; the copy under `gateway-skills-mcp/skills/remote-pc/` is a verbatim mirror and must never be edited directly.
+
+## Context
+
+The LiteLLM UI at `litellm.easybutt0n.ai/ui/skills/` shows **"No skills found"**, which looked
+like our custom-skill work had regressed.
+
+**Nothing regressed.** The Skills registry is a *brand-new feature* that arrived with the
+LiteLLM upgrade **1.93.0 → v1.100.0 on 2026-09-07** (`cognizioware-mcp-tools/infrastructure/docker-compose.yml:32-34`).
+It is a second, independent registry we have never written to. Our skills are live and working
+on that same box through a different channel.
+
+### What we actually built, and where it lives
+
+Skills are served as **MCP prompts**, deliberately:
+
+> "LiteLLM has no native 'skills' concept. We reuse the MCP **prompts** channel — the same
+> channel the existing `gateway-guides-mcp` uses." — `cognizioware-mcp-tools/skills/README.md`
+
+- `gateway-skills-mcp` serves every `skills/<name>/SKILL.md` in its image as MCP prompt
+  `skill-<name>`, plus a `skills-index` catalog prompt.
+- Registered at `cognizioware-mcp-tools/infrastructure/litellm-config.yaml:421-432`
+  (`gateway_skills_mcp`, `access_groups: ["repo-tools","dev-tools"]`), aliased `skills` at line 101
+  — hence the `skills-skill-<name>` prompt names.
+- Live catalog (4): `audio-qa`, `gateway-skill-authoring`, `litellm-gateway-quickstart`, `remote-pc`.
+- `remote-pc` was delivered and verified live **2026-08-29**
+  (`docs/HANDOFF-LITELLM-FLEET-SKILL.md:3`, status ✅ DONE).
+- Drift-gated by [e2e/fleet-e2e.mjs:211-233](e2e/fleet-e2e.mjs#L211-L233):
+  `skill:registry`, `skill:secret-free` (hard fails) and `skill:published` (warn).
+- `litellm.easybutt0n.ai` and `litellm-gateway-api.cognizioware.com` are two routes to the
+  **same** CT202 router (192.168.21.161 on ptait01) — so the skills are on the very host
+  in the screenshot.
+
+### Why we are adding, not migrating
+
+Full migration was considered and rejected on two findings from the LiteLLM docs:
+
+1. **LiteLLM does not host skill content.** The registry stores only a pointer:
+   `{"source":{"source":"git-subdir","url":"https://github.com/org/repo","path":"..."}}`.
+   Claude Code clones from that URL — and **both our repos are private**
+   (`cogniziocompany/cognizioware-mcp-tools`, `cogniziocompany/ptait09-easybutt0n-ai`),
+   so every consumer would need git credentials.
+2. **The registry is Claude Code-only.** Cursor, Codex, ChatGPT, curl and Open WebUI reach
+   skills today *only* through MCP prompts — which was the entire design rationale
+   ("no local skill loader needed").
+
+So: **one canonical SKILL.md, two publication channels.** The MCP-prompt catalog stays the
+source of truth for all clients; the Skill Hub becomes an additional Claude Code-facing view.
+
+## Approach
+
+### 1. Confirm the live baseline (read-only, do first)
+- `GET https://litellm.easybutt0n.ai/claude-code/marketplace.json` (no auth) — confirm the
+  registry is empty rather than misconfigured.
+- `GET /claude-code/plugins` with the master key — confirm the admin API is present on v1.100.0.
+- Run `npm run test:fleet` with `LITELLM_API_KEY` set and read the `gateway:skill` /
+  `skill:published` rows to prove the MCP catalog is currently serving.
+  Note: those rows degrade to `warn`/`skip` when the gateway is unreachable, so a green run
+  does not by itself prove the mirror is current — read the row text, not just the exit code.
+
+### 2. Resolve the private-repo access question (blocking for step 3)
+The `git-subdir` source must be clonable by each consumer. Decide between:
+- a GitHub PAT / deploy key on consumer machines, or
+- a dedicated **public** skills-only repo containing just the secret-free SKILL.md files.
+
+The second is the better fit — the catalog is already required to be secret-free
+(`skill:secret-free` is a hard gate), so publishing those four files publicly costs nothing
+and removes all credential distribution. Recommend that unless you object.
+
+### 3. Register the four skills
+Per skill, `POST /claude-code/plugins` with master-key auth, then
+`POST /claude-code/plugins/{name}/enable` to publish. Fields: `name`, `source` (git-subdir),
+`description`, `version`, `category`, `keywords`. Descriptions and names come straight from
+each SKILL.md frontmatter — do not re-author them.
+
+Script this as a small idempotent Node script (`scripts/publish-skill-hub.mjs`) that reads the
+same `skills/<name>/SKILL.md` frontmatter the MCP server reads, so the two channels cannot
+diverge in name/description.
+
+### 4. Extend the drift gate
+Add a `skill:hub` row to [e2e/fleet-e2e.mjs](e2e/fleet-e2e.mjs) beside the existing
+`skill:published` check: fetch `/claude-code/marketplace.json` and assert every skill in the
+MCP catalog also appears in the Hub. Follow the existing `add(name, status, msg)` pattern and
+keep it `warn`-level, consistent with `skill:published`.
+
+### 5. Document it
+Update `docs/HANDOFF-LITELLM-FLEET-SKILL.md` and
+`cognizioware-mcp-tools/infrastructure/docker/gateway-skills-mcp/skills/gateway-skill-authoring/SKILL.md`
+so "publish a skill" means *both* channels — otherwise the next skill added will silently
+appear in only one and this exact confusion recurs.
+
+## Critical files
+
+| File | Change |
+|---|---|
+| `cognizioware-mcp-tools/.../gateway-skills-mcp/skills/*/SKILL.md` | unchanged — stays canonical |
+| `scripts/publish-skill-hub.mjs` | **new** — idempotent registration script |
+| `e2e/fleet-e2e.mjs` | add `skill:hub` drift row near L211-233 |
+| `docs/HANDOFF-LITELLM-FLEET-SKILL.md` | document the dual channel |
+| `.../skills/gateway-skill-authoring/SKILL.md` | add the Hub step to the authoring workflow |
+
+## Verification
+
+1. `/ui/skills/` lists all four skills, marked public.
+2. `GET /claude-code/marketplace.json` returns four entries.
+3. On a clean machine: `/plugin marketplace add https://litellm.easybutt0n.ai/claude-code/marketplace.json`,
+   install `remote-pc`, confirm the body matches `created-skills/fleet/remote-pc/SKILL.md`.
+4. `npm run test:fleet` — `gateway:skill`, `skill:registry`, `skill:secret-free`,
+   `skill:published` and the new `skill:hub` all pass.
+5. Regression: `prompts/get skills-skill-remote-pc` still returns the body, proving the
+   MCP channel is untouched.
+
+## Security finding (unrelated, worth acting on)
+
+`.env.bak-relay:21` contains a **plaintext `LITELLM_MASTER_KEY`**. It is untracked, but it is
+on disk in the working tree. Recommend rotating that key and deleting the file. Flagging only —
+not part of this plan's scope.

@@ -1,0 +1,16 @@
+{
+ "name": "9999zn-212-verify-cgroup-mechanism-live",
+ "task_file": "C:/tmp/task212-verify-mechanism.txt",
+ "workspace": "LongHorizon-Harness",
+ "max_rounds": 2,
+ "trio": "kimi",
+ "note": "FILED+QUEUED 2026-09-18 21:35 PT by SCHEDULED TICK, appended to TAIL of active band (no reordering). Purpose: close RUNBOOK-worker-rss-bound-live-verify.md step 6 (real-episode proof) -- the last acceptance item on tasks 202/208/211. This tick already ran the runbook's steps 1-5 for real: deployed main (40b2dd8, task 211's self-relocation fix) to CT110, confirmed Delegate=memory pids live, and ran tests/test_worker_rss_bound.py as the harness user inside the delegated cgroup (sole-resident via `exec setpriv`, not a forked child, per the code's own sole-resident requirement) -- ALL 4 TESTS PASS including the two that previously failed/skipped with EBUSY. Verification-ONLY task, makes no code changes, opens no PR, 1 round expected. ALL-SYNTHETIC trio per Paxton 2026-09-17 13:45 PT convention (trio=kimi maps to all-:synthetic-anthropic via launch_queue.py fallback, matching task 211/211b). Overseer will read CT110's journalctl for this run's own \"worker memory isolation: mechanism=...\" line as the actual proof, separate from the run's own report.",
+ "task_source": "task_file",
+ "run_id": "20260919T042718Z_c2ccaecb",
+ "roles_bound": {
+  "manager": "kimi-k3:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-19T04:27:18.852583+00:00"
+}

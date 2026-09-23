@@ -1,0 +1,52 @@
+TASK 214 - IMPLEMENT THE CURE TASK 213 SPECIFIED: VENDOR THE azure-mcp TOOLCHAIN INTO A BUILT IMAGE.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+
+WHY THIS EXISTS AS A SEPARATE TASK: task 213 did the diagnosis and shipped the GUARD (PR #178, merged
+52a76d6) - the analysis, the ops-doctor amber row for a container sitting above 90% of its own cap, and
+its tests. It did NOT implement the fix it recommended. So today the leak still runs: ~2,000 child
+kills a day inside a 4 GiB cap. 213 is done; this is the half that stops the bleeding.
+
+WHAT 213 ESTABLISHED (measured - inherit it, do not re-derive):
+  - Attribution, medium-high confidence: the azmcp CHILD processes, not the supergateway parent.
+    Evidence: PID 1 (supergateway) never dies and RestartCount is 0, while the cgroup reports
+    oom 4246 / oom_kill 2024 and memory.peak exactly at the 4 GiB ceiling - children dying, parent
+    surviving.
+  - The namespace is DEGRADED, NOT DOWN, which corrects the fleet's own records: tools/list through the
+    gateway with `x-mcp-servers: azure` returns 71 tools in 0.3 s, and a live azure-subscription_list
+    call returns HTTP 200 after ~40 s.
+  - A SECOND, SEPARATE DEFECT was found on the way and is NOT the leak: that live call comes back with
+    an application-level 401, `CredentialUnavailableException` from azmcp's internal
+    ChainedTokenCredential. Fixing the memory does not fix the credential, and vice versa. Report it
+    with evidence; do not silently bundle it.
+
+DELIVERABLE
+ 1. A BUILT IMAGE instead of a runtime install. Today the compose command is
+    `apt-get update && apt-get install -y libssl3 && npm install -g @azure/mcp supergateway && npx
+    supergateway --stdio 'azmcp server start' ...` - so every container start pulls its whole toolchain
+    from the network, unpinned. Build it: a Dockerfile under infrastructure/docker/, apt and npm
+    versions PINNED by exact version, the entrypoint running supergateway directly. Follow the repo's
+    existing build-context pattern - deploy-mcp-tools.yml derives its build list from
+    docker-compose.yml, so a service with a `build:` context is built and pushed by the lane already.
+ 2. PROVE THE PIN. Record the resolved versions of @azure/mcp and supergateway in the PR body, and make
+    a rebuild reproducible: the same Dockerfile must yield the same versions tomorrow.
+ 3. MEASURE WHETHER IT ACTUALLY HELPS, because a vendored image alone may not stop an upstream leak:
+    after deploy, watch the container's cgroup for at least 2 hours and report memory.current,
+    memory.peak and the oom_kill delta against the pre-change baseline (oom_kill 2024 over ~22 h).
+    If the leak persists at a similar rate, SAY SO - that is a real result, and it promotes the
+    supervised-restart fallback from option to necessity.
+ 4. IF AND ONLY IF the leak persists, add the supervised restart: a scheduled, logged restart with the
+    reason recorded, so the service's own health surface shows a deliberate action rather than silent
+    worker kills. Do not add it pre-emptively; 3 decides.
+
+HARD RULES: do NOT raise the 4 GiB cap (mem_limit 4g + memswap_limit 4g) - Paxton set it explicitly,
+ACK CAP-AZUREMCP-20260917-1440, and the cap is what kept the 2026-09-11 outage from recurring. Do NOT
+edit infrastructure/litellm-config.yaml (it force-recreates the prod router). A compose change DEPLOYS
+through the lane to CT202, which is now unheld - treat a merge as a real production deploy and keep the
+change to this one service. Never print a secret; env var NAMES only. NEVER git add -A; commit by
+explicit path; git diff --stat before every commit. No @claude comment (task 117). Open the PR and STOP.
+
+DONE MEANS: azure-mcp-backend runs from a pinned, built image with no network install at start; the
+resolved versions are recorded; the post-change memory behaviour is measured against the 2024-kill
+baseline and reported honestly whichever way it comes out; and the separate credential defect is
+written up with its evidence rather than folded into this one.

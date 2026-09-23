@@ -1,0 +1,55 @@
+BUILD + TEST (mcp-cognizioware, billing service): add the ONE read endpoint that unblocks the signed-out Stripe
+return page. Work ONLY in /home/harness/work/mcp-cognizioware on branch `feat/guest-checkout-status-endpoint`
+(run `git fetch origin && git checkout -B feat/guest-checkout-status-endpoint origin/develop` first); plain git;
+commit by EXPLICIT PATH; no push; NO writes to any live system; env NAMES only.
+
+## WHY THIS EXISTS - AND WHY IT IS SMALL
+Harness run `20260909T084904Z_caad6e1a` (task 53, powerplatform) stopped and asked rather than inventing a path:
+the public Stripe return page must turn a Stripe `session_id` into `{paid, email}` for a **signed-out** buyer, and
+there is no server-side way to do it. Verified independently in this repo, 2026-09-10:
+`GuestSubscriptionController` is routed at `api/v1/guest` and exposes exactly three endpoints -
+`POST checkout-session`, `GET customer-portal`, `GET subscription`. **None accepts a Stripe session id.**
+**THE DATA ALREADY EXISTS - do not go to Stripe for it.** `GuestWebhookController` persists `CheckoutSessionId`
+on the guest checkout-intent record and already looks rows up by exactly that field
+(`FirstOrDefaultAsync(x => x.CheckoutSessionId == session.Id, ...)`). So this is a read over a row this service
+already writes. **Read `GuestWebhookController` and `GuestSubscriptionController` before writing anything** and
+follow their existing shape - DTOs, validation, logging, error envelope. Do not introduce a new pattern.
+
+## WHAT TO BUILD
+A single anonymous read endpoint on the EXISTING `api/v1/guest` controller - **do not create a new controller** -
+that takes a Stripe checkout session id and returns whether it is paid, plus the payer email.
+Return a shape that is honest about the three real states, and say in the report which you chose and why:
+ **paid** | **not yet paid / still pending** (the webhook may not have landed) | **unknown session id**.
+A pending webhook is NOT an error and must not read as one - it is the normal race immediately after redirect.
+
+## SECURITY - THIS IS AN ANONYMOUS ENDPOINT AND THAT IS THE WHOLE RISK
+It must be reachable without a login, which makes the session id the only thing standing between a stranger and
+somebody else's email address. Treat that seriously and state your reasoning in the report:
+ - Return the MINIMUM that the return page needs. Do not return subscription internals, customer ids, amounts,
+   Stripe object dumps, or anything not required to render the page.
+ - An unknown or malformed session id must return the SAME shape and timing as a known-but-unpaid one where you
+   can - do not build an oracle that lets someone enumerate valid sessions by response differences.
+ - Rate-limit or otherwise bound abuse if this repo already has a mechanism for it; if it does not, SAY SO and
+   recommend rather than inventing one.
+ - Never log the email at info level, and never log a full Stripe object.
+If you conclude the email cannot be returned safely, say that plainly and return only the paid state - a smaller
+honest endpoint is a better outcome than a leak.
+
+## TESTS
+Whatever this repo already uses; report counts, baseline first. Assert at minimum: a known paid session returns
+paid with the expected payer; a known intent whose webhook has NOT landed returns the pending state, not an error;
+an unknown session id does not disclose that it is unknown in a way a known-unpaid one would not; the endpoint
+requires no authentication; and no email appears in logs at info level.
+
+## HARD RULES
+No writes to any live system - no calls to Stripe, live or test, from this task. No credentials, keys or account
+identifiers in code, fixtures, docs or the report; env NAMES only. Do NOT modify the webhook controller's
+write path - this task only reads. Do not touch powerplatform; that is task 53's repo and it is waiting on this.
+Explicit-path commits; no push.
+Completion = commits, diff stat, which files you READ first, the response shape with the reason for it, the
+security reasoning above answered point by point, and test counts baseline-first. Auditor: read-only - verify no
+new controller was created where the existing one could carry it, that the endpoint is genuinely anonymous, that
+no more data is returned than the page needs, that an unknown session id is not distinguishable in a way that
+enables enumeration, that no email is logged at info level, and that the webhook write path is unchanged.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.

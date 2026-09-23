@@ -1,0 +1,35 @@
+TASK 154a - Legacy powerplatform sessions must render AS LEGACY, not as broken. (Item 1 of task 154.)
+
+SOURCE: sliced off task 154 by the overseer on 2026-09-14 when 154's run hit its round ceiling with
+Items 2, 3 and 4 done or in verified WIP and Item 1 NOT STARTED. Item 1 is self-contained, so it
+was cut cleanly rather than granted more rounds. Same repo, same base rules as 154.
+
+REPO / WORKSPACE: cognizioware-powerplatform   BASE ON DEVELOP (prod runs develop-derived images).
+
+WHAT IT IS
+  Sessions created through the legacy form (before the setup wizard) currently render as BROKEN in
+  FlowVisualizer.tsx and SessionDetail.tsx. They must instead render a "predates the setup wizard"
+  card with a MIGRATE button, and the Start Pipeline control must be HIDDEN for them.
+  These two files were CLEAN and UNMODIFIED when 154's run ended - nothing to reconcile.
+
+THE CAVEAT THAT MUST BE STATED IN THE PR (from 154's own audit):
+  Task 107's persistStep fix may change HOW MANY sessions land in this state, but it does NOT remove
+  the state - sessions created through the legacy form still exist. So this fix stands on its own.
+  Say that in the PR body explicitly.
+
+HARD RULES (inherited from 154)
+  - Do NOT write an archive migration. Whether legacy sessions are migrated is PAXTON'S call; the
+    Migrate button is the UI affordance only.
+  - No production data touched. Base on develop; never merge to main.
+  - NEVER git add -A; commit by explicit path; git diff --stat before every commit.
+  - Do NOT post an @claude comment (task 117).
+  - Open the PR and STOP.
+
+VERIFICATION
+  1. A unit test that renders a legacy-shaped session and asserts the card, the Migrate button, and
+     the ABSENCE of Start Pipeline. Green Vitest run quoted.
+  2. A wizard-created session still renders normally (regression case in the same test file).
+  3. Tree clean, commit shas in the report.
+
+DONE MEANS: both files changed, both test cases green, PR open on develop with the persistStep caveat
+in its body, no migration written.

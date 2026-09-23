@@ -1,0 +1,45 @@
+TASK 217 - REMOVE CLAWDTALK EVERYWHERE (Paxton: "clawdtalk is deprecated, we have to remove it and all parts")
+
+DECIDED BY PAXTON 2026-09-22. Telnyx (api.telnyx.com) is the KEEPER. ClawdTalk is the deprecated layer.
+
+================================================================================
+MEASURED INVENTORY 2026-09-22 by the interactive session - do not re-derive, verify then act
+================================================================================
+REPOS referencing clawdtalk (GitHub code search, cogniziocompany):
+  cognizioware-mcp-tools  27 files   <- the live MCP server; the hard part
+  cognizioware-clawdtalk  17 files   <- the product repo itself; 256 KB, last push 2026-08-01, NOT archived
+  cognizioware-nebo       12 files   <- PR #2 repoints sends here; Paxton chose REVERT TO TELNYX
+  ptait09-easybutt0n-ai    2 files
+  mcp-cognizioware         1 file
+  cognizioware-powerplatform 1 file
+
+LIVE AND SERVING RIGHT NOW: container `cognizioware-mcp-tools-telnyx-mcp` on CT202 (Up, healthy) publishes
+36 tools through the gateway alias `telnyx`, and **12 of them are `clawdtalk_*`** (CORRECTED tick #1611, enumerated in the DEPLOYED /app/dist of the live CT202 container: 36 = 12 clawdtalk_* + 24 telnyx-native; the earlier 20/16 split was wrong):
+  assign_number, create_assistant, create_mission, end_call, get_assistant, get_assistant_connection_id,
+  get_call_status, get_mission, list_assistants, list_missions, list_numbers, make_call, + assistant bind/chat
+  and related. Source: infrastructure/docker/telnyx-mcp/src/tools/clawdtalk-{missions,calls,assistants}.ts and
+  src/lib/clawdtalk-client.ts, wired in src/index.ts.
+ENDPOINT STATE: clawdtalk.com is UP (/health 200, /v1/calls 401 = route exists) but **/v1/messages/send is 404**.
+`CLAWDTALK_SERVER` is UNSET in the n8n/nebo containers - so nebo PR #2 would post to an empty URL.
+
+================================================================================
+SCOPE - in this order. STOP GATES ARE HARD.
+================================================================================
+STEP 1 (SAFE, do first): inventory + dependency read. For each of the 12 live clawdtalk tools, find every CALLER:
+  grep the fleet for `clawdtalk_` tool names, mcpo config, Open WebUI, n8n workflows, hive/outreach flows,
+  any skill or doc that tells an agent to use them. Write the caller list into the PR body. If ANY live caller
+  exists, name it and STOP for Paxton before deleting that tool.
+STEP 2 (code, mcp-tools): remove the clawdtalk tools/lib from telnyx-mcp, keeping the 24 telnyx-native tools
+  working. Delete src/tools/clawdtalk-*.ts and src/lib/clawdtalk-client.ts, unwire from src/index.ts, drop
+  CLAWDTALK_* env from compose/docs, update the e2e suite that asserts the telnyx tool list, update the MCP
+  namespace docs. The server must still build and serve its 24 remaining tools.
+STEP 3 (nebo): revert the send nodes to api.telnyx.com as PR #1 had them and RESTORE the hive-api outreach
+  gate that PR #2 dropped. PR #2 must not merge as-is - Paxton chose revert.
+STEP 4 (small repos): remove the stray references in ptait09-easybutt0n-ai, mcp-cognizioware, powerplatform.
+STEP 5 (the repo): ARCHIVE `cognizioware-clawdtalk` - do NOT delete it. Archiving is reversible and keeps the
+  history; deletion is not. Never use delete_repo.
+PR PER REPO. Push and STOP. DO NOT MERGE - merging mcp-tools fires the CT202 deploy lane and the telnyx-mcp
+container is recreated with 12 fewer tools; that is the overseer's call in a zero-active window.
+
+HARD RULES: no key values anywhere; the 24 telnyx-native tools must keep working (that is the acceptance test -
+read the gateway tool list back per key after deploy); if a caller turns up in step 1, stop rather than break it.

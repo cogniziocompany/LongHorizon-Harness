@@ -1,0 +1,8 @@
+{
+ "name": "05h0a-eval-gate-dead-build",
+ "task_file": "C:/tmp/eval-gate-deadbuild-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "run_id": "20260908T072322Z_57039535"
+}

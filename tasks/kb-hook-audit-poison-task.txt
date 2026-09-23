@@ -1,0 +1,96 @@
+TASK 199 - THE REPO'S OWN CLAUDE HOOK POISONS EVERY HARNESS AUDIT IN THIS WORKSPACE.
+
+SOURCE: scheduled overseer tick #481, 2026-09-17 14:16 PT. Measured, not inferred.
+
+REPO / WORKSPACE: cognizioware-powerplatform
+
+================================================================================
+THE DEFECT, AS MEASURED
+
+`.claude/settings.json` at the root of this repo is GIT-TRACKED (`git ls-files --error-unmatch
+.claude/settings.json` succeeds on CT110) and registers this hook:
+
+    PostToolUse  matcher Bash   -> python3 kb-article/kb-hook.py
+    PostToolUse  matcher Edit   -> python3 kb-article/kb-hook.py
+    PostToolUse  matcher Write  -> python3 kb-article/kb-hook.py
+    Stop                        -> python3 kb-article/kb-hook.py
+
+Every lh-harness role - manager, executor AND AUDITOR - runs Claude Code inside this workspace, so
+the hook fires in the auditor's window too and writes `kb-article/kb-hook.log` into the working
+tree. The harness integrity check sees a workspace mutation during a read-only phase and returns:
+
+    Status: blocked
+    Integrity: violation
+    Auditor read-only violation: the auditor window changed task workspace files while checking.
+    Changed paths observed: kb-article/kb-hook.log
+
+The auditor's ACTUAL findings are then demoted to "for diagnostics only" and cannot be promoted to
+audited state. The run learns nothing and the next round re-derives it.
+
+BLAST RADIUS, MEASURED ON RUN 20260917T192333Z_f23e48d2 (task 169, 8 rounds, ~106 min):
+  round 1  executor done (820 s), auditor done   -> INVALIDATED by kb-hook.log
+  round 2  invalid_plan
+  round 3  executor done (2,143 s), auditor done -> INVALIDATED by kb-hook.log
+  round 4  executor done (262 s), auditor done   -> INVALIDATED by kb-hook.log
+  round 5  invalid_plan
+  round 6  manager timeout at 1,200 s
+  round 7  executor done (188 s), auditor done   -> INVALIDATED by kb-hook.log
+  round 8  stopped by the overseer at the ceiling
+The run's own round-8 plan opens with "No fact currently carries a clean-integrity audit."
+Four strikes, same cause, across a trio that was entirely Synthetic (manager
+nemotron-3-super:synthetic-anthropic, executor kimi-k3:synthetic-anthropic, auditor
+syn:large:vision:synthetic-anthropic). This is a configuration fault, NOT a scope fault and NOT a
+model fault - do not respond to it by cutting scope or swapping models.
+
+This is not specific to task 169. EVERY task that runs in a cognizioware-powerplatform workspace
+eats the same poison, including 109 and 156.
+
+================================================================================
+WHAT TO BUILD
+
+PART A - STOP THE HOOK MUTATING THE TREE UNDER THE HARNESS (the durable fix, in this repo)
+
+Make `kb-article/kb-hook.py` a no-op when it is running as an lh-harness role. The harness exports
+`LH_HARNESS_CLAUDE_ROLE` into the role's environment; guard on it:
+
+  - At the very top of the hook, before any file is opened for writing: if
+    `os.environ.get("LH_HARNESS_CLAUDE_ROLE")` is set, exit 0 immediately, writing nothing.
+  - VERIFY the variable's real name and that it is actually present in a role process before you
+    rely on it. Read it from the running service on CT110 rather than trusting this file:
+    `pct exec 110 -- tr '\0' '\n' < /proc/<role-pid>/environ | grep -i LH_HARNESS`.
+    If the variable is NOT exported to roles, say so plainly in the PR and fall back to PART B as
+    the primary fix rather than inventing a variable.
+
+PART B - DO NOT LEAVE THE LOG IN THE TREE AT ALL
+
+  - Add `kb-article/kb-hook.log` to `.gitignore` (it is currently untracked-and-visible, which is
+    what the integrity check reports).
+  - Better: point the hook's log at a path OUTSIDE the working tree (e.g. under `$TMPDIR`), so no
+    ignore rule is load-bearing. An ignored file is still a workspace mutation - confirm which of
+    the two the harness integrity check actually keys on before choosing, by reading the harness
+    check itself in LongHorizon-Harness rather than guessing.
+
+PART C - PROVE IT
+
+Do not claim this fixed until you have a CLEAN auditor round in this workspace:
+  - Run the hook's trigger path by hand under a set `LH_HARNESS_CLAUDE_ROLE` and show the log file
+    is not created or not modified (stat before/after, not "it should be").
+  - Then show a harness round in this repo whose auditor reports `Integrity: clean`.
+A green test suite is NOT the evidence here; the evidence is an auditor report.
+
+================================================================================
+BOUNDARIES
+
+  - Do NOT delete the kb-article feature or its hook for ordinary interactive use - it exists for a
+    reason. Guard it; do not remove it.
+  - Do NOT change anything under `.github/workflows/` - this task is not a CI change, and the run
+    token is refused workflow pushes by permission anyway.
+  - Do NOT touch task 154's or task 165's uncommitted work in the pp workspaces.
+  - The workspace may be sitting on `fix/ruflo-drift-preflight`. Branch from `origin/develop`.
+
+LANE: this repo is BRANCH-PER-ENV; landing on `develop` deploys DEV ONLY. That is the correct and
+sufficient destination for this change. Do NOT promote it, do not dispatch promote.yml, do not
+touch `release` or `main`.
+
+FINISH: commit, push, and open the PR yourself (the run holds a scoped GH_TOKEN), then STOP.
+Do not merge - merging is the overseer's.

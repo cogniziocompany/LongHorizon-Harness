@@ -1,0 +1,9 @@
+{
+ "name": "05h3b-billing-health-live-hang",
+ "workspace": "mcp-cognizioware",
+ "task_file": "C:/tmp/billing-health-live-hang-task.txt",
+ "pool": "kimi",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "run_id": "20260908T115217Z_e8e6b000"
+}

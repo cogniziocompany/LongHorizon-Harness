@@ -1,0 +1,9 @@
+{
+  "name": "0008-55-orchestrator-migration",
+  "task_file": "C:/tmp/orchestrator-migration-task.txt",
+  "workspace": "LongHorizon-Harness-b",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "run_id": "20260909T042235Z_848a6ea8",
+  "note": " || STATE = MERGED, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in a triage of every undispositioned failed/cancelled entry. The run ended without a disposition note, but its work SHIPPED: branch feat/orchestrator-migration -> LongHorizon-Harness PR #9 is MERGED at 29235d5. This was a RECORDS gap, not a work gap: nothing needs relaunching. LIVE/VERIFIED still require the usual lane and read-back evidence."
+}

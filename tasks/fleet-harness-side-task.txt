@@ -1,0 +1,86 @@
+TASK 77a - lh-harness side: make an unregistered fleet node IMPOSSIBLE to mistake for an idle one
+
+THIS IS STEP 1 OF 3. Paxton set the sequence explicitly on 2026-09-09:
+  1. (THIS TASK) change the lh-harness code so it meets the requirements
+  2. the overseer deploys lh-harness and verifies fleet.easybutt0n.ai shows the node
+  3. (TASK 77b) the mcp-tools e2e suite + page wording, then re-run the mcp-tools pipeline
+
+Do NOT do 77b's work here. Do NOT write the e2e suite. Do NOT touch the mcp-tools repo.
+
+## WHY THIS EXISTS - read off the live system 2026-09-09, do not re-derive
+
+    GET https://fleet.easybutt0n.ai/api/fleet/nodes  ->  200  []
+
+The Fleet Window renders, its header pill says "connected", and it shows Nodes 0 / Active 0 / Gates 0 /
+24h Events 0 over "No fleet nodes registered." Paxton read that as the site being down. It is not down. It
+has nothing to display, and NOTHING anywhere reports that as a fault.
+
+Root cause on CT110:
+
+    lh-harness.service has EnvironmentFile=/home/harness/.lh-harness-secrets.env   (correct path)
+    that file holds LH_HARNESS_FLEET_URL / _NODE / _LABELS / _KEY, all present and non-empty
+    service started        2026-09-08 07:33:15 UTC
+    secrets file modified  2026-09-08 09:08:54 UTC   <- 95 minutes LATER
+    LH_HARNESS_FLEET* in the running process environ: 0   (counted from /proc/<MainPID>/environ)
+
+systemd reads EnvironmentFile ONCE at process start. The variables were added after the last start, so the
+harness has never held them and has never registered. Nothing is misconfigured; the config was never loaded.
+Hydra registers fine because it is a separate service (repo cognizioware-hydra, on corsairai300) with its own
+configuration - do NOT touch Hydra.
+
+THE REAL DEFECT IS NOT THE MISSING RESTART. It is that a harness which CANNOT register is, from every
+surface we have, indistinguishable from a harness with nothing to report. That is the same family as a test
+that reports green forever, and it is why this sat unnoticed for a day.
+
+## WHERE THE CODE IS - established, do not go looking
+
+  - src/lh_harness/fleet/reporter.py   - the fleet registration/reporting code
+  - tests/fleet/test_reporter.py       - existing tests. EXTEND these, do not start a new test module.
+  - src/lh_harness/webapi/server.py and src/lh_harness/webapi/protocol.py - serve /api/meta, which today
+    already returns a `capabilities` object and flags such as `mcp_gateway_configured`.
+
+## SCOPE - three things, all small
+
+1. STARTUP DETECTION. If the LH_HARNESS_FLEET_* variables are missing or incomplete, log at WARN naming the
+   MISSING VARIABLE NAMES - names only, NEVER values. "Incomplete" matters as much as "absent": three of
+   four set is a misconfiguration that must be loud, not a silent partial start.
+
+2. EXPOSE IT ON THE EXISTING /api/meta. Add a sibling flag in the same style as `mcp_gateway_configured`
+   (name it something equally plain, e.g. `fleet_configured`). Alongside it, expose enough to diagnose
+   without shell access: whether a registration has ever succeeded, and the LAST registration attempt's
+   outcome and error string if it failed.
+   **DO NOT ADD AN ENDPOINT.** /api/meta already exists and is already what the deploy script reads.
+   RULE 2 applies: extend what exists. If you find yourself adding a route, STOP and say so in the report.
+
+3. TESTS. Extend tests/fleet/test_reporter.py to cover: all four variables present -> configured true;
+   none present -> configured false and the WARN names all four; a PARTIAL set -> configured false and the
+   WARN names only the missing ones. Report counts, baseline first.
+
+## WHAT THE DEPLOY WILL DO WITH THIS (context - not your work)
+
+The overseer's deploy script already restarts the service and then reads /api/meta:
+
+    systemctl restart lh-harness && sleep 6 && systemctl is-active lh-harness
+    curl ... http://127.0.0.1:8799/api/meta | python3 -c "... print('mcp_gateway_configured:', ...)"
+
+The overseer will extend that same check to assert the new flag and FAIL the deploy if the harness comes
+back unregistered. That script is NOT in this repo - do not look for it, do not write it. Your job is to
+make the flag exist and be trustworthy. If the flag's meaning has a subtlety the deploy check must know
+about (for example: configured-but-not-yet-registered immediately after boot, and how long registration
+normally takes), SAY SO PLAINLY in the PR body - that is the handoff.
+
+## HARD RULES
+
+ - Work in the LongHorizon-Harness repo. Branch off main, PR to main, DO NOT MERGE.
+ - Do NOT restart lh-harness, do not deploy, do not touch CT110, do not touch Hydra, do not touch mcp-tools.
+ - Env NAMES only, never values. Do not ask for credentials - everything you need is above.
+ - No new endpoint. No config-reload machinery: the restart requirement is a documented constraint, not a
+   bug to engineer around. Add ONE line wherever .lh-harness-secrets.env is already described saying that
+   changes to it need a service restart to take effect.
+
+## DONE MEANS
+
+A PR against main where: an unconfigured or partially-configured harness logs a WARN naming the missing
+variables; /api/meta carries the new flag plus last-attempt outcome; tests/fleet/test_reporter.py covers
+all three cases; the one-line doc is added; and the PR body states any timing subtlety the deploy-time
+check needs to know. Report test counts, baseline first.

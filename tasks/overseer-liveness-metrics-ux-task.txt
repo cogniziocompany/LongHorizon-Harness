@@ -1,0 +1,286 @@
+TASK 145 - Fold the overseer's per-tick liveness metrics into the EXISTING fleet/ops web UX.
+
+REPO / WORKSPACE: cognizioware-mcp-tools  (ops-control-center lives here; the fleet view is hydra)
+Source: Paxton 2026-09-10, session [93d1c0] (93d1c025-00d3-534e-8b73-9c1cd6143e00), read-only review.
+That session is NOT the overseer. The overseer is longhorizon-harness-99 [2df7a7], session
+5321285c-..., cron f91de072, owner of C:/tmp/queue and LEDGER.md.
+
+================================================================================
+THE PROBLEM, stated as the reviewer found it
+================================================================================
+Every five minutes the overseer computes a handful of numbers BY HAND and types them into a report
+or, worse, into a static page. The reviewer checked whether the outstanding fleet work already
+builds these into the web UX. **It does not - on either surface.** So the numbers exist only in
+chat scrollback and a ledger, and they go stale the moment they are written.
+
+THE METRICS THE OVERSEER COMPUTES BY HAND EACH TICK:
+
+  A. CEILING PREDICTION for every active role episode:
+       elapsed vs budget  ->  seconds remaining  ->  ABSOLUTE wall-clock time it will die
+       worked example the reviewer verified: 3600 - 2809 = 791 s remaining;
+       01:21:23Z + 791 s = 01:34:34Z = 18:34:34 PDT
+       budgets: cli_executor 3600 s, auditor 1800 s, manager 1200 s,
+                and a separate auditor_format_repair sub-step at 120 s
+  B. TRAJECTORY GROWTH as the real liveness signal:
+       current bytes, and whether they are GROWING or FROZEN, with "frozen since <timestamp>"
+       compared against the known size at which a comparable episode previously died
+       (task 69 died at 13,357,549 bytes; task 125 died at 9,704,631)
+  C. INFRA, per tick: CT202/CT204/CT210/CT110 disk %, ptait07 thin-pool Data%,
+       router /health/liveliness, launcher + quota-watcher alive, Ollama keys N of 7,
+       Synthetic tokens remaining
+
+================================================================================
+*** RULE 2 - NO SPEC DRIFT. EXTEND, DO NOT ADD A SURFACE. ***
+================================================================================
+There are exactly three surfaces and each answers ONE question:
+
+  fleet.easybutt0n.ai   the wallboard for every lh-harness run. RUN DETAIL LIVES HERE ONLY.
+                        -> metrics A and B belong HERE.
+  ops.easybutt0n.ai     INFRASTRUCTURE HEALTH ONLY. Seven routes: /, overview, catalog, e2e,
+                        certs, admin-centres, audit. **THERE IS NO /doctor ROUTE** - the doctor
+                        script renders on /overview.
+                        -> metric C belongs on /overview, extending what is already there.
+  Hydra (corsairai300)  device fleet and control plane; the only WRITE surface. NOT for this.
+
+**DO NOT CREATE A NEW PAGE, VIEW OR ROUTE.** Before writing anything, CHECK WHETHER A VIEW ALREADY
+EXISTS AND EXTEND IT. The ops doctor already has a `check_disk` with an 80% threshold and CT202
+rootfs targets - metric C is largely a rendering and threshold-surfacing job, not a new collector.
+If this task starts drifting toward a fourth surface or a duplicate panel, CUT IT BACK AND SAY SO.
+
+================================================================================
+*** THE HARD DEPENDENCY - READ THIS BEFORE PLANNING ANY FLEET WORK ***
+================================================================================
+**fleet.easybutt0n.ai HAS NEVER RECEIVED A SINGLE PAYLOAD.** Measured on CT110 /api/meta:
+
+    fleet_configured      True
+    fleet_ever_succeeded  FALSE
+    fleet_last_ok         False
+    fleet_last_error      HTTP 413
+
+Every push is rejected as too large. `reporter.py` IS deployed at /home/harness/release-src. So the
+wallboard is not merely empty - it has never worked. **That is task 114 (747-114-fleet-heartbeat-413)
+and it BLOCKS metrics A and B.** Building a fleet view on an emitter that cannot deliver is building
+on nothing.
+
+SO: if 114 has not landed, DELIVER METRIC C (ops /overview) AND STOP, and say plainly that A and B
+are BLOCKED ON 114 by name. Do not fake it with a poller that bypasses the emitter - that would
+duplicate the very surface 114 exists to feed.
+
+RELATED, DO NOT DUPLICATE: task 134 (992-134-harness-queue-postgres) owns getting the QUEUE into the
+API. `GET /api/queue` and friends ARE already deployed on CT110 (22 endpoints); nothing writes to
+them, so they answer {pending:0,launched:0,done:0,failed:0}. Queue counts are 134's job, not this
+task's. This task is about RUN LIVENESS and INFRA.
+
+================================================================================
+GET THE ARITHMETIC RIGHT - the overseer got it wrong by quoting instead of reading
+================================================================================
+ 1. Remaining = budget - elapsed. Render BOTH the raw pair and the derived remainder, so a reader
+    can check the subtraction.
+ 2. Absolute death time must be shown in BOTH UTC and the operator's local zone, computed from a
+    clock READ AT RENDER TIME, never from a hardcoded offset. The overseer repeatedly quoted
+    "~18:34" from an offset it had asserted rather than measured, and was wrong about whether that
+    moment had already passed.
+ 3. A budget counts time spent QUEUED as well as computing. On a single-slot local model two runs
+    serialise, so an episode can burn its whole budget waiting for a slot. If you can distinguish
+    queued from computing, do; if you cannot, SAY SO on the surface rather than implying the number
+    means compute time.
+
+================================================================================
+THE READER TRAPS THIS SURFACE MUST NOT REPEAT
+================================================================================
+ * **`updated_at` in the /api/runs LIST IS NOT A LIVENESS SIGNAL.** It read 68 minutes stale while
+   the snapshot showed a round recorded 4.9 minutes earlier. Do NOT drive a freshness indicator
+   from it.
+ * **A frozen trajectory means a request IS IN FLIGHT, not that the run is dead.** One request ran
+   ~14 minutes and returned. Render "frozen for N min" as a NEUTRAL fact, not a failure.
+ * **The Ollama GIN access log writes ONLY ON COMPLETION**, so an in-flight request is invisible
+   there. Never infer "no work happening" from an absent log line.
+ * The GIN line is `POST     "/api/chat"` - QUOTED and MULTI-SPACE; a naive grep matches nothing.
+   `docker logs --since` parses a bare timestamp as HOST LOCAL time, not UTC.
+ * **A cached 200 proves nothing about a backend.** Count arrivals, not status codes.
+
+================================================================================
+SCOPE AND DELIVERY
+================================================================================
+ * Metric C on ops /overview: extend the existing doctor rendering. Surface the 80% disk threshold
+   so it ALARMS VISIBLY rather than merely being computed - both the 2026-09-08 CT202 fill (which
+   hit 100%, killed the router for an hour and destroyed 23 runs) and the 09-10 climb were SILENT
+   on every operator surface. That visibility is the single highest-value item in this task.
+ * Metrics A and B on the fleet wallboard, ONLY if 114 has landed.
+ * No new collectors where one exists. No new routes. No secrets in code, fixtures or docs - env
+   var NAMES only.
+ * NEVER the bare gateway /health - it fans a completion out to every configured model including
+   paid and GPU ones. Use /health/liveliness.
+ * Do NOT edit infrastructure/litellm-config.yaml - any edit force-recreates the CT202 prod router.
+ * Never git add -A; commit by explicit path; check git diff --stat first.
+ * Do NOT merge. Open the PR and STOP.
+
+DONE MEANS: the disk threshold is VISIBLY alarming on /overview at 80%, verified by reading the
+rendered page and not by the check returning a number; metrics A and B are either live on the fleet
+wallboard or explicitly reported as BLOCKED ON 114; and no fourth surface was created.
+
+================================================================================
+*** DEDUP - READ THIS BEFORE PLANNING. TWO QUEUED TASKS ALREADY TOUCH THESE SURFACES. ***
+================================================================================
+The overseer scanned the queue before creating this task and found two neighbours. They are NOT the
+same work, but the boundary is narrow and must be respected or this duplicates queued effort.
+
+  TASK 113  `golden-runs-operator-surfaces` (blocked/, gated behind task 111)
+            Golden QA RUNS for every operator surface: ops.easybutt0n.ai (7 routes, NO /doctor),
+            fleet.easybutt0n.ai, the Hydra web UX, billing admin on CT100. It copies
+            e2e/golden-path/run.mjs from powerplatform and asserts, via a NETWORK LEDGER, that a
+            page rendered AND its data loaded.
+            **113 TESTS THE SURFACES. THIS TASK ADDS CONTENT TO THEM.**
+            DO NOT build a test harness here. DO NOT add golden-run infrastructure. If you find
+            yourself writing a page-render assertion, you are in 113's scope - stop.
+
+  TASK 77b  `721-77b-fleet-e2e-mcp-tools` (blocked/, gated behind task 114)
+            Fleet REGISTRATION e2e. Correctly blocked because GET /api/fleet/nodes returns [] -
+            the heartbeat POSTs every run that has ever existed (265 runs, 763 KB gzipped) and the
+            endpoint 413s it.
+            **That 763 KB figure is the concrete shape of the 114 blocker** and is why metrics A
+            and B here cannot land first: the emitter cannot deliver a payload at all.
+
+ORDERING THAT FALLS OUT OF THIS, and it is not negotiable:
+    114 (fix the 413)  ->  then 77b (registration e2e) AND metrics A+B of this task
+    111 (BMAD specs)   ->  then 113 (golden runs over whatever the surfaces then show)
+    metric C (ops /overview infra alarming) is INDEPENDENT of all of the above and can land now.
+
+So if you can only do one thing: **DO METRIC C.** It is unblocked, it is the highest-value item
+(both silent CT202 disk fills were invisible on every operator surface), and it does not collide
+with 113 or 77b.
+
+================================================================================
+*** ADDED BY PAXTON 2026-09-10 18:45 PT - SYNTHETIC CREDIT/REQUEST METERING ***
+================================================================================
+Add to the fleet/ops reporting, as part of metric C:
+
+    Weekly credits    3.28%    regenerates 2% ($2.40) in 2 h 05 m
+    Five-hour requests 100%    500 per pack; +5% of total every 15 min (= +25 req);
+                               full regeneration from zero takes five hours
+
+*** AND FIX THE CHECK THAT PRODUCES THIS NUMBER, BECAUSE IT IS WRONG TODAY. ***
+
+`check_synthetic_quota()` in infrastructure/docker/ops-control-center/doctor/ops_doctor.py (~line
+1123) does NOT ask Synthetic anything. It runs a psql query against OUR OWN database, sums tokens,
+and compares the total to a hardcoded weekly ceiling of 625,900,000. On 2026-09-10 that estimate
+read "0 tokens remaining this week (625,900,000 used of 625,900,000)" while the REAL Synthetic
+dashboard showed 3.28% weekly credit remaining and 100% of the five-hour request allowance unused.
+
+**The consequence was not cosmetic.** The launcher gates on this check
+(`synthetic_quota_exhausted()` in launch_queue.py). A false "exhausted" pinned the fleet at
+DEGRADED_CAP=2 for an entire evening with 23 tasks queued, and the only reason any Synthetic work
+ran at all is that the gate is written to FAIL OPEN on error.
+
+WHAT THE REAL METERS ARE - there are TWO and the doctor models NEITHER correctly:
+  1. REQUESTS: 500 per five hours, regenerating 5% of total (25 requests) every 15 minutes.
+     Plentiful today.
+  2. CREDITS: a weekly dollar allowance, regenerating ~2% every ~2 hours (~1%/hour).
+     **This is the scarce one and therefore the one that should drive any gate.**
+  A token count summed from our own SpendLogs is a PROXY for neither, and it drifts.
+
+SO: report BOTH meters, label them as requests-vs-credits rather than "quota", show the regeneration
+rate alongside the level (a number that refills is not the same as a number that does not), and stop
+presenting a locally-summed token estimate as if it were the provider's own figure. If the real
+figures cannot be obtained from Synthetic, SAY the number is a local estimate ON THE SURFACE rather
+than printing it as fact - that mislabelling is what cost a full evening of capacity.
+
+================================================================================
+*** ADDED 2026-09-10 19:05 PT - MECHANISM DETAIL FOR METRIC C. ***
+Source: plan C:\Users\PaxtonTait\.claude\plans\sequential-purring-neumann.md, session [93d1c0].
+This section was in that plan and was DROPPED when the plan's three deliverables were
+collapsed into this one task. It is restored here verbatim in intent. Metric C above says
+WHAT to show; this says HOW to obtain it and where the honest limits are.
+================================================================================
+
+C-1. TURN THE POINTER ROWS INTO MEASURED ONES.
+`check_disk()` (infrastructure/docker/ops-control-center/doctor/ops_doctor.py ~L608, targets in
+targets.json under "disk") emits CT204 / CT210 / CT110 as WARN "pointer" rows - a row that exists
+but carries no number. **Only CT202 is actually measured.** A pointer row is worse than no row: it
+occupies the space where an operator expects a reading.
+  Get the real numbers from the Proxmox API with a READ-ONLY PVEAuditor token:
+      /nodes/{node}/lxc/{vmid}/status/current   ->  disk / maxdisk
+  PVEAuditor is sufficient. Do NOT use a root token. Env var NAMES only in code and docs.
+
+C-2. ADD PVE HOST ROOTFS ROWS - ptait01, corsairai300, ptait07.
+      /nodes/{node}/status
+  The doctor today sees only containers, so a host filling up is invisible on every surface. ptait07
+  root hit 74% on 2026-09-10 and nothing reported it; it was found by hand.
+
+C-3. ADD AN LVM THIN POOL DATA% ROW.
+      /nodes/{node}/storage/{thinpool}/status   ->  used / total
+  Reuse the EXISTING warn-80 / crit-90 env thresholds; do not invent new ones. A thin pool at 100%
+  is not the same failure as a filesystem at 100% - it takes every volume on it down at once, and
+  it is the one number with no warning from inside the guest.
+
+C-4. RECONCILE THE OLLAMA KEY COUNT.
+  `_check_cloud_key_quota` probes OLLAMA_CLOUD_KEY_n and its operator hint names keys **1..4**.
+  C:/tmp/keys_status.txt on PTAIT09 tracks **7**. One of those two is wrong. Find out which by
+  reading, and make the hint match reality - an operator reading "2 of 4 OK" when 7 exist is being
+  told a wrong number, which is this task's entire subject.
+
+C-5. STATE THE LIMIT INSTEAD OF INVENTING A PROBE.  *** THIS ONE IS NOT OPTIONAL. ***
+  **Launcher liveness and quota-watcher liveness ARE NOT REACHABLE FROM CT202.** They run on
+  PTAIT09 (launch_queue.py, C:/tmp/keys_status.txt). The doctor runs on CT202 and cannot see that
+  machine. So:
+    - Do NOT build a probe for them. Any probe you can write from CT202 would be measuring
+      something else and labelling it "launcher alive" - the same class of defect as the Synthetic
+      token estimate (task 146).
+    - You MAY propose, in the PR description only, a PTAIT09 -> ops push of a small status JSON.
+      PROPOSE. Do not build it; it needs a decision from Paxton about what pushes from that box.
+    - Until then these two stay on the overseer's per-tick readout, and the surface should say so
+      rather than omitting them silently.
+
+C-6. LABEL ESTIMATES AS ESTIMATES. Same rule as task 146: any figure this surface renders that was
+  computed locally rather than read from the owning system must SAY SO on the surface. Do not print
+  an estimate in the same visual register as a measurement.
+
+================================================================================
+*** METRICS A+B DELIVERY MECHANISM - also from plan [93d1c0], also dropped. ***
+Read this ONLY if task 114 has landed. If it has not, metrics A and B stay BLOCKED and this
+section is not yours to act on yet.
+================================================================================
+
+**THE TRANSPORT ALREADY EXISTS. DO NOT BUILD A POLLER.** Spec: docs
+`harness-fleet-window-2026-09-07.md:71,73`. Built today in cognizioware-mcp-tools fleet-admin:
+`src/server.js:605` defines the `/fleet` socket.io namespace with `run:<host>:<runId>` rooms, and
+`web/src/lib/socket.ts` is the client. The path is:
+
+    CT110 _heartbeat()  --HMAC POST /harness/heartbeat-->  fleet-admin
+      -> upsert fleet.harness_runs.summary  (server.js ~L293 - already stores whatever arrives)
+      -> socket.io /fleet emits 'run.updated' -> room run:<host>:<runId> + broadcast
+           -> OverviewPage (every run's card) and RunPage (one run's window)
+
+**THE MEASURED GAP:** `server.js:310` emits `run.updated` carrying ONLY
+`{host, run_id, status, round}`. `socket.ts:9` types it the same way, and BOTH
+`OverviewPage.tsx:37` and `RunPage.tsx:86` merge only status/round. So today the liveness object
+would land in Postgres and reach the page **only on a manual reload.**
+  FIX: add `liveness` (and `active_role`) to that emit, widen the `onRunUpdated` type, merge it in
+  both pages. The payload is fstat numbers only, so the socket frame stays fixed-size as episodes
+  grow. No schema change is expected - `summary` is jsonb and persists whatever arrives - but
+  VERIFY that rather than assuming it.
+
+**KEY-MAPPING CHECK, do this before believing any of it works:** the harness sends
+`build_run_summary` keys (`id`, snake_case) while ingest reads `run.runId || run.run_id`,
+`startedAt`, `activeRole` (server.js ~L302-305). Find where the reporter maps them, or `liveness`
+lands silently under a key nothing reads - a 200 that proves nothing, which is the exact failure
+class this whole task is about.
+
+RENDERING - extend `RunSummaryCard` (RunPage.tsx:217) and `RunCard` (OverviewPage.tsx:150).
+**NO NEW PAGE.**
+  Overview card, one compact line under `role . round`:   `13m 11s left . 8.76 MB`
+      plus an amber `frozen 4m 47s` pill past a stated threshold.
+  Run page, full rows:  `Ends 01:34:34 UTC . 18:34:34 PT`  |  `13m 11s left`
+                        `8.76 MB . +44 KB/min . 66% of prior death (13.36 MB)`
+                        `Frozen since 01:16:36 UTC (4m 47s)`
+  * **Count down CLIENT-SIDE from the absolute `ceiling_at`**, with a 1s local timer between 30s
+    heartbeats. Accuracy then never depends on push frequency and nobody converts a zone in their
+    head. Add `formatDateTz(ts, tz)` to `web/src/lib/format.ts:3` and render UTC **and**
+    America/Los_Angeles explicitly - never browser-local only.
+  * **"Frozen" and "heartbeats stopped" are DIFFERENT STATES and must stay visually distinct.**
+    Frozen is judged from `last_growth_at`; a dead heartbeat already shows via `node.last_heartbeat`.
+    Collapsing them would report a healthy in-flight request as a dead run.
+  * Add a vitest in `web/src/__tests__/RunPage.test.tsx` covering the tz rendering and the frozen
+    threshold.
+  * LANE NOTE: mcp-tools merges recreate the CT202 prod router. **The overseer picks the window.**
+    Open the PR and STOP.

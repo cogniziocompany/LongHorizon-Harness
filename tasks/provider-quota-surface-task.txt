@@ -1,0 +1,237 @@
+TASK 84 - surface PROVIDER QUOTA/USAGE on ops.easybutt0n.ai, for Synthetic and Ollama
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools.
+
+Paxton, 2026-09-09: "create a task to add this to the ops.easy... admin center as with ollama
+https://docs.ollama.com/api/usage".
+
+## WHY THIS MATTERS - it is not a nice-to-have
+
+On 2026-09-09 Synthetic's weekly credit ran out with **no warning on any operator surface**. Six
+concurrent harness runs died inside sixty seconds. Paxton had to spend his **once-a-month** manual
+quota reset to recover, and the page then read "0 usage resets available, next in 29 days and 23
+hours" - **so there is no second rescue until ~2026-10-09.**
+
+Measured from `LiteLLM_SpendLogs` on CT202 over the 12 hours to 18:15Z:
+
+| backend | requests | tokens |
+|---|---|---|
+| **SYNTHETIC** | 6,808 | **367,162,337** |
+| local/other | 42,412 | 29,362,011 |
+| ollama-cloud | 78 | 1,476,145 |
+
+Synthetic's own subscription page states **625.9M tokens over 7 days** exhausted the weekly credit.
+So we burned roughly **59% of a week's allowance in half a day** and nothing showed it until requests
+started failing. **That is the gap this task closes.**
+
+## RULE 2 - EXTEND, DO NOT ADD A SURFACE
+
+ops.easybutt0n.ai has exactly seven routes: `/`, overview, catalog, e2e, certs, **admin-centres**,
+audit. **There is NO /doctor route and you must not add one**; the doctor script's results render on
+**/overview**. Paxton asked for this on the **admin-centres** page. **Extend that existing page.** Do
+not create a new route, a new view, or a second dashboard. If you conclude the data belongs on
+/overview instead (because the ops doctor already renders there), say so and justify it - but still do
+not create a new route.
+
+## WHAT IS ALREADY KNOWN ABOUT THE APIs - use this, do not re-derive it
+
+### Synthetic - THE ENDPOINT IS NOT YET PROVEN. Resolve this first.
+Docs: https://dev.synthetic.new/docs/api/overview
+
+The docs list, under "Synthetic-Specific Endpoints": **`GET/POST /quotas` - Check subscription usage**,
+with base URL `https://api.synthetic.new` and auth `Authorization: Bearer ${SYNTHETIC_API_KEY}`.
+
+**Measured 2026-09-09, and it did NOT work.** With a key proven good in the same session
+(`GET https://api.synthetic.new/openai/v1/models` -> **200**, 11 models):
+
+    GET  api.synthetic.new/quotas                -> 404
+    POST api.synthetic.new/quotas                -> 404
+    GET  api.synthetic.new/v1/quotas             -> 404
+    GET  api.synthetic.new/openai/v1/quotas      -> 404
+    GET  api.synthetic.new/anthropic/v1/quotas   -> 404
+    GET  api.synthetic.new/api/quotas            -> 404
+    GET  synthetic.new/quotas                    -> 307 -> /users/login   (session cookie, not a token)
+
+So `/quotas` as documented is either a **web-app route requiring a browser session**, or it lives at a
+path the overview page does not spell out. **Step 1 of this task is to settle that**: read the full
+docs site (not just the overview page), and if a token-authenticated endpoint exists, prove it with a
+live call and record the exact path + response shape. **If no token-authenticated endpoint exists, say
+so plainly and do not fake it** - fall back to the derived estimate in the "fallback" section below.
+Do NOT attempt to automate a browser login or store a session cookie.
+
+### Ollama
+Docs Paxton supplied: https://docs.ollama.com/api/usage - read it and use what it actually documents.
+Our Ollama surfaces: the local containers on ptait01 (`cognizioware-ollama-span` :11442,
+`cognizioware-ollama-gpu1` :11441, `cognizioware-ollama-cloud` :11438), plus Ollama Cloud accounts
+whose keys are already tracked by the launcher's key checker. Local Ollama has no billing; the value
+there is **cloud account quota**, plus loaded-model and slot state (`/api/ps`, `/api/tags`).
+
+## SCOPE
+
+1. **Resolve the Synthetic quota endpoint** as above. Record path, method, auth, and the exact JSON
+   field names for remaining credits, remaining requests, and reset time.
+2. **Add provider quota rows to the admin-centres page.** For each provider show: what is left (credit
+   and/or request allowance), the reset/regeneration time, and a plain WARN/CRIT state. Thresholds in
+   code with env overrides, matching the pattern `check_disk` already uses in
+   `ops_doctor.py` (merged today in PR #119 - **read it and follow its conventions rather than
+   inventing new ones**).
+3. **Fallback when no quota API exists.** If Synthetic exposes nothing token-authenticated, derive an
+   estimate from `LiteLLM_SpendLogs` token counts on CT202 and Synthetic's published
+   tokens-to-exhaustion figure. **If you do this, label it on the page as an ESTIMATE and say what it
+   is derived from.** A number presented as authoritative when it is inferred is worse than no number.
+   **Caveat you must handle:** `spend` in that table is **0.0000 for every one of these models** (no
+   pricing configured), so use TOKEN counts, not the spend column. And per task 82, streaming spend
+   rows fail to insert, so any total from that table is a **FLOOR, not a total** - say so on the page.
+4. **A threshold nobody sees is not a warning.** Confirm the new rows actually render on the live
+   admin-centres page, not just that the check returns data.
+
+## HARD RULES
+
+ - **Do NOT add a route or a new page.** Extend admin-centres. No /doctor route.
+ - **Env NAMES only** (`SYNTHETIC_API_KEY`), never values. Do not put a key in code, a doc, a commit
+   message, a PR body, or a test fixture.
+ - Read-only against providers. Do not purchase credits, change a subscription, or trigger a quota
+   reset - **the monthly reset is spent until ~2026-10-09 and must not be touched.**
+ - Do not automate a browser login to synthetic.new or persist a session cookie.
+ - Any change to `infrastructure/litellm-config.yaml` force-recreates the PROD router - avoid touching
+   it in this task; if unavoidable, say so prominently in the PR body.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+ - PR to `main`, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR against main that extends the existing admin-centres page with provider quota rows for Synthetic
+and Ollama; a settled, evidence-backed answer on whether a token-authenticated Synthetic quota endpoint
+exists (with the live call that proves it, or a plain statement that it does not); thresholds following
+`ops_doctor.py`'s existing pattern; anything derived rather than read labelled as an ESTIMATE with its
+basis; and confirmation that the rows RENDER on the live page.
+
+## ADDENDUM (Paxton, 2026-09-09) - VIEWING THE QUOTA PAGE, AND WHY THE OBVIOUS ANSWER IS BLOCKED
+
+Paxton: *"Then create an iframe or something we can view it from ... then we can have chat.easy agent
+exposed to their web pages and auth against them to manage and view."*
+
+**MEASURED BEFORE YOU START - an iframe will NOT work. Do not spend rounds discovering this.**
+
+    GET https://synthetic.new/quotas       -> HTTP 307,  x-frame-options: SAMEORIGIN
+    GET https://synthetic.new/users/login  -> HTTP 200,  x-frame-options: SAMEORIGIN
+    GET https://synthetic.new/             -> HTTP 307,  x-frame-options: SAMEORIGIN
+    set-cookie: S=...; Domain=synthetic.new; Path=/; HttpOnly; SameSite
+
+`x-frame-options: SAMEORIGIN` means **the browser refuses to render any synthetic.new page inside a
+frame on ops.easybutt0n.ai.** There is no header we control that overrides it - it is the remote site's
+choice. The session cookie is also `HttpOnly`, so page JavaScript cannot read or forward it.
+
+So evaluate these, in this order, and implement the highest one that is acceptable:
+
+**OPTION A - link-out (no credentials, always works).** A clearly-labelled link on admin-centres that
+opens `https://synthetic.new/quotas` in a new tab, where Paxton's own browser session authenticates.
+Zero secrets stored, zero moving parts. **Implement this unconditionally as the baseline**, because it
+is strictly better than nothing and cannot break.
+
+**OPTION B - server-side authenticated fetch, rendered as our own rows.** A small backend job logs in,
+holds the session cookie server-side, fetches `/quotas`, parses the values, and renders them as native
+rows next to the Ollama rows. This is the option that actually delivers thresholds and alerting.
+**It requires storing Synthetic web-login credentials, which is a decision for Paxton, not for this
+run.** Therefore:
+  - **This task must NOT be given credentials and must not ask for them.** Build the mechanism so it
+    reads from env NAMES that an operator populates later (e.g. a `SYNTHETIC_WEB_*` pair), document
+    exactly which names, and leave them unset.
+  - **Never write a credential into the repo, a doc, a KB article, a commit message, a PR body, a test
+    fixture, or a memory file.** Env names only.
+  - Deliver it switched OFF by default, so merging cannot start a login loop.
+  - Say plainly in the PR body that Option B needs an operator step and Paxton's go before it does
+    anything.
+
+**OPTION C - browser agent (Paxton's "chat.easy agent" idea).** We already run Playwright containers on
+CT202 (`cognizioware-mcp-tools-playwright-mcp`, `-playwright-qa1-mcp`, `-playwright-qa3-mcp`), so a
+headless authenticated session is technically available without new infrastructure. **Do not build this
+in this task.** Assess it only: state in the PR body what it would need (credential storage, session
+lifetime, what happens on MFA, how a failed login is surfaced rather than silently retried) and whether
+it is worth it once Option B exists. **Scope discipline matters more than coverage here** - this task
+is already large, and an authenticated browser agent against a paid provider's account is its own piece
+of work with its own security review.
+
+**Applies to every option:** read-only. Do not click anything that purchases credits, modifies the
+subscription, or triggers the monthly quota reset - **that reset is spent until ~2026-10-09.**
+
+**Update to DONE MEANS:** in addition to the above, the admin-centres page must carry at minimum the
+Option A link-out, and the PR body must state which of A/B/C were implemented and why, including the
+`x-frame-options: SAMEORIGIN` finding so nobody re-proposes an iframe later.
+
+## ADDENDUM 2 (Paxton, 2026-09-09) - CREDENTIAL FORM, AGENTIC PATH, AND E2E FOR BOTH
+
+Paxton, verbatim intent: *"instructions! use case: how can I access ops.easy... or any of our infra's
+admin centers, and if I can access the LLM providers' usage with API. We need a link and instruction
+how the user can. Hidden passwords/API keys R/W on the same form and then the user can copy'n'paste to
+admin center. Also this should be possible from an AI agentic standpoint with browser emulation tools.
+BOTH paths, e2e for both."*
+
+**ALREADY DONE - do not redo it.** PR #123 landed the **links** and the **instructions** on
+`/admin-centres`, including what an agent can and cannot do today. Read that page first and build on it.
+This addendum is about the two things #123 deliberately did NOT do.
+
+### PATH 1 - the human path: a masked credential form on the same page
+
+A section on `/admin-centres` where an operator can store and retrieve the credentials for these
+surfaces, so they can copy them into the provider's own login rather than hunting for them.
+
+Requirements:
+ - **Masked by default**, with an explicit reveal, and a copy-to-clipboard control that does not
+   require revealing.
+ - **Read AND write** from the same form, as Paxton asked.
+ - **Scoped to the provider/admin-centre rows already on the page** - it is a companion to that table,
+   not a general password manager. Do not build a general password manager.
+
+**SECURITY - this is the part to get right, and it is not negotiable:**
+ - `ops.easybutt0n.ai` is already behind `oauth2-proxy` on CT202. **Confirm that the new form is
+   inside that protection** and state how you confirmed it. A credential form on an unauthenticated
+   route is a breach, not a feature.
+ - **Secrets must NEVER be committed.** Not in the repo, not in a doc, not in a KB article, not in a
+   commit message, not in the PR body, not in a test fixture, not in a seed file. **Env NAMES and
+   aliases only.**
+ - Store them in a real secret store or an encrypted-at-rest store outside the image. **Do not** write
+   them into `mcp-tools.env`, `litellm-config.yaml`, appsettings, or any file the repo tracks.
+ - **This task must not be given any live credential and must not ask for one.** Build the mechanism,
+   ship it EMPTY, and document the operator step. If you need to demonstrate it, use an obvious
+   dummy value that is clearly not real.
+ - Log access to the form (who revealed what, when) to the existing audit surface - there is already
+   an `audit` route; **extend it, do not add one**.
+ - Deliver it **switched OFF by default** if that is possible without breaking the page.
+
+### PATH 2 - the agentic path: browser emulation
+
+We already run Playwright on CT202: `cognizioware-mcp-tools-playwright-mcp`,
+`-playwright-qa1-mcp`, `-playwright-qa3-mcp`. So the capability exists without new infrastructure.
+
+ - Make an agent able to reach a session-authenticated provider page (Synthetic quotas, Ollama
+   settings), read the usage values, and return them - **using a credential supplied at run time from
+   the same store as Path 1, never one baked into code.**
+ - **Handle failure honestly:** MFA, an expired session, a changed page layout, and a login that
+   simply fails must each surface as a clear, distinguishable error. **A scraper that silently returns
+   stale or zero values is worse than no scraper** - that is exactly the class of failure that let
+   Synthetic's credit hit zero unnoticed.
+ - **Rate-limit it.** Do not poll a provider's login page in a loop; a login storm looks like an attack
+   on our own account. State the interval you chose and why.
+ - Ship it **disabled by default**, requiring an explicit switch plus a credential to do anything.
+
+### E2E FOR BOTH PATHS - required, and this is the part that makes it real
+
+`e2e/suites/` is the home for these; follow the numbering and style of the existing suites.
+
+ - **Path 1 e2e:** the form renders inside the authenticated route; a written value can be read back;
+   the value is **masked in the DOM by default**; the reveal works; and - assert this explicitly - the
+   secret **does not appear in page source, logs, or any committed artefact**. Use a dummy value.
+ - **Path 2 e2e:** the browser-emulation route returns a usage value for a known fixture, **and** a
+   failed/expired login produces a distinguishable error rather than a zero or a stale value.
+   **Prove the failure case, not just the happy path.** A test that only asserts success would have
+   passed all through the incident that prompted this task.
+ - Both suites must pass with **no live provider calls and no real credentials** - stub the provider.
+   The estate rule stands: no live calls to third parties from tests.
+
+**Scope warning.** This task is now large: quota rows + thresholds + a credential form + an agentic
+path + two e2e suites. **If it runs past its rounds, land Path 1 and its e2e first and say plainly
+what is left** - Path 2 is the more valuable but also the more dangerous half, and a half-built
+scraper with stored credentials is the worst possible resting state. Cutting scope and reporting it is
+correct here; leaving something half-wired is not.

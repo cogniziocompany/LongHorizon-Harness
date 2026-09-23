@@ -1,0 +1,16 @@
+{
+  "name": "9999e-165-ruflo-patch-overlay",
+  "task_file": "C:/tmp/ruflo-patch-overlay-task.txt",
+  "task_source": "task_file",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "*** TASK TEXT REPLACED 2026-09-11 by Paxton with the version authored in planning session [5b1a13]. My earlier draft CONTAINED A PRODUCTION HAZARD and three wrong premises; the superseded draft is kept at ruflo-patch-overlay-task.txt.bak-superseded-*. ***\nTHE HAZARD, RE-VERIFIED BY ME BEFORE QUEUEING: my draft told the run to verify by doing a fresh `npm install -g` 'on ruflo-uat, NOT CT101 prod'. THERE IS NO ruflo-uat. Measured on ptait07: pct list shows exactly ONE ruflo container (CT101, prod); /opt/ruflo-uat does not exist; only ruflo-mcp.service and ruflo-daemon.service are installed; deploy-ruflo-uat.ps1 has ContainerId=101 and installs at L36 with npm install -g; and `npm prefix -g` on CT101 is /usr, with /usr/bin/ruflo resolving to /usr/lib/node_modules/ruflo/bin/ruflo.js. So my own verification step would have REVERTED CHANGE C ON PRODUCTION and reddened the blocking eval gate.\nTHREE PREMISE CORRECTIONS THAT CHANGE THE DESIGN: (1) Change A is NOT in node_modules - it is a standalone /opt/ruflo/v3 tree with NO package.json, so npm never touches it and it cannot be version-pinned; it is pinned by SHA-256 instead, which is strictly stronger. (2) Change D also survives npm install -g, because the symlink path stays valid. (3) ONLY Change C is reinstall-fragile - A and D break on CONTAINER REBUILD. So the old 'a reinstall reverts all three' premise would have produced a patch set that fails its own verification.\nNOW CARRIES: measured versions (ruflo 3.5.2, @claude-flow/cli 3.5.2, @claude-flow/mcp 3.0.0-alpha.8, sql.js 1.14.0), four pre-patch SHA-256 pins, exact hunk line numbers, a Tier-1 fixture test that gates the PR with no host at all, a Tier-2 on-box procedure for the overseer against a DISPOSABLE pct clone, the cross-repo unit move (the units live in POWERPLATFORM's deployments/ruflo/, not here), and the marker-grep-before-hash-check ordering rule. Secret hazards named: mcp-tools.env line 50 holds a live bearer token in the working tree, and the on-box ruflo-daemon.service.d/apikey.conf must never be committed. Appendix A split out as task 171. | TICK #464 2026-09-17 11:34 PT - STATE: PR. Run 20260917T154704Z_5fa5199c (at its r8/8 ceiling) pushed and opened mcp-tools PR #165 `fix/ruflo-patch-overlay` -> main ITSELF at 18:26:43Z, MERGEABLE - the scoped GH_TOKEN path working as designed, so no hand-finish was owed after all. The run was still `running` when this tick read it; if it gates at the ceiling, resolve `stop` (the PR is already open) rather than granting rounds. NEXT: review then merge; reviewDecision empty as on all 36 open PRs - report, do not buy.",
+  "run_id": "20260917T154704Z_5fa5199c",
+  "roles_bound": {
+    "manager": "kimi-k3:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-17T15:47:04.222740+00:00"
+}

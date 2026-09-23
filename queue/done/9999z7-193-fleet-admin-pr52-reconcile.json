@@ -1,0 +1,16 @@
+{
+ "name": "9999z7-193-fleet-admin-pr52-reconcile",
+ "task_file": "C:/tmp/fleet-admin-reconcile-task.txt",
+ "workspace": "/home/harness/work/ptait09-easybutt0n-ai",
+ "max_rounds": 5,
+ "trio": "kimi",
+ "task_source": "task_file",
+ "note": "*** PR 2026-09-17 12:18 PT (SCHEDULED TICK #470): completion gate `610f51403c15` on run 20260917T185213Z_71a3c714 resolved STOP after verifying from GitHub (not from the run's claim): ptait09 PR #52 OPEN/MERGEABLE/CLEAN at 56bc92e, base easybutt0n-runner-v2, EXACTLY 2 files +72/-8 - docs/FLEET-V2-ROLLOUT.md (+58/-8) and infrastructure/caddy/fleet.easybutt0n.ai.Caddyfile (+14/-0), updated 19:00:12Z after the push. The three deploy-path files are gone from the tree, so the duplication this task existed to remove is removed. DONE MEANS met; state PR. MERGE IS THE OVERSEER'S and is HELD with the rest - no run merges. Next step for 193 is a review route (task 117 triage, never an @claude comment) and then the merge. *** || Queued 2026-09-17 05:44 PT by SCHEDULED TICK #414 as the follow-up slice task 175's note authorised at tick #411 ('if it ends without closing the Caddy gap, that gap is the follow-up slice, NOT more rounds'). Run 20260917T103931Z_0d93d8a2 hit its 6/6 ceiling and was resolved stop this tick. THE OVERSEER CLOSED THE CADDY GATE FROM THE HOST - the run had no authorised path and correctly reported BLOCKED rather than approximating. Measured on CT202: cognizioware-mcp-tools-fleet-admin UP 15h healthy, created 2026-09-16T21:52:36Z, deployed from the MCP-TOOLS lane (project cognizioware-mcp-tools, /opt/cognizioware-mcp-tools/docker-compose.yml, build ./docker/fleet-admin), backed by EXTERNAL agent-db 192.168.21.154/ai_easybutt0n schema fleet (no co-located postgres), and https://fleet.easybutt0n.ai/ serves 200 through the live Caddyfile /opt/cognizioware-mcp-tools/Caddyfile. So PR #52 DUPLICATES a live deploy path -> RULE 2 says cut back, not merge. PROVEN DEFECT, not a style note: PR #52 proxies 127.0.0.1:8787 but from inside the caddy container fleet-admin:8787 -> 200 OK while 127.0.0.1:8787 -> Connection refused, and HostPortBindings=map[] (expose only, no host port). Merging it would take fleet.easybutt0n.ai from 200 to 502; the snippet's comment asserts the exact inverse. Scope is DELETE the rival compose + deploy script + env example, replace the Caddyfile with the verbatim live block, fix the docs (incl. line 65 mislabelling .154 as ct202) and the false 'read-only capture, 2026-09-18' header. Same branch, same PR #52, never merge. Appended at the END of the band - no reordering.",
+ "run_id": "20260917T185213Z_71a3c714",
+ "roles_bound": {
+  "manager": "nemotron-3-super:synthetic-anthropic",
+  "executor": "syn:large:vision:synthetic-anthropic",
+  "auditor": "kimi-k3:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-17T18:52:13.870687+00:00"
+}

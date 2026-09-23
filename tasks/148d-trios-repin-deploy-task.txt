@@ -1,0 +1,29 @@
+TASK 148d - Trio table, slice 4 of 5: RE-PIN fleet-admin into cognizioware-mcp-tools and DEPLOY.
+*** OVERSEER-EXECUTED. NOT FOR A HARNESS RUN. Sits in blocked/ so the launcher cannot take it. ***
+
+BLOCKED ON, all three:
+ 1. 148a, 148b and 148c merged into ptait09-easybutt0n-ai feat/harness-fleet-report.
+ 2. TASK 122 (azure-mcp-backend crash loop + a memory limit on every CT202 container). The mcp-tools
+    deploy lane is HELD: `docker compose up` would recreate azure-mcp-backend with no memory limit and
+    bring back the crash loop that OOM-killed the prod router on 2026-09-11.
+ 3. A decision on PR #48 in ptait09-easybutt0n-ai (see below), so the re-pin does not have to be redone.
+
+STEPS
+ - Re-pin from the MERGED feat/harness-fleet-report commit. *** NEVER re-pin from main: main has almost
+   no fleet-admin (14,836 fewer lines than the pinned branch) and re-pinning from it would delete the
+   deployed app. ***
+ - Replace infrastructure/docker/fleet-admin/ in mcp-tools with that tree and update SOURCE_REF.md to
+   the new commit. DISCARD the vendored-only WIP left by the looped 148 run (web/src/types/index.ts,
+   components/ui/table.tsx); it is preserved in /home/harness/wip-backups/mcp-tools-tree-20260914-191456.
+ - Do NOT touch infrastructure/litellm-config.yaml (any edit force-recreates the CT202 prod router).
+ - Merge through the lane; fleet.harness_trio_config is created from schema.sql on start.
+ - Apply the launcher patch from 148e to C:/tmp/launch_queue.py (backup, CRLF-aware, py_compile,
+   restart by PID, confirm process start later than the file mtime).
+
+PR #48 CONTEXT: it re-adds the whole fleet-admin to main (164 files, +27,507/-1,716, MERGEABLE,
+unreviewed) plus a harness pull backstop. The pinned branch, #48's branch and main have diverged three
+ways. Settle whether #48 merges before choosing the re-pin commit.
+
+LIVE VERIFICATION (parent spec steps 3-6) - BLOCKED ON TASK 114 until /api/fleet/nodes stops returning
+[]: launcher log shows the push succeeded; GET /api/fleet/trios returns a body matching _TRIOS tuple for
+tuple; /trios shows trios 0-1 with a green local ornith executor and 2-5 Synthetic, plus D0/D1.

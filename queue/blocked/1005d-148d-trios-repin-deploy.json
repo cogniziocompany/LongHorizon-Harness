@@ -1,0 +1,9 @@
+{
+  "name": "1005d-148d-trios-repin-deploy",
+  "task_file": "C:/tmp/148d-trios-repin-deploy-task.txt",
+  "task_source": "task_file",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 4,
+  "trio": "kimi",
+  "note": "OVERSEER-EXECUTED, NOT FOR A HARNESS RUN. BLOCKED on 148a-c merged at source, on task 122 (mcp-tools deploy lane held for the azure-mcp-backend memory limit), and on a PR #48 decision. Never re-pin from main."
+}

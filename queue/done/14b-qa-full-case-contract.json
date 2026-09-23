@@ -1,0 +1,8 @@
+{
+ "name": "14b-qa-full-case-contract",
+ "task_file": "C:/tmp/qa-full-case-contract-task.txt",
+ "workspace": "/home/harness/work/cognizioware-qa",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "run_id": "20260908T140622Z_2cf6e44f"
+}

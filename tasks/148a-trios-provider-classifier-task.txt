@@ -1,0 +1,55 @@
+TASK 148a - Trio table, slice 1 of 5: the PROVIDER CLASSIFIER and its tests.
+
+REPO / WORKSPACE: ptait09-easybutt0n-ai   (the fleet-admin SOURCE repo, cogniziocompany/ptait09-easybutt0n-ai)
+PARENT SPEC: C:/tmp/fleet-trios-table-task.txt (task 148). Read its sections for your slice; the
+payload schema, table, classifier rules and page layout there are binding. This slice exists because
+task 148 as one run looped 8 rounds with nothing completed (overseer, 2026-09-14).
+
+================================================================================
+*** BRANCH AND TREE RULES - MEASURED 2026-09-14, READ BEFORE ANY GIT COMMAND ***
+================================================================================
+ - The deployed fleet-admin is the PINNED COPY in cognizioware-mcp-tools, from branch
+   feat/harness-fleet-report at 804a4f07f779bd7b. THAT BRANCH IS YOUR BASE.
+ - Do NOT base on main: main has almost no fleet-admin (14,836 fewer lines than the pinned branch),
+   and the pinned commit is not an ancestor of main. Work built on main has nothing to change.
+ - This working tree is currently checked out on feat/fleet-window-harness-pull, the head of OPEN PR
+   #48 (a pull backstop, 164 files, unreviewed). Do not commit to it.
+ - FIRST: git fetch origin feat/harness-fleet-report:refs/remotes/origin/feat/harness-fleet-report
+   then: git checkout -b <your slice branch> origin/feat/harness-fleet-report
+   The tree was clean when measured; if git refuses, STOP and ask.
+ - Open your PR with BASE feat/harness-fleet-report, not main. A PR against main would show the whole
+   app as new and cannot be reviewed.
+ - PR #48 also edits fleet-admin/src/test/helpers.js, web/src/pages/OverviewPage.tsx and
+   web/src/types/index.ts. Keep your edits to those files ADDITIVE and small, so a later rebase over
+   #48 is mechanical. Do not touch the harness poller or harnessClient code from #48.
+
+HARD RULES (every 148 slice)
+ - Env var NAMES only: never a key, token or signature value in code, tests, docs or commits.
+ - Do NOT insert a fleet.hosts row to satisfy a foreign key; the live host is BLOCKED ON TASK 114.
+ - Do NOT edit C:/tmp/launch_queue.py, and do NOT edit cognizioware-mcp-tools at all.
+ - Never git add -A; commit by explicit path; git diff --stat before each commit.
+ - Read the individual tests, not the rollup: a green run can contain a hard-failing test.
+ - Do NOT merge, and do NOT post an @claude comment (it bills Paxton's personal subscription).
+   Open the PR and STOP.
+
+================================================================================
+SCOPE - PARENT SPEC SECTION 3 ONLY
+================================================================================
+Create fleet-admin/web/src/lib/providers.ts: a pure function from a model name to a provider label
+and colour. First match wins:
+    contains ":synthetic"  -> "Synthetic"            amber
+    starts with "ornith-"  -> "Local - ptait01 GPU"  green
+    ends with ":cloud"     -> "Ollama cloud"         blue
+    anything else          -> "Unknown"              grey, and the caller shows the raw name
+*** NEVER classify a ":pool" model as local. glm-5.3:pool was an OLLAMA CLOUD pool. *** That is the
+trap this classifier exists to avoid, so it MUST be a test case.
+
+TESTS (fleet-admin/web/src/__tests__, vitest): every row of the live table in the parent spec,
+including ornith-1.5:pool -> Local, kimi-k3:synthetic-anthropic -> Synthetic, glm-5.3:cloud ->
+Ollama cloud, and glm-5.3:pool -> Unknown (NOT local). Add an empty string and a mixed-case name.
+
+NOT IN THIS SLICE: the backend, the page, the launcher patch.
+
+DONE MEANS: providers.ts plus its test file committed on your slice branch; npm test in
+fleet-admin/web green with the individual classifier tests read; PR open against
+feat/harness-fleet-report.

@@ -1,0 +1,53 @@
+TASK 214d — make the supervised-restart script and cron actually land on CT202
+
+BACKGROUND (read before doing anything): PR #181 (merged, mcp-tools, commit bad56e84) added
+`infrastructure/scripts/azure-mcp-supervised-restart.sh` and a design doc claiming it is "deployed
+to /opt/cognizioware-mcp-tools/ by the existing sync path" with a cron line
+`47 */4 * * * root bash /opt/cognizioware-mcp-tools/infrastructure/scripts/azure-mcp-supervised-restart.sh`
+in `/etc/cron.d/azure-mcp-restart`. That claim was FALSE, verified by an overseer tick reading the
+live systems directly: the deploy ran green (all 6 jobs success, run 35484322168) and yet on CT202
+(pct exec 202, ptait01) neither the script file nor any cron.d entry exists, and there is no
+`litellm-ui-session-cleanup` cron either (the pattern the doc cited as precedent does not exist on
+the box). ROOT CAUSE, read from `.github/workflows/deploy-mcp-tools.yml`'s "Sync infrastructure
+files" step (~line 711-725 in the version read this tick): it syncs an explicit allowlist —
+`docker-compose.yml litellm-config.yaml auth-proxy.js azure-inference-adapter.js
+register-mcp-tools-stack.py` — plus `hooks/*.py` and the Caddyfile. `infrastructure/scripts/*.sh`
+is never in that list, and nothing anywhere installs a `/etc/cron.d/*` file on CT202.
+
+HARD CONSTRAINT — DO NOT EDIT `.github/workflows/*`: your run's GH_TOKEN is fine-grained,
+push+PR only, and GitHub refuses any push that touches a workflow file under `.github/workflows/`.
+A branch that edits `deploy-mcp-tools.yml` will fail to push. Do not attempt it, do not spend a
+round discovering this the hard way — solve this WITHOUT touching any workflow file.
+
+THE FIX: `register-mcp-tools-stack.py` is already in the synced allowlist above AND is already
+executed as root on every deploy (`pct exec 202 -- python3 $DEST_DIR/register-mcp-tools-stack.py`,
+`$DEST_DIR` = `/opt/cognizioware-mcp-tools`). Extend that script so, as part of its normal run, it
+idempotently:
+  1. Writes `/opt/cognizioware-mcp-tools/infrastructure/scripts/azure-mcp-supervised-restart.sh`
+     with the exact byte content of the committed file at that repo path (embed it — e.g. read it
+     via `Path(__file__).parent / "infrastructure/scripts/azure-mcp-supervised-restart.sh"` if you
+     can additionally get that one extra file into the sync allowlist by ALSO checking whether a
+     non-workflow file controls that list — if it turns out the allowlist truly only lives in the
+     workflow YAML, then embed the script's content as a string/heredoc literal directly inside
+     `register-mcp-tools-stack.py` and write it out, chmod 0755). Whichever approach you take, add a
+     unit test that fails if the embedded/derived content ever drifts from
+     `infrastructure/scripts/azure-mcp-supervised-restart.sh` in the repo, so a future edit to the
+     script can't silently go stale on CT202 again.
+  2. Installs/overwrites `/etc/cron.d/azure-mcp-restart` with exactly:
+     `47 */4 * * * root bash /opt/cognizioware-mcp-tools/infrastructure/scripts/azure-mcp-supervised-restart.sh`
+     (idempotent: safe to run every deploy, must not duplicate lines on repeat runs).
+  3. Does nothing destructive if either file already matches — this runs on every deploy, so it
+     must be a no-op diff when nothing changed.
+
+Do NOT touch the cap (`mem_limit`/`memswap_limit` stay untouched — ACK CAP-AZUREMCP-20260917-1440),
+do NOT touch PR #179/#181's already-merged content beyond what's needed to wire the install path.
+
+Prod-landing rule applies (mcp-tools deploys to CT202 prod): this must launch on an all-Synthetic
+trio; if a local/ornith executor binds, that is a bug in the launcher config, not something to work
+around — report it in your final message and stop.
+
+Push your branch and open the PR yourself (your GH_TOKEN can do this for non-workflow files) and
+STOP — do not merge. In your final report, state plainly whether you actually tested the cron
+install / idempotency (e.g. running register-mcp-tools-stack.py twice against a scratch dir and
+diffing) or whether you're asserting it without having run it — say "unverified" rather than
+claiming a test that didn't happen.

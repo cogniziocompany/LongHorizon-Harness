@@ -1,0 +1,136 @@
+TASK 126 - Fix the intermittent 502 on billing.easybutt0n.ai. TOP PRIORITY: this blocks the prod
+billing-admin path the Power Platform release work depends on.
+
+REPO / WORKSPACE: mcp-cognizioware
+
+SOURCE PLAN: `C:\Users\PaxtonTait\.claude\plans\zippy-wishing-spark.md`
+  (session `0df52f9e-228e-4949-bee6-e2cdbce2b3b1`, diagnosis complete and REPRODUCED, read-only -
+   no changes were made). **READ THAT PLAN FIRST.** It contains the full evidence and the exact
+   line numbers. This file records the scope split and the traps.
+
+================================================================================
+*** BRANCH: this is the single easiest way to waste the whole task ***
+================================================================================
+
+Lane infra lives on **`origin/develop` -> `origin/release` -> `origin/prod`**. It does **NOT**
+exist on `main`, and it does NOT exist on `docs/youtrack-gap-analysis` (the branch the plan session
+happened to be sitting on, HEAD `4a9824f0`).
+    git fetch origin && git checkout -B fix/billing-tunnel-origin origin/develop
+Promotion is carried by `.github/workflows/promote-billing.yml`. **Do not target `main`.**
+
+================================================================================
+THE DIAGNOSIS - already proven, do not re-derive it
+================================================================================
+
+`https://billing.easybutt0n.ai/admin` serves Cloudflare **502 on roughly half of all requests**.
+Two plausible theories are both WRONG and were eliminated: the hostname resolves and HAS an ingress
+rule (rule `2` on tunnel `c5fdb916-947d-4440-95b9-88742bc4dcb0`), and the origin is healthy -
+`mcp-billing-service` on CT100 was up 15h, `healthy`, image `sha-728a140`, and
+`http://192.168.21.153:20251/api/health/ready` returns **200**.
+
+The real cause is two things combining:
+
+1. **A duplicate connector on the PROD tunnel.** `/opt/mcp-cognizioware-uat/.env` line 6 sets
+   `TUNNEL_TOKEN` to a token that decodes to `"t":"c5fdb916-947d-4440-95b9-88742bc4dcb0"` - the
+   **prod** tunnel. So `billing-uat-lane-cloudflared-1` is a SECOND connector on prod. (The dev
+   lane is correct, on its own tunnel `b36c4501-88ac-481b-9005-10bc87c4d146`.)
+   The token came from the committed `cloudflare/uat.env`, which is **labelled "uat" but holds the
+   PROD token** - exactly the mistake `design/handoffs/billing-litellm-mcp-next-export.md:76`
+   warns against.
+
+2. **A container-name origin that only resolves from one connector.** Ingress rule `2` points at
+   `http://mcp-billing-service:20251`, a Docker DNS name - every OTHER rule on that tunnel uses a
+   host IP. `cloudflared-uat` sits on `mcp-cognizioware-networkk` where that name resolves;
+   `billing-uat-lane-cloudflared-1` sits on `billing-uat-lane_default` where it does **not**.
+   **Whichever connector Cloudflare happens to pick decides whether you get 200 or 502.** That is
+   the coin-flip.
+
+================================================================================
+SCOPE SPLIT - READ THIS. STEPS 1 AND 2 ARE **NOT** YOURS.
+================================================================================
+
+Steps 1 and 2 of the plan are **live production changes made outside git** - a Cloudflare dashboard
+edit and a container/env change on CT100. **A harness run must not perform them.** The overseer or
+Paxton does those, and they need Cloudflare dashboard access which this run does not have.
+
+  STEP 1 (operator): repoint ingress rule `2` on tunnel `c5fdb916-...` from
+     `http://mcp-billing-service:20251` -> `http://192.168.21.153:20251`. Dashboard-managed; the
+     gateway's Cloudflare MCP tools are READ-ONLY (`tunnel_list_routes` has no write counterpart).
+     **This alone stops the bleeding.**
+  STEP 2 (operator): retire the duplicate connector on CT100 - `docker compose stop cloudflared &&
+     docker compose rm -f cloudflared` in `/opt/mcp-cognizioware-uat`, and blank `TUNNEL_TOKEN` in
+     that `.env`. **PRE-FLIGHT FIRST:** confirm no public hostname is served ONLY by a lane
+     connector - check routes on `b36c4501-...` and confirm every hostname the lanes need also
+     appears on `c5fdb916-...` with an IP origin. If `b36c4501-...` uniquely serves a hostname,
+     keep the dev connector and scope to uat only. Expect the tunnel to drop 16 -> 12 connections
+     and stay `healthy`.
+
+**YOUR SCOPE IS STEPS 3 AND 4 - the repo changes.** They are what stops it recurring.
+
+================================================================================
+STEP 3 - repo changes (yours)
+================================================================================
+
+  - `deployments/tier/docker-compose.yml` - delete the `cloudflared:` service (~lines 53-61) and
+    its comment block. Add a header note that lane hostnames are routed by the PROD tunnel via
+    host IP, not by a per-lane connector.
+  - `deployments/tier/env.dev.example`, `deployments/tier/env.uat.example` - drop `TUNNEL_TOKEN`.
+  - `deployments/tier/README.md` - replace the per-lane-tunnel setup step with the IP-origin rule
+    on the shared tunnel. Keep and SHARPEN the existing collision-hazard note. (This deliberately
+    departs from the per-lane-tunnel intent in that README - say so.)
+  - **`cloudflare/uat.env` - THE LANDMINE.** Rename the key or add an unmistakable header saying
+    this file holds the **PROD** tunnel token (`c5fdb916-...`), not a uat one. Same for the
+    duplicate copies in `uat.env` (repo root, line 74) and `env.template` (line 76).
+    **This file is what caused the incident. Leaving it as-is invites an exact repeat.**
+  - `cloudflare/prod.config.yaml` - change the `billing.easybutt0n.ai` and
+    `mcp-cognizioware.easybutt0n.ai` origins to `http://192.168.21.153:20251` so the reference copy
+    matches live.
+  - `scripts/tests/validate_prod_tunnel_config.py` - update `BILLING_SERVICE` to match, and make
+    the guard FAIL on a container-name origin for these hostnames. A test that would not have
+    caught this is not worth keeping.
+
+================================================================================
+STEP 4 - the dev-lane 503 (separate bug found while diagnosing; in scope)
+================================================================================
+
+The dev billing lane reports `/api/health/ready` **503** because ONE pending secondary ack sets
+`degraded: true` while the secondary is `"disabled"` and `secondaryRequired: false`. **A disabled,
+not-required secondary must not be able to make the service un-ready.** This matters beyond dev:
+`promote-billing` polls `/ready`, so a permanently-degraded dev lane means the dev gate never goes
+green and promotion cannot start. Fix the readiness predicate and add a test for the
+disabled-secondary case.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **Do NOT run `openclaw doctor`** at any point - see CLAUDE.md. Unrelated here, but the work is
+   on the same box.
+ - **Do NOT `docker compose down -v`** anything on CT100. Step 2 is `stop` + `rm -f` of a SINGLE
+   service, and it is not yours anyway.
+ - Back up `/opt/mcp-cognizioware-uat/.env` to a timestamped `.env.bak-...` before any change,
+   matching the convention already in that directory.
+ - **SKIP `dotnet ef migrations add` in this repo - HAND-WRITE migrations.**
+ - No secrets in the repo, in docs, or in commit messages. **The tunnel token is a credential** -
+   refer to it by tunnel ID or env var name, never paste the token itself.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat` first.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+ - Another agent has been actively iterating `promote-billing` - CHECK before touching that
+   workflow and say so if it has moved.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+Steps 3 and 4 committed on a branch cut from **`origin/develop`**: the lane `cloudflared` service
+gone, `TUNNEL_TOKEN` dropped from both lane env examples, the README corrected, **every copy of the
+mislabelled prod token clearly relabelled**, the reference config matching live, the tunnel guard
+test updated to FAIL on a container-name origin, and the dev readiness predicate fixed with a test
+for the disabled-secondary case. Plus a short note in the PR body stating plainly that **steps 1
+and 2 are operator actions that must happen for the 502 to stop**, and that the repo change alone
+does not fix the live symptom.

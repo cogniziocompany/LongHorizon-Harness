@@ -1,0 +1,16 @@
+{
+ "name": "9999zj-213-azmcp-leak-root-cause",
+ "task_file": "C:/tmp/azmcp-leak-root-cause-task.txt",
+ "task_source": "task_file",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "note": "Queued 2026-09-19 08:24 PT by the interactive overseer [5321285c], appended to the END of the active band. THE CURE, not the shield: task 122's 4 GiB cap is merged, declared in the deployed compose file and PROVEN to hold the blast radius, but the leak behind it has no owner. Measured after ~22 h under the cap: the container sits at 3.979 GiB of 4 GiB with cgroup oom_kill 2024 and oom 4246, all confined - RestartCount 0, CT202 keeping ~11.9 GiB free, router untouched (RestartCount 0, liveliness 200). So about two thousand child kills a day, indefinitely, while the azure namespace is unreliable rather than restored. Scope: find WHICH process grows (supergateway, azmcp, or the runtime npm install the compose command performs on every start), name the fix with its cost, MEASURE whether the namespace is down or merely degraded, and add an ops-doctor row so a container pinned at its own cap stops reading as green. HARD RULE: do not raise the cap - Paxton set it explicitly (ACK CAP-AZUREMCP-20260917-1440). Number read from the queue at write time: max was 212.",
+ "run_id": "20260919T152807Z_ce57dab1",
+ "roles_bound": {
+  "manager": "kimi-k3:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-19T15:28:07.296109+00:00"
+}

@@ -1,0 +1,237 @@
+BUILD + TEST (code; the overseer runs the live spike, adds secrets, dispatches the gate and wires callers): implement PHASE 1 and PHASE 2 of the "Admin Config Parity QA Gate (UAT -> PROD)" plan below in the cognizioware-qa repo. Work ONLY in /home/harness/work/cognizioware-qa on branch feat/admin-config-parity-gate (run `git fetch origin && git checkout -B feat/admin-config-parity-gate origin/main` first; if origin/main lacks the ci/qa-gate-billing work referenced by the plan, base on origin/ci/qa-gate-billing and say so); plain git; commit by EXPLICIT PATH; no push; never touch /home/harness/venv; NO live calls to UAT/prod admin APIs, Entra or M365 (no secrets exist in this workspace - every endpoint path the plan marks "confirm" is implemented from the manifest and labelled UNVERIFIED in README for the overseer's spike). Reuse points named in the plan are mandatory: port loginPassword() from packages/runner/src/lib/ce-auth.ts:34-67, follow oidc-acceptance/ and litellm-acceptance/run-env.sh patterns, extend scripts/gate-report.mjs fromPlaywright (line ~134) with the [tag:...] prefix, keep qa-gate.yml conventions (validate job, report-status contexts, concurrency group).
+SLICES (one per round, each = files + unit tests + explicit-path commit):
+ (1) admin-config-acceptance/ scaffold: package.json, playwright.config.ts (setup-<surface> + <surface> projects, json reporter), config.ts, lib/manifest.ts (validate; ${env:X}/${secret:X} fail-fast), admin-config-manifest.yml exactly as the plan's schema (mark "confirm" paths with a `# UNVERIFIED` comment).
+ (2) lib/snapshot.ts, lib/redact.ts (length marker, never a hash), lib/parity.ts (equal/differ/ignore/present with `unless`), lib/baseline.ts, lib/tags.ts - with node:test or vitest unit tests using fixture JSON (two fake snapshots -> expected diff list; redaction; ignore globs).
+ (3) surfaces/litellm.ts + tests/litellm.spec.ts (API-only: preflight -> snapshot -> parity vs compare_to and vs golden -> results), scripts/update-baseline.mjs, run-env.sh, empty golden placeholders config-baselines/litellm/{uat,prod}.json with a README note that goldens are committed only via reviewed PR after the overseer's first run.
+ (4) scripts/gate-report.mjs tag-prefix parsing (+ test), .github/workflows/qa-gate.yml: targets admin-litellm/admin-ops/admin-billing, inputs compare_to + screens, validate rules (admin-ops only prod; compare_to != env), new `admin` job on [self-hosted, qa-host], report-status wiring; run `bash scripts/validate-workflows.sh` if present.
+ (5) Phase 2: lib/entra-login.ts (loginfmt -> passwd -> KMSI, consent Accept, "Skip for now"), lib/screens.ts (goto, networkidle + ready selector, mask, fullPage PNG), tests/setup.spec.ts (storageState per surface/env), surfaces/ops.ts + surfaces/billing.ts + their specs, scripts/contact-sheet.mjs, scripts/notify-mail.mjs (Graph sendMail via ROPC with the repo's public client id; SMTP fallback via nodemailer; AADSTS50076/50079/7000218 -> ::warning::), the `Notify by email` step (if: always(), continue-on-error).
+ (6) README "Admin config parity" section (targets, compare_to, golden update procedure, secrets table incl. ADMIN_CENTER_AI_USERNAME/PASSWORD, LITELLM_MASTER_KEY_UAT/PROD, OPS_INGEST_KEY?, ADMIN_GATE_NOTIFY_TO, ADMIN_GATE_MAIL_TRANSPORT), .env.example rows, .gitignore entries, and docs/admin-config-gate-SPIKE.md: the exact spike checklist the overseer runs on qa-host (plan Phase 0 + Verification 1-7b) with expected outputs.
+HARD RULES: no secrets or real key values; env NAMES only; redaction never hashes; no thresholds changed elsewhere; existing suites untouched; explicit-path commits; no push. Completion = commit hashes, `git diff --stat origin/main..HEAD`, unit-test summary, list of UNVERIFIED endpoints, and the caller-wiring snippets for mcp-tools (qa-gate-uat + qa-verify-prod) and mcp-cognizioware (ci.yml, build-and-deploy.yml) as a ready-to-paste doc section (the overseer wires callers after the gate is green from manual dispatch). Auditor: no git fetch; verify redact never hashes, the validate job rejects admin-ops on non-prod, gate-report keeps the old heuristic when no tag prefix, and no live calls exist in unit tests.
+
+
+ADDITION (Paxton 2026-09-07 17:30 PT): the `litellm` surface of the admin-config parity gate MUST also snapshot the two skill channels, so UAT-vs-PROD and PROD-vs-golden catch skill drift: (a) the Skill Hub (PRIVATE source repo; Paxton 19:50 PT) - `GET /claude-code/marketplace.json` (no auth) picked as `skills_hub`, sortBy name, and `GET /claude-code/plugins` (master key) picked as `skills_hub_admin` with parity rules `skills_hub[*].source.url: differ` and `skills_hub[*].name|description|version|category: equal`; (b) the MCP-prompt catalog - `POST /mcp/` prompts/list with header `x-mcp-servers: skills` picked as `skills_prompts`, sortBy name, `equal`. Add both to admin-config-manifest.yml under surfaces.litellm.endpoints + parity, add a UI page `{name: skills, path: '/ui/skills/'}` to the screenshot list, and a check that every `skills_prompts` name has a matching `skills_hub` entry (drift, warn-level). The four canonical skills today: audio-qa, gateway-skill-authoring, litellm-gateway-quickstart, remote-pc (source of truth = MCP prompts; see the sibling task 15-litellm-skill-hub in ptait09-easybutt0n-ai).
+
+
+CREDENTIALS (Paxton 2026-09-07 18:10 PT, NAMES ONLY - values live in the cognizioware-qa env files on the qa-host runner, e.g. prod.env): the CE/web-ux flows sign in with CE_USERNAME (ai-dev01@cognizio.company) / CE_PASSWORD via ce-auth loginPassword(); admin surfaces use admin_center_ai_username (Ai-dev03@cognizio.company) / admin_center_ai_password. Read them from process.env exactly like the existing suites; never print or commit values.
+
+
+ADDITION (Paxton 2026-09-07 20:40 PT) - new public hostname + "one e2e gate per admin surface" rule: the billing admin is now ALSO served at https://billing.easybutt0n.ai/admin/ (same tunnel/service as mcp-cognizioware.easybutt0n.ai; redirect URI added to the SPA app registration 5651b092-...). In admin-config-manifest.yml the billing prod env baseUrl becomes https://billing.easybutt0n.ai with `aliases: [https://mcp-cognizioware.easybutt0n.ai]`, and the snapshot asserts both names return the same /api/v1/admin/auth-config (equal) - a redirect-URI mismatch on either name is a `real` failure. Generalise: every admin surface of our infra apps gets its own gate target and manifest entry, driven by ONE data-driven surfaces list so adding an app is a manifest row, not code: admin-litellm (litellm.easybutt0n.ai/ui + litellm-gateway-api.cognizioware.com as alias), admin-ops (ops.easybutt0n.ai), admin-billing (billing.easybutt0n.ai + alias), admin-hydra (hydra.cognizioware.com, HYDRA_API_KEY bearer; snapshot /devices, /harness/nodes when present, /fleet/runs summary), admin-pihole (http://pihole.lan.easybutt0n.ai/admin + http://pihole2.lan.easybutt0n.ai/admin, Pi-hole v6 API session auth with PIHOLE_PRIMARY_PASSWORD / PIHOLE2_PASSWORD env names; snapshot dns.hosts, upstreams, gravity counts; parity equal between the two - this IS the DNS-mirror drift gate), admin-portainer (portainer.easybutt0n.ai; token env PORTAINER_API_KEY; stacks/containers list, screenshot only), admin-pgadmin (pgadmin.easybutt0n.ai; screenshot + login page only), admin-fleet-chat (chat.easybutt0n.ai; tools list contains the expected servers), admin-harness (http://192.168.21.168:8799 LH_HARNESS_WEB_TOKEN; /api/meta capabilities + profiles; runs count summary). Each target: preflight, endpoints, parity rules, ui pages; pihole/hydra/harness/portainer/pgadmin/chat are LAN-only and soft-skip off-LAN. Power Platform admin center stays deferred. Keep the gate policy (UAT blocks on drift, prod advisory) per surface. Credentials are env NAMES only.
+
+=== PLAN (verbatim, C:\Users\PaxtonTait\.claude\plans\create-a-qa-plan-cryptic-owl.md, session e426d3d2) ===
+# Admin Config Parity QA Gate (UAT -> PROD)
+
+| | |
+|---|---|
+| **Session id** | `e426d3d2-0587-4ee6-902e-18c13bc570a3` |
+| **Repo** | `cogniziocompany/cognizioware-qa` |
+| **Checkout** | `c:\Users\PaxtonTait\source\cognizioware-qa` (branch `ci/qa-gate-billing`, clean at planning time) |
+| **Plan file** | `C:\Users\PaxtonTait\.claude\plans\create-a-qa-plan-cryptic-owl.md` |
+| **Author / date** | Claude (Fable 5.1) with Paxton Tait, 2026-09-07 |
+| **Status** | Ready for handoff. Any manager can pick this up: every step names its file, its reuse point, and its verification. |
+| **Sibling repos touched** | `cognizioware-mcp-tools`, `mcp-cognizioware` (caller wiring only). `cognizioware-powerplatform` is deferred. |
+
+## Context
+
+Every repo deploys through the `qa-gate.yml` workflow in this repo, which runs a suite and posts a commit status the caller polls. Today it checks that services *work* (LiteLLM completions, billing SPA auth config, CE checkpoints). It does not check that admin *configuration* matches between UAT and PROD, and it captures no screenshots. Promotions have been going out with undetected config drift, and the biggest source is invisible to any repo scan: LiteLLM runs `store_model_in_db: true`, so models and MCP servers added through its admin UI live in Postgres and never appear in `litellm-config.yaml`. The same is true of the billing service's `app_configuration` table and the ops control center's runtime state.
+
+Decision (confirmed with the user): snapshot what the **live** system serves through its admin API and admin UI, never the repo YAML. Compare UAT against PROD live, and PROD against a committed golden. Drive every admin UI with the non-MFA O365 service account `ai-dev03@cognizio.company` (keys `admin_center_ai_username` / `admin_center_ai_password`, already in `.env` and `.env.example`, zero code references today). Capture a full-page screenshot of every admin page as evidence.
+
+Scope decisions from the user:
+- **Surfaces in v1**: LiteLLM admin, Ops command center (`ops.easybutt0n.ai`), Billing admin SPA (`mcp-cognizioware`). Power Platform admin center is deferred to a follow-up plan.
+- **Gate policy**: block the UAT gate on a UAT-vs-PROD mismatch; post-PROD runs are advisory and open an issue (mirrors how mcp-tools treats `litellm-prod` today).
+- **Custom product UX** is out of scope; it stays in the existing deeper suites.
+
+Prerequisite the user is handling: ai-dev03 is being added to the Entra group **Ai Agents-Dev**, which holds `Global.Admin` on the ops enterprise app (`2562701c-211c-44cf-bb2c-25c605ad875e`). The billing app (`5651b092-…`) has its own `Global.Admin`/`Billing.Admin` roles plus a DB allow-list; ai-dev03 needs both there too.
+
+## Design summary
+
+- **One new standalone suite** `admin-config-acceptance/` (Playwright, like `oidc-acceptance/`) with per-surface modules. One `npm ci`, one Playwright config with a `setup-<surface>` login project that saves `storageState`, and one `<surface>` project per admin surface.
+- **A manifest** `admin-config-manifest.yml` is the single source of truth for: env base URLs, auth type, the live endpoints to snapshot, sort keys, redaction patterns, parity rules per key path, and the admin pages to screenshot.
+- **Snapshot** = normalized, redacted JSON per surface+env. **Parity** = per-path rule: `equal` (default), `differ` (must exist, values may differ: hostnames, keys), `ignore` (timestamps, spend, ids), `present`.
+- **Two comparisons per run**: live(env) vs live(`compare_to`) and live(env) vs committed golden in `config-baselines/<surface>/<env>.json`. Goldens change only through reviewed PRs.
+- **Gate targets** `admin-litellm`, `admin-ops`, `admin-billing`, all served by one `admin` job in `qa-gate.yml`. Status contexts follow the existing pattern, e.g. `cognizioware-qa/admin-litellm-uat`.
+- **Failure tags**: mismatches and 403-after-login are `drift`; 401/5xx/login errors are `real`; selector timeouts on a 200 page are `test-debt`. Delivered via an explicit `[tag:…]` prefix the reporter learns to read.
+
+## Files to create
+
+```
+admin-config-acceptance/
+  package.json                  @cognizioware-qa/admin-config-acceptance (deps: @playwright/test, yaml)
+  playwright.config.ts          projects: setup-litellm/ops/billing + litellm/ops/billing; json reporter -> results/results.json
+  admin-config-manifest.yml     surfaces, envs, endpoints, parity rules, redact, ui pages (schema below)
+  config.ts                     env -> resolved run config (SURFACE, ADMIN_ENV, ADMIN_COMPARE_TO, ADMIN_BASE_URL, creds)
+  lib/manifest.ts               load + validate; resolve ${env:X} / ${secret:X} (fail fast when empty)
+  lib/snapshot.ts               fetch endpoints, pick, sort, strip ignore paths, redact
+  lib/redact.ts                 key-name regex -> "<redacted:len=N>" (length only, never a hash)
+  lib/parity.ts                 diff two snapshots under the rules -> [{path, mode, a, b}]
+  lib/baseline.ts               read/write config-baselines/<surface>/<env>.json
+  lib/entra-login.ts            port of loginPassword() from packages/runner/src/lib/ce-auth.ts:34-67
+                                (loginfmt -> passwd -> KMSI; also handles consent "Accept" and "Skip for now")
+  lib/screens.ts                per manifest page: goto, networkidle + ready selector, mask, fullPage PNG
+  lib/tags.ts                   fail('drift', msg) -> throws Error('[tag:drift] msg')
+  surfaces/litellm.ts           bearer master key; /ui login as admin + master key
+  surfaces/ops.ts               Entra via oauth2-proxy; preflight GET /oauth2/userinfo groups contains Global.Admin
+  surfaces/billing.ts           Entra loginRedirect; capture bearer from the SPA's own /config/me request
+  tests/setup.spec.ts           login once per surface as ai-dev03, assert role, save .auth/<surface>-<env>.json
+  tests/litellm.spec.ts, ops.spec.ts, billing.spec.ts   preflight -> snapshot -> parity -> screenshots
+  scripts/contact-sheet.mjs     screens/<surface>/<env>/*.png -> index.html grid (name, url, status, sha)
+  scripts/update-baseline.mjs   promote a run snapshot to config-baselines/ (used in a PR)
+  run-env.sh                    local runner reading .env like litellm-acceptance/run-env.sh
+  README.md
+config-baselines/litellm/{uat,prod}.json, ops/prod.json, billing/{uat,prod}.json   committed goldens
+```
+
+Add to `.gitignore`: `admin-config-acceptance/.auth/`, `admin-config-acceptance/screens/`, `admin-config-acceptance/results/`, `qa-reports/config/`.
+
+### Manifest schema (v1, values to confirm in the spike)
+
+```yaml
+version: 1
+identity:
+  username: ${env:ADMIN_CENTER_AI_USERNAME}     # config.ts also accepts the lowercase .env names
+  password: ${env:ADMIN_CENTER_AI_PASSWORD}
+defaults:
+  redact: ['(?i)(api_key|secret|password|token|master_key|cookie_secret|private_key|connection_string)']
+  ignore: ['**.updated_at', '**.created_at', '**.spend', '**.id']
+surfaces:
+  litellm:
+    envs:
+      uat:  { baseUrl: http://192.168.21.162:4000,   auth: { type: bearer, secret: LITELLM_MASTER_KEY_UAT } }
+      prod: { baseUrl: https://litellm.easybutt0n.ai, auth: { type: bearer, secret: LITELLM_MASTER_KEY_PROD } }
+    preflight: { get: /key/info, expect: { path: info.user_role, equals: proxy_admin } }
+    endpoints:
+      models:           { get: /model/info,      pick: data, sortBy: model_name }
+      mcp_servers:      { get: /v1/mcp/server,               sortBy: server_name }
+      router_settings:  { get: /router/settings }
+      general_settings: { get: /config/general_settings }        # confirm path on the pinned image
+      teams:            { get: /team/list,                   sortBy: team_alias }
+      readiness:        { get: /health/readiness }
+    parity:
+      - { path: 'models[*].litellm_params.api_base', mode: differ }
+      - { path: 'models[*].model_info.*',            mode: ignore }
+      - { path: 'readiness.litellm_version',         mode: equal }
+    ui:
+      login: { type: litellm-ui, path: /ui, user: admin, secret: LITELLM_MASTER_KEY_${ENV} }
+      pages:
+        - { name: models,      path: '/ui?page=models',           ready: 'text=Model Name' }
+        - { name: mcp-servers, path: '/ui?page=mcp-servers',      ready: 'text=MCP' }
+        - { name: keys,        path: '/ui?page=api-keys',         mask: ['td:has-text("sk-")'] }
+        - { name: teams,       path: '/ui?page=teams' }
+        - { name: settings,    path: '/ui?page=general-settings' }
+  ops:
+    envs:
+      prod: { baseUrl: https://ops.easybutt0n.ai, auth: { type: entra-oauth2-proxy } }
+    preflight: { get: /oauth2/userinfo, expect: { path: groups, contains: Global.Admin } }
+    endpoints:
+      doctor: { get: /api/doctor, sortBy: name }     # confirm whether X-Ops-Ingest-Key is required
+      status: { get: /api/status }
+    parity:
+      - { path: 'doctor[*].latency_ms', mode: ignore }
+      - { path: 'doctor[*].detail',     mode: ignore }
+    ui:
+      pages: [ {name: home, path: /}, {name: overview, path: /overview}, {name: catalog, path: /catalog},
+               {name: e2e, path: /e2e}, {name: certs, path: /certs},
+               {name: admin-centres, path: /admin-centres}, {name: audit, path: /audit} ]
+  billing:
+    envs:
+      dev:  { baseUrl: http://192.168.21.153:20252,            auth: { type: entra-msal-spa } }
+      uat:  { baseUrl: http://192.168.21.153:20253,            auth: { type: entra-msal-spa } }
+      prod: { baseUrl: https://mcp-cognizioware.easybutt0n.ai, auth: { type: entra-msal-spa } }
+    preflight: { get: /api/v1/admin/config/me, expect: { path: roles, containsAny: [Global.Admin, Billing.Admin] } }
+    endpoints:
+      auth_config: { get: /api/v1/admin/auth-config }
+      config:      { get: /api/v1/admin/config, sortBy: [scope, tenantId, category, configKey] }
+    parity:
+      - { path: 'config[*].configValue', mode: differ, unless: { category: E2E-Monitoring } }
+      - { path: 'config[*].isSecret',    mode: equal }
+      - { path: 'auth_config.clientId',  mode: equal }
+    ui:
+      pages: [ {name: admin-config, path: /admin/, ready: '#signout'} ]
+```
+
+## Files to modify
+
+**`.github/workflows/qa-gate.yml`**
+- `inputs.target.options`: add `admin-litellm`, `admin-ops`, `admin-billing`.
+- New inputs: `compare_to` (choice `[baseline, prod, uat, dev, none]`, default `baseline`) and `screens` (boolean, default `true`).
+- `validate` job: reject `admin-ops` with `env != prod` (no UAT lane) and `compare_to == env`.
+- New job `admin` (`if: startsWith(inputs.target, 'admin-')`, `runs-on: [self-hosted, qa-host]`, bash, `working-directory: admin-config-acceptance`, `concurrency.group: qa-gate-${{ inputs.target }}-${{ inputs.env }}-job`). Steps follow the existing per-target shape: checkout, node 22, toolchain echo, `npm ci`, `npx playwright install chromium`, verify secrets present, derive `SURFACE`/`ADMIN_ENV`/`ADMIN_COMPARE_TO`/`ADMIN_BASE_URL` into `GITHUB_ENV`, `npx playwright test --project=setup-$SURFACE --project=$SURFACE` with `id: suite` + `continue-on-error`, contact sheet, `node scripts/gate-report.mjs --target ${{ inputs.target }} --env … --profile n/a --caller-sha … --source playwright --file admin-config-acceptance/results/results.json`, fail-if-suite-failed, upload artifacts `qa-gate-report-admin` (`qa-reports/gate/${sha}-*.json`), `qa-gate-admin-screens-$SURFACE-<env>` (`admin-config-acceptance/screens/**`), `qa-gate-admin-config-$SURFACE-<env>` (`qa-reports/config/**` + `results/parity-*.json`).
+- `report-status`: add `admin` to `needs`; add `admin-*) result='${{ needs.admin.result }}' ;;` to the outcome case.
+- Vantage: all lab-side on `qa-host`. This gate checks configuration, not the identity shield.
+
+**`scripts/gate-report.mjs`** (`fromPlaywright`, line 134): if `message` starts with `/^\[tag:(drift|real|test-debt|unclassified)\]/`, use that tag and strip the prefix; otherwise keep the current heuristic. Nothing else changes; the merge filter already matches `<sha>-admin-litellm-uat`.
+
+**`README.md`**: new "Admin config parity" section (targets, `compare_to`, golden update procedure, secrets table rows).
+
+**`.env.example`**: add a section comment above the two `admin_center_ai_*` keys and the new `LITELLM_MASTER_KEY_UAT` / `LITELLM_MASTER_KEY_PROD` names.
+
+## Email notification from the AI dev account (M365)
+
+After the gate report is built, send one email per run from `ai-dev03@cognizio.company` with: the score line, the target/env/`compare_to`, a table of every `drift` and `real` check, the parity JSON attached, and the screenshot contact sheet inlined as a zip attachment (artifact link too). Recipients from a repo variable `ADMIN_GATE_NOTIFY_TO` (comma list, default the user's email).
+
+- **Transport, primary**: Microsoft Graph `POST /users/{ai-dev03}/sendMail` using a token from the ROPC flow (`grant_type=password`, the account is non-MFA) against the well-known public client already used by this repo (`51f81489-12ee-4a9e-aaae-a2591f45987d`) with scope `https://graph.microsoft.com/Mail.Send`. No app registration change, no SMTP feature flags.
+- **Transport, fallback**: SMTP AUTH on `smtp.office365.com:587` STARTTLS with the same username/password via `nodemailer`. Only works if SMTP AUTH is enabled on the mailbox (tenant default is disabled since 2020); the spike checks `Get-CASMailbox ai-dev03 | fl SmtpClientAuthenticationDisabled`. Selected by `ADMIN_GATE_MAIL_TRANSPORT=smtp`.
+- **Files**: `admin-config-acceptance/scripts/notify-mail.mjs` (builds the HTML body from the gate JSON + parity JSON, zips `screens/<surface>/<env>/`, sends); one `Notify by email` step in the `admin` job with `if: always()` and `continue-on-error: true`, because a mail failure must never change the gate verdict (same rule as the status publisher).
+- **Failure handling**: `AADSTS50076`/`50079` (MFA now required) or `AADSTS7000218` (ROPC blocked) are logged as `::warning::` with the code so a policy change is visible in the run log.
+- Add to the phase order as **Phase 2b** after screenshots exist, since the contact sheet is the main payload.
+
+## Caller wiring (after the gate is green from manual dispatch)
+
+Pattern (bash, same as `deploy-mcp-tools.yml` today):
+```yaml
+- name: Dispatch cognizioware-qa gate (admin-litellm uat)
+  env: { GH_TOKEN: ${{ secrets.QA_GATE_DISPATCH_TOKEN }} }
+  run: |
+    gh workflow run qa-gate.yml --repo cogniziocompany/cognizioware-qa \
+      -f target=admin-litellm -f env=uat -f compare_to=prod \
+      -f base_url=http://192.168.21.162:4000 \
+      -f caller_repo=${{ github.repository }} -f caller_sha=${{ github.sha }}
+- name: Poll cognizioware-qa/admin-litellm-uat   # same 30 s loop already used for litellm-uat
+```
+
+| Repo | Workflow | Add |
+|---|---|---|
+| `cognizioware-mcp-tools` | `deploy-mcp-tools.yml` job `qa-gate-uat` | `admin-litellm env=uat compare_to=prod` (blocking) |
+| `cognizioware-mcp-tools` | job `qa-verify-prod` | `admin-litellm env=prod compare_to=baseline`, `admin-ops env=prod compare_to=baseline` (advisory, issue on failure) |
+| `mcp-cognizioware` | `ci.yml` after release->uat deploy | `billing` + `admin-billing env=uat compare_to=prod` (blocking); needs `QA_GATE_DISPATCH_TOKEN` secret added |
+| `mcp-cognizioware` | `build-and-deploy.yml` after prod | `admin-billing env=prod compare_to=baseline` (advisory) |
+
+## Secrets and variables to add on `cognizioware-qa`
+
+`ADMIN_CENTER_AI_USERNAME`, `ADMIN_CENTER_AI_PASSWORD`, `LITELLM_MASTER_KEY_UAT`, `LITELLM_MASTER_KEY_PROD`, and `OPS_INGEST_KEY` only if the spike shows `/api/doctor` needs it. Variables: `ADMIN_GATE_NOTIFY_TO`, optional `ADMIN_GATE_MAIL_TRANSPORT` (`graph` default, `smtp`). The existing `LITELLM_QA_KEY` is non-admin and cannot read `/team/list` or full `/model/info`.
+
+## Phases
+
+0. **Spike (no commits).** From qa-host confirm: exact LiteLLM admin paths on the pinned image and that the master key reports `proxy_admin` on `/key/info`; `/oauth2/userinfo` shape on ops and whether `/api/doctor` is key-gated; ai-dev03 signs in to ops and billing with no MFA, Conditional Access, or consent interrupt; ai-dev03 shows `Global.Admin` on both apps. Output: manifest v1 with confirmed paths, risk list resolved.
+1. **LiteLLM API-only.** Suite scaffold, manifest loader, snapshot/redact/parity/baseline, `litellm.spec.ts` without UI, gate-report tag prefix, `admin` job + `admin-litellm` target, mcp-tools UAT wiring. First real value: UAT vs PROD model and MCP-server parity.
+2. **Entra login + screenshots.** `entra-login.ts`, storageState projects, `screens.ts`, contact sheet; LiteLLM `/ui` pages, then `ops` (golden-only) and `billing`.
+3. **Remaining wiring + docs.** mcp-cognizioware gates, README section, golden update procedure, initial goldens committed via PR.
+
+## Risks and how the plan treats them
+
+- **Entra interrupts**: "Stay signed in" (handled, as in `ce-auth.ts`), "Keep your account secure" (click Skip, else fail `real`), Conditional Access requiring a compliant device (qa-host is not managed; fail `real` and stop). Reuse one Entra storage state across ops and billing so only the first login is interactive.
+- **Prod behind Cloudflare** intermittently 502s and blocks non-browser UAs. Retry 502-504 three times as `billing-acceptance` does and set a browser UA on the API context.
+- **LiteLLM UI selectors** drift on image upgrades. They live in the manifest, not in code.
+- **Golden staleness**: a legitimate prod change turns the PROD advisory gate red until the golden is updated by PR. That is the intended review point, not noise.
+- **Secrets in snapshots**: redaction is by key name to a length marker only, never a hash, so UAT and PROD secrets can neither leak nor be compared.
+
+## Verification
+
+Local on qa-host (Git Bash):
+1. `cd admin-config-acceptance && npm ci && npx playwright install chromium`.
+2. `bash run-env.sh litellm uat prod`. Expect `results/results.json`, two snapshots under `qa-reports/config/litellm/`, and `results/parity-litellm-uat-vs-prod.json`. Add a throwaway model to UAT via `/model/new`, rerun, confirm exactly one `[tag:drift]` check names it, then delete it.
+3. `node scripts/update-baseline.mjs --surface litellm --env prod`, rerun with `ADMIN_COMPARE_TO=baseline`, expect green. Edit the golden by hand, confirm one red `drift` check.
+4. `HEADED=1 bash run-env.sh ops prod` once to watch the ai-dev03 login; confirm `/oauth2/userinfo` lists `Global.Admin`; open `screens/ops/prod/index.html` and check every page rendered.
+5. `bash run-env.sh billing uat prod`; confirm `config/me.roles` in the snapshot and that `E2E-Monitoring` keys are compared as `equal`.
+6. `node scripts/gate-report.mjs --target admin-litellm --env uat --caller-sha local --source playwright --file admin-config-acceptance/results/results.json`; confirm `tagCounts` shows `drift`, not `test-debt`.
+7. `bash scripts/validate-workflows.sh` passes.
+7b. `node scripts/notify-mail.mjs --report qa-reports/gate/local-admin-litellm-uat.json --to <your email>`; confirm the mail arrives from ai-dev03 with the contact-sheet zip attached. Also run once with `ADMIN_GATE_MAIL_TRANSPORT=smtp` to record whether SMTP AUTH is enabled on the mailbox.
+
+In CI:
+8. `gh workflow run qa-gate.yml -f target=admin-litellm -f env=uat -f compare_to=prod -f base_url=http://192.168.21.162:4000 -f caller_repo=cogniziocompany/cognizioware-qa -f caller_sha=<full 40-hex sha>`. Confirm the three artifacts and the `cognizioware-qa/admin-litellm-uat` status on that sha.
+9. Repeat for `admin-ops env=prod` and `admin-billing env=uat compare_to=prod`.
+10. Push to `main` on `cognizioware-mcp-tools` and confirm `qa-gate-uat` now waits on both `litellm-uat` and `admin-litellm-uat`.
+
+## Deferred (separate plan)
+
+Power Platform admin center + Dataverse Web API parity (`admin-ppac`), Entra app registration snapshots, Portainer/SEQ/n8n admin pages, chat UAT gate.

@@ -1,0 +1,16 @@
+{
+  "name": "9999p-176-hydra-enqueue-and-interlock",
+  "task_file": "C:/tmp/hydra-enqueue-and-interlock-task.txt",
+  "task_source": "task_file",
+  "workspace": "cognizioware-hydra",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "STATE: MERGED -> LANE IN FLIGHT (tick #438, 2026-09-17 08:29 PT). cognizioware-hydra #28 MERGED 2026-09-17T15:25:44Z by **prax211 (Paxton, by hand)**, base main, merge commit fe6b311bf839b0c1c7a770c68e9fb7f8253dd5b0 - NOT merged by a tick; the overseer hold recorded from #422 was overridden by the owner, which is his call. The merge triggered **Hydra CI run 35240173367 on main, createdAt 2026-09-17T15:25:47Z, status in_progress** at read time. Lane target corsairai300. NEXT: read that run to conclusion; green -> LIVE probe on corsairai300, red -> diagnose and re-run. Still UNREVIEWED (reviewDecision EMPTY) - reported, never bought. | TICK #439 2026-09-17 08:45 PT: MERGED (fe6b311) and the LANE IS GREEN - hydra CI 35240173367 all 5 jobs success incl. deploy, image hydra-orchestrator built 2026-09-17T08:35:17-07:00, container Up, enqueue_task present 34x in the RUNNING container (fleet-routes.js, mcp.js, maintenance.js, public/index.html). BUT NOT LIVE: an authenticated MCP tools/list on the live orchestrator (127.0.0.1:8080/mcp, clean JSON parse of the SSE frame, 2447 bytes) returns exactly 7 tools - list_devices, get_device_health_history, create_session, destroy_session, send_input, read_screen, run_plugin_action - and NO fleet tools at all (enqueue_task, list_harness_nodes, create_fleet_run all absent). Cause is in the code, not the deploy: mcp.js:402 gates the handler on `fleet &&`, and mcp.js:17 takes `fleet = null` as an injected default, so the server entrypoint is constructing createHydraMcp WITHOUT a fleet instance. No FLEET env var exists in the container and none in compose. This is NOT specific to 176 - create_fleet_run/list_harness_nodes predate it, so the whole fleet plane has been inert on this instance. State: LANE, not LIVE. Next actor: find the createHydraMcp call site in the orchestrator entrypoint and establish why fleet is null before re-testing. Two false readings avoided and worth keeping: /health returned 200 on ports 8080, 3000 and 8000 - 3000 is the powerplatform dev app and 8000 an unrelated OK, only 8080 is hydra; and a first tools/list read through `tr|grep` could not be trusted for absence, so it was re-read with a real JSON parse.",
+  "run_id": "20260917T124214Z_0dccb53f",
+  "roles_bound": {
+    "manager": "kimi-k3:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-17T12:42:14.056894+00:00"
+}

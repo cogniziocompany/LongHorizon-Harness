@@ -1,0 +1,15 @@
+{
+  "name": "736-93-cost-visibility",
+  "task_file": "C:/tmp/cost-visibility-task.txt",
+  "workspace": "cognizioware-mcp-tools-b",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "DISPOSITIONED 2026-09-16 (scheduled tick #280): PRIMARY LIMB IS LIVE - NOT A FULL STRANDING. Do NOT requeue this entry as-is. Read from the LIVE CT202 prod router (GET /model/info on 127.0.0.1:4000 inside CT202, its own master key, never the YAML): 218 models, 10 ':synthetic-anthropic' aliases, 10/10 PRICED - e.g. nemotron-3-super 3e-07/1e-06, syn:large:vision 3e-06/1.5e-05, glm-5.3-flash 1.5e-07/5e-07. The '.00 for 643M prompt tokens because no price is configured' defect this task was filed for is FIXED on the live target. UNVERIFIED REMAINDER, stated so it is not mistaken for done: the SECOND limb (tags surviving on ':synthetic-anthropic' rows, not just ':synthetic') was NOT checked this tick - it needs a spend-log query, not /model/info. If that limb matters, file it as its own narrow task; do not resurrect this whole entry for it. ORIGINAL NOTE >>> BLOCKS measurement of tasks 88/91. LiteLLM records $0.00 for 643M prompt tokens because no price is configured for the :synthetic-anthropic aliases - that is why nothing alerted on 2026-09-09. Separate defect from task 82 (which corrupts completion_tokens). Also: tags survive on glm-5.2:synthetic but NOT on glm-5.2:synthetic-anthropic, so 11,884 of 11,885 rows on 09-09 are untagged while 09-08 rows are tagged but have prompt_tokens=0. Visibility only - do NOT set a spend limit that could 429 the fleet.",
+  "run_id": "20260910T131728Z_86229c2a",
+  "roles_bound": {
+    "manager": "qwen3.8",
+    "executor": "ornith-1.5:pool",
+    "auditor": "ornith-1.5:pool"
+  },
+  "launched_at": "2026-09-10T06:17:28.760664-07:00"
+}

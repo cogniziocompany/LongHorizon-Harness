@@ -1,0 +1,180 @@
+TASK 166 - GET THE HYDRA FLEET PLANE ACTUALLY DEPLOYED. fleet.easybutt0n.ai is DOWN and the
+branch has never shipped.
+
+SOURCE: Paxton, 2026-09-11, direct instruction to the overseer: "create another task on how you are
+not able to get this deployed: Hydra fleet MCP (control) / fleet.easybutt0n.ai (report view) /
+feat/harness-fleet 38e4184 / reads the harness fleet API / built, deploy after the release".
+Everything in the DIAGNOSIS below was MEASURED by the overseer on 2026-09-11, not assumed.
+
+REPO / WORKSPACE: cognizioware-hydra
+
+================================================================================
+THE HONEST STATUS: THIS HAS BEEN "BUILT, DEPLOY AFTER THE RELEASE" SINCE 2026-09-06 AND NEVER
+DEPLOYED. FIVE DAYS. THE REASONS ARE BELOW AND NONE OF THEM IS "IT NEEDS MORE CODE".
+================================================================================
+
+DIAGNOSIS - FOUR SEPARATE BLOCKERS, MEASURED 2026-09-11
+--------------------------------------------------------------------------------
+BLOCKER 1 *** THE DNS RECORD POINTS AT THE WRONG HOST. THIS IS THE HEADLINE. ***
+    fleet.easybutt0n.ai resolves to 192.168.21.161 (via pi.hole at 192.168.21.3).
+    .161 is CT202, the LiteLLM gateway - it serves the router on :4000 and has NO WEB SERVER:
+        http://192.168.21.161/                       -> HTTP 000 (nothing listening)
+        https://192.168.21.161/ (Host: fleet...)     -> HTTP 000
+    Hydra actually runs on corsairai300 at 192.168.21.151:3000 -> HTTP 200, ping 3 ms.
+    So the hostname has been pointed at a box that never served it. Every "fleet is down" reading
+    all week is explained by this one record.
+    NOTE: ops.easybutt0n.ai is ALSO HTTP 000, while chat.easybutt0n.ai is HTTP 200. Check whether
+    ops has the same wrong-host record - if so, fix both, and report them as one root cause.
+    *** DNS is a two-pihole setup: .3 is primary (admin), .4 is the mirror on corsairai300, and the
+    dns.hosts setter REPLACES the whole list. Read the current list, add/patch, write it back, then
+    READ IT BACK - do not blind-set, you will erase the other records. ***
+
+BLOCKER 2 *** THERE IS NO HYDRA DEPLOY WORKFLOW. THE LANE MAP IS WRONG. ***
+    The overseer's lane map says "cognizioware-hydra -> Hydra deploy -> corsairai300".
+    Measured: .github/workflows/ contains EXACTLY TWO files - claude-code.yml and hydra-ci.yml.
+    There is NO deploy workflow. Hydra has only ever been deployed by hand (tarball to
+    corsairai300). So "deploy after the release" had nothing to execute. PR #20 ("ci(deploy): never
+    overwrite the live .env on corsairai300") implies deploy scripting exists SOMEWHERE - find it
+    and say where, or state plainly that it is manual.
+
+BLOCKER 3 *** THE BRANCH NEVER GOT A PR AND IS NOW 47 COMMITS BEHIND. ***
+    feat/harness-fleet @ 38e4184 EXISTS on the remote. Measured against main:
+        ahead_by=3  behind_by=47  status=diverged
+    There is NO open PR for it. Open PRs are #25, #24, #23 and #5 - none of them is this branch.
+    Meanwhile the fleet control-plane work landed on main by a DIFFERENT route: PR #18
+    ("feat(fleet): control-plane apply - CT110 external node, /fleet/runs + queue panel, doctrine
+    invariants, corsairai300 deploy doc"), merged 2026-09-08.
+    *** SO YOUR FIRST JOB IS A DIFF, NOT A MERGE. *** Determine what those 3 commits contain that
+    main does NOT already have. If #18 superseded them, this branch is DEAD and must be retired,
+    not rebased - and saying so IS a successful outcome of this task. If they carry unique work,
+    carry it over PER PATH onto a fresh branch off main. DO NOT rebase a 47-behind branch.
+
+BLOCKER 4 *** THREE MERGEABLE PRs ARE QUEUED BEHIND NOTHING. ***
+        #25 feat/task-92-session-bridge  -> main  MERGEABLE  (CI success)
+        #24 feat/env-keys-webux          -> main  MERGEABLE  (*** CI FAILED 2026-09-08 ***)
+        #23 fix/overseer-ingest-installer-> main  MERGEABLE  (CI success)
+        #5  feat/device-token-api        -> main  CONFLICTING
+    #24 is a fleet WEB UX page and its CI is red - fix or report the failure; do not merge it red.
+    #5 has been conflicting for days; decide rebase-or-close, do not leave it.
+
+WHAT "DEPLOYED" MEANS HERE - THE TWO SURFACES DO NOT LIVE IN THE SAME PLACE
+--------------------------------------------------------------------------------
+  - Hydra fleet MCP (CONTROL) - corsairai300. Hydra is the control plane and the ONLY WRITE
+    SURFACE. This is where writes belong.
+  - fleet.easybutt0n.ai (REPORT VIEW) - the wallboard for every lh-harness run. Run detail lives
+    HERE and NOWHERE ELSE. It READS the harness fleet API; it must not become a second write path.
+  - The harness fleet API it reads is ALIVE and needs nothing: CT110 http://192.168.21.168:8799
+    -> /api/runs HTTP 200 (root is 404, which is correct - there is no index route).
+  *** RULE 2, NO SPEC DRIFT: run detail belongs to fleet, infra health belongs to ops
+    (7 routes + /doctor), writes belong to Hydra. If this task starts adding a run view to ops or a
+    write path to fleet, CUT IT BACK AND SAY SO. ***
+
+DELIVERABLES
+--------------------------------------------------------------------------------
+ 1. A written DEPLOY PATH for Hydra, committed in the repo: either a real deploy workflow, or a
+    documented manual runbook naming every step, the host, the .env handling (see PR #20 - NEVER
+    overwrite the live .env) and the rollback. One of the two, not neither.
+ 2. The branch decision from BLOCKER 3, with the diff that proves it: retire 38e4184, or carry N
+    named commits per path onto a fresh branch off main.
+ 3. The DNS correction for fleet (and ops if it shares the fault), applied through the pihole setter
+    with the full existing host list preserved, then READ BACK.
+ 4. #24's CI failure diagnosed; #25/#23 reviewed and merged if green; #5 rebased or closed with a
+    reason.
+ 5. The report view served at fleet.easybutt0n.ai, reading the CT110 API, with run detail present.
+
+HARD RULES
+--------------------------------------------------------------------------------
+ - *** NO HOST-LEVEL CHANGES ON ptait01 (192.168.21.151 is corsairai300, which is FINE; ptait01 is
+   the off-limits one). *** corsairai300's memory split (32 GB iGPU VRAM for ROCm Ollama) is
+   INTENTIONAL - do not "optimise" it, do not touch containerd's docker-data LV.
+ - Restarting anything shared: first confirm NO gate or promotion is mid-flight.
+ - The deploy must not overwrite the live .env on corsairai300 (that is literally what PR #20 fixed;
+   re-breaking it is a regression).
+ - NEVER git add -A; commit by explicit path; git diff --stat before every commit; clone with
+   autocrlf=false; never chain create+merge.
+ - Do NOT post an @claude comment - it bills Paxton's personal subscription (task 117).
+ - No secrets anywhere - env var NAMES only. Never print a token value.
+ - Do NOT reconfigure terranas01.
+
+VERIFICATION - READ IT BACK, A 200 FROM A WRITE API IS NOT PROOF
+--------------------------------------------------------------------------------
+ 1. nslookup fleet.easybutt0n.ai returns the host that ACTUALLY serves it, and the OTHER pihole
+    records still exist (enumerate them, do not sample one).
+ 2. https://fleet.easybutt0n.ai/ returns 200 FROM A HOST THAT IS NOT THIS WORKSTATION as well as
+    from it - probe from the box that actually failed, not only the convenient one.
+ 3. The wallboard lists real runs whose ids match GET /api/runs on CT110 - compare the LISTS, do not
+    infer from the page rendering.
+ 4. Hydra on corsairai300 still answers after the deploy, and its .env is unchanged (diff it).
+ 5. `gh pr list --state open` on hydra shows the #25/#24/#23/#5 dispositions actually applied.
+
+DONE MEANS: fleet.easybutt0n.ai serves the report view over the live CT110 API from a correct DNS
+record; Hydra's deploy path exists in the repo as workflow or runbook; feat/harness-fleet is either
+retired with proof or carried over per path; and the four open PRs have a recorded disposition.
+
+================================================================================
+*** CORRECTION 2026-09-14 16:21 PT (overseer). BLOCKER 1 ABOVE WAS WRONG. READ THIS FIRST. ***
+================================================================================
+fleet.easybutt0n.ai is LIVE. Measured today: HTTP 200, <title>Fleet Window</title>, headers
+"Via: 1.1 Caddy" and "X-Powered-By: Express", and GET /api/fleet/nodes returns 200 with [].
+The 09-11 reading (HTTP 000) was taken WHILE CT202 WAS DOWN in the memory outage; CT202's Caddy is
+the reverse proxy for that hostname, so the DNS record at 192.168.21.161 was never wrong. Do NOT
+change DNS. ops.easybutt0n.ai was dead for the same reason and is not evidence of anything.
+ALSO WRONG in the original text: "Hydra runs on corsairai300 192.168.21.151:3000". Port 3000 there
+serves <title>Cognizioware - Power Platform Builder</title>, i.e. powerplatform, not Hydra.
+STILL TRUE: hydra has no deploy workflow (only claude-code.yml and hydra-ci.yml), feat/harness-fleet
+is ahead 3 / behind 47 with no PR, and /api/fleet/nodes is [] because the harness heartbeat has
+never succeeded (task 114). The report view exists; what it lacks is DATA (114) and the CONTROL half.
+Deliverable 3 (DNS) is WITHDRAWN. Deliverable 5 becomes: the report view shows real runs once 114
+lands. The rest stands.
+
+
+================================================================================
+CORRECTIONS 2026-09-14 (session [fe2679], measured in the repo; Paxton's decisions in M2b of the audit)
+================================================================================
+ - fleet.easybutt0n.ai is LIVE (the overseer withdrew the DNS claim 16:21); the empty view is task 114 (heartbeat 413).
+ - A Hydra deploy path EXISTS: .github/workflows/hydra-ci.yml job `deploy` (L110+) on the self-hosted `hydra-host`
+   runner: rsync ./ -> /opt/cognizioware-hydra, compose build orchestrator+ocr-service, up -d orchestrator redis
+   ocr-service, force-recreate tunnel, health wait on :8080/health, smoke, then dispatches hydra-deployed to
+   cognizioware-qa. This task is NOT "create a deploy workflow"; it is: make that job the ONLY path, write the
+   runbook, and note that a merge to main restarts the orchestrator (window).
+ - feat/harness-fleet is NOT stranded: merge-base with main is its own commit fbd150d, so the control-plane work is
+   already in main. Its only delta (d38faa8, 721de8f = device-token provisioning) duplicates open PR #5, CONFLICTING.
+   PAXTON 2026-09-14: CLOSE PR #5 AS SUPERSEDED. Close feat/harness-fleet too, with a note that its content is in
+   main. Never rebase it. Triage #23/#24/#25 (all MERGEABLE) as before.
+ - claude-code.yml is absent in the LOCAL clone but the ledger says #26 merged it 09-11: the clone is stale; verify
+   with `gh api repos/cogniziocompany/cognizioware-hydra/contents/.github/workflows/claude-code.yml` before claiming.
+ - The enqueue tool and the interlock are task 176, not this task.
+
+================================================================================
+*** SECOND CORRECTION 2026-09-14 (overseer, verified against the repo). BLOCKER 2 WAS ALSO WRONG. ***
+================================================================================
+hydra-ci.yml DOES contain a `deploy` job (about line 121): concurrency group hydra-deploy, runs on the
+self-hosted hydra-host runner, rsync -a --delete to /opt/cognizioware-hydra on cognizio03-corsairai300,
+compose build/up, health check, a post-deploy smoke, then a repository_dispatch of `hydra-deployed` to
+cognizioware-qa. The overseer had listed the workflow file names without opening this one. So:
+deliverable 1 (write a deploy path) is WITHDRAWN - the path exists; verify it runs green instead.
+BLOCKER 3, refined: feat/harness-fleet's 3 commits (d38faa8, 721de8f, 38e4184; 11 files) are the
+device-token provisioning work that is PR #5, still OPEN and CONFLICTING. Paxton's decision recorded by
+session [fe2679]: close #5 as superseded. Do that with a reason, and retire the branch; do not rebase.
+WHAT IS STILL REAL: the four open PRs need dispositions (#24 CI red), and fleet has no data until 114.
+Task 175 (fleet-admin deploy path) and 176 (Hydra enqueue tool + interlock) now own the build-out;
+this task is the PR/branch hygiene plus proving the existing deploy job.
+
+ADDED 2026-09-15 (hydra expert review via Paxton): MERGES DEPLOY. Any merge to main (#23, #25, or a rebased PR) runs
+hydra-ci's deploy job and RESTARTS the orchestrator. The same check task 176 builds as an interlock applies by hand
+until it exists: read GET /api/runs on every harness node; if any run is `waiting_approval` or `starting`, do not
+merge. Merging is the OVERSEER'S action in a window; this run opens/updates PRs and stops.
+
+================================================================================
+CORRECTION - SCHEDULED TICK #167 [5e066a], 2026-09-15 15:45 PT (verified live this tick)
+================================================================================
+- PR #5 is CLOSED (2026-09-15T18:56:47Z, merged=false) with the supersede reason posted. DONE - do not redo.
+- feat/harness-fleet is ABSENT from the remote branch list. Retirement DONE on the remote.
+- HAZARD: the retirement doc commit 76eddcb ("docs(fleet): retire feat/harness-fleet") exists ONLY
+  locally in CT110 /home/harness/work/cognizioware-hydra, and it sits on feat/task-92-session-bridge,
+  which is PR #25's head branch (1 ahead of upstream). Do NOT push that branch. Cherry-pick 76eddcb onto
+  its own branch off origin/main, push, open its own PR, then reset feat/task-92-session-bridge to its upstream.
+- Run 20260915T205817Z_dea540c9 was stopped: its ornith-1.5:pool AUDITOR failed three rounds running
+  (backend fault, not scope). Relaunch needs a :synthetic-anthropic auditor.
+- REMAINING SCOPE: diagnose PR #24 CI red (do not merge red); prove the hydra-ci.yml deploy job runs green;
+  triage #23/#25. Open PRs and STOP - merging is the overseer's.

@@ -1,0 +1,8 @@
+{
+ "name": "05h4b-guest-seed-any-tier",
+ "task_file": "C:/tmp/guest-uat-seeding-task.txt",
+ "workspace": "cognizioware-powerplatform-evalfix",
+ "max_rounds": 4,
+ "trio": "kimi",
+ "run_id": "20260908T134833Z_4f7306ff"
+}

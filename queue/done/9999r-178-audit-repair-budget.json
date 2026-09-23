@@ -1,0 +1,16 @@
+{
+  "name": "9999r-178-audit-repair-budget",
+  "task_file": "C:/tmp/audit-repair-budget-task.txt",
+  "task_source": "task_file",
+  "workspace": "LongHorizon-Harness",
+  "max_rounds": 5,
+  "trio": "kimi",
+  "note": "STATE: MERGED (tick #438, 2026-09-17 08:29 PT). LongHorizon-Harness #21 MERGED 2026-09-17T15:24:47Z by **prax211 (Paxton, by hand)**, base main, head feat/task-178-audit-repair-fallback, merge commit 0017a194f7475dbf91a764cf270eb8e05167f931 - NOT merged by a tick; the zero-active-window hold was overridden by the owner. **NO DEPLOY FIRED AND NONE MUST BE FIRED NOW:** LH has only two workflows (claude-code.yml, release.yml); release.yml is tag-driven so the merge started nothing, VERIFIED - newest LH Actions run is 2026-09-11. The CT110 deploy restarts lh-harness and kills every in-flight run, and **3 runs are live** (20a610bd, 2d94e58d, c8e4a4c5, all alive this tick). So this is MERGED, not LANE/LIVE, and it stays there until a zero-active window. Still UNREVIEWED - reported, not bought. | STATE: LIVE on CT110 (tick #554, 2026-09-17 23:59 PT): PR #21 rode the same manual deploy as task 180 (main 1602f7b); marker _unformatted_auditor_report_text 0 -> 2 in site-packages, service restarted 06:56:10Z. It had NOT been live since its 09-17 15:24Z merge - no LHH deploy lane exists. Behavioural proof (an auditor repair fallback firing in a real run) still owed = not VERIFIED.",
+  "run_id": "20260917T131323Z_434ff888",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "kimi-k3:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-17T13:13:23.326171+00:00"
+}

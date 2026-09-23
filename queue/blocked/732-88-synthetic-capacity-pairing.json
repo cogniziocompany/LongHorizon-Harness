@@ -1,0 +1,13 @@
+{
+  "name": "732-88-synthetic-capacity-pairing",
+  "task_file": "C:/tmp/synthetic-capacity-pairing-task.txt",
+  "workspace": "cognizioware-mcp-tools-b",
+  "max_rounds": 10,
+  "trio": "kimi",
+  "note": "Paxton goal: second Synthetic pack + local compute pairing to maximise subscription value. DECISIVE unknown first: does a 2nd subscription give a SEPARATE key+quota, or just enlarge the same pack (which is what happened last time)? Also adds per-role virtual keys so spend can finally be attributed by role - today ALL synthetic traffic is on ONE key hash with empty request_tags. Buy nothing; recommend only. Pairs with task 89 (key/tool least-privilege audit). MEASURED 12:43: Synthetic averages ~52,700 PROMPT tokens/request vs local ~604 (~87x). But completion_tokens reads ~2/req, which is task 82 streaming bug corrupting the data - so token totals are a prompt-weighted FLOOR. Task 82 is a DEPENDENCY.",
+  "roles_bound": {
+    "manager": "qwen3.8",
+    "executor": "qwen3.8-nothink",
+    "auditor": "qwen3.8"
+  }
+}

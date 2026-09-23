@@ -1,0 +1,16 @@
+{
+ "name": "9999zk-210-ct204-uat-puppeteer-image-gap",
+ "task_file": "C:/tmp/ct204-uat-puppeteer-image-gap-task.txt",
+ "task_source": "task_file",
+ "workspace": "cognizioware-mcp-tools",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "note": "Queued 2026-09-18 15:55 PT by the interactive session [session banner shows primary cwd LongHorizon-Harness/cognizioware-mcp-tools, no fixed short-ref assigned] on Paxton's explicit 'run one overseer sweep tick' request, appended to the TAIL of the active band (priority is Paxton's alone). Follow-up to task 121/PR#175 (merged, CT202 prod VERIFIED tick #713) — NOT a reopen. Root cause measured this tick by reading deploy-mcp-tools.yml directly: the CT204/uat job only syncs litellm-config.yaml + docker-compose.yml and force-recreates litellm-router; it never builds or redeploys any app-level container, so CT204 never received the puppeteer-mcp fix (still on pre-merge image c18040ec13e0, RestartCount climbing, actively leaking per tick #713's direct read) and never will for any future app fix either. ALL-SYNTHETIC trio per Paxton 2026-09-17 13:45 PT (lands on main -> CT202/CT204): trio set to \"kimi\" deliberately, NOT \"synthetic\" — task 209 tick #701 measured that launch_queue.py only recognises \"kimi\"|\"qwen\" for the trio-selection/divert branch; an unrecognised value silently skips the divert and can bind the local ornith-1.5:pool span on a prod-landing task. Overseer must confirm roles_bound after launch per that same lesson. Diff touches .github/workflows/ — the run's scoped GH_TOKEN refuses workflow-file pushes; run commits and STOPS, overseer pushes the branch and opens the PR. Not urgent: the leak is self-contained (2g cap, container-only OOM, auto-restart) per task 121's own prior findings — correctness over speed. | TICK #724 2026-09-18 17:1x PT [SCHEDULED TICK]: gate cbc7063db17b resolved `stop` (work done, single clean commit b36034d audited by the run; declined the offered hygiene-fix round and the offered SSH-to-ptait07 grant). Read back: run cancelled, alive=false, branch free. Overseer pulled the branch via a git bundle off CT110 (pct exec 110 as harness, base64 over ssh root@192.168.21.151) into a throwaway clone, reviewed the full diff (single file, .github/workflows/deploy-mcp-tools.yml, 90+/3-, no litellm-config.yaml touch, no mem_limit change, timeout-minutes 15->40 only), pushed, and opened cognizioware-mcp-tools PR #177 (head b36034d, base main, OPEN/MERGEABLE, reviewDecision empty). State: RUNNING -> PR. NOT merged: routes through task 117's triage (no @claude); verification (CT204 puppeteer-mcp image/Created + RestartCount before/after a triggered deploy run) still owed post-merge, logged in the PR body.",
+ "run_id": "20260918T225656Z_0c28f3c1",
+ "roles_bound": {
+  "manager": "kimi-k3:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-18T22:56:56.679878+00:00"
+}

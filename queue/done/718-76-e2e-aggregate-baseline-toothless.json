@@ -1,0 +1,15 @@
+{
+  "name": "718-76-e2e-aggregate-baseline-toothless",
+  "task_file": "C:/tmp/e2e-aggregate-baseline-task.txt",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 6,
+  "trio": "kimi",
+  "run_id": "20260909T191444Z_742af8cd",
+  "roles_bound": {
+    "manager": "glm-5.2:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-09T19:14:44.477804+00:00",
+  "note": " || STATE = MERGED, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in a triage of every undispositioned failed/cancelled entry. The run ended without a disposition note, but its work SHIPPED: branch task-76-baseline-calibration -> cognizioware-mcp-tools PR #125 is MERGED at 8760ca5. This was a RECORDS gap, not a work gap: nothing needs relaunching. LIVE/VERIFIED still require the usual lane and read-back evidence."
+}

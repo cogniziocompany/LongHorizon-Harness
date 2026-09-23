@@ -1,0 +1,88 @@
+================================================================================
+TASK 211 — DELEGATED CGROUP RSS BOUND (TASK 208) CANNOT ACTUALLY ACTIVATE: EBUSY
+================================================================================
+Workspace: LongHorizon-Harness
+Repo: cogniziocompany/LongHorizon-Harness
+Follow-up to task 202 (PR #30) + task 208 (PR #33), both MERGED to main
+(f2deb9c) and DEPLOYED live to CT110 tick #724 (Delegate=memory pids +
+OOMPolicy=continue confirmed live: `systemctl show lh-harness -p
+DelegateControllers` = "memory pids"). This is a SEPARATE, NEW defect found
+by actually exercising the mechanism live — do not reopen 202/208.
+
+ROOT CAUSE, MEASURED 2026-09-18 ~17:30 PT (scheduled overseer tick #724),
+read from the live source at /home/harness/release-src (== main f2deb9c) and
+reproduced live on CT110 inside the real delegated cgroup:
+
+- `worker_isolation.own_cgroup_path()` returns the cgroup the CALLING
+  process itself is a member of — for the real lh-harness service this is
+  always `/system.slice/lh-harness.service` (MainPID lives directly there;
+  Delegate=memory pids grants this exact cgroup to the `harness` user).
+- `_prepare_child_cgroup()` then tries to enable `+memory +pids` in THAT
+  SAME cgroup's own `cgroup.subtree_control` (worker_isolation.py:274) so it
+  can create a child cgroup for the new worker.
+- cgroup v2's "no internal process" constraint forbids enabling
+  subtree_control on a cgroup that has a MEMBER PROCESS directly inside it
+  (only leaf cgroups may hold processes; a cgroup with subtree_control
+  enabled must hold only child cgroups, no processes of its own). Since the
+  calling process (the harness service itself, or in the reproduction, a
+  pytest process moved into that same cgroup) IS a member of
+  `/system.slice/lh-harness.service`, the write fails:
+  `OSError: [Errno 16] Device or resource busy`.
+- Reproduced LIVE, inside the real delegated cgroup, not a fake cgroupfs:
+  `tests/test_worker_rss_bound.py::test_v8_shaped_reservation_survives_an_rss_bound`
+  and `::test_resident_blowup_is_killed_alone_inside_its_own_cgroup` both
+  FAIL with exactly this OSError when run from a process resident in
+  `/system.slice/lh-harness.service` (reproduction method: root moves a
+  shell into that cgroup's `cgroup.procs`, then `setpriv --reuid=harness
+  --regid=harness` — not `su -`, which starts a new logind session/scope
+  and silently defeats the reproduction — to run pytest as the `harness`
+  UID while keeping cgroup membership).
+- NOT a production outage risk today: every real call site
+  (worker_isolation.py:386-394, :437-465) wraps `cgroup_plan(...)` in
+  `except OSError` and falls back to `unbounded_plan(...)` — so real runs
+  launch fine, just silently unbounded, exactly as before this deploy. The
+  danger is purely that acceptance criteria A2/A3 (a real episode survives
+  the RSS bound; a deliberate resident blowup is killed alone) can NEVER
+  pass with the current design, because the top-level delegated cgroup can
+  never simultaneously hold the service's own process AND have
+  subtree_control enabled for children.
+
+DONE MEANS
+- The service's own process is relocated into a LEAF child cgroup at (or
+  before) the point it needs to create worker cgroups — e.g. the service
+  moves its own PID into `/system.slice/lh-harness.service/main/` once at
+  startup (or first worker launch), leaving the top-level
+  `lh-harness.service` cgroup empty of processes so its
+  `cgroup.subtree_control` can be enabled and sibling `worker-*` cgroups can
+  be created under it. Implement wherever is architecturally correct (a
+  one-time self-relocation at process start is the obvious shape, but you
+  decide after reading worker_isolation.py and its callers) — do not guess
+  at cgroup layout without reading the current code.
+- `own_cgroup_path()` / `_prepare_child_cgroup()` must target the cgroup
+  that is actually the PARENT of where workers get created, not the cgroup
+  the calling process itself occupies, once that process has relocated.
+- Live proof, in a deploy window (ACTIVE=0), exactly like tick #724's
+  reproduction: run `tests/test_worker_rss_bound.py` inside the real
+  delegated `lh-harness.service` cgroup (root moves a shell in via
+  `cgroup.procs`, `setpriv --reuid=harness --regid=harness` to drop to the
+  `harness` UID without a new logind session) and get ALL FOUR tests
+  passing, not the current 2 passed / 2 skipped-then-EBUSY.
+- Existing unit tests against a fake cgroupfs
+  (tests/test_worker_isolation_fallback.py) must keep passing; add unit
+  coverage for the self-relocation step against a fake cgroupfs too, so this
+  doesn't rot silently again.
+- No change to the RSS limit values (2G default, task 208) or to
+  OOMPolicy=continue.
+
+CONTEXT YOU DO NOT NEED TO RE-DERIVE
+- The RSS-vs-address-space distinction, the 2G default, and why VmPeak must
+  never size the cap: all settled in task 208, read `worker_isolation.py`'s
+  module docstring and `packaging/lh-harness.service`'s comments, don't
+  re-derive.
+- Delegate=memory pids IS correctly live on CT110 today (tick #724) — this
+  is not a "the deploy didn't happen" bug, it is a design bug in what the
+  code does with a subtree that IS correctly delegated.
+- CT110 has no polkit and no user manager (task 205) — `systemd-run --scope`
+  and `systemd-run --user` are both permanently unavailable; the fix must
+  work through direct cgroupfs writes as the current code already does, not
+  through systemd-run.

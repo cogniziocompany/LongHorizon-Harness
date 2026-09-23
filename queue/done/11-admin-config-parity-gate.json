@@ -1,0 +1,8 @@
+{
+ "name": "11-admin-config-parity-gate",
+ "task_file": "C:/tmp/admin-config-gate-task.txt",
+ "workspace": "/home/harness/work/cognizioware-qa",
+ "max_rounds": 10,
+ "trio": "kimi",
+ "run_id": "20260908T093704Z_cc213173"
+}

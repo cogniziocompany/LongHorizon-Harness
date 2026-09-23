@@ -1,0 +1,16 @@
+{
+ "name": "9999zo-214d-azmcp-restart-install",
+ "task_file": "C:/tmp/azmcp-restart-install-task.txt",
+ "task_source": "task_file",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 5,
+ "trio": "kimi",
+ "note": "Queued 2026-09-19 19:59 PT by SCHEDULED TICK [current] [longhorizon-harness overseer]. TASK 214's deliverable 4 (PR #181, merged bad56e84) claimed the supervised-restart script + cron would land on CT202 via 'the existing sync path' - VERIFIED FALSE by reading the live box: deploy run 35484322168 completed all 6 jobs success, yet CT202 (pct exec 202) has neither the script file nor any /etc/cron.d/azure-mcp-restart entry, and the cited precedent cron (litellm-ui-session-cleanup) doesn't exist either. Root cause read from deploy-mcp-tools.yml's Sync infrastructure files step: its file allowlist (docker-compose.yml, litellm-config.yaml, auth-proxy.js, azure-inference-adapter.js, register-mcp-tools-stack.py, hooks/*.py, Caddyfile) never included infrastructure/scripts/*.sh, and nothing installs a cron.d file anywhere in that workflow. This task wires the install through register-mcp-tools-stack.py (already synced+executed every deploy) instead of editing the workflow - the run's GH_TOKEN cannot push changes to .github/workflows/* at all, so the task text explicitly forbids trying. Prod-landing rule applies: check roles_bound after launch, all-Synthetic required. Push+PR only, no merge - overseer merges after review. Task 214 stays MERGED (not LIVE/VERIFIED) until this lands and CT202 is read back showing both the script file and the cron.d line. || 2026-09-20 09:08 PT TICK #974 [241e00]: run ended round4 task-complete, gate `e09dc995fe8e` resolved stop. Reviewed PR#182 myself (diff, sha256 of embedded script matches repo file, install_supervised_restart() re-tested directly on Linux/WSL after Windows chmod false-failed 2/5 pytest - passed: mode 0755, idempotent no-op, cron line exact) - MERGED `4b0f8acc7` 16:06:12Z into main, zero active runs at merge time. Deploy run 35521649779 launched, E2E Gate in_progress at tick end. Task 214 stays MERGED - next tick must read CT202 directly (script file + /etc/cron.d/azure-mcp-restart) before calling it LIVE/VERIFIED.",
+ "run_id": "20260920T025559Z_4b1e1560",
+ "roles_bound": {
+  "manager": "kimi-k3:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-20T02:55:59.698332+00:00"
+}

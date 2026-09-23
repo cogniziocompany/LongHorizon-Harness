@@ -1,0 +1,162 @@
+TASK 144 - THE QUIET WINDOW: merge PR #140, then reclaim CT202's 25 GB with pg_repack.
+
+*** THIS IS AN OVERSEER-EXECUTED OPERATION. IT IS NOT FOR A HARNESS RUN. ***
+It lives in queue/blocked/ deliberately, so the launcher CANNOT pick it up and burn one of only two
+capacity slots on work a run is structurally incapable of doing: both steps need the LiteLLM master
+key and prod credentials, and a harness run is never given credentials.
+
+Scheduled by Paxton 2026-09-10 18:35 PT. Execute at the next moment ACTIVE RUNS = 0.
+
+================================================================================
+THE PRECONDITION IS THE WHOLE POINT - AND IT IS STRICTER THAN IT LOOKS
+================================================================================
+*** ZERO ACTIVE HARNESS RUNS. NOT ONE. NOT "ONLY THE BMAD ONE". ZERO. ***
+
+Both steps disturb CT202, and EVERY harness run routes its model traffic through the CT202 LiteLLM
+router regardless of which repo it is working on. A run on BMAD_Cognizioware is just as exposed as a
+run on cognizioware-mcp-tools.
+
+The overseer got this wrong once already, on 2026-09-10 at 18:31, by offering to take the window "as
+soon as task 125 dies" while task 111 was still running. That would have left ACTIVE=1 and killed a
+productive run. **Read GET /api/runs and count. Do not reason from which task you were watching.**
+
+ALSO CHECK, same instant:
+  * no deploy lane mid-flight (a CT202 deploy concurrent with pg_repack is a compounding change)
+  * no promotion or QA gate in flight
+  * the launcher's next poll is NOT imminent - it polls every 15 minutes and WILL refill the slot.
+    Check the log mtime and give yourself the gap, or the window closes under you.
+
+================================================================================
+STEP 1 - MERGE PR #140  (cognizioware-mcp-tools)
+================================================================================
+STATE AS OF SCHEDULING, re-verify before acting:
+    branch  fix/synthetic-anthropic-fallbacks   head 44ab80c
+    diff vs origin/main: 4 files, +779, 0 deletions
+    infrastructure/litellm-config.yaml IS NOT IN THE DIFF - 0079e7d was reverted by 5938a1e
+    reviewed AND re-reviewed by claude[bot]; the re-review passed:
+      "item 3 is fixed. All four compounding defects are actually resolved."
+    author-side build check: py_compile x3 OK, YAML parses, guard exits clean 0 tracebacks
+    fixtures 6/6 on the final tree (good write 0, unwrapped 0, piped 0; discard/partial/dup all 2)
+
+ 1. Re-confirm the YAML is still absent from the diff. If it has returned, STOP - merging it
+    force-recreates the CT202 prod router.
+ 2. Merge. Do NOT chain create+merge; the PR is already open.
+ 3. The merge FIRES THE DEPLOY LANE. This is expected and is why the window exists:
+    `Build local images` and `Deploy stack (docker compose up -d --remove-orphans)` both run
+    UNCONDITIONALLY against CT202, and the workflow's own health step sleeps 40s "waiting for
+    LiteLLM startup". A rebuilt image gets a new ID and `up -d` recreates the container using it.
+    The config-application steps are gated on LITELLM_CONFIG_CHANGED and WILL skip - but that is a
+    different claim from "the router will not restart". Do not conflate them.
+ 4. Watch the lane: e2e-tests -> deploy-uat-litellm -> qa-gate-uat -> deploy -> qa-verify-prod.
+    A GREEN ROLLUP CAN CONTAIN A HARD-FAILING TEST. Read the jobs, not the summary.
+ 5. VERIFY LIVE, not by the lane being green: /health/liveliness on CT202 returns 200, and the three
+    scripts are present on the box. NEVER the bare gateway /health - it fans a completion out to
+    every configured model including paid and GPU ones.
+
+================================================================================
+STEP 2 - pg_repack on CT202: reclaim the 25 GB  (task 141 track D)
+================================================================================
+ALREADY DONE TODAY, do not repeat:
+  * `docker builder prune -f` freed 10.43 GB (72% -> 59%). The pre-check is SATISFIED.
+  * The entire pre-cutoff SpendLogs backlog - 219,367 rows - was exported to terranas01,
+    checksum-verified AT THE DESTINATION, and deleted. Arithmetic reconciled exactly.
+  * CONFIRMED: the file did NOT shrink. total_relation stayed 26 GB, toast 25 GB, because a DELETE
+    returns nothing to the filesystem. **That dead space is exactly what this step reclaims.**
+  * Autovacuum verified keeping up: n_dead_tup 122,525 -> 0 unprompted.
+
+ PRE-CHECKS, in the same invocation:
+  * free space >= live table size. Last read 34G free vs a 26G table. TIGHT. State the measured
+    margin and REFUSE if insufficient rather than starting and running out.
+  * pg_repack client must match PG 16. If the alpine repo lacks it, run the client from a sidecar
+    postgres:16 debian image carrying postgresql-16-repack - do NOT install build tooling into the
+    live database container.
+ EXECUTION:
+    CREATE EXTENSION pg_repack;
+    pg_repack -t '"LiteLLM_SpendLogs"' --no-kill-backend --wait-timeout=60
+  The table name is QUOTED and CASE-SENSITIVE. RUN IT IN THE BACKGROUND WITH A LOG AND POLL IT - the
+  ssh MCP has a 180 s hard cap and `pkill -f` self-kills the call.
+ VERIFY: table size and `df` BEFORE and AFTER; /health/liveliness 200; and confirm NEW SpendLogs rows
+  are still landing after the swap.
+ ROLLBACK: an interrupted run leaves `repack.*` objects behind - clean with
+  `DROP EXTENSION pg_repack CASCADE`. The original table is untouched until the final swap.
+
+*** VACUUM FULL IS NOT AN ALTERNATIVE. It takes an ACCESS EXCLUSIVE lock on a table the gateway
+writes to on every single request. pg_repack exists precisely to avoid that lock. ***
+
+================================================================================
+ORDER AND WHY
+================================================================================
+MERGE FIRST, THEN REPACK. The merge triggers a deploy that restarts containers on CT202; doing that
+DURING a pg_repack would interrupt the repack mid-swap, which is the one moment it is not safe to
+interrupt. Let the lane finish and the router come back healthy, THEN repack.
+
+If the window closes before step 2 (a run launches, or the lane drags), STOP AFTER STEP 1 and leave
+the repack for the next window. A partial merge is fine; a partial repack is not.
+
+================================================================================
+AFTERWARDS
+================================================================================
+Record in the ledger with evidence in the row: the merge sha, the lane run id with PER-JOB
+conclusions, the live probe that proved it, and the CT202 disk + table size before/after. Task 136
+advances to MERGED -> LANE -> LIVE -> VERIFIED only on those readings. Task 141 track D advances
+only on the measured table-size drop, not on pg_repack exiting 0.
+
+================================================================================
+*** PAXTON'S DECISION 2026-09-10 21:55 PT: ONE COMBINED WINDOW FOR 144 AND 151.
+AND 144 IS NO LONGER BLOCKED ON 69b-token. ***
+================================================================================
+Both need the same thing - a fleet with zero active runs - and 147 is the step that produces it.
+**Draining twice costs twice the lost run time for no benefit.**
+
+ORDER INSIDE THE WINDOW, and the order is the safety design:
+  1. **DRAIN (task 147).** Arm `C:/tmp/queue/DRAIN`, resolve or park EVERY `waiting_approval` gate,
+     and wait for a COUNTED `running + waiting_approval == 0` from GET /api/runs. Count, do not infer.
+  2. **MERGE PR #140** (mcp-tools). Re-confirm `litellm-config.yaml` is still absent from the diff
+     first. **This recreates the CT202 containers.** Read the lane's PER-JOB conclusions, not the
+     rollup - a green rollup can hide a hard-failing test.
+  3. **MERGE hydra #26.** It deploys corsairai300, NOT CT202.
+  4. **TASK 151** - LiteLLM v1.100.1 + the #38998 backport. **This recreates the router AGAIN.**
+     Verify on live traffic that `_on_deferred_native_stream_complete` errors fall to ~0, and record
+     the POST count in the same window (zero errors with zero traffic proves nothing).
+  5. **RE-MEASURE FREE SPACE ON CT202**, then **pg_repack LAST**.
+
+*** WHY THE REPACK GOES LAST - two independent reasons, both disqualifying on their own: ***
+  * **Anything that restarts the router during a repack interrupts the table swap, and that is the
+    one moment interrupting is unsafe.** Both merges AND the 151 upgrade restart the router, so all
+    three must finish first.
+  * **Pulling the v1.100.1 image CONSUMES CT202 DISK.** The margin was already only ~8 G (34 G free
+    vs a 26 G table). So measure free space AFTER the pull, immediately before the repack, and
+    **refuse to start if the margin is short** rather than running out mid-swap.
+
+*** IF THE WINDOW RUNS OUT, THE REPACK IS THE STEP YOU DROP. *** Skipping it leaves dead space, which
+is merely wasteful. Half-running it leaves a BROKEN TABLE. Never start what you cannot finish here.
+
+**THE 69b DEPENDENCY IS DROPPED.** 69b was resolved at 20:55 with an explicit fallback: if its CI
+checkout fails, its three checkpoints skip with a stated reason. **Its CI result does not touch
+CT202.** The only reason it mattered was that a parked run counts as active - and answering its gate
+is part of the drain (step 1), not a prerequisite to it.
+
+================================================================================
+BUNDLED WINDOW - Paxton 2026-09-16 15:58 PT ("bundling all three into one window is the efficient move"). OVERSEER-EXECUTED.
+================================================================================
+ONE zero-active window (running + waiting_approval == 0, DRAIN armed via 147), in THIS order, each step read back
+before the next, any step skippable without touching the others:
+ 0. Pre-window (no traffic impact): back up CT105's postgres volume on corsairai300; read every cloudflared
+    connector's tunnel id + ingress (7 connectors listed in task 138's note) and confirm none names CT105's IP;
+    re-measure CT202 `/` free space and LiteLLM_SpendLogs dead tuples; snapshot the live router config row.
+ 1. TASK 136 - Synthetic fallbacks to the LIVE router row: apply per 136's note runbook (`--from-row`, /config/update
+    SETS the whole list; UAT .162 first, read back, then prod .161, read back and diff). This is the fix for the
+    'No fallback model group found for <X>:synthetic-anthropic' deaths (tasks 99/100 today).
+ 2. TASK 170 - retention: `store_prompts_in_spend_logs=false` + 7-day retention as DB settings, read back
+    (Paxton 09-16 decision 1a). Nothing is deleted by this step.
+ 3. CT105 STOP (Paxton 09-16 decision 2a): `pct stop 105` + `pct set 105 -onboot 0` on corsairai300. Verify the
+    host-level prod stack still serves powerplatform.easybutt0n.ai (uptime one second apart from the public
+    endpoint, per the 09-09 method). Rollback `pct start 105`.
+ 4. 25 GB RECLAIM (Paxton 09-16 decision 1b): only if step 0 measured dead tuples > 0 and disk margin >= 8 G after
+    step 1's image pulls; VACUUM FULL or pg_repack on LiteLLM_SpendLogs, whichever 170's measurement supports.
+    Skip if the margin is thin - retention makes it unnecessary over time.
+ 5. Window merges (impact:deploy): powerplatform PR #111 (CI test job; red-by-design until 154), the hydra reviewer
+    PR (deploys the orchestrator - confirm no gate mid-flight first), and any 178 stubs open by then.
+ 6. Clear DRAIN; the next launcher cycle resumes. Ledger row per step with before/after evidence.
+The original steps of this task (PR #140 merge, hydra #26) are DONE (09-11); the repack condition is superseded by
+step 4 above. The 69b-token dependency was dropped 09-10.

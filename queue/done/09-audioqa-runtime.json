@@ -1,0 +1,8 @@
+{
+ "name": "09-audioqa-runtime",
+ "task_file": "C:/tmp/audioqa-runtime-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 5,
+ "trio": "kimi",
+ "run_id": "20260908T075152Z_7fed29a8"
+}

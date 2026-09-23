@@ -1,0 +1,51 @@
+TASK 220 - Rebase PR #35 (task 173 shadow/observe mode) onto current main and make it Postgres-safe
+
+PR #35 (`feat/task-173-shadow-lease`, tip 4ead320, +2407/-28, 13 files) is CONFLICTING against
+origin/main. Measured 2026-09-22 12:55 PT: 6 commits ahead, and exactly THREE files changed in both:
+`src/lh_harness/fleet/reporter.py`, `src/lh_harness/launcher.py`, `src/lh_harness/webapi/server.py`.
+
+WHAT MAIN NOW CARRIES IN THOSE THREE FILES (merged 2026-09-22; resolve in favour of main, then
+re-apply #35's additions on top - do NOT revert any of it):
+ * reporter.py, PR #37: heartbeat bounding. `_MAX_ACTIVE_RUNS_PER_HEARTBEAT = 200`, `runs[]` carries
+   only non-terminal runs, plus `runsTotal` / `runsByStatus` / `runsTruncated`. Cause on record: a
+   532-run store produced a 5.47 MB body the fleet plane rejected with HTTP 413.
+ * reporter.py, PR #40: `_send` computes `sign_bytes` (the JSON bytes) BEFORE gzip and passes it to
+   `_build_request(..., sign_bytes=...)`, which HMACs `sign_bytes` rather than the wire bytes.
+   fleet-admin verifies the HMAC over the INFLATED body; signing the gzip stream produced 9,098
+   `harness_bad_sig` rejections. Do not reintroduce signing over the compressed bytes.
+ * server.py + launcher.py, PR #39: `create_app` selects the queue store via
+   `_select_queue_store(runs_root, project)` behind `[queue] backend` (file default, `postgres`
+   reaches `PgQueueStore`, an unknown name raises at startup); the file store is still rebuilt with
+   `queue_config` so its path is byte-for-byte what it replaced. `launcher.py` writes service events
+   via `getattr(self.queue_store, "_root", None)` and returns early when the store has no on-disk
+   queue directory.
+
+THE DEFECT THIS REBASE MUST FIX (found 2026-09-22 12:55 PT, not present in either branch alone):
+ `#35` adds `GET /api/queue/shadow`, which calls `queue_store.read_shadow_records(since=...)`
+ (server.py:1198 on the PR branch). `PgQueueStore` on main has NO `read_shadow_records` method, so
+ with `[queue] backend = "postgres"` that endpoint raises AttributeError -> HTTP 500. Decide and
+ implement ONE of:
+   (a) implement `read_shadow_records` on `PgQueueStore` (shadow records in Postgres), or
+   (b) have the endpoint return an explicit, documented 501/409 with a clear message when the active
+       store cannot serve shadow records.
+ State which you chose and why in the PR body. A silent AttributeError is not acceptable.
+
+DELIVERABLES
+ 1. Rebase (or merge main into) `feat/task-173-shadow-lease`, resolving the three conflicts as above.
+    Same branch, same PR #35 - do NOT open a second PR.
+ 2. The shadow-mode behaviour #35 already claims must still hold: `[queue] observe` defaults false;
+    with `observe=false` the behaviour is byte-for-byte today's (no shadow path, no shadow log, no
+    `queue.shadow_*` events); with `observe=true` the full decision is computed and short-circuited
+    immediately before `_launch`.
+ 3. Re-run #35's own tests AND the tests main added: `tests/webapi/test_queue_store_selection.py`,
+    `tests/webapi/test_pg_migrations.py`, `tests/fleet/test_reporter.py`. Report counts honestly;
+    `tests/fleet/test_reporter.py` has 7 known Windows-only failures (control-bus dir) that also fail
+    on unmodified origin/main - do not claim to have fixed those.
+ 4. Prove by test that a contention/shadow finding still never blocks a launch.
+
+CONSTRAINTS: env NAMES only, never a credential value; never `git add -A`, commit by explicit path;
+PR only - do NOT merge; no @claude review invocation (task 117); do not touch the deployed CT110 tree.
+
+WHY THIS MATTERS: cutover task 168 requires the shadow phase (task 55 / task 173) to run BEFORE the
+queue is promoted to Postgres, and promotion is Paxton's call on six evidence items. #35 is the only
+thing standing between the merged wiring and that shadow window.

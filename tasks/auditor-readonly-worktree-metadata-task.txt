@@ -1,0 +1,24 @@
+TASK 203 - auditor read-only check voids clean audits over .git/worktrees metadata
+
+WORKSPACE: LongHorizon-Harness. Develop-only harness code. Open the PR against main and STOP; never merge.
+
+MEASURED DEFECT (two runs, same cause, 2026-09-18):
+- Run 20260918T110559Z_53a95fc5 (task 200): r3 AND r4 audits voided; changed paths `.git/worktrees/task-200`.
+- Run 20260918T125319Z_ea0716f1 (task 201): r3 audit voided; changed paths `.git/worktrees/lh-task201`,
+  `.git/worktrees/task-201`.
+In every case the auditor's own report body read `Status: complete / Integrity: clean / Contract audit: aligned`.
+The harness replaced it with `Status: blocked / Integrity: violation` ("Auditor read-only violation", text at
+src/lh_harness/auditor_agent.py:93; path list from `_mutation_paths`, auditor_agent.py:820; consumer
+`_workspace_mutation_detected`, manager.py:1846). The work was done and the PR open, yet the run burned further rounds.
+
+LIKELY CAUSE (verify, do not assume): when the task workspace is a linked git worktree, read-only git commands
+(`git status`, `git diff`) refresh `index` / stat-cache files under the MAIN repo's `.git/worktrees/<name>/`.
+The mutation fingerprint counts that git-internal metadata as a task workspace file.
+
+DELIVER:
+1. A failing test first: an auditor episode whose only observed change is under `.git/` (incl. `.git/worktrees/<name>/`)
+   must NOT be reported as a read-only violation.
+2. The fix: exclude git-internal metadata from the auditor mutation fingerprint. Tracked/untracked WORKING files must
+   still trip it - keep (or add) a test proving a real file write by the auditor is still a violation.
+3. Do not weaken anything else in the read-only check. No new config switch.
+4. Run the targeted tests, commit by path, push, open the PR, STOP.
