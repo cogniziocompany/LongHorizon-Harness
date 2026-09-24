@@ -48,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Queue launches no longer burn an attempt on an ineligible auditor MCP
+  profile (task 234).  An auditor role that would resolve to a non-read-only
+  profile is refused on the pre-burn path: the exact supervisor reason
+  (`roles.auditor.mcp_profile '<name>' is not read-only; auditor roles
+  require a read-only MCP profile`) is appended to the queue entry's
+  `skip_reasons`, the entry stays pending with its attempt count unchanged,
+  and `mark_failed` is never reached.  The check honours the worker's
+  precedence — an explicit `[run.roles.auditor] mcp_profile` in the project
+  config wins over the trio's run-wide profile — so a deployment binds the
+  auditor to a read-only profile (e.g. built-in `audit`) while the
+  manager/executor keep a richer one.
 - Race where two queue entries for the same workspace could be launched across concurrent ticks is now prevented by a launch lock and active-run re-check.
 - `migrations/001_harness_queue.sql` now applies cleanly to a fresh database as
   a non-superuser role owner. It previously failed under `ON_ERROR_STOP=1` with
