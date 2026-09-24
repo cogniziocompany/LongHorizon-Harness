@@ -412,7 +412,7 @@ class Launcher:
             if entry.status != "pending":
                 continue
             if launched:
-                # Once we have launched one entry this pass, any later pending
+                # Once one entry has LAUNCHED this pass, any later pending
                 # entry in the same trio must be skipped with an up-to-date
                 # capacity reason.
                 skip_reason = self._capacity_reason(entry, capacities)
@@ -439,9 +439,9 @@ class Launcher:
                     launched = True
                     capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
                     continue
-                self._launch(entry)
-                launched = True
-                capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
+                if self._launch(entry):
+                    launched = True
+                    capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
             elif self._observe:
                 self._shadow_skip(entry, skip_reason)
             else:
@@ -732,11 +732,19 @@ class Launcher:
                 result[run_id] = {"status": status, "owner": self.supervisor.owner(run_id)}
         return result
 
-    def _launch(self, entry: QueueEntry) -> None:
+    def _launch(self, entry: QueueEntry) -> bool:
+        """Attempt to launch ``entry``; report whether a run was created.
+
+        Task 230: a False return (guard refusal, create_run failure, or a
+        missing run id) does NOT consume the pass's batch capacity — the pass
+        falls through to the next eligible entry instead of starving the whole
+        queue behind one refused head entry.  Refusals and skips are recorded
+        here exactly as before; only their capacity side effect changed.
+        """
         trio = self._config.get("trios", {}).get(entry.trio)
         if trio is None:
             self._skip(entry, f"unknown trio {entry.trio}")
-            return
+            return False
         agent = trio.get("agent", "codex")
         model = trio.get("model")
         mcp_profile = trio.get("mcp_profile")
@@ -785,7 +793,7 @@ class Launcher:
             if updated is not None:
                 updated.last_checked_at = _now()
                 self.queue_store.update(updated)
-            return
+            return False
         workspace = str(base.workspace if base.mode == "worktree" else entry.workspace)
         try:
             created = self.supervisor.create_run(
@@ -819,14 +827,14 @@ class Launcher:
             # would reproduce identically on a successor, so it stays failed.
             if updated is not None and self._is_retryable_cause(failure_reason):
                 self._handle_retry(updated, failure_reason)
-            return
+            return False
         if not run_id:
             failure_reason = "launch returned no run id"
             updated = self.queue_store.mark_failed(entry.queue_id, failure_reason)
             # Handle retry for retryable causes
             if updated is not None and self._is_retryable_cause(failure_reason):
                 self._handle_retry(updated, failure_reason)
-            return
+            return False
         launched = self.queue_store.mark_launched(entry.queue_id, run_id)
         self._emit_run_event(
             run_id,
@@ -843,6 +851,7 @@ class Launcher:
         if launched is not None:
             launched.last_checked_at = _now()
             self.queue_store.update(launched)
+        return True
 
     def _skip(self, entry: QueueEntry, reason: str) -> None:
         updated = self.queue_store.record_skip(entry.queue_id, reason)
