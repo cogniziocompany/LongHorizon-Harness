@@ -39,10 +39,14 @@ Accepted fields (all persisted on the queue entry):
   deliverables, and hard rules.
 - workspace (string, required): workspace directory path for the run.
 - trio (string, optional): resource trio, 'kimi' for development work or
-  'qwen' for QA only. When omitted the entry is stored with trio unset and
-  the launcher skips it each pass as 'unknown trio' until a trio is set
-  (launcher.py _launch); no default trio is applied at enqueue time. Supply
-  'kimi' or 'qwen' whenever the task should actually launch.
+  'qwen' for QA only. No default trio is applied at enqueue time. When
+  omitted, the entry persists with trio unset and never launches until a
+  trio is set: remaining capacity is derived only from the configured
+  trios (launcher.py _remaining_capacity), so each launcher pass records
+  an ' at capacity' skip for the entry (launcher.py _check_eligibility)
+  and it stays pending, unlaunched, consuming no capacity; _launch and
+  _shadow_launch_decision guard the same condition with an 'unknown trio'
+  skip. Supply 'kimi' or 'qwen' whenever the task should actually launch.
 - max_rounds (integer, optional): maximum harness rounds (default 25).
 - priority (integer, optional): higher number = earlier launch within the
   same trio (default 0).

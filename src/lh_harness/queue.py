@@ -271,12 +271,15 @@ def _validate_workspace(value: Any) -> str:
     return text
 
 
-def _validate_trio(value: Any) -> str | None:
+def _validate_trio(value: Any) -> str:
     if value is None:
-        # Optional (task 233): the launcher resolves the trio itself and skips
-        # an entry whose trio is not a configured trios key (launcher.py
-        # _launch/_shadow_launch_decision "unknown trio ..."), so persisting
-        # unset is safe -- no default is invented here.
+        # Optional (task 233): no default is invented here.  Persisting unset
+        # is safe because the launcher defers such an entry: remaining
+        # capacity exists only for configured trios (launcher.py
+        # _remaining_capacity), so _check_eligibility records an " at
+        # capacity" skip each pass and the entry stays pending, unlaunched;
+        # _launch/_shadow_launch_decision guard the same condition with an
+        # "unknown trio ..." skip.
         return ""
     if isinstance(value, bool) or not isinstance(value, str):
         raise ValueError("trio/roles must be a string")
