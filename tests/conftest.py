@@ -17,6 +17,33 @@ from urllib.parse import urljoin
 _SRC = str((Path(__file__).resolve().parent.parent / "src").resolve())
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+# A stale site-packages copy can still win if the ambient PYTHONPATH lists one
+# AFTER our insertion point, or if ``lh_harness`` was imported before conftest
+# ran (e.g. pytest plugins).  Retarget any already-primed modules to this
+# checkout so the suite always tests the tree being run.
+if "lh_harness" in sys.modules:
+    _primed = getattr(sys.modules["lh_harness"], "__file__", "") or ""
+    if Path(_primed).resolve() != Path(_SRC) / "lh_harness" / "__init__.py":
+        for _name in [n for n in sys.modules if n == "lh_harness" or n.startswith("lh_harness.")]:
+            del sys.modules[_name]
+elif [
+    p
+    for p in sys.path
+    if p
+    and "site-packages" in p
+    and Path(p).resolve() == Path(_SRC).resolve().parent
+]:
+    pass  # src tree itself, nothing to do
+else:
+    for _p in [
+        p
+        for p in sys.path
+        if p
+        and "site-packages" in p
+        and (Path(p) / "lh_harness").exists()
+        and Path(p).resolve() != Path(_SRC).resolve().parent
+    ]:
+        sys.path.remove(_p)
 
 # TASK 211: a test run launched from inside a harness run inherits the
 # service's own fleet-reporter environment (LH_HARNESS_FLEET_URL/KEY/...).

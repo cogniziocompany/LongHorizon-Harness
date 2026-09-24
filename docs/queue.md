@@ -78,6 +78,41 @@ Tool descriptions carry the operating rules:
 - `harness_resolve_gate` rejects any `user_input` that contains non-ASCII
   characters.
 
+### MCP streamable-HTTP endpoint (`POST /mcp`)
+
+The Web API also serves the fleet tools as a real MCP server over
+streamable HTTP at `POST /mcp` (and `POST /mcp/`), so LiteLLM can register the
+service directly with `transport: http` instead of relying on a separate REST
+bridge. The endpoint speaks JSON-RPC 2.0 with these methods:
+
+| Method | Behavior |
+|---|---|
+| `initialize` | Returns `protocolVersion` (the client's is echoed when supported, otherwise `2025-03-26`), `capabilities: {"tools": {}}`, and `serverInfo.name = "lhharness"` |
+| `notifications/initialized` | Accepted with an empty `202` response |
+| `tools/list` | Returns the same tool list and input schemas as `GET /api/mcp/fleet/tools` (one shared manifest, no duplicate copy) |
+| `tools/call` | Runs the tool through the same dispatch path as `POST /api/mcp/fleet/{tool_name}` and returns `content: [{type: "text", text: "<json>"}]`; failures set `isError: true` |
+
+Any other method returns JSON-RPC error `-32601` (method not found). Unknown
+tool names in `tools/call` return a normal MCP result with `isError: true`.
+
+- **Auth**: the same `LH_HARNESS_WEB_TOKEN` bearer token as the rest of the
+  API. Requests without a valid `Authorization: Bearer <token>` header get
+  `401`.
+- **Responses**: plain `application/json` (SSE streaming is not required).
+- **Sessions**: the server is stateless. It never requires an
+  `Mcp-Session-Id` header; clients that track sessions can ignore it.
+- `Accept: application/json` is honored; a client that negotiates SSE still
+  receives JSON.
+
+Example:
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/mcp \
+  -H "Authorization: Bearer $LH_HARNESS_WEB_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}'
+```
+
 ## Storage backend
 
 The queue's storage engine is selected under `[queue]`:
