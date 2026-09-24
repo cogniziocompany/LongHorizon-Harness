@@ -38,6 +38,7 @@ from ..fleet import get_reporter
 from ..queue import (
     PgQueueStore,
     QueueStore,
+    UnknownQueueFieldError,
     default_queue_config,
     queue_config_from_config,
     read_lease,
@@ -1091,6 +1092,11 @@ def create_app(
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
         try:
             entry = queue_store.create(body)
+        except UnknownQueueFieldError as exc:
+            # Task 233: a body with keys outside the accepted set is a client
+            # error (400) that names every offending field -- never a silent
+            # drop and never a generic 422.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"ok": True, "queue_id": entry.queue_id}
