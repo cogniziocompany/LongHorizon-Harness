@@ -15,7 +15,7 @@ the LAN runner (CT210, label `lan-deploy`).
 | wait | runner | `wait_zero_active.py`: counted consecutive zero-active polls of `GET /api/runs` |
 | deploy | runner → PVE → CT110 | `run_on_ct110.sh` pushes bytes (sha256-verified at both hops) and runs `ct110_deploy.sh deploy` |
 | verify | runner / CT110 | `systemctl is-active` == active; installed `lh_harness.__version__` == target; `GET /api/meta` == 200 |
-| rollback | runner → CT110 | automatic on any post-deploy failure; loud sentinel if the rollback itself fails |
+| rollback | runner → CT110 | automatic on any failure AFTER the deploy step has started (a skipped deploy step — wheel download, SSH key staging, zero-active wait — aborts the run with NO service restart); loud sentinel if the rollback itself fails |
 
 Greppable terminal markers: `CT110_DEPLOY_OK`, `CT110_DEPLOY_FAILED_ROLLBACK_OK`,
 `CT110_DEPLOY_ROLLBACK_FAILED` (page-worthy: host is on an unknown version).
@@ -38,7 +38,9 @@ Greppable terminal markers: `CT110_DEPLOY_OK`, `CT110_DEPLOY_FAILED_ROLLBACK_OK`
 4. **DEPLOY-HOLD.** `ct110_deploy.sh` aborts when a hold file exists (its
    contents are the human reason). Rollback deliberately ignores the hold:
    it only runs after a failed deploy and must not be blocked from restoring
-   the previous version.
+   the previous version. The workflow gates rollback on the deploy step
+   having actually started (`steps.deploy.outcome` in `success`/`failure`),
+   so a pre-deploy failure can never reach the rollback's service restart.
 
 ## Assumptions (mechanics that live only on PTAIT09 and could not be read)
 

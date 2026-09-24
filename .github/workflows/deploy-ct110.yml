@@ -229,12 +229,19 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: echo "CT110_DEPLOY_OK version=$EXPECTED_VERSION sha=${{ needs.preflight.outputs.sha }}"
 
-      # Automatic rollback.  Encodes lesson 3 too: the rollback also restarts
-      # the service, so it only runs after a failed deploy (the window was
-      # already zero-active and the service was already restarted).
+      # Automatic rollback.  Encodes lesson 3 twice over: the rollback also
+      # restarts the service, so it only runs after the deploy has actually
+      # STARTED — the deploy step ran and produced an outcome (`success` or
+      # `failure`; a step skipped by its `if` reports `skipped`).  A pre-deploy
+      # failure (wheel download, SSH key staging, zero-active wait) must abort
+      # the run with NO service restart: no window was confirmed and no deploy
+      # touched the host.  A failure at or after the deploy step still rolls
+      # back automatically — the service was already restarted inside a
+      # confirmed window, so restoring the previous version cannot widen the
+      # blast radius.
       - name: Automatic rollback to previous version
         id: rollback
-        if: ${{ failure() && !inputs.dry_run }}
+        if: ${{ failure() && !inputs.dry_run && (steps.deploy.outcome == 'success' || steps.deploy.outcome == 'failure') }}
         run: |
           set +e
           scripts/deploy/ct110/run_on_ct110.sh rollback
@@ -249,7 +256,7 @@ jobs:
           echo "::warning::CT110_DEPLOY_FAILED_ROLLBACK_OK — rolled back to the pre-deploy version"
 
       - name: Report rolled-back outcome
-        if: ${{ failure() && !inputs.dry_run && steps.rollback.outcome == 'success' }}
+        if: ${{ failure() && !inputs.dry_run && (steps.deploy.outcome == 'success' || steps.deploy.outcome == 'failure') && steps.rollback.outcome == 'success' }}
         run: |
           echo "CT110_DEPLOY_FAILED_ROLLBACK_OK version_restored"
           exit 1
