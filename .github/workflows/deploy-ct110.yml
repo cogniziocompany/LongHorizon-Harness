@@ -18,6 +18,14 @@ name: Deploy CT110 harness
 #   3. The deploy RESTARTS lh-harness.service and kills every in-flight run.
 #      We wait for a counted zero-active window (GET /api/runs) before
 #      touching the host, and the inner script re-checks idleness itself.
+#      TASK 242: with a backlog the three kimi slots refill the moment one
+#      frees, so a plain zero-active wait may never fire.  The deploy now
+#      first sets the queue drain flag (POST /api/queue/drain) so NO new
+#      launches happen while live runs finish, waits for the zero-active
+#      window, deploys, verifies, and clears the drain.  The flag persists
+#      across the restart, so a failed verify leaves CT110 drained (new
+#      launches still blocked) rather than silently refilling the slots;
+#      clearing it is an explicit, verified step.
 #   4. A DEPLOY-HOLD hold file aborts the deploy so a known-bad main cannot
 #      ship (09-18 mechanism; path candidates in ct110_deploy.sh).
 #
@@ -178,6 +186,16 @@ jobs:
           printf '%s\n' "$CT110_PVE_SSH_KEY" > "$key_file"
           echo "SSH_KEY_FILE=$key_file" >> "$GITHUB_ENV"
 
+      - name: Set drain (stop new queue launches, task 242)
+        id: set_drain
+        if: ${{ !inputs.dry_run }}
+        run: |
+          python3 scripts/deploy/ct110/set_drain.py \
+            --url "$CT110_WEB_URL" \
+            --enable \
+            --reason "deploy $EXPECTED_VERSION (${{ needs.preflight.outputs.sha }}) maintenance window" \
+            --verify-state enabled
+
       - name: Wait for a counted zero-active window (GET /api/runs)
         if: ${{ !inputs.dry_run }}
         run: |
@@ -225,9 +243,32 @@ jobs:
           fi
           grep -q '"service"' "$RUNNER_TEMP/meta.json"
 
+      - name: Verify drain survived the restart (task 242)
+        if: ${{ !inputs.dry_run }}
+        run: |
+          # The new service must come back up still drained: launches stay
+          # blocked until the clear step below runs, so a crash between the
+          # restart and this point can never refill the slots mid-deploy.
+          python3 scripts/deploy/ct110/set_drain.py \
+            --url "$CT110_WEB_URL" \
+            --verify-state enabled \
+            --verify-attempts 3 \
+            --verify-interval-seconds 10
+
       - name: DEPLOY OK
         if: ${{ !inputs.dry_run }}
         run: echo "CT110_DEPLOY_OK version=$EXPECTED_VERSION sha=${{ needs.preflight.outputs.sha }}"
+
+      - name: Clear drain (resume queue launches, task 242)
+        if: ${{ !inputs.dry_run && always() && steps.set_drain.outcome == 'success' }}
+        run: |
+          # Always run once we have set the flag: the success path clears it
+          # after verify, and the failure path clears it before/around the
+          # rollback so a failed deploy never leaves CT110 permanently drained.
+          python3 scripts/deploy/ct110/set_drain.py \
+            --url "$CT110_WEB_URL" \
+            --disable \
+            --verify-state disabled
 
       # Automatic rollback.  Encodes lesson 3 twice over: the rollback also
       # restarts the service, so it only runs after the deploy has actually

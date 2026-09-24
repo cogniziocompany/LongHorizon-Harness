@@ -35,6 +35,7 @@ def build_meta(
     fleet_ever_succeeded: bool = False,
     fleet_last_ok: bool | None = None,
     fleet_last_error: str | None = None,
+    drain: dict[str, Any] | None = None,
     launcher_stalled: bool = False,
     launcher_stall_cycles: int | None = None,
 ) -> dict[str, Any]:
@@ -81,4 +82,11 @@ def build_meta(
         result["mcp_gateway_alias"] = mcp_gateway_alias
     if model_discovery is not None:
         result["model_discovery"] = model_discovery
+    # Queue drain state (task 242) in the same plain-flag style as the fleet
+    # fields: always present when the server passes it (``{"enabled": bool,
+    # "reason": str|None, "since": ts|None}``).  Consumers such as the fleet
+    # window and deploy tooling read ``drain.enabled`` to see a maintenance
+    # window without a second call.
+    if drain is not None:
+        result["drain"] = drain
     return result
