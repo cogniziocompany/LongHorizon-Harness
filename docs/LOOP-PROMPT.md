@@ -206,7 +206,11 @@ finishes its work is expected to `git push` and `gh pr create` itself, and a gat
 for the overseer to push is now a run that did not read its environment — answer it with "push and open
 the PR yourself" rather than doing it by hand. **MERGING STAYS THE OVERSEER'S**: no run merges, and the
 token could merge, so the rule is doctrine, not permission — every task text keeps "open the PR and STOP".
-Runs that launched BEFORE 16:21 PT still lack the token and stall at push; finish those by hand once, as before.
+**PR TITLES MUST NOT CONTAIN "DO NOT MERGE" (any casing).** The no-merge rule is a rule the run follows
+itself, not a label for Paxton; putting the literal phrase in a PR title confused Paxton (#185). If a PR
+genuinely must not be merged yet, open it as a GitHub draft PR or apply a `blocked` label, and explain why
+in the body. Runs that launched BEFORE 16:21 PT still lack the token and stall at push; finish those by
+hand once, as before.
 
 **A run that hits its round ceiling with the work DONE does not need more rounds — it needs the
 last three steps.** Three times today a run finished the work and stopped at commit/push/PR.
@@ -290,6 +294,42 @@ change touches `litellm-config.yaml` (any edit force-recreates the prod router).
 **After a failed deploy, RECONCILE BEFORE RETRYING.** Re-running a partially-applied deploy renamed
 27 containers and left 18/73 running. First establish where it died: a failure at IMAGE BUILD never
 reached `docker compose up` and is safe; a failure after it is not.
+
+## PRESENTING PRs TO PAXTON (task 245)
+Every time an overseer (the CT overseer tick, the chat Fleet Operator, or any session reporting
+for the overseer) presents PRs to Paxton, it MUST use exactly this format.
+
+FORMAT RULES
+1. Group by repository. The group heading is the plain repo name (e.g. `LongHorizon-Harness (LHH)`, `cognizioware-hydra`, `cognizioware-mcp-tools`).
+2. One line per PR. The link TEXT is the full `owner/repo#N` reference and the link TARGET is the full PR URL:
+   `[cogniziocompany/<repo>#<N>](https://github.com/cogniziocompany/<repo>/pull/<N>)`
+   Never a bare `#N`, never a bare URL.
+3. After the link: a colon, a short plain-language description of what the PR does, and the task number in parentheses. Then any sentence Paxton needs to act on it: merge order, "needs setup after merge, which I'll do", a review point, size warning.
+4. When merge ORDER matters within a repo, use a NUMBERED list in merge order and say why the first one is first and what depends on what ("Only after #49, because it's built on #49's branch"). Otherwise use a bulleted list.
+5. Only PRs that are actually OPEN and waiting on Paxton, verified live (gh / GitHub API) at the moment of reporting. Say plainly if any is CONFLICTING or red, and what is being done about it.
+6. PR TITLES must not contain "DO NOT MERGE". That phrase is an instruction to the run (the agent must not merge its own PR), not a label for the human; runs put it in titles and it confused Paxton (#185). Keep "do not merge" in the run's own rules only. Where a PR genuinely must not be merged yet, use a GitHub draft PR or a `blocked` label and say why in the body.
+
+REFERENCE EXAMPLE (reproduce this shape exactly):
+
+LongHorizon-Harness (LHH)
+
+1. [cogniziocompany/LongHorizon-Harness#50](https://github.com/cogniziocompany/LongHorizon-Harness/pull/50): queue-stall fix (task 230). Merge this first, since it's what stops the queue getting stuck.
+2. [cogniziocompany/LongHorizon-Harness#52](https://github.com/cogniziocompany/LongHorizon-Harness/pull/52): enqueue fields fix (233).
+3. [cogniziocompany/LongHorizon-Harness#53](https://github.com/cogniziocompany/LongHorizon-Harness/pull/53): overseer files moved into the repo (104b). It's big (598 files) but mostly records.
+4. [cogniziocompany/LongHorizon-Harness#49](https://github.com/cogniziocompany/LongHorizon-Harness/pull/49): CI deploy workflow (224). It needs setup after merge, which I'll do.
+5. [cogniziocompany/LongHorizon-Harness#51](https://github.com/cogniziocompany/LongHorizon-Harness/pull/51): queue drain switch (242). Only after #49, because it's built on #49's branch.
+
+cognizioware-hydra
+
+* [cogniziocompany/cognizioware-hydra#32](https://github.com/cogniziocompany/cognizioware-hydra/pull/32): hydra sees CT110 runs (232).
+* [cogniziocompany/cognizioware-hydra#33](https://github.com/cogniziocompany/cognizioware-hydra/pull/33): removes the dead `rc_*` tools (237).
+* [cogniziocompany/cognizioware-hydra#34](https://github.com/cogniziocompany/cognizioware-hydra/pull/34): tool error handling and stale devices (238).
+
+cognizioware-mcp-tools
+
+* [cogniziocompany/cognizioware-mcp-tools#185](https://github.com/cogniziocompany/cognizioware-mcp-tools/pull/185): fleet.easybutt0n.ai accuracy (231). This fixes the 12 dead runs showing as live.
+* [cogniziocompany/cognizioware-mcp-tools#186](https://github.com/cogniziocompany/cognizioware-mcp-tools/pull/186): Penpot (241).
+* [cogniziocompany/cognizioware-mcp-tools#188](https://github.com/cogniziocompany/cognizioware-mcp-tools/pull/188): keeps the chat's `ssh` tool off the Windows PCs (239). One review point: chat gets the Proxmox hosts only, not CTs.
 
 ## STEP 4 — INFRASTRUCTURE HEALTH
 Cheap probes only: `/health/liveliness` or `/health/readiness`, **never the bare gateway `/health`**
