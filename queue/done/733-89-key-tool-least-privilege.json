@@ -1,0 +1,15 @@
+{
+  "name": "733-89-key-tool-least-privilege",
+  "task_file": "C:/tmp/key-tool-least-privilege-task.txt",
+  "workspace": "cognizioware-qa",
+  "max_rounds": 10,
+  "trio": "kimi",
+  "note": "Paxton 2026-09-09: audit every virtual key AND every device, grant only the tools/models each is allowed. Today ONE key hash carries all harness traffic. REVOKES NOTHING - produces the matrix + proposal only; anything unprovable is UNKNOWN and goes to Paxton. Never print a key value. Coordinates with task 88 (per-role keys). || *** BLOCKED ON TASK 136 — 2026-09-16 08:55 PT, SCHEDULED TICK #283. NOT a plain stranding; do NOT requeue yet. Cause read from run 20260910T001551Z_6b606b73's failure_reason, not inferred: `No fallback model group found for original model_group=nemotron-3-super:synthetic-anthropic` (429 from Synthetic with no fallback to land on). Died at round 11/10. This is ONE cause shared by 14 of the 18 undispositioned strandings — ENUMERATED this tick across all 18 snapshots, not sampled; the other 4 are 2x `403 key not allowed`, 1x Ollama 400, 1x `worker disappeared`. REQUEUEING THIS NOW REPRODUCES THE IDENTICAL DEATH, because the fallback groups are still missing on the live router. UNBLOCK WHEN: task 136 (`002-136-litellm-fallbacks-db-write`, run 20260916T144554Z_96563c4c) lands the `:synthetic-anthropic` fallback groups in the LiteLLM Postgres config AND the row is read back and diffed (the DB row wins over the YAML). Then requeue this entry at its ORIGINAL prefix with identity fields (run_id, roles_bound, launched_at) stripped. Only Paxton reorders.",
+  "run_id": "20260910T001551Z_6b606b73",
+  "roles_bound": {
+    "manager": "glm-5.2:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-10T00:15:51.515416+00:00"
+}

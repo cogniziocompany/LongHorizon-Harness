@@ -1,0 +1,15 @@
+{
+ "name": "734-90-fleet-run-hierarchy",
+ "task_file": "C:/tmp/fleet-run-hierarchy-task.txt",
+ "workspace": "cognizioware-mcp-tools",
+ "max_rounds": 10,
+ "trio": "kimi",
+ "note": "Paxton 2026-09-09: the per-run round/session status the overseer hand-builds every tick belongs on fleet.easybutt0n.ai, expandable run->round->session with the live feed. EXTEND OverviewPage.tsx (which today renders only 'Fleet Window' / 'No active runs') reusing RunPage.tsx + socket.ts - the hierarchy is ALREADY modelled there. Must also serve the orchestrator via ONE aggregate call. No new route, no second socket client.",
+ "run_id": "20260910T131727Z_6eac2df7",
+ "roles_bound": {
+  "manager": "qwen3.8",
+  "executor": "ornith-1.5:pool",
+  "auditor": "qwen3.8"
+ },
+ "launched_at": "2026-09-10T13:17:27.185338+00:00"
+}

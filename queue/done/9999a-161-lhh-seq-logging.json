@@ -1,0 +1,16 @@
+{
+  "name": "9999a-161-lhh-seq-logging",
+  "task_file": "C:/tmp/lhh-seq-logging-task.txt",
+  "task_source": "task_file",
+  "workspace": "LongHorizon-Harness",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "*** PR OPEN 2026-09-14 12:15 PT (overseer): LongHorizon-Harness #18, feat/seq-logging -> main at edef634, 6 files +956/-0. Pushed from CT110 with the scoped token. tests/test_seq_logging.py 13 passed in the workspace .venv. NEXT: review, merge, then the CT110 release (kills runs - zero-active window only) and prove a harness event arrives in Seq. ***\n*** PAXTON 2026-09-14: SEQ IS A DEV ENVIRONMENT - INGEST NEEDS NO AUTH. NO API KEY WILL BE CREATED; STOP WAITING FOR ONE. The overseer PROVED it: POST /api/events/raw?clef with NO Authorization header returns HTTP 201 {\"MinimumLevelAccepted\":null} on BOTH https://seq.easybutt0n.ai AND http://192.168.21.128:5341. (The /api/events QUERY endpoint still returns 401 'Please log in' without a session - that is the UI, not ingest.) So: do NOT require SEQ_API_KEY; treat it as OPTIONAL and ship with it unset. Any 'missing SEQ_API_KEY' guard that blocks logging is a BUG to remove. ***\nRE-REQUEUED 2026-09-14 by the overseer (done-at-launch stranding): run 20260912T065112Z_4dda32f1 FAILED at round 4: abort_reason=provider_rate_limit, AUDITOR 429 Custom_openaiException. Its executor had already produced the exact signal 'seq logging configuration incomplete; missing environment variables: SEQ_API_KEY' - which the delta above resolves. Rounds 1-4 of work exist in the workspace tree; check git status before rebuilding.\nBridged 2026-09-11 ~11:20 PT by session [fe2679] via /claude-bridge (Paxton: 'can you try that now'). Discovery: 40 transcripts touched in 30 h, all read; 4 class-(a) handoffs + 1 cancelled task re-surfaced. Source [d9461e] plan 'Ship harness logs to prod Seq'. FOURTH Seq task, no overlap: 135=powerplatform, 137=mcp-tools, 139=qa, 161=LongHorizon-Harness. Appended LAST (9999a-) so Paxton's ordering is untouched. Code+tests+docs only; the CT110 restart and the Seq ingest key (SEQ_API_KEY, env NAME only) are overseer/Paxton steps written into the task. DO NOT reuse SEQ_INGEST_KEY_PP_PROD.",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "kimi-k3:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "run_id": "20260914T164146Z_04598395",
+  "launched_at": "2026-09-14T16:41:46.706277+00:00"
+}

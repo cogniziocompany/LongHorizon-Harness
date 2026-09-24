@@ -9,8 +9,10 @@ routes, and returns plain JSON results that an HTTP MCP wrapper can forward.
 
 No native MCP server SDK is required.  The tools are advertised in
 ``GET /api/mcp/fleet/tools`` and invoked through ``POST
-/api/mcp/fleet/{tool_name}``; a separate LiteLLM-compatible MCP bridge (not in
-this repo) maps the gateway alias ``lhharness`` to those endpoints.
+/api/mcp/fleet/{tool_name}``.  The WebAPI also serves them as a real MCP
+server over streamable HTTP at ``POST /mcp`` (``webapi/mcp_jsonrpc.py``), so
+LiteLLM can register the gateway alias ``lhharness`` directly; both transports
+share this module's manifest and dispatcher.
 """
 
 from __future__ import annotations
@@ -30,6 +32,40 @@ _ENQUEUE_DESCRIPTION = """Enqueue a long-horizon run in the harness service.
 Use this tool to ask the service to start a task. The service stores the task in
 the durable queue, evaluates capacity from [queue.capacity], and launches it
 through the same code path as POST /api/runs.
+
+Accepted fields (all persisted on the queue entry):
+- name (string, required): short human-readable task name.
+- task (string, required): scoped task text. Provide repo, branch,
+  deliverables, and hard rules.
+- workspace (string, required): workspace directory path for the run.
+- trio (string, optional): resource trio, 'kimi' for development work or
+  'qwen' for QA only. No default trio is applied at enqueue time. When
+  omitted, the entry persists with trio unset and never launches until a
+  trio is set: remaining capacity is derived only from the configured
+  trios (launcher.py _remaining_capacity), so each launcher pass records
+  an ' at capacity' skip for the entry (launcher.py _check_eligibility)
+  and it stays pending, unlaunched, consuming no capacity; _launch and
+  _shadow_launch_decision guard the same condition with an 'unknown trio'
+  skip. Supply 'kimi' or 'qwen' whenever the task should actually launch.
+- max_rounds (integer, optional): maximum harness rounds (default 25).
+- priority (integer, optional): higher number = earlier launch within the
+  same trio (default 0).
+- continue_branch (boolean, optional): continuation opt-in. When true the
+  launcher uses whatever branch the workspace currently has checked out
+  as-is (no relocation, no stash, no open-PR refusal). Mutually exclusive
+  with branch.
+- branch (string, optional): continuation opt-in naming a specific branch
+  to use as-is. Mutually exclusive with continue_branch.
+- dedup_key (string, optional): idempotent-enqueue key. Two enqueues with
+  the same non-terminal key resolve to one queue entry, so the work is
+  launched at most once; the key frees up once the entry reaches a
+  terminal state (done/failed).
+- requested_by (string, required): fleet client identity, e.g. 'openwebui'
+  or 'hydra'.
+- base_check (string, optional): base commit/branch check guard.
+
+Unknown fields are rejected with an error naming them; they are never
+dropped silently.
 
 Rules:
 - task text must be scoped: repository, branch, deliverables, and hard rules.
@@ -86,6 +122,10 @@ def _tool_spec(name: str, description: str, parameters: dict[str, Any]) -> dict[
         "input_schema": {
             "type": "object",
             "properties": parameters,
+            # Reject unknown properties instead of dropping them silently
+            # (task 233): a chat client misspelling a field must get an error
+            # naming it, not a task filed without that field.
+            "additionalProperties": False,
         },
     }
 
@@ -102,6 +142,15 @@ def _integer_param(description: str, default: int) -> dict[str, Any]:
     return {"type": "integer", "description": description, "default": default}
 
 
+def _boolean_param(description: str, default: bool) -> dict[str, Any]:
+    return {"type": "boolean", "description": description, "default": default}
+
+
+def _optional_integer_param(description: str) -> dict[str, Any]:
+    """Integer parameter the caller may omit entirely (no filled-in default)."""
+    return {"type": "integer", "description": description}
+
+
 def tools_manifest() -> list[dict[str, Any]]:
     """Return the list of fleet MCP tools exposed by this service."""
     return [
@@ -112,9 +161,24 @@ def tools_manifest() -> list[dict[str, Any]]:
                 "name": _string_param("Short human-readable task name.", required=True),
                 "task": _string_param("Scoped task text. Provide repo, branch, deliverables, and hard rules.", required=True),
                 "workspace": _string_param("Workspace directory path for the run.", required=True),
-                "trio": _string_param("Resource trio: 'kimi' for dev, 'qwen' for QA only.", required=True),
-                "max_rounds": _integer_param("Maximum harness rounds.", default=25),
-                "priority": _integer_param("Higher number = earlier launch within the same trio.", default=0),
+                "trio": _string_param(
+                    "Resource trio: 'kimi' for dev, 'qwen' for QA only. "
+                    "Optional: omit to store the entry with trio unset; the "
+                    "launcher then skips it as 'unknown trio' until a trio "
+                    "is set. No default trio is applied at enqueue time.",
+                ),
+                "max_rounds": _optional_integer_param("Maximum harness rounds."),
+                "priority": _optional_integer_param("Higher number = earlier launch within the same trio."),
+                "continue_branch": _boolean_param(
+                    "Continuation opt-in: use whatever branch the workspace has checked out as-is. Mutually exclusive with branch.",
+                    default=False,
+                ),
+                "branch": _string_param(
+                    "Continuation opt-in naming the branch to use as-is. Mutually exclusive with continue_branch.",
+                ),
+                "dedup_key": _string_param(
+                    "Idempotent-enqueue key: same non-terminal key resolves to one queue entry, launched at most once.",
+                ),
                 "base_check": _string_param("Optional base commit/branch check guard.", required=False),
                 "requested_by": _string_param("Fleet client identity, e.g. 'openwebui' or 'hydra'.", required=True),
             },
@@ -216,15 +280,35 @@ def _bounded(value: Any, *, field: str, max_chars: int = 4096, required: bool = 
 def _enqueue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any]:
     if queue_store is None:
         return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
+    # Task 233: reject unknown argument keys by name instead of dropping them.
+    # The schema already advertises additionalProperties=false; the dispatch
+    # layer enforces it too so non-schema-conformant transports behave the
+    # same way.
+    from .queue import KNOWN_REQUEST_KEYS
+
+    unknown = sorted(set(arguments) - KNOWN_REQUEST_KEYS)
+    if unknown:
+        return {
+            "ok": False,
+            "error": "unknown field(s): " + ", ".join(unknown),
+            "code": 400,
+        }
     body = {
         "name": _bounded(arguments.get("name"), field="name", max_chars=256, required=True),
         "task": _bounded(arguments.get("task"), field="task", max_chars=100_000, required=True),
         "workspace": _bounded(arguments.get("workspace"), field="workspace", max_chars=4096, required=True),
-        "trio": _bounded(arguments.get("trio"), field="trio", max_chars=64, required=True),
-        "max_rounds": arguments.get("max_rounds", 25),
-        "priority": arguments.get("priority", 0),
+        # trio is optional (task 233): omitting it stores the entry with trio
+        # unset; no default is invented at enqueue time.
+        "trio": _bounded(arguments.get("trio"), field="trio", max_chars=64),
+        # max_rounds/priority stay unset when omitted so the store's own
+        # validation defaults apply (no duplicated defaults here).
+        "max_rounds": arguments.get("max_rounds"),
+        "priority": arguments.get("priority"),
+        "branch": _bounded(arguments.get("branch"), field="branch", max_chars=256),
+        "continue_branch": arguments.get("continue_branch"),
         "base_check": _bounded(arguments.get("base_check"), field="base_check", max_chars=4096),
         "requested_by": _bounded(arguments.get("requested_by"), field="requested_by", max_chars=256, required=True),
+        "dedup_key": _bounded(arguments.get("dedup_key"), field="dedup_key", max_chars=256),
     }
     try:
         entry = queue_store.create(body)

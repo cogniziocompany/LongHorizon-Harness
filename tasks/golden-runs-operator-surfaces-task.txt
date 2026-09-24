@@ -1,0 +1,190 @@
+TASK 113 - golden QA runs for EVERY operator surface, not just the product.
+
+*** GATED BEHIND TASK 111 (BMAD flow specs). Build tests against a validated flow, not an assumed one. ***
+*** Task 112 covers the powerplatform product UX. THIS task covers the operator surfaces. ***
+
+Paxton, 2026-09-09: *"we need to make sure that it works all the way through with the golden QA runs
+being deployed and passing on each repo's admin center or any and all web ux."*
+
+================================================================================
+THE SURFACES - and RULE 2 governs which repo each one lives in
+================================================================================
+
+    ops.easybutt0n.ai           cognizioware-mcp-tools   infrastructure health ONLY
+                                7 routes: / · overview · catalog · e2e · certs · admin-centres · audit
+                                **There is NO /doctor route** - the doctor script renders on /overview.
+                                A test that asserts /doctor exists is asserting a surface we deleted.
+    fleet.easybutt0n.ai         cognizioware-hydra       wallboard; run detail lives HERE only; READ-ONLY
+    Hydra web UX (corsairai300) cognizioware-hydra       device fleet + control plane; the ONLY WRITE surface
+    billing admin (CT100)       mcp-cognizioware         billing dev + uat lanes
+
+**Do NOT build a new harness per surface.** Copy `e2e/golden-path/run.mjs` from
+cognizioware-powerplatform - the pattern is settled there and task 112 uses it too. Same step ledger,
+same `NN-kebab-label.png` naming, same `report.json` + `report.md` written in a `finally`, same
+**NETWORK LEDGER** (`METHOD path => status` for `/api/*`, last 40 in the report).
+
+**The network ledger is the non-negotiable part.** On the product side it is what would have caught a
+button that fired ZERO requests. On an operator surface it is what distinguishes "the page rendered"
+from "the page rendered and its data actually loaded" - which is exactly the failure mode ops has
+today, where tiles show green having made no call at all.
+
+================================================================================
+WHAT EACH SURFACE'S RUN MUST ASSERT - beyond "it rendered"
+================================================================================
+
+**ops.easybutt0n.ai** - walk all seven routes. For each: screenshot, and assert the page made the API
+calls its content depends on. Specifically:
+  - **/catalog**: the tool count shown must match what the gateway actually serves. A known live
+    discrepancy exists here (a displayed total below the measured one, with whole namespaces absent),
+    so **assert the number against the source, not against a hardcoded expectation.**
+  - **/certs**: reported EMPTY by Paxton. A run that screenshots an empty page and passes is worthless -
+    assert it lists at least the certificates the estate is known to hold, or fails saying it found none.
+  - **/overview**: the doctor output must be present, since there is no other route for it.
+  - **/e2e**, **/audit**, **/admin-centres**: assert data, not chrome.
+
+**fleet.easybutt0n.ai** - it must show REGISTERED NODES. As of 2026-09-09 21:00 it shows zero, and the
+harness's own `/api/meta` now reports why: `fleet_configured=true`, `fleet_ever_succeeded=false`,
+`fleet_last_error=HTTP 413`. **So a fleet golden run should currently FAIL, and that is correct** -
+write the assertion so it fails on zero nodes rather than passing on an empty list. Do not weaken it
+to make the suite green.
+
+**Hydra web UX** - it is the WRITE surface, so a read-only walk under-tests it. Assert at least one
+state-changing operation round-trips and is visible afterwards. **Do NOT perform destructive writes**
+and do NOT touch device tokens.
+
+**billing admin** - read-only walk; assert the lane/version it reports matches the deployed image.
+
+================================================================================
+WHERE THESE RUN - and the same discipline as task 112
+================================================================================
+
+  - **COMMIT THE CAPTURES.** Follow `e2e/golden-path/.gitignore`: `_out/**/*.webm` only. The PNGs and
+    `report.md` are TRACKED on purpose - without them in git you cannot diff run to run, and that diff
+    is the entire review mechanism.
+  - **MAINTAIN A RUN-HISTORY TABLE per suite**, like golden-path's `run2 4/6 -> run9 6/6`. A human
+    reads the numbered captures plus `report.md` and appends a row. **That table IS the approval step**,
+    and updating it is part of running the suite, not an afterthought.
+  - Wire each suite into the DEPLOY LANE of the repo that owns the surface - not `ci.yml`, not every
+    PR, not a cron. These take minutes and drive real auth; on every push they become noise, noise gets
+    muted, and a muted suite is documentation that runs on a cron. That is precisely how the existing
+    suites became decorative.
+  - `actions/upload-artifact@v4` with `if: ${{ !cancelled() }}` - **uploading artifacts is not
+    optional.** A screenshot suite whose output is discarded proves nothing.
+  - Write down the PROMOTION CRITERION (how many consecutive green runs before it becomes required).
+    "Informational until stable" with no written bar is why the existing gates never became real.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **RULE 2. Do not add a view, route or dashboard.** These surfaces are settled: fleet reads, Hydra
+   writes, ops is infrastructure-only. If a test wants a page that does not exist, the finding is
+   "this is untestable as built" - report it, do not build the page.
+ - Cheap probes only against the gateway: `/health/liveliness` or `/health/readiness`.
+   **NEVER the bare `/health`** - it hits every model including paid and GPU ones.
+ - Run against dev/uat lanes where they exist. **Do not create data in production to satisfy a gate.**
+ - Do NOT use a bearer-token bypass to skip login - these must exercise real auth, or they do not test
+   the thing that breaks.
+ - **A surface that genuinely fails must FAIL the run.** Honour `e2e/golden-path/README.md:19-21`:
+   *"treat known gaps as failures, not passes. Do not 'fix' it by loosening the assertions."* fleet
+   showing zero nodes and certs showing empty are the two you will be tempted to soften. Do not.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat`.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+   **Note in your report that suites touching mcp-tools merge into a lane that recreates the CT202
+   prod router, so the overseer must pick the window.**
+
+================================================================================
+DONE MEANS
+================================================================================
+
+One golden-run suite per surface, built to the golden-path pattern INCLUDING the network ledger,
+runnable against the correct lane, producing committed captures and a `report.md`; a run-history table
+per suite; lane wiring with artifact upload; a written promotion criterion; and an honest first-run
+result. **If ops/certs is empty and fleet shows zero nodes, the correct deliverable is a suite that
+FAILS on both and a report saying so** - that is the suite working, not the suite broken.
+
+
+================================================================================
+ADDENDUM 2026-09-09 23:55 PT (Paxton) — ADD A FIFTH GOLDEN RUN: THE GUEST PATH
+================================================================================
+
+Paxton: "we need to have this done ... a newer version to show how close we are. this is a golden qa
+run you should be adding to the other plan about that."
+
+READINESS DOC (read it before building this suite; it carries the measured preconditions):
+    C:\Users\PaxtonTait\source\LongHorizon-Harness\tasks\guest-e2e-readiness-2026-09-09.md
+It SUPERSEDES `guest-e2e-readiness-2026-09-07.md`, which stops at 09-08. Do not work from the old
+one - among other things it sends you to the wrong host (see the CT100 correction below).
+
+--- THE SUITE: `guest-e2e` -------------------------------------------------------
+SCOPE: Stripe TEST card -> customer -> environment grant -> wizard -> design -> approve -> build,
+plus the usage event landing on the Stripe meter.
+WHERE: **dev first** (pp `192.168.21.163:3000` + billing `192.168.21.153:20252`), then **uat**
+(pp `:3001` + billing `.153:20253`). **NOT prod** - prod carries no guest configuration at all
+(measured: no `Billing__Guest*` / `Stripe__GuestMeter*` on the live prod service).
+
+--- MEASURED STATE 2026-09-09 23:47-23:52 PT, so you do not re-derive it -----------
+    pp dev      :3000/api/health        200 (0.19s)
+    pp uat      :3001/api/health        200 (0.07s)
+    billing uat .153:20253 /ready       200
+    billing prod .153:20251 /ready      200 healthy, sha-728a140
+    billing dev .153:20252 /ready       **503 UNHEALTHY**, sha-608cf64   <-- THE BLOCKER
+    switches, dev AND uat: GuestChargingEnabled=true, GuestExecutionEnabled=true,
+                           NightlyCloseEnabled=false, AllowLiveMode=false
+**CORRECTION: CT100 is on ptait01 (192.168.21.110), NOT ptait07 (.138)** as the old doc says.
+Probing .138 for billing containers returns nothing; .110 returns seven.
+
+--- THE PRECONDITION THAT MUST FAIL LOUDLY ----------------------------------------
+Billing dev `/ready` is 503 while `/live` is 200. Cause read from the body: `pendingSecondaryAck: 1`
+sets `degraded: true` **even though `secondary: "disabled"` and `secondaryRequired: false`.** A
+disabled, not-required secondary should not be able to make the service un-ready - that looks like a
+defect in the readiness predicate from the bounded-health-check work (PR #85). It also means
+`promote-billing`, which polls `/ready`, **cannot start from dev.**
+**The suite must ASSERT `/ready` == 200 and FAIL on it. Do not skip, soften, or fall back to
+`/live`.** Honour the golden-path rule already in this task: treat known gaps as failures, not
+passes.
+
+--- ASSERTIONS THAT CARRY THE REAL RISK -------------------------------------------
+ 1. `verifyAuth` PASS with a customer id that is **NOT `internal`**. Both the 2026-09-07 dev seeding
+    and the 2026-09-08 uat seeding produced `customerId=internal`. That proves the GRANT path and
+    says nothing about the PAYING-CUSTOMER path, which is the one being launched.
+ 2. The Stripe test customer used **exists in that lane's own Stripe account**. Dev and uat are
+    SEPARATE Stripe accounts with separate products/prices/meters. The 09-08 audit found the dev lane
+    pinned `cus_TPFW7YS21tEYUs`, which does not exist in the dev account, so usage against it fails
+    "No such customer". A customer id is NOT portable between lanes - assert per lane.
+ 3. A guest usage event actually moves the meter, and the writer log line names the RESOLVED event
+    name. The 09-08 root cause was the service sending a meter ID where Stripe expects an event name.
+ 4. The guest meter setting is a real event-name setting with a startup guard refusing an
+    `mtr_`-shaped value. PR #90 (merged 09-08 18:41) was meant to replace the stopgap, but the live
+    variable is still named `Stripe__GuestMeterId` holding the event-name value - **so either the
+    guard shipped under the old key or the stopgap is still load-bearing. Determine which.**
+ 5. The approval-log env-variable entry is created once and **REUSED** for a second solution in the
+    same environment - no duplicates. This was Paxton's original requirement from 2026-09-07 and
+    nothing has tested it.
+
+--- CAPTURES ----------------------------------------------------------------------
+Same rule as the other four golden runs: **COMMIT the captures.** `.gitignore` covers
+`_out/**/*.webm` ONLY; screenshots and reports are TRACKED, and their committed diff IS the review
+mechanism. Maintain the run-history table for this suite too.
+
+--- THE TRAP -----------------------------------------------------------------------
+A green result that proves nothing. Two live precedents in this estate: the E2E Gate reports
+`success` while `26-fleet-dns-tls` hard-fails underneath; and on 2026-09-09 a long-context test
+passed only because a context-window fallback answered instead of the model under test. **Assert
+WHICH lane and WHICH customer actually served the request**, and treat a rollup-vs-detail mismatch as
+its own defect rather than noise.
+
+
+================================================================================
+ADDED 2026-09-14 (Paxton) - GOLDEN SCENARIO: per-user gateway key in Fleet Chat, status, gate
+================================================================================
+On the Fleet Chat operator surface, as a golden QA run (after tasks 140 + 177 land): log in as user A -> enter
+gateway key once -> restart the UI -> key still there for A, absent for user B (B gets the default harness-chat key)
+-> "status of everything" answers from hydrafleet-list_fleet_runs + harness_list_queue -> A (operator group) resolves
+a gate via hydrafleet-resolve_run_gate with a rationale -> the resolution shows A's identity in Hydra's log and the
+gateway spend log shows A's key id; B does not see the gate tool at all. Read every step back.

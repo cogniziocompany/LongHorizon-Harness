@@ -1,0 +1,68 @@
+STATUS (2026-09-20 11:23 PT, tick #997): VERIFIED. PR #183 merged 609c1254 (tick #995), deploy run
+35528199461 all-6-jobs green, CT202 read back directly (pct exec 202, ptait01): /etc/cron.d/azure-
+mcp-restart present (`47 */4 * * * root bash .../azure-mcp-supervised-restart.sh`), the script
+itself present and mode 0755, container `cognizioware-mcp-tools-azure-mcp-backend` running,
+StartedAt 2026-09-20T18:19:31Z, restarting=false. Task 214 (and its 214b/214c/214d/214e chain) is
+CLOSED — all four deliverables actually landed and observed on the live box, not just green CI.
+
+TASK 214e — install_supervised_restart() never runs because it sits after main()'s sys.exit(1)
+
+BACKGROUND (read before doing anything): task 214d (PR #182, merged 4b0f8acc7) extended
+`infrastructure/register-mcp-tools-stack.py` with an `install_supervised_restart()` function meant
+to write `/opt/cognizioware-mcp-tools/infrastructure/scripts/azure-mcp-supervised-restart.sh` and
+install `/etc/cron.d/azure-mcp-restart` on every deploy. It STILL DID NOT LAND, verified this tick
+by reading CT202 directly (pct exec 202, ptait01) after deploy run 35521649779 finished all 6 jobs
+green: no such script file under infrastructure/scripts/, no /etc/cron.d/azure-mcp-restart.
+
+ROOT CAUSE, read from the merged file itself (bottom of
+`infrastructure/register-mcp-tools-stack.py`):
+
+    if __name__ == "__main__":
+        main()
+        # Install supervised restart components as part of the normal run
+        install_supervised_restart()
+
+`main()` calls `sys.exit(1)` when the Portainer stack update/create API call fails (see the
+`UPDATE FAILED` / `FAILED` branches around line ~166-176). That Portainer failure is EXPECTED AND
+PERMANENT for this stack — the deploy workflow's own step is literally named "Sync Portainer stack
+metadata (non-fatal)" and prints `::warning::Portainer sync failed (expected — it cannot build this
+stack)` on every single deploy (confirmed this tick from the live job log: Portainer returns
+`{"message":"Failed to deploy a stack: compose build operation failed: unable to prepare context:
+path \"/data/compose/68/docker/gateway-guides-mcp\" not found","_status":500}`). Because `sys.exit(1)`
+raises `SystemExit`, the interpreter never reaches the next top-level statement, so
+`install_supervised_restart()` has NEVER RUN on CT202 — not once, on any deploy, since PR #182
+merged. The bug is the ORDERING/control-flow in 214d's own change, not Portainer and not the sync
+allowlist (which 214d already fixed correctly).
+
+THE FIX: make `install_supervised_restart()` run regardless of whether `main()`'s Portainer sync
+succeeds or fails. Two acceptable shapes — pick whichever is cleaner in context, do not overthink it:
+  1. Reorder: call `install_supervised_restart()` BEFORE `main()` in the `__main__` block, since it
+     has no dependency on Portainer auth/state; OR
+  2. Wrap: call `main()` inside `try: main() except SystemExit: pass` (or equivalent) and put
+     `install_supervised_restart()` in a `finally` block, so a Portainer failure still exits the
+     process with the same code afterward if that exit-code behavior is relied on elsewhere.
+Do NOT change `main()`'s own exit-on-failure behavior for the Portainer path — that is unrelated and
+out of scope. Do NOT touch the cap (`mem_limit`/`memswap_limit` stay untouched — ACK
+CAP-AZUREMCP-20260917-1440). Do NOT touch `.github/workflows/*` — your run's GH_TOKEN is
+fine-grained, push+PR only, and GitHub refuses any push touching a workflow file; do not spend a
+round rediscovering this.
+
+TEST IT FOR REAL, NOT JUST BY READING THE DIFF: run `register-mcp-tools-stack.py` (or at minimum
+import it and call `install_supervised_restart()` directly, then separately exercise the
+Portainer-failure path) in a scratch dir / against a stub, and show that
+`infrastructure/scripts/azure-mcp-supervised-restart.sh` and the cron.d line get written EVEN WHEN
+the Portainer call fails/raises/exits. The existing `tests/test_register_mcp_tools_stack.py` from
+214d already covers `install_supervised_restart()` in isolation — extend it (or add a new test) to
+cover the ordering/control-flow bug specifically: assert that `install_supervised_restart()` is
+invoked (e.g. via a monkeypatch/mock counting calls) even when `main()` raises `SystemExit`. A test
+that only re-checks the function in isolation again would not have caught this bug and does not
+satisfy this task.
+
+Prod-landing rule applies (mcp-tools deploys to CT202 prod): this must launch on an all-Synthetic
+trio; if a local/ornith executor binds, that is a bug in the launcher config, not something to work
+around — report it in your final message and stop.
+
+Push your branch and open the PR yourself (your GH_TOKEN can do this for non-workflow files) and
+STOP — do not merge. In your final report, state plainly what you actually ran to prove the fix
+(command + observed output), not just what you read. Say "unverified" for anything you assert
+without having executed it.

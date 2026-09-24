@@ -1,0 +1,98 @@
+TASK 80 - booking semantics are tested but the deploy gate does not require them
+
+REPO: cogniziocompany/westhivecapital-hivemind. Workspace on CT110:
+/home/harness/work/westhivecapital-hivemind (confirmed present 2026-09-09).
+
+Paxton's request, 2026-09-09: "Booking-semantics eval in the deploy gate". There is a companion
+handoff session on PTAIT-DESK03 (`claude --resume bee85a6d-0f8f-4708-9d1b-2ba67f0485af`) holding the
+full voice-agent incident history. **You cannot reach that session or its transcript.** Everything
+below was read from the repository at commit `406cfe4` and is sufficient.
+
+## THE GAP - measured, not assumed
+
+Three commits established the booking semantics, and each shipped tests:
+
+    575e27b  fix(voice): 3.5s context budget; idempotent booking
+             -> hive-mind/api/main.py, hive-mind/tests/test_api.py (+23 test lines)
+    a6ede47  feat(voice): reschedule semantics - one upcoming intro call per contact
+             -> hive-mind/api/main.py, hive-mind/tests/test_api.py (+61 test lines)
+    406cfe4  fix(voice): forbid post-conversation tool calls; purge the Sep 2 phantom
+             -> hive-mind/assets/voice-agent/instructions.md, hive-mind/tests/test_agent_prompts.py
+
+**Those tests live in `hive-mind/tests/`. The eval gate does not run them.**
+
+`hive-mind/evals/cases.yaml` is, in its own words, "the single source of truth for what the CI eval
+gate requires". It holds **19 cases** - costar-import-minmax, costar-import-single, noi-gap-report,
+validator-contract, offer-price-determinism, underwrite-golden, costar-review-determinism,
+stage-gates, comps-gates, buy-box-scorecard, judge-json-contract, tooldef-parity, description-class,
+tool-call, judge-live, qa-browser, outreach-gate, outreach-e2e, happy-path.
+
+**Not one of them is voice or booking.** So a regression in idempotent booking, in the
+one-upcoming-intro-call rule, or in the post-conversation tool-call prohibition would pass the gate.
+That is the same failure this estate keeps hitting: a test that exists but that nothing requires is a
+file, not a gate.
+
+## HOW THE GATE WORKS - read these before changing anything
+
+`.github/workflows/eval-gate.yml` (triggers on PRs to main and pushes to main):
+    python evals/run_evals.py --suite deterministic --source ci-hosted --report out/eval-report.json
+    python scripts/eval_gate.py --from-report out/eval-report.json
+and a separate live job:
+    python evals/run_evals.py --suite live ... ; python scripts/eval_gate.py ... --cases live
+
+`cases.yaml` documents its own schema in its header. Per case: `id`, `suite`
+(deterministic = offline, every PR | live = LiteLLM gateway), `pytest` (the target run_evals
+invokes), `required` (tiers where the gate FAILS without a fresh pass; dev = feature-branch PRs,
+prod = PRs into main + go-live), `threshold` (omit = all-pass), `rsi_risk` (low = fixable by
+whitelisted config/data changes -> bot PR; high = code/math regression -> escalate),
+`rsi_fix_globs`.
+
+## SCOPE
+
+1. **Register the booking semantics as eval cases.** Add cases to `cases.yaml` covering the three
+   behaviours above. Suggested ids `booking-idempotent`, `booking-one-upcoming-intro`,
+   `voice-no-post-conversation-tools` - use whatever fits the file's existing naming.
+   - `suite: deterministic` if they run offline (they appear to - they are API and prompt tests, not
+     gateway calls). **Verify by reading the tests rather than assuming**, and say which you chose
+     and why.
+   - `required: [dev, prod]`. These are the semantics of the product's booking behaviour; a
+     regression is not acceptable at either tier.
+   - `rsi_risk`: these are **code/behaviour** regressions, so `high` unless you can show otherwise.
+     Do NOT mark them `low` for convenience - `low` invites an automated bot PR to "fix" a real
+     behavioural regression by editing data files.
+   - Give each a `description` that states the RULE, not the file, so a failure is readable.
+
+2. **RESOLVE THE PATH QUESTION AND SAY WHAT YOU FOUND.** Every existing case's `pytest` target is
+   under `evals/` (e.g. `evals/test_costar_import.py -k minmax`). The booking tests are under
+   `hive-mind/tests/`. So either `run_evals.py` can target that path directly, or a thin eval entry
+   under `evals/` must import/delegate to them. **Read `evals/run_evals.py` and determine which.**
+   Prefer pointing at the existing tests over copying them - duplicated assertions drift apart and
+   then disagree. If a wrapper is genuinely needed, make it a delegation, not a re-implementation.
+
+3. **A test that cannot fail is worse than no test.** For each case you register, prove it actually
+   guards the behaviour: state in the PR body how you confirmed the underlying test FAILS when the
+   behaviour is broken. Reading the assertion is acceptable evidence; asserting that it "looks
+   correct" is not.
+
+4. Update whatever doc lists the eval cases, if one exists. Do not create a new one.
+
+## HARD RULES
+
+ - Branch off `main`, PR to `main`, **DO NOT MERGE**.
+ - Do NOT lower any existing `threshold`, do NOT move a case out of `required`, and do NOT weaken an
+   existing assertion to make a new case pass.
+ - Do NOT invent test cases for behaviour you cannot find in the code. If one of the three
+   behaviours has no existing test, say so plainly and register the two that do - a fabricated
+   assertion passes forever and catches nothing.
+ - No live calls: no Telnyx, no Graph, no n8n, no LiteLLM gateway calls from this task. Do not dial
+   the voice line (+1 424 421 7540). Do not touch the assistant configuration.
+ - Env NAMES only, never values. Do not ask for credentials.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+
+## DONE MEANS
+
+A PR against main that registers the booking-semantics cases in `cases.yaml` with `required:
+[dev, prod]`, a stated and justified `suite` and `rsi_risk`, the path question resolved with what you
+found in `run_evals.py`, and - for each case - how you confirmed the underlying test genuinely fails
+when the behaviour breaks. Report the case count before and after. If any of the three behaviours
+lacks a test, name it rather than inventing one.

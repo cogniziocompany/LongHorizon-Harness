@@ -1,0 +1,16 @@
+{
+  "name": "9999zl-53-public-purchase-route",
+  "task_file": "C:/tmp/public-purchase-route-task.txt",
+  "workspace": "cognizioware-powerplatform",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "*** READMITTED AT THE TAIL 2026-09-21 by the interactive session on Paxton's decision (OPEN-ASKS stranding-readmission: 'Readmit powerplatform ones only'). Task number preserved, run identity stripped. ORIGINAL CAUSE was the provider layer, not this task: Synthetic 429 with 'No fallback model group found' - fixed by task 136 (fallbacks), VERIFIED 2026-09-17 on positive proof. ROUND 1 MUST START BY MEASURING WHAT ALREADY LANDED: pp PRs #89 (guest slices + SPA checkout), #99 (checkout entry) and #101 (Stripe return for a signed-out buyer) all merged 09-08/09-09, after this task was written. Diff the task's acceptance list against develop; build ONLY what is missing; if nothing is missing, report that with evidence and STOP - do not rebuild. *** || || *** BLOCKED ON TASK 136 — 2026-09-16 08:55 PT, SCHEDULED TICK #283. NOT a plain stranding; do NOT requeue yet. Cause read from run 20260909T132842Z_38e30ae9's failure_reason, not inferred: `No fallback model group found for original model_group=syn:large:vision:synthetic-anthropic` (429 from Synthetic with no fallback to land on). Died at round 1/8. This is ONE cause shared by 14 of the 18 undispositioned strandings — ENUMERATED this tick across all 18 snapshots, not sampled; the other 4 are 2x `403 key not allowed`, 1x Ollama 400, 1x `worker disappeared`. REQUEUEING THIS NOW REPRODUCES THE IDENTICAL DEATH, because the fallback groups are still missing on the live router. UNBLOCK WHEN: task 136 (`002-136-litellm-fallbacks-db-write`, run 20260916T144554Z_96563c4c) lands the `:synthetic-anthropic` fallback groups in the LiteLLM Postgres config AND the row is read back and diffed (the DB row wins over the YAML). Then requeue this entry at its ORIGINAL prefix with identity fields (run_id, roles_bound, launched_at) stripped. Only Paxton reorders.\n\nOVERSEER tick #1321 2026-09-21 18:16 PT: run 20260921T224135Z_58ef9593 hit round 8/8 with the work done (HEAD 41aef23, 9 commits +802/-20 vs develop). Gate 0a5855dee618 resolved action=stop. Branch pushed by the overseer from CT110 (push needed `-c credential.helper=`; a stored credential was overriding the run token and is the likely reason runs stall at push) and PR #121 opened against develop. State: PR. Next: review via task 117 triage, merge -> dev only.",
+  "task_source": "task_file",
+  "run_id": "20260921T224135Z_58ef9593",
+  "roles_bound": {
+    "manager": "kimi-k3:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-21T22:41:35.741373+00:00"
+}

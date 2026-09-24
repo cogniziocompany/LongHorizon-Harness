@@ -1,0 +1,116 @@
+TASK 169 - STOP THE LANGFUSE QUOTA BLEED, AND INSTRUMENT POWERPLATFORM PRODUCTION PROPERLY.
+
+SOURCE: audit session [fe2679] 2026-09-11 section F. Verified by the overseer 2026-09-11: NOTHING in
+the queue or OPEN-ASKS tracks Langfuse quota. This is new work, not a duplicate.
+
+REPO / WORKSPACE: cognizioware-powerplatform   (the harness-side sampling is a config change the
+overseer applies; see PART 1)
+
+================================================================================
+THE SITUATION
+================================================================================
+The Langfuse free tier is EXHAUSTED: 50,152 of 50,000 events, and it does not reset until
+2026-09-30. Quota is ORG-WIDE, so a separate project buys NO headroom.
+
+*** THE BURNER IS THE HARNESS, NOT POWERPLATFORM. *** The lh-harness LiteLLM virtual key has
+per-key Langfuse logging (set 2026-08-29 by infrastructure/scripts/set-perkey-langfuse.sh in
+mcp-tools) and the Claude Code adapter tags EVERY turn. This workstation alone: 27 September runs,
+380 rounds, 528 episodes at roughly 22 turns each - about 11.6k calls, and roughly 2 events per
+call, so about 23k events. The Hydra fleet runners (ptait09, desk03, htpc01) run the SAME harness.
+
+And the cruel part: POWERPLATFORM PRODUCTION EMITS NOTHING. The SDK is wired
+(packages/backend/src/config/tracing.ts, agents/base-agent.ts, one generation per agent call with
+sessionId grouping) but prod.env HAS NO LANGFUSE KEYS. So the quota is consumed by the harness while
+the one revenue-generating live system is dark.
+
+================================================================================
+PART 1 - STOP THE BLEED FIRST. THIS IS THE URGENT HALF.
+================================================================================
+Nothing below matters if the quota stays exhausted, and it cannot be bought back before 09-30.
+Choose ONE and apply it, then READ THE KEY'S METADATA BACK to prove it took:
+  (a) SAMPLE the harness: executor role OFF, manager and auditor ON (or 1-in-N episodes), applied
+      via set-perkey-langfuse.sh; or
+  (b) POINT lh-harness at SELF-HOSTED Langfuse, which removes it from the org quota entirely.
+Recommendation: (a) now because it is minutes of work, (b) as the durable answer.
+*** VERIFY THE KEY'S CURRENT METADATA BY READ-BACK BEFORE AND AFTER. *** A 200 from the LiteLLM key
+update endpoint is NOT proof - this exact endpoint returned 200 and silently discarded a key twice.
+
+ALSO CHECK, because it changes the diagnosis if true: global LiteLLM callbacks are supposed to be
+opentelemetry ONLY (Langfuse was deliberately REMOVED 2026-06-28 after a tenant leak). But CT202
+runs store_model_in_db: true and litellm_settings IS one of the five DB-SHADOWED sections. So
+confirm via /config/list that the DB is not shadowing a global Langfuse callback back into life. If
+it is, that is a second bleed AND a repeat of a known leak - report it immediately.
+
+COUNT THE OTHER WRITERS before concluding: the librechat and n8n-dev-pipeline-orchestrator keys ALSO
+push into the same project via per-key logging, and cognizioware-agent-harness (pk-lf-b9f6...) is a
+third, dormant consumer. ENUMERATE every key with Langfuse logging and report the list with counts -
+one sample does not characterise a population.
+
+================================================================================
+PART 2 - POWERPLATFORM INSTRUMENTATION
+================================================================================
+ 1. ONE TRACE PER USER TURN with the 6 child generations, instead of loose per-agent generations.
+ 2. userId from the MSAL principal, and tags for env and tenant. There are NO tags today.
+ 3. SCORES: evals/acceptance.ts ALREADY COMPUTES combinedBasisPoints and isVerified100 and posts
+    NOTHING. Post them as a numeric and a categorical score on the session. This is the highest
+    value item - it is a computed result being thrown away.
+ 4. TOOL-CALL SPANS: handleToolCall writes Postgres only, so tool latency is invisible.
+ 5. Add the keys to prod.env THROUGH THE LANE'S SECRET PATH. Not in git, not in a doc, not in this
+    file.
+ 6. RENAME the env var: the code reads LANGFUSE_BASE_URL while everything else in the fleet uses
+    LANGFUSE_HOST, and the DEFAULT IS THE EU HOST, which is the wrong region. Fix both.
+ 7. PICK ONE MECHANISM PER CALL PATH - per-key LiteLLM logging OR the app SDK, never both. Both is
+    how a call becomes two traces and the quota doubles.
+
+================================================================================
+A SECURITY ITEM THAT MUST BE CHECKED, NOT ASSUMED
+================================================================================
+Plaintext sk-lf- secret keys sit in dev.env, uat.env and the agent-harness .env. CONFIRM ALL THREE
+ARE GITIGNORED and that none is committed anywhere in history. If one IS committed, STOP and report
+it as a finding - do NOT rotate it (credential rotation is out of scope in this lab by standing
+decision) and do NOT print the value. Report only the PATH and the FACT.
+
+HARD RULES
+================================================================================
+ - NEVER print a secret value. Env var NAMES only, in code, notes, commits and the report.
+ - Do NOT rotate credentials - out of scope, standing decision.
+ - powerplatform ships on DEVELOP, not main: prod runs develop-derived images and main is held.
+   Base this work on develop.
+ - Do NOT edit infrastructure/litellm-config.yaml in mcp-tools as part of this (it force-recreates
+   the CT202 prod router). The per-key change is an API call plus a read-back, not a YAML edit.
+ - NEVER git add -A; commit by explicit path; git diff --stat before every commit.
+ - Do NOT post an @claude comment (task 117).
+ - The sampling change in PART 1 is applied by the OVERSEER (it needs credentials a run never gets).
+   The run DELIVERS the exact command and the read-back procedure, and STOPS.
+
+VERIFICATION
+================================================================================
+ 1. The lh-harness key's metadata, READ BACK, shows the sampling change.
+ 2. The org event rate DROPS on the next daily read - quote both numbers, before and after.
+ 3. /config/list confirms no global Langfuse callback is DB-shadowed.
+ 4. powerplatform prod emits ONE trace per user turn with scores attached - read a real trace back
+    from Langfuse and quote its id; do not infer it from the code.
+ 5. The enumerated list of Langfuse-logging keys is in the report, with per-key event counts.
+
+DONE MEANS: the harness no longer consumes the org quota at its current rate (proven by two
+measurements), powerplatform prod emits traces with acceptance scores attached, exactly one
+mechanism logs each call path, and the gitignore status of all three .env files is confirmed.
+
+
+================================================================================
+SAMPLING SIZE - Paxton 2026-09-14 ("create a sampling size to meet our requirements"). BINDING.
+================================================================================
+Budget 50,000 events/calendar month, org-wide (resets 09-30). Allotment: powerplatform prod 15,000 (~14 events per
+user turn = 1 trace + 6 generations + ~3 scores + ~4 tool spans => ~1,070 turns/month; re-cut after week 1);
+librechat + n8n-dev-pipeline-orchestrator 5,000; lh-harness 25,000; headroom 5,000 (do not spend).
+Harness arithmetic (measured 09-01..09-11 on PTAIT09): 48 episodes/day x ~22 turns x 2 events = ~2,100/day =
+~63,000/month from ONE box. Budget => <= ~570 episodes/month (~19/day) at full tracing.
+MECHANISM: per-key logging is on/off per virtual key; the Claude Code adapter cannot set per-request no-log. So
+sampling = WHICH ROLE KEYS LOG = task 88's per-role keys (lh-harness-manager / -executor / -auditor):
+  PTAIT09/CT110 : executor OFF (~60% of turns), manager ON, auditor ON  => ~845/day = ~25,000/month = the allotment
+  fleet runners : executor OFF, auditor OFF, manager ON                => ~300/day/box
+  TRIPWIRE: daily read of Langfuse usage by key; > 900 harness events/day for 3 days => the next step is NOT thinner
+  sampling, it is self-hosted Langfuse for the harness project (own Postgres on CT103) queued as 169b.
+UNTIL 88's role keys exist: REMOVE per-key logging from the single lh-harness key now (set-perkey-langfuse.sh
+remove path, read the key metadata back). All-or-nothing on one key => nothing, until 09-30.
+Powerplatform lands one-trace-per-turn BEFORE prod keys go in; six root traces per turn is ~6x the events.

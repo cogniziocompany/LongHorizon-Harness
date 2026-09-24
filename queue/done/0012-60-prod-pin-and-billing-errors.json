@@ -1,0 +1,15 @@
+{
+  "name": "0012-60-prod-pin-and-billing-errors",
+  "task_file": "C:/tmp/prod-pin-and-billing-errors-task.txt",
+  "workspace": "cognizioware-powerplatform",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "launched_at": "2026-09-09T18:58:50.055558+00:00",
+  "note": "REQUEUED 2026-09-09 11:53 PT. First attempt (20260909T173345Z_43955d5f) did nothing and was RIGHT to refuse: the queue entry pointed at cognizioware-powerplatform-evalfix while the task text names cognizioware-powerplatform, and that copy sat on a feature branch not origin/develop. Workspace corrected here. || STATE = MERGED, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in a triage of every undispositioned failed/cancelled entry. The run ended without a disposition note, but its work SHIPPED: branch fix/prod-pin-and-billing-errors -> cognizioware-powerplatform PR #103 is MERGED at 9a64d4e. This was a RECORDS gap, not a work gap: nothing needs relaunching. LIVE/VERIFIED still require the usual lane and read-back evidence.",
+  "run_id": "20260909T185850Z_38acf19f",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "syn:large:vision:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  }
+}

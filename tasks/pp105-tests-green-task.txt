@@ -1,0 +1,56 @@
+TASK 192b - Make PR #105's `test` check green. ONE STEP. COMMIT AND PUSH.
+
+REPO / WORKSPACE: cognizioware-powerplatform, the -evalfix tree
+(/home/harness/work/cognizioware-powerplatform-evalfix).
+BRANCH: task-101/build-dispatch, already checked out, HEAD = 196bf784 (the develop merge).
+Do NOT branch fresh. Do NOT open a new PR - PR #105 already exists and you are updating it.
+Do NOT merge it; merging is the overseer's.
+
+WHY THIS IS NARROW
+The previous run (192, round ceiling 4/4) DID finish the other two things and they are verified:
+the base conflict is cleared (mergeable=MERGEABLE) and the frontend BUILD check is SUCCESS.
+Exactly one thing is left. Do not redo the merge and do not redo the build.
+
+THE FACT THAT MATTERS - measured from the GitHub API 2026-09-17 13:0x PT, not from a run report:
+  CI run 35263388178 on head 196bf784: build=SUCCESS, test=FAILURE.
+  Base `develop` (3bd9040) CI = SUCCESS.
+So the test regression is THIS BRANCH'S OWN, introduced by the develop merge resolution. It is not
+inherited and it is not flaky. All three failures are in the two files the merge resolved.
+
+THE THREE FAILURES - fix these and nothing else:
+  1. packages/frontend/src/workspace/__tests__/WorkspaceLayout.stall-detection.test.tsx:163
+     AssertionError: expected '' to contain 'Test Session'   (the render produced nothing at all)
+  2. the same file, line 292 - identical assertion, same cause
+  3. packages/frontend/src/sessions/wizard/__tests__/SessionWizard.test.tsx:189
+     expected the fetch mock to be called with "/sessions/test-session-id/setup/status"
+     but it was called with "/sessions/test-session-id/flow"
+
+READ (3) CAREFULLY BEFORE YOU TOUCH IT. This PR's whole subject is "wire the wizard Start button to
+dispatch a build via POST /setup/start". A Start button calling `/flow` instead of `/setup/status`
+is the behaviour this PR exists to change, so the merge resolution plausibly took the WRONG SIDE and
+reinstated the old call path. DECIDE WHICH SIDE IS CORRECT FROM THE PR'S INTENT, then make code and
+test agree. If the intended behaviour is the setup/status call, fix the COMPONENT. Only change the
+test's expectation if you can show the /flow call is the intended post-merge behaviour - and say why
+in the commit message. Do not "fix" a red test by asserting whatever the code happens to do.
+
+For (1) and (2), an empty render usually means the component threw or a required mock/provider was
+dropped in the conflict resolution. Run the file locally and read the actual error:
+  cd packages/frontend && npx vitest run src/workspace/__tests__/WorkspaceLayout.stall-detection.test.tsx
+
+RULES (carried over, they still apply):
+  - Do NOT cast to `any` to make it pass.
+  - Stage BY PATH. NEVER `git add -A` / `git add .` - packages/frontend/dist/ and
+    packages/frontend/node_modules/ are build artefacts and must not enter a commit.
+  - Keep the BUILD green: re-run `npm run build` before you push.
+  - NEVER post an @claude comment anywhere - it bills Paxton's personal subscription (task 117).
+
+VERIFY, DO NOT ASSUME
+`npm test` passing on your box is NOT the deliverable. After you push, read the check back:
+  gh run list --repo cogniziocompany/cognizioware-powerplatform --branch task-101/build-dispatch --limit 1
+and confirm the `test` job's conclusion is success on YOUR head sha. A green local run with a red CI
+job is exactly the failure the last run shipped - its own final report conceded it never read the
+CI colour.
+
+DONE MEANS
+PR #105 is OPEN, mergeable, and CI on its head sha has build=SUCCESS and test=SUCCESS.
+Then STOP. Do not merge.

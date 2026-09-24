@@ -1,0 +1,189 @@
+TASK 125 - SCHEDULED 2-HOURLY EXPORT-AND-PRUNE of the CT202 LiteLLM spend logs to the terranas01
+USB volume, with an audit-log entry on the admin centre for EVERY run, success or failure.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+
+*** Paxton 2026-09-10 08:0x PT, DECISION MADE, verbatim: "dump all records on terranas01 usbdrive
+    ... Every 12hrs, export (clear space) from prod server and save it in same dir terranas01
+    usbdrive volume with mcp should be accessible /cognizioware-mcp-gateway ssh exec. Make this
+    scheduled. I will manage terranas01. make sure we write in the audit log for the admin center
+    for this app. Every time this is done and the status if it's successful or not how much how
+    much was moved, etc." ***
+
+This is the IMPLEMENTATION of the decision. The investigation and plan are TASK 115
+(`002-115-ct202-spendlog-disk-retention`, already in queue/done) - READ IT FIRST and do not redo it.
+
+================================================================================
+THE PROBLEM, measured - do not re-derive
+================================================================================
+
+CT202 is the LIVE MODEL GATEWAY box. It is at **57G/80G = 72%** and climbing ~1 GB/hour whenever
+traffic flows. The cause is proven: LiteLLM records the full request and response text of every
+call into `"LiteLLM_SpendLogs"` and nothing ever deletes them - roughly **18 GB**, about ninety
+percent of it written in the last week. **This is the identical mechanism that filled the same box
+and took the gateway down for an hour**, destroying 23 runs, with nothing on any operator surface
+showing it. Growth is paused only because the fleet is idle; it resumes when the providers do.
+
+================================================================================
+TARGET - all verified 2026-09-10, use these, do not go hunting
+================================================================================
+
+  SOURCE   CT202 (ptait01 /CT202), Postgres container **`cognizioware-mcp-tools-postgres`**,
+           database `litellm`, table `"LiteLLM_SpendLogs"` (quoted - it is case-sensitive).
+  DEST     **terranas01 = 192.168.21.128**, SSH alias `terranas01` via the gateway ssh MCP
+           (`ssh-ssh_exec`). **The USB drive volume is `/Volume2`** - verified: the USB disk `sdc`
+           partition `sdc4` is a RAID5 member -> `md0` -> `vg1-lv1` -> mounted at `/Volume2`,
+           18.2 TB with **7.3 TB free**. (`/Volume1` is the SATA pair; `/Volume3` is 925 GB ext4
+           holding Docker data. Neither is the USB volume.)
+  DEST DIR `/Volume2/cognizioware-mcp-gateway/spendlogs/` - create if absent. Paxton manages
+           terranas01 itself; do not reconfigure the NAS, only write into this path.
+  CADENCE  **EVERY 2 HOURS**, scheduled. (Changed from 12h by Paxton 2026-09-10 15:30 PT -
+           see the decision block at the end of this file. It changes more than a number.)
+
+================================================================================
+THE ORDER OF OPERATIONS IS THE WHOLE SAFETY DESIGN - DO NOT REARRANGE IT
+================================================================================
+
+This deletes production data. The sequence below is not a suggestion:
+
+  1. **Pick a cutoff** - an explicit timestamp, e.g. rows with `"startTime" < now() - interval
+     '48 hours'`. Never "everything"; recent rows are what an operator debugging a live incident
+     needs. Record the cutoff in the audit entry.
+  2. **EXPORT FIRST** to a temp file on CT202, compressed. Record the exact row count exported.
+  3. **TRANSFER** to `/Volume2/cognizioware-mcp-gateway/spendlogs/` on terranas01.
+  4. **VERIFY ON THE DESTINATION** - re-read the file ON TERRANAS01 and confirm both a checksum
+     match and the row count. **A successful scp exit code is NOT proof the bytes are readable at
+     the far end.** If verification fails: STOP, delete NOTHING, write a FAILED audit entry.
+  5. **ONLY THEN DELETE**, and only rows at or before the same cutoff, bounded by the same
+     predicate used for the export - not a fresh `now()`, or you delete rows written between steps
+     2 and 5 that were never exported.
+  6. **RECLAIM** - `DELETE` does not return space to the filesystem in Postgres. A plain `VACUUM`
+     marks pages reusable; only `VACUUM FULL` returns space to the OS and it **takes an exclusive
+     lock on the table**. Decide deliberately and say which you chose and why. **VACUUM FULL MUST NOT be in the 2-hourly path at all** -
+     see the cadence decision block at the end of this file.
+  7. **AUDIT ENTRY, ALWAYS** - success or failure, see below.
+
+================================================================================
+THE AUDIT LOG - Paxton asked for this explicitly
+================================================================================
+
+ops.easybutt0n.ai already has an **`audit`** route (the seven routes are /, overview, catalog, e2e,
+certs, admin-centres, audit). **EXTEND THE EXISTING AUDIT SURFACE. Do NOT add a new page, view or
+route** - RULE 2 forbids duplicating surfaces and this has been violated before.
+
+Every run writes one entry containing at minimum:
+    timestamp (start and finish), outcome **SUCCESS / FAILED / SKIPPED**, and on failure WHICH STEP
+    failed and the error
+    the cutoff timestamp used
+    rows exported, rows deleted (these must match, or say loudly that they did not)
+    bytes written to terranas01, and the destination path + filename
+    CT202 disk used/total and percent **before and after** - this is the number that says whether
+    the job is actually working
+    table size before and after
+A run that fails must still write an entry. **A silent failure here is the whole problem repeating:
+the original outage happened because nothing surfaced it.**
+
+================================================================================
+SCHEDULING
+================================================================================
+
+Every 2 hours. Prefer a systemd timer or cron on a box that is not CT202 itself where practical,
+so a full disk cannot prevent the job that fixes the full disk from running. State where you put it
+and why. It must be idempotent and must not overlap itself - if the previous run is still going,
+SKIP and write a SKIPPED audit entry rather than running two exports at once.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **This deletes production data. Export-verify-then-delete, in that order, always.** If any step
+   is uncertain, delete nothing and write a FAILED entry.
+ - **Never `VACUUM FULL` unattended on a schedule** - exclusive lock on a table the live gateway
+   writes to on every request.
+ - **Do NOT touch `infrastructure/litellm-config.yaml`** - any edit force-recreates the CT202 prod
+   router.
+ - **No secrets anywhere** - not in the script, not in the audit entry, not in a doc, not in a
+   filename. DB credentials and keys come from the existing env files by NAME only. The exported
+   rows contain full request/response bodies, so **the export file itself is sensitive** - say
+   where it lands and who can read it.
+ - **NEVER the bare gateway `/health`** - it fans a completion out to every configured model.
+ - No bare `docker compose up` for mcp-tools - always `--env-file mcp-tools.env`.
+ - **NEVER `docker compose down -v`.**
+ - Never `git add -A`; commit by explicit path; check `git diff --stat` first.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+ - Do not reconfigure terranas01 - Paxton manages it. Write into the destination path only.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A committed, idempotent, non-overlapping 12-hourly job that exports rows older than an explicit
+cutoff from `"LiteLLM_SpendLogs"` on CT202, transfers them to
+`/Volume2/cognizioware-mcp-gateway/spendlogs/` on terranas01, **verifies them at the destination
+before deleting anything**, deletes only the verified set, reclaims space by a deliberately chosen
+and documented method, and writes an audit entry to the EXISTING admin-centre audit surface on every
+run - success, failure or skip - carrying outcome, cutoff, rows exported vs deleted, bytes moved,
+destination path, and CT202 disk percent before and after. Plus a short runbook naming the manual
+recovery path if a transfer half-completes. Nothing merged, nothing pushed.
+
+
+================================================================================
+*** CADENCE CHANGED TO EVERY 2 HOURS - Paxton 2026-09-10 15:30 PT ***
+"can you move up the solution for this? ... have it run every 2 hours. first export."
+================================================================================
+
+The cadence is now **every 2 hours**, not 12. This task is also moved UP the queue by Paxton's
+direction (queue entry renamed `755-125-...` -> `003-125-...`, second only to the running task 136).
+
+"FIRST EXPORT" IS ALREADY THE DESIGN AND MUST NOT BE WEAKENED. The order above -
+cutoff, EXPORT, TRANSFER, VERIFY ON THE DESTINATION, only then DELETE - is unchanged. Six times an
+hour instead of twice a day means the delete step runs six times more often, so the verify-before-
+delete gate matters MORE, not less. Do not "optimise" it away because the batches are small.
+
+THREE CONSEQUENCES OF 2 HOURS THAT ARE NOT JUST A SMALLER NUMBER. Address each explicitly:
+
+ 1. **THE FIRST RUN IS NOT LIKE THE OTHERS AND WILL HURT IF YOU TREAT IT THE SAME.**
+    Steady-state, a 2-hourly job with a 48h cutoff moves roughly 2 hours of aged-out rows - at the
+    measured 5-11 GB/day that is only ~0.4-0.9 GB per run. But the FIRST run faces the whole
+    accumulated stock: ~18 GB of TOAST, 9.88M chunks, everything older than 48h back to 2026-03-29.
+    Exporting and deleting that in one transaction on the LIVE prod router's database is exactly the
+    kind of long-running statement that causes the outage this task exists to prevent.
+    **REQUIRED: chunk the backlog drain.** Bound each pass by row count or by a moving time window
+    (e.g. oldest day first), commit per chunk, and let the schedule work through the backlog over
+    several runs. State the chunk size you chose and why. A first run that tries to do all 18 GB at
+    once is a FAILED design, not an ambitious one.
+
+ 2. **AT 2 HOURS, `VACUUM FULL` IS OFF THE TABLE ENTIRELY - and plain autovacuum is the point.**
+    It takes an ACCESS EXCLUSIVE lock on a table the live gateway writes to on every single request.
+    Six times a day is not a "window", it is a recurring outage. The 2-hourly job does DELETE only,
+    and relies on autovacuum marking those pages reusable so Postgres REFILLS them with new rows.
+    That is what actually keeps the table FLAT: once the stock is drained, the file stops growing
+    because deletes and inserts trade the same pages. Steady-state needs no VACUUM FULL ever.
+    Confirm autovacuum is actually keeping up on this table (`n_dead_tup` in `pg_stat_user_tables`
+    should not climb run over run) and say so in the audit entry - if dead tuples climb, the job is
+    silently losing to the write rate and that is a finding.
+    **The ONE-TIME reclaim of the existing 18 GB still needs `pg_repack` in a deliberate window.**
+    That stays a separate, attended step with Paxton's go. Do not fold it into the schedule.
+
+ 3. **NON-OVERLAP IS NOW A REAL RISK, NOT A FORMALITY.**
+    At 12h a run had no realistic chance of colliding with the next. At 2h, a slow transfer to the
+    NAS or a large chunk can still be running when the timer fires again. The SKIP path (previous
+    run still going -> write a SKIPPED audit entry and exit) must be implemented with a real lock -
+    a lock file with a stale-lock timeout, or systemd's own `RefuseManualStart`/single-instance
+    semantics - and it must be TESTED by deliberately overlapping two invocations. Two concurrent
+    runs both deleting by cutoff is how rows get deleted that were never verified at the far end.
+
+AUDIT ENTRY ADDITION: because the cadence is now 12 entries a day, the audit surface must stay
+readable. Keep ONE entry per run as specified, but make the SKIPPED/SUCCESS/FAILED outcome the
+primary sortable field so an operator can find the failures without reading 84 rows a week. Do NOT
+add a second page or view for this - the RULE 2 constraint against duplicating surfaces is unchanged.
+
+UNCHANGED BY THIS DECISION: destination `/Volume2/cognizioware-mcp-gateway/spendlogs/` on terranas01
+(Paxton manages the NAS; write into that path only); the export file contains full request/response
+bodies and IS sensitive; no secrets in script, audit, doc or filename; do NOT edit
+litellm-config.yaml; do not merge, no `git add -A`.

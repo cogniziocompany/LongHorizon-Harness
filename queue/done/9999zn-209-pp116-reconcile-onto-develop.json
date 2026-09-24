@@ -1,0 +1,18 @@
+{
+  "name": "9999zn-209-pp116-reconcile-onto-develop",
+  "task_file": "C:/tmp/pp116-reconcile-onto-develop-task.txt",
+  "task_source": "task_file",
+  "workspace": "cognizioware-powerplatform",
+  "max_rounds": 5,
+  "trio": "kimi",
+  "continue_branch": true,
+  "branch": "fix/ruflo-drift-preflight",
+  "note": "CREATED 2026-09-21 by the interactive session on Paxton's decision (OPEN-ASKS pp-116-main-base = retarget to develop). Retarget DONE and read back (base=develop); PR now CONFLICTING/DIRTY. Scope: merge develop INTO the branch, keep ONLY the TASK-165 ruflo pre-flight change, push, STOP. continue_branch set for the task-201 workspace guard. Develop-only, so a local executor is acceptable. | TICK #1334 2026-09-21 20:0x PT: gate 7f20f4816be8 (run f7bb6ca7 r5/5) = run token refused on .github/workflows/eval-gate.yml (by design). Overseer bundled 759bcae off CT110 (sha256 429ec86e verified), pushed from PC with workflow-scoped gh token: 033431f..759bcae. pp #116 read back base=develop tip=759bcae MERGEABLE. Diff vs develop = 5 files TASK-165 only. Resolved action=continue with 'write report and STOP'. State PR. Merge is overseer's, unreviewed (task 117 triage). | TICK #1336 2026-09-21 20:18 PT: completion gate 3ce7c5a7d5b8 (run f7bb6ca7) resolved action=stop; run ended exit 0 report_status=completed (api status=cancelled, not a stranding). pp #116 read back base=develop head=759bcae MERGEABLE/CLEAN rev=none. State PR; merge is the overseer's via task 117 triage (unreviewed).",
+  "run_id": "20260922T015941Z_f7bb6ca7",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "syn:large:vision:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-22T01:59:41.781632+00:00"
+}

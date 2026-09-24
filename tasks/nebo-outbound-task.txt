@@ -1,0 +1,335 @@
+TASK 100 - Nebo Outbound: first-response email to marketing-list leads.
+
+REPO: cogniziocompany/cognizioware-nebo (branch `main`, HEAD e893a49 at plan time).
+Workspace on CT110: /home/harness/work/cognizioware-nebo (create with SSH remote +
+.lh-harness/config.toml budgets before launch if it does not exist).
+
+Source: plan `based-on-thei-s-dynamic-fountain.md` by session
+`df0fb7d9-889c-4a4c-9436-d65c4dbfaff9` (Claude Code, claude-fable-5-1), 2026-09-09, relayed by
+Paxton. **The overseer read the plan file off disk - it is 131 lines and this task carries all
+seven steps.** Resume that session with:
+    cd C:\Users\PaxtonTait\source\cognizioware-nebo && claude --resume df0fb7d9-889c-4a4c-9436-d65c4dbfaff9
+Full plan: C:\Users\PaxtonTait\.claude\plans\based-on-thei-s-dynamic-fountain.md
+Read FIRST in the repo: CLAUDE.md, then design/cognizioware-nebo-gap-analysis-and-repo-plan.md
+(v3), then docs/HANDOFF.md.
+
+================================================================================
+STOP GATE A - THIS TASK SENDS REAL EMAIL TO REAL PEOPLE. IT IS IRREVERSIBLE.
+================================================================================
+
+These are Cognizio's actual website leads who subscribed via easybutt0n.ai. A sent email cannot be
+recalled, it lands in a stranger's inbox under `ai-dev01@cognizio.company`, and a bad batch is a
+deliverability and reputation event, not a bug.
+
+**`DRY_RUN` STAYS TRUE FOR THE ENTIRE HARNESS RUN. NO EXCEPTIONS.**
+`dryRun = process.env.DRY_RUN !== 'false'` is existing repo policy - the default is safe and the
+new sender inherits it. **The harness run NEVER sets DRY_RUN=false, never clicks "Approve & send
+first batch", and never calls `SendEmail` with `IssueSend:true` against a real lead.** Step 7's
+live send is PAXTON'S, performed by him, after he has read a preview.
+
+Build it, prove it in dry-run, hand him the preview. **If you find yourself about to send, stop.**
+
+================================================================================
+STOP GATE B - STEP 0 IS ENTIRELY EXTERNAL. THE HARNESS CANNOT DO IT.
+================================================================================
+
+Step 0 needs tenant-admin actions that no harness run can or should perform. Report what is needed
+and STOP that thread; do not attempt, and do not fake it:
+
+ 1. The Entra app (`AZURE_CLIENT_ID`, expected `5651b092-e9ac-4595-b112-083df3648633`) must be an
+    **Application User** in `cognizio.crm.dynamics.com` with a role granting: read `lead`, `list`,
+    `listmember`, `template`, `mailbox`; create/write `template`, `campaign`, `campaignactivity`,
+    `email`; and **Send Email as Another User** (Business Management > Misc privileges).
+    You MAY verify read-only: `GET /api/data/v9.2/systemusers?$filter=applicationid eq <id>`.
+ 2. `ai-dev01`'s Dynamics mailbox: delivery method = server-side sync, email **approved** and
+    **tested & enabled**, and the personal option "Allow other users to send email on your behalf"
+    checked. Verify read-only:
+    `GET /mailboxes?$filter=emailaddress eq 'ai-dev01@cognizio.company'&$select=emailrouteraccessapproval,outgoingemaildeliverymethod,enabledforoutgoingemail`
+ 3. Entra redirect URI `https://nebo.easybutt0n.ai/outbound/oauth2/callback` added to the reused
+    app registration.
+ 4. A new Proxmox LXC for `nebo.easybutt0n.ai` + DNS. **Host-level provisioning is Paxton's** -
+    see memory `no-host-level-changes-ptait01`; a host change needs his explicit go naming the
+    change, a rollback and a quiet window.
+
+**Everything in Steps 1-6 is repo work and proceeds regardless.** That is the bulk of the task. If
+Step 0 is unmet, build against the fake-fetch tests and say plainly which of 1-4 is outstanding.
+
+================================================================================
+SECURITY FINDING FROM THE PLAN HEADER - ACT ON THIS, DO NOT JUST COPY IT ACROSS
+================================================================================
+
+The plan's own header records: *"`.mcp.json` (gitignored, live gateway key); **`.mcp.json.bak` and
+`.codex/config.toml` hold an older live key**"*.
+
+**A superseded key is still a live credential until it is revoked.** Two files in a working repo
+carry one, and only `.mcp.json` is confirmed gitignored.
+
+ - Check whether `.mcp.json.bak` and `.codex/config.toml` are ignored, and whether either has EVER
+   been committed: `git log --all --full-history -- .mcp.json.bak .codex/config.toml`.
+ - **If either was ever committed, say so LOUDLY and immediately** - it is in history and the key
+   must be treated as disclosed. Do NOT rewrite history and do NOT commit a "fix" that deletes the
+   file; report it and let Paxton decide.
+ - Add both to `.gitignore` if absent. **Never print the key value** - state the FILE and the
+   FACT, never the string.
+ - This is a report, not a rotation. **General secret rotation is a dropped topic and must not be
+   re-raised**; a specific disclosed key is different and goes to Paxton as a finding.
+
+================================================================================
+CONTEXT AND THE DECISIONS ALREADY TAKEN - DO NOT REOPEN THESE
+================================================================================
+
+Cognizio's prod Dynamics org holds website leads who subscribed via easybutt0n.ai and **nobody has
+replied to them**. The goal is a small, viewable, approval-gated app in the nebo stack that reads a
+Dynamics Marketing List LIVE (no copy of the leads), lets you build a templated action (AI-drafted
+email you can edit), approve the first batch, then keep sending the same template to new members.
+
+All state lives in Dynamics OOTB entities so it survives and is visible in CRM.
+
+  Send path    Dynamics email activity + `SendEmail` action (server-side sync). NOT Graph, NOT Brevo.
+  Sender       ai-dev01@cognizio.company (aliases support-ai01@, info-ai01@, marketing-ai01@).
+  Surface      Small admin page at https://nebo.easybutt0n.ai/outbound behind the same Entra login
+               as LibreChat (oauth2-proxy). **The "UX = LibreChat only" rule is relaxed for this ONE
+               page - already decided, do not re-litigate.** The LibreChat agent gets the same tools.
+  Recipients   Membership in a Dynamics Marketing List; any lead-type list selectable. First target
+               list `2bb6de0a-9aac-f111-aaac-000d3a5c0dfb`. Lead subject of interest:
+               "Website lead - Power Platform easybutt0n.ai subscription".
+  Engine       NO n8n. In-repo worker at `services/worker` inside the nebo docker compose.
+  Autonomy     Approve the first batch; then auto-send to NEW members, ONCE per lead, daily cap.
+  Copy         AI drafts subject/body under `powerplatform` copy constraints; a human edits and
+               approves. Approved copy is stored as a Dynamics Email Template so CRM can edit it too.
+  Storage      Dynamics OOTB only: `template`, `campaign`, `campaignactivity`, `email`.
+               **NO new custom entities.** Lead list read live with a 60s in-memory cache.
+  Host         New Proxmox LXC, hostname nebo.easybutt0n.ai (node still to pick).
+
+Dynamics targets: org `https://cognizio.crm.dynamics.com`, tenant
+`d647920c-ffab-45b5-b671-563068cd3060`, app reg `5651b092-e9ac-4595-b112-083df3648633`,
+model-driven app `ff047879-763f-ec11-8c60-0022480a0745`, Leads view
+`00000000-0000-0000-00aa-000010001006`.
+
+Answering the plan's own open question - **yes, create the campaign via the API.** Dynamics Sales
+still ships classic Campaign / Campaign Activity / Marketing List / Email Template plus the
+`InstantiateTemplate`, `SendEmail`, `SendEmailFromTemplate` and `DistributeCampaignActivity` Web
+API actions. Use those directly from the worker.
+
+================================================================================
+KEY FINDINGS THAT SHAPE THE BUILD
+================================================================================
+
+ - **G2 is a CLIENT CONFIG bug, not a gateway bug.** `cognizioware_xrm_mcp` is multi-tenant and
+   needs three headers per request: `X-Dataverse-Url`, `X-Dataverse-ClientId`,
+   `X-Dataverse-ClientSecret` (LiteLLM whitelists them at
+   `cognizioware-mcp-tools/infrastructure/litellm-config.yaml:780-791`). Nebo's `.mcp.json` sends
+   only the bearer. Adding the headers fixes it.
+   **But that MCP has only 23 metadata/form/view/webresource tools - NO record CRUD.** So it is for
+   VERIFYING the org and views; leads and emails go through the Dataverse Web API directly.
+ - **REUSE, DO NOT REBUILD:**
+     `packages/data-model/dataverse-auth.js` - `createDataverseAuth`, `DATAVERSE_HEADERS`
+       (client-credentials helper)
+     `packages/app-registry` - `assembleCopyConstraints`, `findForbiddenPhrases` (the copy contract)
+     `mcp-servers/campaign-orchestrator-mcp/server.js` - the decision/gate pattern
+       (`request_campaign_approval`, `answer_decision`) to EXTEND
+     hosting pattern - `cognizioware-mcp-tools/infrastructure/docker/fleet-admin` (Node admin app)
+       plus the `ops-oauth2-proxy` sidecar in `infrastructure/docker-compose.yml`
+ - `packages/channel-sdk/telnyx-clawdtalk.js` still points at the dead clawdtalk.com. **OUT OF
+   SCOPE** (email only) - noted, not fixed here.
+
+================================================================================
+ARCHITECTURE
+================================================================================
+
+    nebo.easybutt0n.ai (Caddy, new LXC)
+      /              -> librechat:3080  (Entra SSO)
+      /outbound/*    -> outbound-oauth2-proxy:4180 (same Entra app) -> outbound-admin:3030
+                                                                           |
+    campaign-orchestrator-mcp:3020 (SSE) --- shared @nebo/outbound lib ----+
+                                                                           |
+                                                        services/worker (poll loop, same lib)
+                                                                           |
+                                                  Dataverse Web API v9.2 (client credentials)
+                                                  lists/listmember -> leads (read, 60s cache)
+                                                  template / campaign / campaignactivity / email
+                                                  SendEmail(IssueSend=true) -> server-side sync
+
+================================================================================
+IMPLEMENTATION STEPS 1-6 (step 0 and 7 are Paxton's - see STOP GATES)
+================================================================================
+
+STEP 1 - `packages/data-model`: Dataverse client + outbound mappings
+ - New `dataverse-client.js`: thin fetch wrapper over `createDataverseAuth` + `DATAVERSE_HEADERS`.
+   `get(path)`, `post(path, body)`, `patch`, `action(name, body, boundPath?)`, paging via
+   `@odata.nextLink`, `Prefer: odata.include-annotations="*"`. **Honors DRY_RUN for writes**
+   (returns `{dryRun:true, request}`); reads are always live.
+ - New `outbound-map.js`:
+     `listLeadMarketingLists()` -> `GET /lists?$filter=createdfromcode eq 4 and statecode eq 0
+        &$select=listid,listname,membercount,type,lastusedon`
+     `listMembers(listId)` -> `GET /leads?$select=leadid,fullname,firstname,lastname,
+        emailaddress1,companyname,subject,createdon,statecode,donotemail
+        &$filter=listlead_association/any(l:l/listid eq <id>)`
+        (fallback: `GET /listmembers?$filter=_listid_value eq <id>` then expand).
+        **EXCLUDE `donotemail eq true` and `statecode ne 0`.** This is a legal/consent boundary,
+        not a nicety - a suppressed lead must never receive mail.
+     `emailTemplate` helpers: create/patch `templates` with `title`, `subject`, `body` (Dynamics
+        template XML wrapper around HTML), `templatetypecode='lead'`, `ispersonal=false`,
+        `languagecode=1033`.
+     `campaign` / `campaignactivity` helpers: `POST /campaigns` (name, description, typecode);
+        `POST /campaignactivities` with `regardingobjectid_campaign@odata.bind`,
+        `channeltypecode=2` (email); then
+        `POST /campaignactivities(<id>)/campaignactivity_list/$ref` to attach the list.
+     `alreadySent(templateId, leadId)` -> `GET /emails?$filter=_templateid_value eq <t>
+        and _regardingobjectid_value eq <lead> and statecode eq 1`
+        **This is the idempotency key and it lives in Dynamics, so it survives a container
+        rebuild.** Getting this wrong means emailing a person twice.
+     `sendTemplatedEmail({templateId, leadId, fromUserId, campaignActivityId})`:
+        1. `POST /InstantiateTemplate` `{TemplateId, ObjectType:'lead', ObjectId}` -> rendered
+           subject/body
+        2. `POST /emails` with subject, description, `regardingobjectid_lead@odata.bind`,
+           `templateid@odata.bind`, `email_activity_parties` (from = systemuser ai-dev01,
+           participationtypemask 1; to = lead, 2), `directioncode=true`
+        3. `POST /emails(<id>)/Microsoft.Dynamics.CRM.SendEmail` `{IssueSend:true}`
+     Resolve ai-dev01 once: `GET /systemusers?$filter=internalemailaddress eq
+        'ai-dev01@cognizio.company'&$select=systemuserid`
+ - Tests: `e2e/outbound-map.test.mjs` with a FAKE FETCH (same style as `e2e/dataverse.test.mjs`),
+   asserting URLs/bodies **and that DRY_RUN blocks all three writes.**
+
+STEP 2 - `packages/outbound`: the action engine (new workspace package)
+ - `actions.js`: a templated action = `{campaignId, campaignActivityId, templateId, listId,
+   offering:'powerplatform', persona, status: draft|approved|running|paused, dailyCap, approvedBy,
+   approvedAt}`. Persisted as the Dynamics `campaign` record (`description` holds the JSON config,
+   `statuscode` mirrors status). Local mirror in `STATE_FILE` for fast reads.
+ - `draft.js`: `draftTemplate({offering, persona, listId, sampleLead})` calls LiteLLM
+   (`LITELLM_BASE_URL`, `LITELLM_API_KEY`, model from `librechat.yaml` default) with
+   `assembleCopyConstraints` injected, runs `findForbiddenPhrases`, returns
+   `{subject, html, violations}`. **NEVER writes.**
+ - `runner.js`: `runOnce(action)` -> members MINUS alreadySent MINUS donotemail -> up to `dailyCap`
+   -> `sendTemplatedEmail` each -> per-lead results. `previewRun(action)` does the same WITHOUT
+   sending (renders first 3 via `InstantiateTemplate`, creates no email).
+ - `gate.js`: reuse the decision shape from `server.js` (`kind:'gate'`, `context:{actionId}`).
+   **`status` may only move to `approved|running` via an answered, approved gate** - same rule as
+   `set_campaign_status`.
+
+STEP 3 - `services/worker`: the poll loop
+ - `services/worker/index.mjs`: every `OUTBOUND_POLL_SECONDS` (default 900), for each `running`
+   action, `runOnce`. Results to stdout + `STATE_FILE.runs[]`; the Dynamics email records ARE the
+   audit trail. Respects DRY_RUN.
+ - Dockerfile + compose service `outbound-worker`, `restart: unless-stopped`, shares the
+   `orchestrator_state` volume.
+
+STEP 4 - Orchestrator MCP tools (EXTEND `mcp-servers/campaign-orchestrator-mcp/server.js`)
+ Add, all via `@nebo/outbound`: `list_marketing_lists`, `preview_list_members(listId)`,
+ `draft_email_template`, `save_email_template`, `create_outbound_action`, `preview_outbound_run`,
+ `request_outbound_approval` (raises the gate), `start_outbound_action`, `pause_outbound_action`,
+ `get_outbound_status`. One paragraph on these in the LibreChat agent system prompt
+ (`deployments/librechat/README.md`).
+ **EXTEND the existing server - do not add a second MCP server** (RULE 2, no duplicate surfaces).
+
+STEP 5 - `services/outbound-admin`: the /outbound page
+ - Node + express, server-rendered HTML (htmx or plain forms, **no SPA build**). Port 3030, mounted
+   at `/outbound` (`app.use('/outbound', router)`; all links relative). Trusts `X-Forwarded-Email`
+   from oauth2-proxy for `approvedBy`.
+ - Pages:
+     `/outbound` - marketing lists table (name, member count, last used) + active actions with
+        status / last run / sent count
+     `/outbound/lists/:id` - live member table (60s cache): name, email, company, subject, created,
+        already-sent badge
+     `/outbound/actions/new?list=:id` - "Draft with AI", then editable subject + HTML body textarea
+        (the same textarea is what gets saved), forbidden-phrase result, Save as template
+     `/outbound/actions/:id` - rendered preview for 3 sample leads, recipient count,
+        **Approve & send first batch**, **Turn on autonomous**, **Pause**, run log
+ - Compose: `outbound-admin` (expose 3030) + `outbound-oauth2-proxy`
+   (`quay.io/oauth2-proxy/oauth2-proxy`, provider `oidc`, same `OPENID_CLIENT_ID/SECRET/ISSUER`,
+   `--reverse-proxy`, `--proxy-prefix=/outbound/oauth2`, `--upstream=http://outbound-admin:3030`,
+   `--pass-user-headers`, `--email-domain=cognizio.company`).
+ - `deployments/caddy/nebo.Caddyfile`: `handle_path`/`route /outbound*` ->
+   `reverse_proxy 127.0.0.1:4180`.
+
+STEP 6 - config, docs, tests
+ - `env.template`: add `OUTBOUND_FROM_EMAIL=ai-dev01@cognizio.company`,
+   `OUTBOUND_DEFAULT_LIST_ID=2bb6de0a-9aac-f111-aaac-000d3a5c0dfb`, `OUTBOUND_POLL_SECONDS=900`,
+   `OUTBOUND_DAILY_CAP=50`, `OUTBOUND_ADMIN_PORT=3030`, `OUTBOUND_PUBLIC_PATH=/outbound`.
+   **NAMES in env.template, never values.**
+ - `docs/HANDOFF.md`: new dated section, including G2 closed. `CLAUDE.md`: one line noting the
+   /outbound exception and that Dynamics is the store for outbound actions.
+ - `npm test` stays green; add `e2e/outbound.test.mjs` covering **runner idempotency, the daily
+   cap, the gate rule, and dry-run**.
+
+================================================================================
+VERIFICATION
+================================================================================
+
+ - Unit: `npm test` - the 41 existing tests plus the new outbound tests, all green.
+ - Live READ-ONLY: a small script hitting `listLeadMarketingLists()` and
+   `listMembers(OUTBOUND_DEFAULT_LIST_ID)` prints the expected leads. Reads are safe; do them.
+ - Gateway: after the `.mcp.json` header fix,
+   `xrm-dataverse_view_get_list_by_table_schema_name lead` returns views instead of the header
+   error. That is the G2 proof.
+ - **IDEMPOTENCY, PROVEN IN DRY-RUN:** run `previewRun` twice against the same list and show the
+   second pass yields ZERO sends. Do not settle for reasoning about `alreadySent` - exercise it.
+ - Send verification is PAXTON'S (STOP GATE A): with DRY_RUN=false he sends to ONE test lead,
+   confirms `GET /emails?$filter=...` shows `statecode 1 / statuscode 3 (Sent)` and that it appears
+   in ai-dev01's Sent Items, then re-runs to confirm zero duplicates.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **DRY_RUN=true for the whole run. Never send a real email. Never set DRY_RUN=false.**
+ - **Never grant a Dataverse privilege, never edit the Entra app registration, never provision an
+   LXC.** Report what is needed (STOP GATE B).
+ - Dataverse credentials go in `.env` ONLY. **Never commit a secret; never print a key value.**
+   Report the `.mcp.json.bak` / `.codex/config.toml` finding by FILE and FACT.
+ - **No new custom Dynamics entities.** OOTB only.
+ - **No n8n.** In-repo worker only.
+ - Extend `campaign-orchestrator-mcp`; do not create a second orchestrator (RULE 2).
+ - `donotemail` and `statecode ne 0` filters are mandatory and must be covered by a test.
+ - Commit by EXPLICIT PATH; never `git add -A`; clone/check with autocrlf=false; check
+   `git diff --stat` before the PR.
+ - PR to `main`. **DO NOT MERGE.**
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A PR against main implementing Steps 1-6: the Dataverse client and outbound mappings with
+fake-fetch tests proving DRY_RUN blocks every write; the action engine with the gate rule enforced;
+the worker; the ten orchestrator tools added to the EXISTING MCP server; the `/outbound` admin page
+with its oauth2-proxy sidecar and Caddy route; env/doc updates with names only. Plus: a live
+read-only proof that the target list's members resolve, a dry-run preview run executed TWICE
+showing zero sends on the second pass, the G2 header fix documented, the `.mcp.json.bak` /
+`.codex/config.toml` credential exposure reported with whether either was ever committed, and a
+plain statement of which STOP GATE B items (1-4) remain outstanding for Paxton.
+
+**Not deployed, nothing sent, awaiting Paxton.**
+
+
+================================================================================
+=== CORRECTION APPENDED BY SCHEDULED TICK #298, 2026-09-16 11:58 PT - READ THIS
+=== LAST; IT OVERRIDES ANYTHING ABOVE THAT CONTRADICTS IT.
+================================================================================
+
+WHY THIS IS IN THE TASK FILE: the queue entry's `note` field is NEVER sent to you.
+Verified this tick by reading the launcher - the string `note` does not appear in
+launch_queue.py at all; you receive ONLY this file. Anything earlier ticks put in the
+note was invisible to you. Nothing below is new scope.
+
+1. PUSH AND OPEN THE PR YOURSELF, THEN STOP. Commit by explicit path, check
+   `git diff --stat` first, never `git add -A`, then `git push` and `gh pr create`.
+   Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14 16:21 PT, so do
+   NOT ask for a GitHub credential and do not ask the overseer to push for you.
+   Do NOT merge - merging stays the overseer's.
+   EXCEPTION: if your diff touches `.github/workflows/`, the scoped token refuses
+   workflow-file pushes by permission. Commit, then STOP and say the branch needs an
+   overseer push; do not retry.
+
+2. STOP GATE A IS UNCHANGED AND ABSOLUTE: DRY_RUN stays true. No real email to a real
+   lead, ever. Nothing in this correction relaxes that.
+
+3. WHY YOUR PREDECESSOR DIED - a PROVIDER fault, not a task fault, and NOT a reason to
+   cut scope. Run 20260916T183449Z_cc37a3d6 failed 2026-09-16 11:47 PT, exit 1, with:
+     429 "You've exceeded your subscription rate limits" on
+     syn:large:vision:synthetic-anthropic, plus
+     "No fallback model group found for original model_group=...:synthetic-anthropic"
+   That second line is a KNOWN router defect (task 136 is fixing it): every one of the
+   ~22 fallback entries on the live router targets a ':cloud' group, and ZERO
+   ':synthetic-anthropic' groups have any fallback, so a provider blip kills the run
+   outright instead of degrading. You are the FIFTH run lost to this.
+   If you hit a 402 or 429, that is the provider. Do not narrow the task in response.

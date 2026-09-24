@@ -1,0 +1,58 @@
+TASK 189 - THE ACCEPTANCE SUITE CANNOT TELL A FALLBACK DEGRADE FROM A LYING ALIAS. TEACH IT THE DIFFERENCE.
+
+REPO / WORKSPACE: cognizioware-qa    BASE: master (the gate's own branch)
+
+WHAT HAPPENED, MEASURED 2026-09-16 22:50 PT (do not re-derive):
+The overseer set QA_LITELLM_MODELS = ornith-1.5:pool,kimi-k3:synthetic-anthropic and ran the gate
+(run 35187327582, target=litellm env=prod). Result: score 92.31, passed 12, failed 1, infra 0. The one
+failure:
+    not ok 1 - POST /v1/messages works for kimi-k3:synthetic-anthropic
+    error: "Served model mismatch for kimi-k3:synthetic-anthropic messages:
+            body model 'glm-5.3-flash' !== requested 'kimi-k3:synthetic-anthropic'"
+THAT IS NOT A DEFECT IN THE ROUTER. It is task 136 working: earlier the same day the ten
+:synthetic-anthropic groups got fallback chains in router_settings.fallbacks (prod row 32 entries, 10
+synthetic, SQL-verified), each chaining to glm-5.3-flash:cloud then kimi-k2.6:cloud. Synthetic was
+rate-limiting, so the request DEGRADED to glm-5.3-flash instead of dying at round zero - the exact
+behaviour 136 exists to produce, and the first positive proof of it.
+
+THE COLLISION: the suite asserts served == requested, which is the check that caught aliases silently
+serving another model (the 2026-09-09 class of incident - a green 200 from a model that was not the one
+named). That check is still valuable AND it now fires on every legitimate degrade. Both cannot stand as
+written.
+
+*** DO NOT "FIX" THIS BY DELETING THE SERVED-MODEL ASSERTION. *** That assertion is the only thing
+standing between this fleet and an alias that answers 200 while serving something else.
+
+DELIVERABLE (packages/runner + litellm-acceptance):
+ 1. Read the router's DECLARED fallback chain for the requested group - router_settings.fallbacks, the
+    single-key-map shape {"<group>": [targets...]}. The QA key CANNOT read router settings (measured:
+    HTTP 401 "Only proxy admin can be used", and the suite already SKIPs that subtest), so the chain
+    must come from somewhere the gate can read. Decide and justify ONE of:
+      (a) a checked-in expectations file in this repo, refreshed by a scheduled job; or
+      (b) a read-only endpoint/env the gate can reach without the master key.
+    Do NOT put the master key in this repo or in CI. Env var NAMES only.
+ 2. Classify each served-model mismatch:
+      - served model IS a declared fallback target of the requested group -> PASS WITH A WARNING,
+        counted as a DEGRADE in the report, never silently green;
+      - served model is NOT in that chain -> FAIL exactly as today (the lying-alias case).
+ 3. Surface degrades in the gate report line (score= passed= failed= infra=) as a fourth counter,
+    degraded=N, and in the commit-status description. A run that is all-degrades must not read as
+    identical to a clean run.
+ 4. Tests for BOTH branches, with a fake router: a degrade to a declared target passes with the warning;
+    a swap to an undeclared model still fails.
+
+ALSO IN SCOPE, one line: QA_LITELLM_MODELS is currently ornith-1.5:pool,qwen3.8 (set by the overseer
+22:53 PT; gate run 35187520396 GREEN). It was qwen3.5:27b,qwen3.5:27b - the same retired tag twice.
+Document in litellm-matrix.mjs WHY the two slots must be different models and why a rate-limited paid
+group in the last (/v1/messages) slot makes the gate flaky until item 2 above lands.
+
+(Numbered 189, not 182: 182 was already in use by the overseer-web-ux entry. 175-188 are taken.)
+
+HARD RULES: never print a key value; env var NAMES only. Do NOT edit infrastructure/litellm-config.yaml
+in mcp-tools (it force-recreates the CT202 prod router). NEVER git add -A; commit by explicit path; git
+diff --stat before every commit. Do NOT post an @claude comment (task 117). Open the PR and STOP -
+merging is the overseer's.
+
+DONE MEANS: a gate run where a :synthetic-anthropic model degrades to its declared target reports
+degraded>=1 and PASSES, a run where a model serves something outside its chain still FAILS, both proven
+by tests, and the report line carries the new counter.

@@ -1,0 +1,20 @@
+TASK 205 - PR #30's scope-to-RLIMIT fallback never fires on CT110, so every worker launch would die (LongHorizon-Harness)
+
+MEASURED 2026-09-18 09:40 PT (overseer tick #663) on CT110 as user harness, do not re-derive:
+- lh-harness.service runs as User=harness. `systemd-run --scope --quiet --unit=... --property=MemoryMax=3G -- /bin/true`
+  exits rc=1 with stderr EXACTLY: "Failed to start transient scope unit: Access denied".
+- worker_isolation._SCOPE_FAILURE_SIGNATURES contains "failed to start transient service unit" (SERVICE, not SCOPE),
+  "failed to connect to bus", "failed to allocate", "bus connection refused". None matches the real text, so
+  scope_launch_failed() returns False, _spawn_isolated does NOT retry with RLIMIT_AS, and the worker never runs.
+- probe_systemd_run() returns the binary because /run/systemd/system exists, so the scope path is always chosen.
+- The 7 existing tests only exercise the fallback with an injected probe; none feeds the real CT110 stderr.
+
+SCOPE (continue branch feat/task-202-worker-memory-isolation in worktree /tmp/lh-task202-base, PR #30; push and STOP -
+no merge, no deploy, no service restart; never touch /home/harness/work/LongHorizon-Harness):
+1. Make the fallback robust: treat ANY non-zero systemd-run exit where no scope cgroup appeared as a failed scope
+   launch (do not depend on an stderr phrase list; keep the phrases only for logging). Also handle poll() still being
+   None after the cgroup wait (wait briefly for exit before deciding).
+2. Add a test that feeds "Failed to start transient scope unit: Access denied" rc=1 and asserts the RLIMIT_AS retry.
+3. Run ONLY tests/test_worker_isolation_fallback.py under `( ulimit -v 2500000; timeout 900 ... )` with
+   /home/harness/work/LongHorizon-Harness/.venv/bin/python. Commit, push, note it in the PR body, STOP.
+OUT OF SCOPE: polkit rules / Delegate= / running the service as root; task 204's failure_reason mapping.

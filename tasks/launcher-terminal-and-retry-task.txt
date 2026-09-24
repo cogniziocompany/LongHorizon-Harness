@@ -1,0 +1,126 @@
+TASK 172 - CT110 launcher: launched is not done, and a failed entry gets a successor (gaps 1.8 + 1.15).
+
+SOURCE: Paxton's priority-2 handoff (C:/tmp/HANDOFF-hydra-fleet-plane-replaces-overseer-2026-09-14.md,
+"Retry / requeue of a failed entry ... the single change that ends the stranding class") and audit [fe2679]
+section M (2026-09-14). Ordered AFTER every powerplatform task by Paxton's instruction.
+
+REPO / WORKSPACE: LongHorizon-Harness    BASE: origin/main (NOT feat/spec-staging, NOT feat/seq-logging)
+
+================================================================================
+MEASURED 2026-09-14 - do not re-derive
+================================================================================
+ - src/lh_harness/launcher.py: class Launcher (L56) really launches (_launch L298-322 -> supervisor.create_run).
+ - Terminal promotion from the run report EXISTS: _reconcile at launcher.py L150-207 / L209-216 marks done|failed.
+ - mark_failed is TERMINAL: launcher.py L191-193, L325, L335 -> queue.py mark_failed (L450-456) sets status=failed
+   and nothing anywhere creates a successor. record_skip (queue.py L458-465) returns None for non-pending entries.
+ - _VALID_STATUS = {pending, launched, done, failed} on origin/main (queue.py L28). No transition table; only
+   mark_launched is guarded (queue.py L434-435). mark_done / mark_failed overwrite any status.
+ - The PC launcher's "file to done/ at launch" behaviour produced 25 strandings 09-11 -> 09-14 (LEDGER). The CT110
+   store already distinguishes launched from done; what it lacks is RETRY.
+
+================================================================================
+SCOPE
+================================================================================
+ 1. queue.py: add `retry_of: str | None`, `attempt: int` (default 1), `failure_cause: str | None` to QueueEntry
+    and to_dict (docs/queue.md is the contract - update it; it is append-only and says 18 fields, this makes 21).
+    Add `[queue] max_retries` (default 2) to config.py with a ProjectConfigError on non-int.
+ 2. QueueStore.requeue(queue_id, cause) -> QueueEntry: creates a NEW pending entry copying name/task/workspace/
+    trio/max_rounds/priority/dedup_key(None - a retry must not collide with the original's dedup), sets
+    retry_of=<original>, attempt=original.attempt+1, failure_cause=cause. Refuses (ValueError) if attempt would
+    exceed max_retries, or if the original is not failed.
+ 3. launcher.py: on every mark_failed path (L191, L325, L335) call requeue when the cause is RETRYABLE:
+    provider_rate_limit, executor/auditor timeout, "launch failed" transport errors. NOT retryable: invalid task,
+    workspace missing, max_retries exhausted, human stop. Emit queue.requeued {original, successor, cause, attempt}.
+ 4. A transition table in queue.py (one dict), enforced in mark_done/mark_failed/requeue:
+      pending -> launched -> done | failed ; failed -> (successor pending) ; nothing else.
+    Entries with an unknown on-disk status are logged, not silently dropped (_read_path L402-403 drops them today).
+ 5. record_skip allowed on failed entries so the reason accrues.
+ 6. Tests (tests/webapi/test_queue*.py hermetic, no Postgres): requeue creates a successor with the right fields;
+    max_retries stops it; non-retryable causes do not requeue; the transition table rejects done->pending.
+ 7. E2E in e2e/: enqueue -> launch -> force a 429 on round 1 via the synthetic provider fake (task 47's provider)
+    -> assert the entry is `failed` with failure_cause recorded and a successor is `pending`; assert no entry is
+    ever `done` while its run is non-terminal.
+
+HARD RULES: no Postgres dependency (134 owns the store swap; keep the surface identical so PgQueueStore inherits
+this). Do not touch launch_queue.py. Push the branch and open the PR (runs hold GH_TOKEN since 09-14 16:21);
+DO NOT MERGE - merging and the CT110 restart are the overseer's, in a zero-active window.
+
+DONE MEANS: PR open against main with the seven items, hermetic tests green, e2e 429 case green, docs/queue.md
+updated, and the PR body names which failure causes are retryable.
+
+
+================================================================================
+CORRECTION / EVIDENCE — 2026-09-16 07:55 PT, scheduled overseer tick #277.
+MEASURED FROM A LIVE RUN. Do not re-derive this; act on it.
+================================================================================
+Enumerated from the snapshot of run 20260916T065253Z_7784478f (task 98, workspace
+cognizioware-powerplatform-c, agent=codex, max_rounds=12) — ALL nine executor rounds,
+not a sample:
+
+  TIMED OUT at the 3600 s wall  (phase=executor, kind=timeout,
+  "Episode timed out after 3600s.", exit_code -1, runtime_signals EMPTY):
+      round 1  duration_ms 3600239
+      round 3  duration_ms 3600190
+      round 5  duration_ms 3600233
+      round 6  duration_ms 3600233
+      round 7  duration_ms 3600150
+      round 9  duration_ms 3600284
+  COMPLETED:
+      round 2  1913 s
+      round 4  1299 s
+      round 8    76 s        <-- seventy-six seconds
+
+SIX of nine hit the wall. The three that returned returned FAST.
+
+WHAT THIS SETTLES, AND WHY IT IS THIS TASK'S SUBJECT:
+
+1. THE DISTRIBUTION IS BIMODAL — minutes, or never. An overloaded or merely slow
+   backend degrades CONTINUOUSLY. It does not return in 76 s on round 8 and then
+   consume a full hour on round 9 against the SAME workspace and the SAME scope.
+   This is a HANG signature, not a slowness signature: no progress, no partial
+   output, exit_code -1, and runtime_signals empty.
+
+2. IT IS NOT SCOPE. The failure stayed on the SAME role (executor) six times and
+   never moved between roles. By the harness's own three-strikes discriminator that
+   is a backend/runtime fault. Scope edits cannot fix it and have already been tried.
+
+3. IT IS ALSO NOT CONTENTION. Tick #238 killed the contention hypothesis with three
+   role completions under genuine two-executor overlap. Do not rebuild that theory.
+
+THE RESOURCE BEING LOST IS WALL CLOCK, NOT TOKENS:
+that single run spent ~6 hours of one of only TWO launcher slots producing timeouts
+while 23 tasks sat HOLD at cap. Every hung round costs a full hour of a scarce slot.
+
+THEREFORE THE DELIVERABLE THAT MATTERS MOST HERE:
+detect a stalled episode and FAIL IT FAST WITH A SIGNAL, instead of letting it burn
+the full 3600 s budget. A terminal-detection / retry change that shortens the wall is
+worth more than any timeout-tuning or scope edit. State plainly what signal you use to
+distinguish "working slowly" from "hung" — the 76 s vs 3600 s split above is the
+evidence that such a distinction is available in the data.
+
+WHAT WOULD PROVE THE FIX: an executor round that fails FAST carrying a runtime signal,
+instead of a 3600xxx ms duration_ms with an empty runtime_signals array.
+
+NOTE FOR WHOEVER MAINTAINS THIS TASK: this entry's queue row has task_source=task_file,
+so the run reads THIS FILE and never sees the queue entry's `note`. Corrections put only
+in the note do not reach the run.
+
+---
+[OVERSEER TICK #416, 2026-09-17 06:02 PT] TASK 172 IS NOW AT **PR**, NOT BRANCHED.
+Run 20260917T093800Z_74b96689 exhausted its 8/8 rounds and gated for more; the overseer resolved
+STOP and finished the last three steps by hand, because the work was already committed.
+
+- Branch `feat/task-172-retry-requeue` @ `207a662` is ON THE REMOTE (verified via matching-refs).
+- **PR #20** — cogniziocompany/LongHorizon-Harness, base `main`, 13 files +1541/-21, OPEN/MERGEABLE,
+  **UNREVIEWED** (reported, never bought with an `@claude` invocation).
+- **Do not go looking for the uncommitted `queue.py` change the run's final response describes.**
+  It does not exist: the CT110 tree was verified clean at `207a662` before the push, carrying only
+  an untracked `.claude/` hook dir, which is deliberately not committed.
+- **Unverified, carried into the PR body:** the tip commit `207a662` (`e2e/rate_limit_429_retry.py`,
+  +456) was never cleanly audited — the run's only audit attempt invalidated itself by mutating
+  workspace files while checking. `59b8f65` WAS audited against origin/main.
+- **Test figures are the run's claim, not re-run by the overseer:** 557 pass / 1 skip, plus two
+  pre-existing `test_webapi.py` failures that reproduce on origin/main.
+- **MERGE CONSTRAINT:** merging `main` in this repo triggers the CT110 deploy, which restarts
+  `lh-harness.service` and kills every in-flight run. Zero-active window only. The diff touches no
+  `.github/workflows/` and no `litellm-config.yaml`, so no prod-router window is needed.

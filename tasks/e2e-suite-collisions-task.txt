@@ -1,0 +1,153 @@
+TASK 106 - the E2E gate can report SUCCESS while a suite inside it fails hard. Find out why,
+fix the suite-number collisions that make it possible, and make the rollup tell the truth.
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110: use a FREE mcp-tools tree
+(-b or -c; check which is idle - NEVER two runs on one working tree).
+
+================================================================================
+WHERE THIS CAME FROM - unread review feedback, then verified by the overseer
+================================================================================
+
+This did not come from a fresh idea. It came from a review comment that had been sitting unread
+on PR #55 since 2026-08-27, found on 2026-09-09 when the overseer finally counted the review
+backlog properly: **65 review comments across 15 of 26 open PRs**, from `chatgpt-codex-connector`,
+which had been reviewing the whole time while the overseer was reporting "nothing reviews PRs".
+
+The comment (P2, on `e2e/suites/26-fleet-dns-tls.test.js:36`):
+
+  "The repository already contains `e2e/suites/26-ssh-fleet.test.js`, so adding another suite
+   numbered 26 makes the documented numeric selector `bash run-all.sh --suite 26` match and
+   execute both unrelated suites through Jest's testPathPattern."
+
+**The overseer verified it against `main` and found it is WORSE than reported - FOUR collisions,
+not one:**
+
+    20-comfyui-video-pipeline.test.js        20-mcp-servers-matrix.test.js
+    23-playwright-qa1-autonomous-login.test.js  23-qwen38-vision-quota.test.js
+    26-fleet-dns-tls.test.js                 26-ssh-fleet.test.js
+    29-hydra-fleet-mcp.test.js               29-pac-mcp.test.js
+
+================================================================================
+WHY THIS IS THE PRIORITY AND NOT COSMETIC
+================================================================================
+
+The overseer has repeatedly logged an anomaly it could not explain:
+
+  **The E2E Gate reports `success` while `26-fleet-dns-tls` fails with
+  "hard failure under RUN_LIVE_REGRESSION".**
+
+That has been treated as a mystery and re-reported for days. A numeric selector that silently runs
+TWO unrelated suites is a first-class candidate explanation: one suite's failure can land inside
+another's summary, or a selector can run a suite the caller never intended and attribute its result
+to the wrong name.
+
+**DO NOT ASSUME THAT IS THE CAUSE. PROVE OR DISPROVE IT.** It is a hypothesis with good motive, not
+a finding. If the collision turns out NOT to explain the green-rollup-with-hard-failure, say so
+plainly and keep digging - a wrong confident answer here is worse than an open question, because it
+would close a real defect that is still live.
+
+================================================================================
+WHAT TO DO
+================================================================================
+
+1. **Reproduce the selector behaviour.** Run the documented `bash run-all.sh --suite 26` (and 20,
+   23, 29) and record EXACTLY which files execute. Show the command and its real output. This is
+   the evidence the whole task rests on - do not paraphrase it.
+
+2. **Establish how a hard failure can sit inside a success.** Read how the gate rolls suite results
+   up into its conclusion. Find the specific mechanism: a swallowed exit code, a summary keyed by
+   suite NUMBER rather than path, a soft-skip that records a pass, a `|| true`, a step that reports
+   on the wrong variable. **Name the line.** Then state whether the collision causes it, contributes
+   to it, or is unrelated.
+
+3. **Renumber the four collisions.** Give each colliding suite an unused number, and update EVERY
+   reference: the suite file, `e2e/README.md`'s suite index, `run-all.sh`, any CI workflow that
+   selects by number, and any doc that names them. **A renumber that leaves a stale reference is a
+   worse state than the collision** - grep for the old numbers and show the grep came back clean.
+
+4. **Make the rollup incapable of lying.** Add a check that fails the gate when any suite reports a
+   hard failure, regardless of what the summary computed - and a check that a numeric selector
+   resolves to exactly ONE suite. That second one is the regression test for this whole class.
+
+5. While in `e2e/README.md`: PR #55's review also flags the index says 56 tests where the suite
+   defines 57, and that `softSkip()` double-logs (it prints, then `skips.record()` prints again).
+   Fix both only if they are still true - VERIFY FIRST, these comments are from August.
+
+================================================================================
+OUT OF SCOPE - deliberately, so this does not sprawl
+================================================================================
+
+ - **Do NOT touch `infrastructure/litellm-config.yaml`.** A separate verified finding (PR #41
+   review) says `enable_pre_call_checks` sits under `litellm_settings` at line 107 when LiteLLM
+   reads it from `router_settings`. That is real and it is being handled separately, because ANY
+   edit to that file force-recreates the CT202 PROD router and both sections are DB-shadowed.
+   **Editing it here would recreate the production router as a side effect of a test-numbering fix.**
+ - Do NOT fix the other 60-odd review comments. They are being worked separately.
+ - Do NOT close, merge or rebase PR #55 itself. Its disposition belongs to task 97.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - Never `git add -A`; commit by explicit path and check `git diff --stat` before the PR.
+ - Never two runs on one working tree - confirm which mcp-tools tree is free before starting.
+ - Do not run the live regression against production to "see what happens". Read the code and use
+   the documented selector; this task is about the harness reporting truthfully, not about
+   exercising prod.
+ - The images on this repo are built AT MERGE TIME, so a non-compiling change is not caught before
+   it blocks the CT202 deploy. Run the project's own lint/build for anything you touch.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A branch with: the four collisions renumbered and every reference updated (with the clean grep
+shown); a stated, line-level answer to HOW a hard failure survives inside a green rollup, with the
+collision's role in it confirmed or ruled out; a regression test that a numeric selector resolves to
+exactly one suite; and a gate check that a hard failure cannot be summarised as success.
+
+**If the collision does NOT explain the green rollup, that is a legitimate and valuable result** -
+report it plainly, with the mechanism you did find, and leave the anomaly open rather than closing
+it with a guess.
+
+
+================================================================================
+=== CORRECTION APPENDED BY SCHEDULED TICK #298, 2026-09-16 11:55 PT - READ THIS
+=== LAST; IT OVERRIDES ANYTHING ABOVE THAT CONTRADICTS IT.
+================================================================================
+
+WHY YOU ARE SEEING THIS HERE: the queue entry's `note` field is NEVER sent to you.
+Verified this tick by reading the launcher: the string `note` does not appear in
+launch_queue.py at all; you receive ONLY this file. Corrections earlier ticks wrote
+into the note were invisible. Nothing below is new scope.
+
+1. *** THERE ARE SEVEN COLLISIONS, NOT FOUR. *** Every place above that says "four
+   collisions" (including DONE MEANS) is STALE - it dates from 2026-09-09. Enumerated
+   against the GitHub contents API on 2026-09-15, the suite numbers appearing twice are:
+       20, 23, 26, 29, AND ALSO 30, 31, 36.
+   Fix the selector for ALL SEVEN, and assert the invariant so an eighth cannot appear.
+
+2. PUSH AND OPEN THE PR YOURSELF, THEN STOP. This SUPERSEDES the line above that says
+   "Do NOT push or open a PR and do not ask for a GitHub credential - commit and stop;
+   the overseer opens it." That instruction is OBSOLETE. Since 2026-09-14 16:21 PT this
+   run holds a scoped GH_TOKEN (push + PR only). Do NOT merge - merging stays the
+   overseer's.
+
+3. STILL FORBIDDEN, unchanged: infrastructure/litellm-config.yaml. Any edit to it
+   force-recreates the CT202 PROD router and both relevant sections are DB-shadowed.
+   The enable_pre_call_checks finding is handled elsewhere. Do not touch PR #55
+   (task 97).
+
+4. The green-rollup anomaly: if the collision does NOT explain how a hard failure
+   survives a green rollup, say so and leave it OPEN. That remains a valid result.
+
+5. WHY YOUR PREDECESSORS DIED - not your fault and not a reason to cut scope:
+   run 20260910T145353Z_f290fc1a died in round 1 and run 20260916T183457Z_35065d88
+   died shortly after launch, both on PROVIDER faults (429 exceeded subscription rate
+   limits on kimi-k3:synthetic-anthropic). SCOPE IS UNCHANGED.

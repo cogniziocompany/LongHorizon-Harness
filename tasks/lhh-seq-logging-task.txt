@@ -1,0 +1,160 @@
+TASK 161 - Ship lh-harness (LongHorizon-Harness) Python logs to the prod Seq server. Open the PR and STOP.
+
+SOURCE: planning session [d9461e] (d9461ead-55f0-4df0-9c99-db2c2046f291), plan mode, 2026-09-10 21:38 PT,
+plan file C:/Users/PaxtonTait/.claude/plans/come-up-with-a-harmonic-magpie.md. Bridged 2026-09-11 by
+session [fe2679] via /claude-bridge: the Seq family in the queue is 135 (powerplatform prod backend),
+137 (mcp-tools ops-control-center + Node MCP services), 139 (cognizioware-qa ONLY). LongHorizon-Harness
+was in none of them. This is the FOURTH Seq task and it does NOT overlap: LHH only.
+
+REPO / WORKSPACE: LongHorizon-Harness
+
+================================================================================
+WHAT THE BRIDGE ADDED THAT THE SOURCE SESSION COULD NOT KNOW
+================================================================================
+ - LEDGER 2026-09-11 (line ~16653): SEQ_INGEST_KEY_PP_PROD was REMOVED from
+   /home/harness/.lh-harness-secrets.env - that key belongs to task 135 (powerplatform) and had been
+   placed on CT110 by mistake. DO NOT reuse it. lh-harness needs its OWN Seq ingest key, referenced
+   as SEQ_API_KEY. Creating it is a CREDENTIAL step for Paxton (Seq UI -> Settings -> API Keys,
+   INGEST ONLY, Application=lh-harness). Until it exists, everything below still builds and tests
+   against a local stub; only the prod rollout step waits.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path on a branch, check `git diff --stat`,
+   then `git push` and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only)
+   since 2026-09-14 16:21 PT, so do not ask for a GitHub credential. Do NOT merge.
+   (RETIRED, corrected by scheduled tick #183: the 'CT110 has NO gh and NO GitHub token' measurement
+   from run b9cfaaa8's gate was true on 2026-09-10 and is FALSE since 2026-09-14 16:21 PT.)
+ - The CT110 service restart in step 5 kills every in-flight run. It is OVERSEER-EXECUTED in a
+   counted zero-active window, never by this run.
+ - Task 150 (spec-staging) also touches cli.py on branch feat/spec-staging. Branch off origin/main
+   and keep the cli.py change to the two lines in main(); the overseer sequences the merge.
+
+================================================================================
+CONTEXT (verbatim from the source plan)
+================================================================================
+LongHorizon-Harness (the lh-harness Python app) currently has NO centralized logging at all: only two
+files (manager.py, fleet/reporter.py) call logging.getLogger, there is no logging.basicConfig /
+dictConfig anywhere in src/lh_harness, and the only structured telemetry that exists today is
+(a) per-run JSONL files on disk and (b) an opt-in fleet-admin HTTPS reporter (fleet.easybutt0n.ai).
+Goal: a small, fail-open, zero-new-dependency log handler that ships Python logging records to Seq
+(https://seq.easybutt0n.ai), wired through the same env-var / EnvironmentFile pattern already used for
+fleet reporting, identical across WSL dev, CT110 systemd prod, and lh-harness-node Docker fleet nodes.
+
+APPROACH: mirror the existing FleetReporter design (src/lh_harness/fleet/reporter.py) - same lifecycle
+idioms - rather than pull in a third-party package (e.g. seqlog). The app stays dependency-free: it uses
+only stdlib urllib.request for the fleet HTTP path; requests/httpx are NOT runtime deps (pyproject.toml).
+
+================================================================================
+STEP 1 - NEW MODULE src/lh_harness/seq_logging.py
+================================================================================
+A logging.Handler subclass (SeqLogHandler) + a singleton installer, following fleet/reporter.py's shape:
+ - ENABLE CONDITION: only when SEQ_URL is set (mirrors LH_HARNESS_FLEET_URL gating). SEQ_API_KEY
+   optional in code, documented as REQUIRED for prod. Handler requires both non-empty to ship.
+ - TRANSPORT: Seq raw CLEF ingestion - POST {SEQ_URL}/api/events/raw?clef, header X-Seq-ApiKey: <key>,
+   body = newline-delimited JSON, one compact CLEF object per record:
+   {"@t": "...Z", "@l": "Information", "@m": "...", "@x": "<exception text>", "logger": "...",
+    "app": "lh-harness", "node": "...", ...extra}
+   Level mapping: DEBUG->Verbose (or Debug), INFO->Information, WARNING->Warning, ERROR->Error,
+   CRITICAL->Fatal.
+ - DELIVERY: background daemon thread + bounded queue.Queue, batched every ~2s (same
+   _BATCH_INTERVAL_SECONDS idea), gzip body, bounded retry (3 attempts, same backoff tuple), never
+   blocks the emitting thread, 4xx NOT retried and warn-once. urllib.request / urllib.error only.
+ - FAILURE ISOLATION: emit() never raises; unreachable Seq degrades to a queue-full warn-once,
+   exactly like the fleet reporter's _warn_once.
+ - SINGLETON ACCESSOR: get_seq_handler() / install_seq_logging() analogous to get_reporter().
+
+================================================================================
+STEP 2 - WIRE-UP POINT src/lh_harness/cli.py: main()   (cli.py ~L391)
+================================================================================
+main() is the single true entry point for every subcommand (run, web, dashboard, plugins). At the top,
+before subcommand dispatch:
+ 1. logging.basicConfig(level=<LH_HARNESS_LOG_LEVEL, default INFO>, ...) ONCE - nothing configures the
+    root logger today (only WARNING+ reaches stderr via the handler of last resort).
+ 2. seq_logging.install_seq_logging() - attaches SeqLogHandler to the ROOT logger when SEQ_URL is set,
+    so uvicorn/FastAPI access + error logs from webapi/server.py flow to Seq too (explicit decision).
+ 3. No-op identically to FleetReporter when SEQ_URL is unset.
+
+================================================================================
+STEP 3 - ENRICHMENT
+================================================================================
+Standard properties on every event: app="lh-harness"; version (same source FleetReporter uses);
+node = LH_HARNESS_FLEET_NODE if set else socket.gethostname(); environment/labels via the existing
+fleet.reporter._parse_labels on LH_HARNESS_FLEET_LABELS (do not invent a second labelling scheme);
+record.exc_info formatted into @x so stack traces are searchable.
+
+================================================================================
+STEP 4 - ENV VARS (mirror the LH_HARNESS_FLEET_* table exactly)
+================================================================================
+  SEQ_URL        (none - disabled)   Seq server origin, e.g. https://seq.easybutt0n.ai
+  SEQ_API_KEY    (none)              Seq ingestion API key (X-Seq-ApiKey header)
+  SEQ_MIN_LEVEL  INFO                Minimum Python logging level shipped to Seq
+
+================================================================================
+STEP 5 - CONFIG SURFACES (rollout scope per Paxton: CT110 prod AND every lh-harness-node fleet instance)
+================================================================================
+ - docker/compose.node.yml: add SEQ_URL, SEQ_API_KEY, SEQ_MIN_LEVEL to environment:. SEQ_URL gets a
+   real default (${SEQ_URL:-https://seq.easybutt0n.ai}); SEQ_API_KEY has NO default (no key = disabled).
+ - README.md: "Seq logging environment" table right after the "Fleet reporting environment" section
+   (~L543), same format, linking to the new doc.
+ - docs/seq-logging.md (new, sibling to docs/fleet-reporting.md): what is shipped, CLEF shape, level
+   mapping, how to query/alert in Seq, privacy note.
+ - CT110 prod: append SEQ_URL and SEQ_API_KEY to /home/harness/.lh-harness-secrets.env, then
+   systemctl restart lh-harness.   *** OVERSEER-EXECUTED, zero-active window. NOT THIS RUN. ***
+ - Fleet nodes: each lh-harness-node gets SEQ_API_KEY through the same mechanism that hands it
+   LH_HARNESS_FLEET_KEY today. One shared key is acceptable to start (events carry node/labels).
+
+================================================================================
+STEP 6 - TESTS
+================================================================================
+tests/test_seq_logging.py, modelled on tests/fleet/test_reporter.py's local http.server.HTTPServer stub:
+disabled when SEQ_URL unset (no thread, emit() no-ops); CLEF payload shape and level mapping for every
+Python level; batching + gzip; 4xx not retried; queue-full warns once and drops. Then the FULL pytest
+suite: the new basicConfig call must not break caplog/stderr assertions.
+
+================================================================================
+FILES
+================================================================================
+NEW:  src/lh_harness/seq_logging.py, tests/test_seq_logging.py, docs/seq-logging.md
+EDIT: src/lh_harness/cli.py (main() only), docker/compose.node.yml, README.md
+
+================================================================================
+VERIFICATION - IN THIS ORDER
+================================================================================
+ 1. pytest tests/test_seq_logging.py -v, then full pytest.
+ 2. Local smoke: docker run -p 5341:80 datalust/seq; SEQ_URL=http://127.0.0.1:5341 SEQ_API_KEY=test
+    lh-harness web; start a run, hit an API error path; confirm events with app/node properties and a
+    stack trace in the local Seq UI. Temporary local instance only - never prod.
+ 3. Commit by explicit path on a branch off origin/main, then `git push` and `gh pr create`
+    yourself, and STOP. Do NOT merge. The overseer merges, and
+    after merge performs the CT110 rollout (node=='ct110' events visible) and one canary fleet node
+    before the rest.
+
+================================================================================
+HARD RULES
+================================================================================
+ - No secrets anywhere - env var NAMES only. Never write a Seq key into a file in the repo.
+ - Do not reuse SEQ_INGEST_KEY_PP_PROD or any powerplatform key.
+ - Do not restart lh-harness on CT110. Do not edit /home/harness/.lh-harness-secrets.env.
+ - Do not post an @claude comment (task 117 - bills Paxton's subscription).
+ - No new runtime dependency in pyproject.toml.
+
+DONE MEANS: the module, wiring, tests, compose passthrough and docs are committed on a branch; full
+pytest green; local Seq smoke shows enriched events; nothing touched on CT110.
+
+================================================================================
+*** AMENDMENT 2026-09-14 (Paxton, via the overseer): SEQ INGEST NEEDS NO AUTH. THE KEY ASK IS CLOSED. ***
+================================================================================
+Seq is a DEV environment. No ingest API key will be created, and none is needed. PROVEN by the
+overseer on 2026-09-14: POST /api/events/raw?clef with NO Authorization header returns HTTP 201
+{"MinimumLevelAccepted":null} on BOTH https://seq.easybutt0n.ai and http://192.168.21.128:5341.
+(The /api/events QUERY endpoint returns 401 "Please log in" without a session - that is the UI
+login, not ingest, and is irrelevant to shipping logs.)
+
+THEREFORE:
+  - SEQ_API_KEY / the OTLP auth header is OPTIONAL. Ship with it UNSET. Do not block startup, do not
+    downgrade logging, and do not emit a "configuration incomplete" warning when it is absent.
+  - *** Any guard that refuses to log without SEQ_API_KEY is a BUG - remove it. *** Task 161's run
+    on 2026-09-12 stopped on exactly that guard ("seq logging configuration incomplete; missing
+    environment variables: SEQ_API_KEY"), which is why this amendment exists.
+  - If a key IS present, send it; if not, send nothing. Both paths must be tested.
+  - Verification stays the same and is now unblocked: emit a uniquely-tagged event from the service
+    and confirm it arrives - the overseer can eyeball it in the Seq UI, and the run should assert the
+    201 from the ingest endpoint it actually used.

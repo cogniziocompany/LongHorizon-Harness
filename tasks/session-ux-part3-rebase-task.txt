@@ -1,0 +1,99 @@
+TASK 81 - land the session-UX Part 3 work, resolving two conflicts that would each delete a live feature
+
+## WHERE THE WORK IS - it is NOT lost, and it is NOT on any branch
+
+Run 822dee5d (the top-priority production-bug task) completed Parts 1 and 2, which are MERGED and LIVE ON
+PRODUCTION as PR #102 / `f2a3633`. It also produced Part 3 - session-wizard UX - and was stopped before that
+landed, because its manager's model became unusable (three consecutive 600s episode timeouts; measured
+directly, `qwen3.8` returned nothing in 180s while `qwen3.8-nothink` on the same span answered in 11s). The
+stop was a backend decision, not a judgement on the work.
+
+The two commits exist ONLY as patch files the overseer extracted from the CT110 workspace:
+
+    C:/tmp/part3-afe84ff.patch   74,958 bytes   feat(ui): step transitions - persistent stepper,
+                                                pending states, reduced-motion safe
+    C:/tmp/part3-e28d546.patch    8,767 bytes   test(ui): assert Create/Open pending feedback and
+                                                double-submit/navigation guards
+
+**You cannot read those paths - they are on the overseer PC.** Ask the overseer to place them in your
+workspace, or ask for the two commits to be pushed to a branch you can fetch. Say which you want in your
+first round. Do NOT try to reconstruct the work from scratch: it is ~75KB of real UI code with tests.
+
+Files the first patch touches: `App.tsx`, `flow/FlowVisualizer.tsx`, `sessions/SessionDetail.tsx`,
+`sessions/SessionList.tsx`, `sessions/__tests__/pending-skeletons.test.tsx`,
+`sessions/__tests__/probe.test.tsx`, `sessions/wizard/SessionWizard.tsx`, `sessions/wizard/SolutionStep.tsx`
+and more. The second touches only `sessions/__tests__/probe.test.tsx`.
+
+## THE TWO CONFLICTS - ALREADY DIAGNOSED. DO NOT RESOLVE THEM BY PICKING A SIDE.
+
+`git am -3` onto current `develop` conflicts in exactly two files. Both are the same trap: **taking either
+side wholesale silently deletes a feature that is live and verified.**
+
+**1. `packages/frontend/src/App.tsx`** - one hunk.
+   - develop has a DATA-DRIVEN route list: `{guardedRoutes.map((route) => <Route ... />)}`, introduced by
+     the nav-flyout work that is already merged and live.
+   - Part 3 replaces that whole block with an explicit `<Route element={<GuardedLayout />}>` wrapper that
+     lists every route literally - because it was written BEFORE the `guardedRoutes` refactor existed.
+   - **Correct resolution: keep the data-driven `guardedRoutes.map(...)` AND wrap it in `<GuardedLayout>`.**
+     Part 3's purpose is the persistent ProcessStrip that must not unmount between steps; that requires the
+     layout wrapper, not the literal route list. Taking Part 3's side would revert the refactor; taking
+     develop's side would drop the layout and with it the entire feature.
+
+**2. `packages/frontend/src/ui/Shell.tsx`** - one hunk.
+   - develop's header renders `<NavFlyout topOffset={navTopOffset} />`. That is LIVE and was verified in the
+     served bundle.
+   - Part 3 restructures the header into a `const header = (...)` variable (adding `flexShrink: 0`) and
+     **does not contain NavFlyout at all**, because it predates it.
+   - **Correct resolution: keep Part 3's `const header` restructure AND keep `<NavFlyout>` inside it.**
+     Taking Part 3 wholesale DELETES the nav flyout from every page. That is the single most likely way to
+     get this wrong, so verify it explicitly.
+
+## SCOPE
+
+1. Branch `feat/session-ux-part3` off current `develop`. Apply both patches (`git am -3` is what the
+   overseer used; `git apply` then hand-commit is also fine - preserve the original commit messages and
+   authorship where you can).
+2. Resolve the two conflicts as described. **In the PR body, quote the resolved App.tsx route block and the
+   resolved Shell.tsx header, and state explicitly that NavFlyout is still rendered.**
+3. Run the frontend tests. The repo builds with `tsc -b && vite build` in `packages/frontend`; a merge that
+   is textually clean can still fail the typecheck - that happened on PR #102, where a shared type gained
+   two required fields and a separate test's stand-in object had not been updated. **If tsc fails, enumerate
+   every affected call site before fixing one and re-running** - fixing one at a time and re-running finds
+   them one per cycle.
+4. Report test counts, baseline first.
+
+## HARD RULES
+
+ - PR to `develop`, DO NOT MERGE, DO NOT push to `main` (pp `main` deploys PRODUCTION and is under a
+   standing no-merge hold until task 59 lands).
+ - Do NOT reimplement Part 3 from scratch if the patches are awkward - ask for them again.
+ - Do NOT delete or "simplify away" NavFlyout, the guardedRoutes refactor, or the checkout routes.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+ - No live calls to Microsoft, Dataverse or Stripe in tests; stub `globalThis.fetch`. Env NAMES only.
+
+## DONE MEANS
+
+A PR against develop carrying both Part 3 commits rebased onto current develop, both conflicts resolved so
+that NEITHER the persistent-stepper feature NOR NavFlyout NOR the guardedRoutes refactor is lost, the
+frontend build and tests passing with counts reported, and the PR body quoting the two resolved blocks with
+an explicit statement that NavFlyout still renders.
+
+## UPDATE 2026-09-09 11:52 PT - THE BRANCH IS NOW ON ORIGIN. YOU DO NOT NEED THE PATCHES.
+
+The section above says the two commits exist ONLY as patch files on the overseer PC. **That is no longer
+true and the instruction to ask for them is superseded.** The branch has been pushed:
+
+    refs/heads/fix/env-access-and-token-refresh  ->  e28d54608640af49be713d285c4cb244cc6e7fe8
+
+verified by reading the ref back from origin. It carries both commits:
+
+    e28d546  test(ui): assert Create/Open pending feedback and double-submit/navigation guards
+    afe84ff  feat(ui): step transitions - persistent stepper, pending states, reduced-motion safe
+
+**So: `git fetch origin fix/env-access-and-token-refresh` and work from it directly.** Do NOT ask the
+overseer for patch files, and do NOT reconstruct anything from scratch.
+
+Note the branch also contains `334e896 Merge origin/develop into fix/env-access-and-token-refresh`, so
+part of the rebase may already be done - **check before redoing it**. Everything else in this task is
+unchanged, especially the two conflict resolutions: **NavFlyout and the guardedRoutes refactor must both
+survive**, and taking either side of either conflict wholesale deletes a live feature.

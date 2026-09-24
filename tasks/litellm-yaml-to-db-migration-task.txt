@@ -1,0 +1,197 @@
+TASK 124 - MIGRATE THE LITELLM MODEL LIST FROM YAML INTO THE DATABASE. This is the upgrade Paxton
+identified: the estate is stuck half-way between config-as-file and config-as-database, and the
+hybrid is the direct cause of several expensive failures. PLAN AND PROVE IT FIRST - this task
+delivers a migration plan plus the tooling, NOT a big-bang cutover.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+
+*** Paxton 2026-09-10 06:50 PT: "Once they identify that we have to start putting everything in the
+    database because we're trying to move away from the Yamel that's part of the upgrade right?" ***
+Yes. This task is that upgrade.
+
+================================================================================
+THE EVIDENCE THAT THE HYBRID IS COSTING US - all measured, do not re-derive
+================================================================================
+
+1. **Config-sourced models cannot be changed at all through the API.** Measured 2026-09-10 06:4x,
+   `POST /model/update` on `qwen3.8-nothink`:
+       "Can't edit model. Model in config. Store model in db via `/model/new`. to edit."
+   `ornith-1.5:pool` has a UUID id (9290c2b8-3d39-4224-8b53-a2a4789ff74c) and IS editable, because
+   it was created in the DB. The four qwen3.8 aliases carry 64-hex config-hash ids and are not.
+
+2. **Every YAML change force-recreates the CT202 PRODUCTION router.** The deploy job hashes the
+   deployed file, so even a comment-only edit triggers it, and a recreate kills in-flight harness
+   runs. That is why a four-alias repoint currently needs a zero-active-runs window - a window that,
+   measured tonight, NEVER ARRIVES ON ITS OWN because the launcher relaunches to keep its cap.
+
+3. **The DB already WINS over the file for five whole sections** - `general_settings`, `guardrails`,
+   `litellm_settings`, `mcp_servers`, `router_settings`. So the file is already NOT the truth.
+   Measured drift right now: `router_settings.allowed_fails` is **file=1, db=50**.
+
+4. **Nine merged alias edits were DEAD on the live router** (measured 2026-09-09). People reviewed
+   them, merged them, and they changed nothing, because the DB row won. That is the worst property
+   of the hybrid: work that looks shipped and is not.
+
+================================================================================
+WHAT TO DELIVER - a plan and tools, in this order
+================================================================================
+
+SLICE 1 - INVENTORY. A script that reads `/model/info` and classifies EVERY deployment as
+  DB-sourced (UUID id) or CONFIG-sourced (64-hex id), and diffs the live list against
+  `infrastructure/litellm-config.yaml`. Output a table: alias, source, api_base, max_input_tokens,
+  supports_vision, supports_function_calling, and IN-FILE-BUT-NOT-LIVE / LIVE-BUT-NOT-IN-FILE.
+  **This inventory is the deliverable that makes the rest safe.** Nobody currently knows the real
+  split; at last count it was 13 CONFIG vs 1 DB just among qwen aliases.
+
+SLICE 2 - MIGRATION TOOL. A script that takes a model_name and recreates it as a DB deployment via
+  `/model/new` with identical litellm_params and model_info, then verifies by reading `/model/info`
+  back and diffing field-by-field. It must be IDEMPOTENT and it must REFUSE to run if a DB
+  deployment with that model_name already exists (or the alias silently ends up load-balanced across
+  a stale config copy and a new DB copy - a trap that would look like it worked).
+
+SLICE 3 - THE ORDER OF MIGRATION, written down with reasoning. Do NOT migrate everything at once.
+  Propose a sequence by blast radius, lowest first, and say why each is where it is. State plainly
+  which aliases are load-bearing for harness runs (the trio table in C:/tmp/launch_queue.py names
+  them) and therefore must move in a quiet window even under this scheme.
+
+SLICE 4 - WHAT THE YAML BECOMES. This is the part that must not be got wrong: **the answer is NOT
+  "delete the YAML".** Two things are lost if the file simply goes away, and the plan must address
+  both:
+    a. **Bootstrap.** If the Postgres row set is lost or the stack is rebuilt from scratch, the file
+       is what brings the router back. Define the file's new role explicitly as a SEED, and say how
+       it is kept adequate for that.
+    b. **Reviewability.** A YAML in git gets a PR, a diff and a reviewer. A DB row gets none of
+       that. Propose an EXPORT path - a scheduled or CI job that dumps the live model list back into
+       a versioned artifact in the repo - so config changes remain auditable after they stop being
+       file edits. Without this, migrating to the DB trades one real problem for a different one.
+
+SLICE 5 - the ops-doctor check. There is already a `config_drift` check in
+  `infrastructure/docker/ops-control-center/doctor/ops_doctor.py`. EXTEND IT to report the
+  DB-vs-CONFIG split and any alias present in the file but shadowed by a DB row. Do NOT add a new
+  view or route - the doctor renders on /overview and RULE 2 forbids duplicating surfaces.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **DO NOT MIGRATE ANYTHING LIVE IN THIS TASK.** Deliver the inventory, the tooling and the plan.
+   The overseer executes migrations, in windows, one alias at a time, with read-back.
+ - **Do NOT edit `infrastructure/litellm-config.yaml` EXCEPT for the Slice 6 banner.** Editing it
+   force-recreates the prod router, which is the exact problem being solved - so the ONLY permitted
+   change to that file in this task is adding the deprecation banner at the top, and it must be the
+   only change in that file. Do not touch a single model entry, do not "tidy" anything, and do not
+   open a separate PR for the banner - it lands with the migration so one recreate covers both.
+ - `POST /config/update` returned 200 twice and silently discarded the key both times. **Any write
+   must be followed by a read-back and a field-by-field diff.** A 200 is not proof.
+ - **NEVER put `LITELLM_MASTER_KEY` in a PR-triggered workflow**, and never write a key into a
+   script, doc, or fixture. Env var NAMES only.
+ - **NEVER the bare gateway `/health`** - it fans a completion out to every configured model,
+   including paid and GPU ones. Use `/health/liveliness` or `/health?model=`.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat` first.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A committed inventory of every deployment classified DB vs CONFIG with the file-vs-live diff; an
+idempotent, verify-by-read-back migration script that refuses duplicate model_names; a written
+migration ORDER by blast radius naming the harness-critical aliases; an explicit answer for what the
+YAML becomes, covering BOTH bootstrap and reviewability including an export-to-git path; and the
+existing doctor check extended to surface the split. Nothing migrated, nothing merged, no config
+file edited.
+
+
+================================================================================
+SLICE 6 - THE DEPRECATION NOTICE. Paxton asked for this explicitly 2026-09-10 08:1x PT:
+"add doc so we don't mess with ymal it's deprecated unless required"
+================================================================================
+
+Two places, because a doc nobody opens changes nothing:
+
+A. **A BANNER AT THE TOP OF `infrastructure/litellm-config.yaml` ITSELF.** This is the highest-value
+   placement - the warning has to be in front of the person whose hands are already on the file.
+   It must say, in this order:
+     1. **This file is DEPRECATED as the way to change models. Do not edit it to add, repoint or
+        remove a model.** Use the DB: `POST /model/new`, `/model/update`, `/model/delete`, then READ
+        BACK with `/model/info` and diff.
+     2. **WHY, concretely:** editing this file FORCE-RECREATES the CT202 production router (the
+        deploy job hashes the deployed file, so even a comment-only change triggers it), which
+        interrupts every in-flight harness run. A DB change takes effect live with no restart -
+        proven 2026-09-10: an ornith deployment was added via `/model/new` (213 -> 214 deployments)
+        and another removed via `/model/delete` (2 -> 1), both read back, router never restarted.
+     3. **AND it may not even work:** five sections here are DB-SHADOWED and the DB row WINS -
+        `general_settings`, `guardrails`, `litellm_settings`, `mcp_servers`, `router_settings`.
+        On 2026-09-09, **nine merged alias edits were dead on the live router**. Reviewed, merged,
+        changed nothing.
+     4. **WHEN THE FILE IS STILL LEGITIMATE** - be specific, or people will either ignore the
+        banner or become afraid to touch anything:
+          - **bootstrap/seed**: rebuilding the stack from scratch, or restoring after DB loss
+          - entries that genuinely have no DB equivalent (name them, having checked)
+        NOTE that container-level settings are **NOT in this file at all** - `OLLAMA_NUM_PARALLEL`,
+        the pinned LiteLLM image digest and env vars live in `docker-compose.yml` and still require
+        a container recreate. Say so, so nobody looks for them here.
+
+B. **`docs/litellm-config-is-deprecated.md`** - the same policy at length, plus the migration
+   status (how many deployments are DB vs CONFIG, from Slice 1's inventory) and the runbook for
+   making a model change the DB way, including the read-back-and-diff step. Link it from the banner.
+
+The banner is a COMMENT-ONLY change to litellm-config.yaml - which, per the banner's own text,
+force-recreates the router. **That is not a reason to skip it; it is a reason to land it in the SAME
+config change as the migration itself.** Do not open a separate PR just for the banner.
+
+
+================================================================================
+*** PAXTON 2026-09-10 08:2x PT - OPTION (B) CHOSEN: COMBINED. ONE RECREATE, THE LAST ONE. ***
+================================================================================
+
+Verbatim: "combined - qwen3.8 consolidation plus move the model list to DB in the same recreate, so
+it's the last one you ever pay for."
+
+TASK 123 AND TASK 124 NOW LAND TOGETHER. Neither ships alone. The point is to pay the
+router-recreate cost ONCE and never again, so the sequencing matters more than either task's own
+scope:
+
+  PHASE 1 - LIVE, NO RECREATE, NO WINDOW NEEDED.
+    Add DB deployments via `POST /model/new` for everything being kept. This is additive and takes
+    effect immediately - proven 2026-09-10: /model/new took deployments 213 -> 214 and /model/delete
+    took 2 -> 1, both read back, the router never restarted.
+    **Expect a transient double-serve**: while both the config entry and the new DB entry exist for
+    the same `model_name`, the router LOAD-BALANCES ACROSS BOTH. For most aliases both point at the
+    same backend so it is invisible. **For `qwen3.8` and `qwen3.8-nothink` it is NOT** - the config
+    copy points at the span and the DB copy at ornith, so traffic splits roughly 50/50 during the
+    gap. That is acceptable and is actually a useful canary, but it must be SHORT and it must be
+    expected rather than discovered.
+    Read every addition back with `/model/info` and diff field-by-field before moving on.
+
+  PHASE 2 - THE ONE RECREATE. A single `litellm-config.yaml` change carrying ALL of:
+      - the model entries migrated in Phase 1 REMOVED from the file (this is the only way to remove
+        them; the API refuses - "Can't edit model. Model in config.")
+      - `qwen3.8--128k` and `qwen3.8--256k` gone entirely
+      - the span (`:11442`) deployment gone
+      - `router_settings.context_window_fallbacks` cleaned of the purged aliases - **if those
+        entries outlive the aliases, a context overflow on qwen3.8 falls back to a model that no
+        longer exists**
+      - the Slice 6 DEPRECATION BANNER at the top
+    Merge in a zero-active-runs window. **This is the last config-file change anyone should need to
+    make for a model.**
+
+  PHASE 3 - LIVE AGAIN, NO RECREATE.
+    With qwen3.8 no longer pointing at the span, the span is unreferenced -> unload it -> that
+    returns **4.3 GB of private host RAM** (measured RssAnon, not shared page cache) and 18.6 GB of
+    VRAM across both cards. ptait01 then has ~8.1 GB available against the ~7.0 GB a second ornith
+    needs - it fits, with roughly 1 GB of margin, which is why the span MUST be freed first and why
+    this cannot be done before Phase 2.
+    Then load ornith on **:11438 (CUDA_VISIBLE_DEVICES=0)** and add its deployment via `/model/new`
+    so `ornith-1.5:pool` spans both GPUs - one instance per card, NOT one model split across two.
+    Both new deployments must carry `supports_vision: true` AND `supports_function_calling: true`.
+
+  VERIFY AT THE END - and not by a 200:
+    `/model/info` shows no `qwen3.8--128k`, no `qwen3.8--256k`, no `:11442` deployment, and
+    `ornith-1.5:pool` with TWO deployments on :11441 and :11438; then drive real traffic and confirm
+    BOTH api_bases actually serve. A pool of one would pass a naive alias check.

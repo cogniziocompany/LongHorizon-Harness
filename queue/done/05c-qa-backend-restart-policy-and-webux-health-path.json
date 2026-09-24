@@ -1,0 +1,8 @@
+{
+ "name": "05c-qa-backend-restart-policy-and-webux-health-path",
+ "task_file": "C:/tmp/qa-backend-resilience-task.txt",
+ "workspace": "/home/harness/work/cognizioware-qa",
+ "max_rounds": 4,
+ "trio": "kimi",
+ "run_id": "20260908T000245Z_ccd03846"
+}

@@ -1,0 +1,459 @@
+TASK 96 - the MCP tool-namespace contract: repair it, ENFORCE it in the pipeline, and stop the
+runaway enumeration.
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools. Suggested branch: `fix/mcp-namespace-contract`,
+cut from origin/main.
+
+Source plan: `mcp-namespace-contract-2026-09-09`, authored 2026-09-09 21:20-21:40 UTC by session
+`284a9e40-18b8-4fdb-b04d-057782f44674` on PTAIT09, relayed by Paxton. Operator scope decision
+already made: **repair-only; all 52 servers stay registered; the runaway-key section is IN.**
+
+Paxton, 2026-09-09: "revises all the tool calling issues and hopefully concretes it into our
+pipeline deployment process."
+
+That second clause is the point of this task. The rename is small. **The deliverable is the
+machine-checked contract** - a test suite in the pipeline that fails when the next alias mistake
+is made, instead of comments in a YAML file that nothing reads.
+
+================================================================================
+SCOPE BOUNDARY - TASK 89 IS ADJACENT. DO NOT DUPLICATE IT.
+================================================================================
+
+  TASK 89 (733-89-key-tool-least-privilege): WHICH tools each key/role/device is ALLOWED to
+        see. Produces a key x tools matrix and a least-privilege proposal. Revokes nothing.
+  TASK 96 (this one):                        WHAT the tools are NAMED, whether the naming
+        rules are enforced, and the one key that enumerates them in bursts and never calls one.
+
+If you find yourself proposing an access-group change for reasons of least privilege, that
+belongs to 89 - hand it over, do not implement it here. The one exception is WI-5 step 3, which
+narrows `overseer-ingest` specifically because it is the runaway, and that is in scope here.
+
+================================================================================
+WHY THIS EXISTS
+================================================================================
+
+An audit of gateway traffic found a single key issuing 68,692 `tools/list` calls in one day
+(~3,384/hr and still climbing at 21:15). Chasing it produced two results.
+
+FIRST - and this CLOSES AN OPEN QUESTION the overseer had raised with Paxton: **the key is
+ours.** `63f403a7...` = **`overseer-ingest`**, scoped to the `hive-mind` access group. It was
+NOT probing Proxmox. Verified independently: `pveproxy` on ptait01 logged no entries in 40
+minutes and 1 auth event total, and the host's load was `llama-server` doing real inference, not
+API pressure. Any note anywhere saying "unknown key probing PVE" is wrong and should be corrected
+where you find it.
+
+SECOND, and the reason for this task: enumerating the gateway exposed how the tool namespace is
+actually governed. Every aggregate tool name is `<alias-or-server-key>-<tool>`, and the alias map
+is a single hand-maintained YAML block whose rules are written ONLY IN COMMENTS. Nothing enforces
+them. The result is one real omission, several stale mirrors of the alias table scattered through
+the test suite, and no guard that would catch the next mistake - in a surface of ~973 tools.
+
+================================================================================
+FINDINGS - measured live, read-only, 2026-09-09. RE-MEASURE BEFORE ACTING.
+================================================================================
+
+  Registered MCP servers              52   (infrastructure/litellm-config.yaml:405-1008)
+  Servers actually contributing tools 37   - 15 return zero
+  Aggregate tools/list                973 tools, 703,425 bytes, 1.54 s
+  Distinct tool basenames             708 -> 265 names DUPLICATED across namespaces
+                                      (browser_click x5, create_backup x5)
+  Tools whose prefix stutters         58   (ssh-ssh_exec, graphify-graphify_query)
+  Longest tool name                   48 chars (under OpenClaw's 64-char truncation - by 16)
+  Servers with no alias               2    - playwright_qa1_mcp, comfyui_mcp
+  Alias entries                       51 entries -> 50 servers (telnyx + clawdtalk -> telnyx_mcp)
+  Runaway key                         overseer-ingest - see the CORRECTION immediately below;
+                                      ZERO mcp_namespaced_tool_name (it never calls a tool)
+
+*** CORRECTION - THE 68,692 FIGURE DOES NOT RECONCILE. MEASURE IT YOURSELF FIRST. ***
+The overseer queried `LiteLLM_SpendLogs` on CT202 at 21:51 on 2026-09-09, counting rows with
+model = 'MCP: list_tools' since midnight, joined to the key table:
+
+    overseer-ingest       2,899 calls    first 05:20:52   LAST 21:20:57
+    (no key alias)          714 calls
+    ops-control-center      335 calls
+
+**2,899, not 68,692** - and `overseer-ingest` had made NO call for the preceding 30 minutes. By
+hour: 18:00 = 3, 19:00 = 15, 20:00 = 23, 21:00 = 1,003. That is BURSTY, not the sustained
+~3,384/hr plateau the plan describes, and the burst had already stopped by the time it was
+measured.
+
+Do NOT conclude the problem is solved, and do NOT conclude the plan was wrong. Either figure
+could be right and measuring something different - a different table, a different model label, a
+window that is not calendar-day, or rows the join drops. **Reconcile the two counts BEFORE
+proposing any rate limit**, and say plainly which query produced which number. Sizing an
+`rpm_limit` off the wrong figure by a factor of 24 is how a guard becomes an outage.
+
+NOTE A DISCREPANCY, and resolve it by measuring rather than picking one: an independent overseer
+measurement the same day recorded **973 tools / 37 namespaces / 737,226 bytes**, against this
+plan's 703,425 bytes. Same tool count, ~34 KB apart. Probably different measurement points or a
+server that came and went. State which you measured and when; do not silently adopt either
+number.
+
+HOW PREFIXING ACTUALLY WORKS. There is no `alias:` field on any server entry and no
+`mcp_info`/`server_name` field anywhere in the repo. The YAML server KEY becomes `server_name`;
+prefixes come from one central map, `litellm_settings.mcp_aliases` at litellm-config.yaml:141-233.
+No alias => LiteLLM falls back to the raw server key. Per docs/config-authority.md:136-137,
+`mcp_aliases` is **NOT** in `LITELLM_SETTINGS_SAFE_DB_OVERRIDES`, so an alias change requires a
+**ROUTER RESTART**, not a config sync. Getting this wrong looks like "the alias didn't apply".
+
+--------------------------------------------------------------------------------
+WHAT IS *NOT* BROKEN - corrections to the record. DO NOT "FIX" THESE.
+--------------------------------------------------------------------------------
+
+1. **Dashed aliases `google-places` and `public-records` are FINE.** litellm-config.yaml:202-208
+   states THE RULE: *a dashed alias is broken if and only if another alias equals its text before
+   the first dash.* No `google` or `public` alias exists. (`n8n-cloud`, `n8n-docs`,
+   `postgres-secondary` and `kb-uat` genuinely WERE broken and were renamed IN THE FILE.)
+
+   **CORRECTION, measured on the LIVE DB 2026-09-09: `n8n-docs` IS STILL LIVE AND STILL BROKEN.**
+   The rename landed in the file; the live `litellm_settings` row still carries `n8n-docs`
+   alongside the replacement `n8ndocs`, and `n8n` exists, so THE RULE is violated on the running
+   router right now. This is the drift described below, and it is exactly why a file-only check
+   is not enough. `n8n-cloud`, `postgres-secondary` and `kb-uat` ARE gone from the live set.
+
+2. **`playwright_qa1_mcp` is unaliased ON PURPOSE** - litellm-config.yaml:180-181: "adding one
+   would rename its tools for existing clients."
+   e2e/suites/23-playwright-qa1-autonomous-login.test.js:64 ASSERTS it stays unaliased, and
+   `playwright_qa1_mcp-browser_close` is a live consumed name (ops-control-center handoff).
+   This task PRESERVES that. It becomes an explicit allowlist entry rather than an accident.
+
+3. The 58 stuttering names are COSMETIC and would require patching each backend's own tool
+   registration. OUT OF SCOPE per the repair-only decision. Do not start renaming backends.
+
+================================================================================
+WI-1 - add the ONE missing alias: `comfyui`
+================================================================================
+
+`comfyui_mcp` is absent from `mcp_aliases` with no explanatory comment (unlike qa1). Its 12 tools
+surface as `comfyui_mcp-*` while every sibling uses a short alias.
+
+ - Add `"comfyui": "comfyui_mcp"` to litellm-config.yaml:141-233, in the block near `langfuse`,
+   with a comment recording the 2026-09-09 rename and that `comfyui_mcp-*` is retired.
+ - Safe under THE RULE: no alias is a dash-prefix of `comfyui`, and `comfyui` shadows nothing.
+ - **CLIENT SWEEP BEFORE DEPLOY.** Grep for `comfyui_mcp-` across `.mcp.json` files, `skills/`,
+   `design docs/`, ops-control-center baselines, and the ComfyUI handoff docs. Known consumers are
+   in `reference_comfyui_vace_api_access` territory. Confirm none call the prefixed name. **This
+   rename breaks any client that does** - the sweep is the whole safety argument.
+ - Requires a ROUTER RESTART, not a config sync.
+
+DECISION ALREADY TAKEN - do not reopen it. The repair-only option as originally presented also
+included aliasing `playwright_qa1_mcp`. The config's own comment declines that rename
+deliberately. **This task keeps qa1 unaliased and allowlists it.** Reversing it would be a
+client-visible rename of 23 tools and must be its own change.
+
+================================================================================
+WI-2 - kill the stale alias mirrors (there must be ONE source of prefix truth)
+================================================================================
+
+The alias table is copied BY HAND into the tests and drifts.
+e2e/suites/17-mcp-server-filtering.test.js:77-117 holds `SERVER_ALIASES` covering **15 of 51**
+aliases, with a comment politely asking future editors to keep it in sync. They have not.
+
+ - Add `e2e/lib/mcp-aliases.js`: parse `mcp_aliases` out of infrastructure/litellm-config.yaml
+   ONCE and export `{ aliasToServer, serverToAliases, prefixesFor(serverKey) }`.
+ - Rewire suite 17's `serverPrefixes()` / `serverToolPattern()` / `hasServerTools()` (:105-117)
+   to consume it; DELETE the hand-copied constant.
+ - Reuse it in 20-mcp-servers-matrix.test.js (`REMOVED_SERVERS.prefixes`, :208-210) and
+   35-rsi-surfacing-adapters.test.js:150.
+
+================================================================================
+WI-3 - the enforcement suite: e2e/suites/47-mcp-namespace-contract.test.js
+================================================================================
+
+**THIS IS THE DELIVERABLE PAXTON ASKED FOR** - "concretes it into our pipeline deployment
+process". Encode the rules that today live only in YAML comments.
+
+Follow the current soft-fail pattern from 20-mcp-servers-matrix.test.js:279-292 -
+`skips.record(...)` via e2e/lib/skip-registry.js, escalating under `RUN_LIVE_REGRESSION`.
+Static assertions (1-4) are HARD failures; live ones (5-7) soft-fail off-LAN.
+
+ 1. ALIAS COVERAGE - every key in `mcp_servers` has an alias, OR appears in an
+    `INTENTIONALLY_UNALIASED` map WITH A WRITTEN REASON. Seed it with `playwright_qa1_mcp`
+    citing :180-181.
+ 2. THE RULE - for every alias containing `-`, assert no OTHER alias equals its text before the
+    first dash. **This is the check that would have caught `kb-uat`, `n8n-cloud`, `n8n-docs` and
+    `postgres-secondary` before they shipped.**
+ 3. ALIAS CHARSET - `^[a-z0-9_-]+$`, and no alias may equal another alias's dash-prefix
+    (the inverse of 2).
+ 4. DUPLICATE ALIAS -> SAME SERVER - `telnyx`/`clawdtalk` both map to `telnyx_mcp` and only the
+    first wins. Assert as a **WARNING, not a failure**: it is pre-existing and documented, and
+    per the config-edit rule it is not removed here.
+ 5. LIVE-VS-FILE DRIFT - `GET /v1/mcp/server` alias set must EQUAL the YAML alias set. Catches a
+    UI/DB alias edit shadowing the file - the same class of bug as the `LiteLLM_Config`
+    router_settings override that cost us a day.
+ 6. NAME-LENGTH CEILING - every advertised tool name <= 64 chars. At 48 today there is little
+    headroom, and OpenClaw silently TRUNCATES past it.
+ 7. PREFIX CLOSURE - every prefix observed on the aggregate is either a known alias or a known
+    server key. Catches a server registered without a matching namespace.
+
+Add `"test:mcp-namespace": "jest --testPathPattern=47-mcp-namespace"` to e2e/package.json.
+
+Note while you are there: suites 20, 22 and 37 - the three that ALREADY guard tool counts - have
+NO dedicated npm script and only run in a full `run-all.sh` pass. Adding scripts for them is a
+reasonable, in-scope improvement; say so if you do.
+
+SUITE-NUMBER COLLISION - read this before naming the file. PR #112 is adding suites 44, 45 and
+46, so **47 is the first free number**. Separately, `26-fleet-dns-tls.test.js` and
+`26-ssh-fleet.test.js` BOTH already exist on main - a genuine duplicate that should be renumbered
+UNDER SEPARATE COVER, not folded into this task.
+
+================================================================================
+WI-4 - write the contract down
+================================================================================
+
+ - Add an "MCP tool namespace contract" section to docs/config-authority.md stating: server key
+   => `server_name`; `mcp_aliases` is the ONLY prefix control; no alias => raw key; THE RULE;
+   alias changes need a RESTART; suite 47 enforces it.
+ - Extend the add-a-server checklists in readme-Cognizioware-MCP-Tools-Gateway.md:403 and
+   `design docs/cloudflare-mcp-gateway-gap.md:142` with "add an alias, or record why not."
+
+================================================================================
+WI-5 - the runaway key (`overseer-ingest`)
+================================================================================
+
+68,692 enumerations today, ZERO tool calls. Its `hive-mind` group contains **6 of the 7
+`placeholder`-host stubs**, so every enumeration fans out across dead backends; LiteLLM's MCP
+discovery is SERIALIZED, so this loop degrades every other MCP call on the gateway.
+
+ 1. **FIND THE CALLER - the overseer already knows where to look, so start here.** The plan says
+    "search the hive-mind / overseer codebase". Narrow it: the strongest candidate is
+    **`cognizioware-hydra/scripts/overseer-session-ingest.mjs`** - the transcript-ingest pipeline
+    live since 2026-09-05, which walks `~/.claude/projects/*/*.jsonl` and posts to memory-mcp
+    **every 5 minutes** via a PTAIT09 Scheduled Task. A per-tick `tools/list` there would produce
+    exactly this signature: high enumeration, zero tool calls, steady climb. CONFIRM IT BEFORE
+    CHANGING IT - a plausible cause is not a verified one, and if it is NOT that script, say so
+    and keep looking.
+    THE FIX IS CLIENT-SIDE: discover once per session and CACHE, rather than re-enumerating per
+    tick.
+ 2. **INTERIM GATEWAY GUARD.** Set an `rpm_limit` on that key via `POST /key/update`. Size it
+    ABOVE legitimate use - note this throttles `tools/call` too, so pick a ceiling (e.g. 120/min)
+    rather than a tight cap. **A limit that starts 429ing the ingest pipeline is an outage, not a
+    fix.**
+ 3. **NARROW THE SCOPE.** If overseer-ingest only needs a subset, move it off `hive-mind` onto a
+    group without the placeholder stubs. Scope by **`mcp_access_groups`, NEVER server IDs** - IDs
+    REGENERATE ON EVERY CONFIG RELOAD and an ID-scoped key silently goes deny-all
+    (litellm-config.yaml:386-403).
+ 4. **DETECTION.** Add a spend/usage check so a key exceeding ~500 `tools/list`/hr surfaces.
+    `infrastructure/scripts/litellm-team-audit.sh` is the closest existing read-only precedent to
+    model it on.
+
+================================================================================
+OPEN-PR AUDIT - REPORT ONLY. DO NOT CLOSE OR MERGE ANY PR IN THIS TASK.
+================================================================================
+
+The source session verified 13 open PRs against origin/main. Carry the verdicts as EVIDENCE for
+Paxton to act on. **Closing eight PRs is a call for Paxton, not for a harness run.** Re-verify
+each verdict before repeating it - these were measured on 2026-09-09 and main moves.
+
+  #36  fix(azure-mcp) transport mismatch  MERGE - highest value here. Still MERGEABLE/CLEAN.
+       main still has url "http://azure-mcp-auth-proxy:3000" with NO /mcp path, and azure_mcp
+       returns 0 tools live (no `azure-` prefix in the histogram). Adds
+       --outputTransport streamableHttp + the /mcp path -> restores 66 tools under `azure-`.
+  #122 Pi-hole allowlist                  KEEP - active. Touches litellm-config.yaml; coordinate
+                                          merge order with WI-1.
+  #120 retire qwen3.5/3.6                 KEEP - blocked BY DESIGN. Title says
+                                          "DO NOT MERGE - ordering blocker". Touches
+                                          litellm-config.yaml; coordinate merge order.
+  #112 e2e model registry                 KEEP - active. Adds suites 44/45/46 -> take 47.
+  #55  suite 26 fleet DNS+TLS             CLOSE - superseded; the file is already on main.
+  #41  qwen3.6 + quota resilience         CLOSE - superseded; main carries qwen3.8/--128k/--256k
+                                          and 23-qwen38-vision-quota.test.js replaced it.
+  #40  gateway-guides-mcp                 CLOSE - superseded + CONFLICTING/DIRTY; live on main.
+  #35  MS365 backend + decommission PHX   CLOSE - superseded; ms365-mcp live (14 tools), PHX
+                                          decommissioned 2026-07-09. Also +409,333 lines /
+                                          127 files - vendored junk.
+  #37  router fallbacks                   CLOSE - superseded; real root cause was the
+                                          LiteLLM_Config DB row shadowing YAML fallbacks.
+  #39  cloud model retirement (draft)     CLOSE - stale draft, 1 month idle, overtaken by #120.
+  #11  ComfyUI deploy                     CLOSE - superseded; comfyui-mcp is on main and running.
+                                          SKIM IT FIRST: confirm it does not already contain the
+                                          `comfyui` alias WI-1 adds.
+  #2   CI workflows / suite 14            CLOSE - superseded; the suite is on main. 5 months idle.
+
+MERGE ORDER. Three PRs (#122, #120, and this work) all edit infrastructure/litellm-config.yaml.
+Land **#36 FIRST** - it is clean, and it changes the tool surface suite 47 will assert against -
+let it settle, THEN WI-1, then reconcile #122/#120. Two tool-surface changes landing together are
+two changes you cannot attribute independently.
+
+================================================================================
+THE UAT GAP - DECIDED. PAXTON ACCEPTED IT 2026-09-09. NO LONGER A STOP GATE.
+================================================================================
+
+The standing rule is UAT (CT204) green BEFORE CT202, and no hand-deploys to CT202. There is no
+UAT lane for the gateway config - `kb_mcp_uat` is a single UAT *backend*, not a second router.
+
+**Paxton, 2026-09-09: "accept the gap and deploy through the pipeline, do this."**
+
+So WI-1 PROCEEDS, on one condition that is now binding: **through the NORMAL PIPELINE, never by
+hand.** The gap is accepted; hand-applying a change to CT202 is still out of bounds. Rollback is
+the one stated below: delete the alias line, redeploy, restart the router.
+
+================================================================================
+THE FILE IS NOT THE AUTHORITY - MEASURED, AND IT CHANGES WI-1
+================================================================================
+
+WI-1 as written says "add `comfyui` to the YAML". **That alone will not work.** The overseer
+measured this on CT202 on 2026-09-09.
+
+`general_settings.store_model_in_db: true` puts five config sections in the Postgres
+`LiteLLM_Config` table: **general_settings, guardrails, litellm_settings, mcp_servers,
+router_settings.** `mcp_aliases` lives inside the `litellm_settings` row. The deployed YAML states
+the merge rule in its own comments:
+
+    DB-backed for keys present in the `LiteLLM_Config` row `litellm_settings`
+    (deep merge, DB WINS); FILE wins only for keys ABSENT from that row. Only the
+    17 LITELLM_SETTINGS_SAFE_DB_OVERRIDES keys live-reload from the DB onto the
+    running module. Change DB-shadowed keys via
+      POST $LITELLM_BASE_URL/config/update  -d '{"litellm_settings":{...}}'
+    then READ BACK the row and diff.
+
+`mcp_aliases` is NOT among the 17 safe overrides. **The DB row wins, and the file loses.**
+
+THE MEASURED DRIFT - re-run this comparison at execution time, do not trust these numbers:
+
+    YAML entries 51   |   LIVE DB entries 50   |   17 entries differ
+
+    IN THE FILE BUT NOT LIVE - 9 aliases whose merged file edits did NOTHING:
+        audioqa  auth  dataversedata  hydrafleet  memory  opsstatus  pac  qarun  stripe
+
+    LIVE BUT WITH NO FILE BACKING - 8:
+        n8n-docs  proxmox-cognizioware01  proxmox-corsairai300  proxmox-phx
+        proxmox-ptait01  proxmox-ptait07  proxmox-terranas01  swarms
+
+    comfyui: absent from BOTH - confirming WI-1's gap AND that a file-only edit would not fix it.
+
+TWO LIVE DEFECTS THIS EXPOSES, both in scope for this task:
+
+  1. **`n8n-docs` is LIVE and BROKEN BY THE RULE.** `n8n` also exists as an alias, and THE RULE
+     (litellm-config.yaml:202-208) says a dashed alias is broken iff another alias equals its text
+     before the first dash. `n8ndocs` - the working replacement - is live too, so the broken name
+     is sitting right beside the good one. **Suite 47 check 2 must fail on the LIVE set, not only
+     on the file**, or it would pass today while a broken namespace is being served.
+  2. **`proxmox-phx` is live and points at a host decommissioned 2026-07-09.**
+
+WHAT WI-1 NOW REQUIRES - the file edit is necessary but NOT sufficient:
+  a. Add `"comfyui": "comfyui_mcp"` to infrastructure/litellm-config.yaml (durability - the repo
+     stays the source of record; never apply only on the box).
+  b. Do the client sweep for `comfyui_mcp-` BEFORE anything ships.
+  c. Ship through the pipeline. Then **READ THE LIVE `litellm_settings` ROW BACK.**
+  d. If `comfyui` is not in it, apply `POST /config/update` with the corrected `mcp_aliases`, and
+     read the row back AGAIN. A 200 is not proof; the row is.
+  e. Prove a real `tools/call` on a `comfyui-*` tool RESOLVES.
+
+RECONCILING THE OTHER 17 ENTRIES IS IN SCOPE FOR THIS TASK, and it is the larger prize - nine
+dead edits and a live broken namespace. But it RENAMES TOOLS FOR LIVE CLIENTS, so every removal or
+addition gets the same client sweep as `comfyui`, and anything with a live consumer stays and gets
+an `INTENTIONALLY_UNALIASED`-style recorded reason instead. **If the sweep cannot prove a name is
+unused, LEAVE IT AND SAY SO.** A broken alias that someone has worked around is less harmful than
+a working alias you deleted underneath them.
+
+**WI-2, WI-3 and WI-4 remain repo-only and carry no deployment risk.** Suite 47 check 5 (live-vs-
+file drift) is now the highest-value check in the whole task: it is the thing that would have
+caught all nine dead edits the day each one shipped.
+
+================================================================================
+VERIFICATION
+================================================================================
+
+STATIC (no deployment):
+    cd e2e && npm run test:mcp-namespace     # new suite 47
+    npm run test:mcp-filtering               # suite 17 after the WI-2 rewire
+
+LIVE, BEFORE AND AFTER (read-only, from CT202) - capture the namespace baseline and DIFF it:
+    pct exec 202 -- bash -lc "K=\$(docker exec cognizioware-mcp-tools-litellm printenv LITELLM_MASTER_KEY); \
+      curl -s -X POST -H x-litellm-api-key:\$K -H 'Content-Type: application/json' \
+      -H 'Accept: application/json, text/event-stream' \
+      -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' http://localhost:4000/mcp/ \
+      | sed -n 's/^data: //p' | jq -r '.result.tools|length, (map(.name|split(\"-\")[0])|unique|.[])'"
+
+EXPECTED after WI-1 + #36: `comfyui_mcp` disappears from the prefix list and `comfyui` appears;
+`azure` appears; total rises from 973 to roughly 1,039.
+
+PER-SERVER, for the two changed servers:
+    tools/list on .../comfyui_mcp/mcp   -> expect 12
+    tools/list on .../azure_mcp/mcp     -> expect ~66
+
+CALLABILITY - the thing the dash rule protects, and the step most likely to be skipped. **A
+namespace that LISTS but cannot be CALLED is the exact failure mode of the proxmox and kb-uat
+incidents.** So assert a real `tools/call`, not just a listing:
+    tools/call  comfyui-<some_tool>     # must resolve, not "Unknown tool"
+    tools/call  azure-<some_tool>
+
+REGRESSION: `bash e2e/run-all.sh --ci`, then confirm e2e/.skips.json records NO NEW soft-skips.
+Note `--ci` alone does NOT set `RUN_LIVE_REGRESSION`/`CI_STRICT` - those are job-level env in
+.github/workflows/deploy-mcp-tools.yml:84-85, **so a local pass is WEAKER than CI.** Do not report
+a local green as if it were the gate.
+
+RUNAWAY KEY: re-count `overseer-ingest` tools/list volume ONE HOUR after WI-5 and confirm the rate
+has dropped off its ~3,384/hr plateau. A config change is not proof; the falling rate is.
+
+================================================================================
+RISKS AND ROLLBACK
+================================================================================
+
+  A client calls `comfyui_mcp-*` by name and breaks
+      -> Grep sweep before deploy (WI-1). Rollback: delete the alias line, restart router; names
+         revert immediately.
+  Alias change silently not applied
+      -> `mcp_aliases` needs a ROUTER RESTART, not a config sync. Verify via GET /v1/mcp/server
+         that `alias` is populated, THEN re-run the prefix histogram.
+  #36 changes the azure surface mid-flight
+      -> Land #36 and let it settle before WI-1, so the two tool-surface changes are
+         independently attributable.
+  DB alias shadowing the file
+      -> Suite 47 check 5 fails loudly instead of drifting silently.
+  CT202 config overwritten by the next deploy
+      -> The change lives in infrastructure/litellm-config.yaml IN THE REPO - never applied only
+         to mcp-tools.env on the box.
+
+ROLLBACK: every change is one commit on `fix/mcp-namespace-contract`. Revert the commit, redeploy,
+restart the router. No data migration, no DB writes, no key deletion.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - The UAT-gap STOP GATE above is binding for WI-1 and the #36 merge. WI-2/3/4 proceed regardless.
+ - **DO NOT CLOSE OR MERGE ANY PR.** The audit is evidence for Paxton. Report it.
+ - ANY change to infrastructure/litellm-config.yaml FORCE-RECREATES the prod router - the deploy
+   job hashes the DEPLOYED file's content, so even a comment-only edit triggers it. Flag this
+   prominently in the PR body and merge in a window with NO ACTIVE RUNS.
+ - NEVER print, log or commit a key VALUE - not even truncated. Key aliases and env NAMES only.
+   `overseer-ingest` is an alias and is safe to write; `63f403a7...` is a hash prefix and should
+   not be extended.
+ - Never `docker compose up` for mcp-tools without `--env-file mcp-tools.env`. Never
+   `docker compose down -v`.
+ - Do not delete or revoke any key in this task. WI-5 sets a limit and may re-scope an access
+   group; revocation is task 89's territory and Paxton's decision.
+ - NEVER use `delete_repo` (task 87).
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR
+   (CRLF hazard - clone with autocrlf=false).
+ - PR to `main`, DO NOT MERGE.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A PR against main carrying: the `comfyui` alias WITH the client-sweep evidence that no consumer
+calls `comfyui_mcp-*` (or the sweep's finding that one does, and WI-1 held); `e2e/lib/mcp-aliases.js`
+as the single source of prefix truth with suites 17, 20 and 35 rewired to it and the hand-copied
+constant deleted; suite 47 implementing all seven checks with `playwright_qa1_mcp` allowlisted and
+a written reason; the namespace contract written into docs/config-authority.md and both
+add-a-server checklists; a before/after prefix histogram from CT202; a real `tools/call` proving
+the renamed namespace RESOLVES; the re-verified PR audit as a recommendation for Paxton; and a
+measured drop in `overseer-ingest` enumeration rate one hour after the WI-5 change, with the
+caller IDENTIFIED (confirmed, not assumed).
+
+If the UAT STOP GATE is still open when the repo-only work is done, ship that as the PR and say
+plainly that WI-1 is held pending Paxton's choice. A partial PR with a clear boundary is the
+correct outcome; a hand-applied CT202 change is not.
+
+================================================================================
+CREDIT
+================================================================================
+
+Plan by session `284a9e40-18b8-4fdb-b04d-057782f44674` (Claude Opus 5, PTAIT09), 2026-09-09.
+The `overseer-ingest` identification and the pveproxy exoneration are that session's, and they
+close an open question the overseer had queued for Paxton. The `overseer-session-ingest.mjs` lead
+in WI-5 step 1, the task-89 boundary, and the byte-count discrepancy note are the overseer's.

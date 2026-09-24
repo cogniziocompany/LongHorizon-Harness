@@ -1,0 +1,16 @@
+{
+  "name": "9999zv-221-queue-database-url-dropped",
+  "task_file": "C:/tmp/queue-database-url-dropped-task.txt",
+  "task_source": "task_file",
+  "workspace": "/home/harness/work/LongHorizon-Harness",
+  "max_rounds": 6,
+  "trio": "default",
+  "note": "CREATED 2026-09-22 20:55 PT by the interactive overseer [5321285c], appended to the TAIL (number read as max+1 at write time): REPRODUCED cutover blocker - the loader drops [queue].database_url, so backend=postgres raises ValueError out of create_app and the CT110 web service would fail to start. PR only; overseer merges after review. | TICK #1595 2026-09-22 22:01 PDT: gate 4dcebdde9bdc resolved stop (work done); PR #42 verified OPEN/base main/head 3172e18b/4 files, changed-file tests 16/16, wider suite identical to base 2679f63 => merged. MERGED as mergeCommit 767f856 on origin/main. NOT LIVE: CT110 MainPID 967850 still pre-#42; CT110 deploy owed (ACTIVE=0, window open). | 2026-09-22 22:09 PDT tick #1596: VERIFIED. PR #42 merged as 767f856; deployed to CT110 (deploy-harness-v2.sh, ACTIVE=0 window), MainPID 967850->995927 active; installed lh_harness.config._flatten_queue_table probed on CT110 returns database_url in its output => the documented Postgres cutover config now boots.",
+  "run_id": "20260923T035722Z_d1d74675",
+  "roles_bound": {
+    "manager": "kimi-k3:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-23T03:57:22.562435+00:00"
+}

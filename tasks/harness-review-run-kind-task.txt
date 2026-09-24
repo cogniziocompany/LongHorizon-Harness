@@ -1,0 +1,35 @@
+TASK 186 - lh-harness `run_kind=review`: a single-role PR review run with a machine-readable verdict.
+
+SOURCE: Paxton 2026-09-15 (harness is the reviewer; @claude/Copilot fallback only); plan
+C:/tmp/PLAN-pr-review-gate-2026-09-15.md step 3. Appended after the pp and fleet-plane tasks.
+
+REPO / WORKSPACE: LongHorizon-Harness    BASE: origin/main
+
+MEASURED 2026-09-15: no review/single-role run kind exists; src/lh_harness/auditor_agent.py is the read-and-judge
+role to reuse; POST /api/runs takes {task, workspace, max_rounds, roles}; runs hold GH_TOKEN (push + PR) since 09-14;
+MCP dispatch has one bearer (task 174 adds caller scoping - this task must not block on it).
+
+SCOPE
+ 1. POST /api/runs accepts `kind: "review"` with {repo, pr_number, head_sha, base_ref, gate_results_url}. A review run
+    has ONE role (reviewer = auditor_agent prompt family), no manager/executor, `max_rounds` fixed at 1, budget
+    `[run.timeouts] reviewer = 900`.
+ 2. Workspace: a READ-ONLY checkout of head_sha into runs_root/review/<repo>/<pr>/ (fetch by sha via refs/pull/N/head;
+    never the shared task workspaces; never writes to the repo).
+ 3. Inputs to the reviewer: the diff vs base, changed files, the pr-gate results (task 185) fetched as JSON, the PR
+    body. Output schema written to the run report as review.json:
+      {verdict: pass|fail|cannot_review, blocking: [{file, line, why}], findings: [{file, line, severity, note}],
+       evidence: [...], model: <served model>, duration_s}
+    `cannot_review` is the ONLY verdict for timeouts, provider errors, or an unreadable diff - never `pass` by default.
+ 4. Model path: the launcher's trio resolve picks the reviewer seat: kimi-k3:synthetic-anthropic, fallback
+    nemotron-3-super:synthetic-anthropic, and ornith-1.5:pool when the launcher reads synthetic=DOWN. Record which
+    served in review.json.
+ 5. GET /api/runs/<id>/review returns review.json; the fleet reporter includes review verdicts in the heartbeat's
+    runs[] summary (counts only, not bodies).
+ 6. Tests: hermetic fixture PR (a small repo tarball in tests/fixtures) -> pass verdict; a fixture with a failing test
+    report -> fail with the test named; a killed run -> cannot_review. e2e in e2e/ against the fake provider.
+
+HARD RULES: review runs never push, never comment on GitHub (task 187's webhook posts the Check Run), never use the
+subscription route. Push + open the PR yourself; DO NOT MERGE (CT110 restart = overseer window).
+
+DONE MEANS: PR open; a review run on a fixture PR produces review.json in under 15 min with the served model
+recorded; the three verdict paths are tested; docs/review-runs.md written.

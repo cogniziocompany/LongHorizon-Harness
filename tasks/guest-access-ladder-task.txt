@@ -1,0 +1,175 @@
+TASK 98 - guest users are told "try again shortly" for a condition that will NEVER change.
+403 is being reported as an outage.
+
+REPO: cogniziocompany/cognizioware-powerplatform. Workspace on CT110:
+/home/harness/work/cognizioware-powerplatform. Branch from **origin/develop**.
+
+Paxton, 2026-09-09: "merge powerplatform its broke in prod for guest users. I couldnt even add a env
+https://orgff9dcfec.crm.dynamics.com/ ... it seems to be working for actual users. I am going to
+test, please proceed with fixing that bug in the lower envs and then notify me when you are ready
+to push again to this repo's prod."
+
+================================================================================
+PROD DEPLOY IS AUTHORISED. PAXTON LIFTED THE HOLD 2026-09-09.
+================================================================================
+
+Paxton: "get these deploy all the changes needed for powerplatform prod since i cannot test
+anymore and need these bugs fixed as they are blockers."
+
+The earlier "DO NOT DEPLOY - Paxton is testing" instruction in this task is **SUPERSEDED**. He can
+no longer test AROUND these bugs, so shipping them is what unblocks him. Build it, prove it on dev,
+then ship it.
+
+WHAT "SHIP" MEANS HERE - AND IT IS NOT "MERGE TO main":
+**Production already runs DEVELOP-derived images.** The live container is
+`app:sha-f2a3633`, and `f2a3633` is on `origin/develop` and `fix/prod-pin-and-billing-errors` -
+it is NOT on `origin/main`. Measured independently twice on 2026-09-09.
+  - `develop` is **142 commits ahead of and 33 behind `main`**, so a develop->main promotion is not
+    a fast-forward and is not this task's job.
+  - The standing hold on powerplatform `main` still stands. **Do NOT merge to main.**
+  - Ship the way prod already got f2a3633: land on `develop`, then deploy through the normal
+    pipeline. **NEVER hand-deploy** - that is exactly how the unpromoted-code finding arose.
+
+STILL BINDING:
+ - **Verify on dev FIRST** (`http://192.168.21.163:3000`). A fix that has not run on dev does not
+   go to prod.
+ - **DO NOT TOUCH CT110** - other agents run deployment-pipeline work there.
+ - Prod is the corsairai300 **host-level** stack, NOT CT105. CT105 is a stale decoy with identical
+   container names whose newest session is 2026-06-09. Deploying to CT105 changes nothing a user
+   can see.
+ - Report, don't act on, the CT105 stack and the duplicate cloudflared replica.
+ - If a gate goes red, STOP and report. "He said ship it" is not a reason to push past a failing
+   gate - a broken prod is worse than a blocked test.
+
+================================================================================
+THIS IS NOT A REGRESSION. PR #102 IS WORKING - IT EXPOSED THE REAL DEFECT.
+================================================================================
+
+Context you must not re-litigate: PR #102 (task 63) IS LIVE and is doing its job. Verified by
+reading the running container, not by reading git:
+
+    running image: ghcr.io/.../cognizioware-powerplatform/app:sha-f2a3633   (= #102's merge commit
+                   f2a36330), created 2026-09-09T16:52:30Z, status running
+    the new string is present in the RUNNING build:
+        /app/dist/routes/middleware.js
+        /app/dist/services/auth.service.js
+
+Before #102 every one of these failures said "Valid MSAL token required" - an expired token, a
+Dataverse outage and an under-privileged user were indistinguishable. #102 replaced that with
+honest reasons, and the honest reason immediately revealed THIS bug. Do not revert #102.
+
+================================================================================
+THE DEFECT - measured from the production audit log, not inferred
+================================================================================
+
+`audit_logs` on the powerplatform postgres (corsairai300 host, container
+`cognizioware-powerplatform-postgres-1`), since the 16:52Z deploy:
+
+    dataverse_unavailable   13     latest 2026-09-09 22:20:49Z
+    auth_success            12     latest 2026-09-09 22:24:17Z
+
+**Every single one of the 13 carries the same cause:**
+
+    {"cause": "forbidden", "resourceUrl": "https://orgff9dcfec.crm.dynamics.com"}
+    {"cause": "forbidden", "resourceUrl": "https://org937bd6b5.crm.dynamics.com"}
+    user_email: mail#prax211@gmail.com          <- the `mail#` prefix is a B2B GUEST UPN
+
+12 concurrent `auth_success` rows are why members are unaffected. **This is guest-only.**
+
+THE CODE PATH, `packages/backend/src/services/auth.service.ts`:
+
+    line 436   if (dvRes.status === 403) {
+    line 437     // Authenticated but not authorized for the verification query itself:
+    line 438     // indeterminate. Fail closed as unavailable rather than reporting an
+    line 439     // empty role list for an identity we could not inspect.
+    line 440     return { status: 'unavailable', cause: 'forbidden', roles: [] };
+    line 441   }
+
+then `verifyAuth` collapses `status === 'unavailable'` to reason `dataverse_unavailable` unless the
+cause is `token_rejected`, and `packages/backend/src/routes/middleware.ts:44` renders:
+
+    503  DATAVERSE_UNAVAILABLE  "Could not reach Dataverse to verify your access. Try again shortly."
+
+**FAILING CLOSED IS CORRECT. THE CLASSIFICATION IS NOT.** A 403 is a PERMANENT authorization
+state, not an availability blip. Telling a guest to "try again shortly" invites them to retry
+forever against something that will never change, and it tells the operator "Dataverse is down"
+when Dataverse is perfectly healthy - `/api/health` reports `dataverse-mcp` ready:true with its
+full tool list at the same moment.
+
+A SECOND INSTANCE OF THE SAME MISTAKE, line 406:
+
+    if (!resourceUrl) return { status: 'unavailable', roles: [], cause: 'network' };
+
+"No resource to query" is a CONFIGURATION or NO-ENVIRONMENT-SELECTED state, not a network failure.
+It produces the identical misleading "try again shortly". Fix both.
+
+THE USER-VISIBLE CONSEQUENCE, from Paxton's session: the Environments page shows **Active 0 /
+Inactive 0** with the red "Environment error: Could not reach Dataverse to verify your access. Try
+again shortly." He could not add an environment either - **you must pass the Dataverse access check
+to add an environment, and the check needs an environment to query.** That circularity is the
+"environment access ladder" #102's title names but did not finish for guests. It is the substance
+of this task, not a footnote.
+
+================================================================================
+SCOPE
+================================================================================
+
+1. **Give `forbidden` its own reason.** Add `dataverse_forbidden` to the `AuthResult.reason` union
+   (`auth.service.ts:77-84`) and stop folding it into `dataverse_unavailable`. In `middleware.ts`
+   map it to **403**, not 503, with a message that says what is actually true and what to do -
+   along the lines of "Your account is signed in but is not permitted to verify access in this
+   environment. Ask an environment administrator to grant you a security role." Carry the existing
+   partner-referral URL the way `insufficient_permissions` does.
+   **Do NOT reuse the `insufficient_permissions` reason** - that one means "we read your roles and
+   they were not enough". This one means "we were not allowed to read your roles at all". Keeping
+   them distinct is the entire point of #102 and collapsing them re-creates the original bug.
+
+2. **Give `!resourceUrl` its own reason too.** It is not `network`. Distinguish "no environment
+   selected/known for this user" from "Dataverse call failed". The former should lead the user to
+   the add-an-environment flow, not to a retry.
+
+3. **Break the ladder circularity - the part that actually unblocks Paxton.** A signed-in user with
+   ZERO environments must be able to reach the add-an-environment flow WITHOUT first passing a
+   Dataverse role query, because there is no environment to run that query against. Establish what
+   the minimum trustworthy gate is for that path (a valid, unexpired token for this tenant's app
+   registration is the obvious floor) and let the environment-discovery/add flow run behind it.
+   **Do not weaken the gate on any route that reads or writes environment DATA** - only the
+   discovery/add path. State plainly in the PR what a guest can now reach that they could not, and
+   what still requires a role.
+
+4. **Keep the audit trail.** `logAuditEvent` must record the new reasons distinctly, so the next
+   operator can tell "guest lacked permission" from "Dataverse was down" by reading the table -
+   which is exactly how this bug was found in twenty minutes.
+
+5. **Tests.** `packages/backend/tests/auth-failure-modes.test.ts` already asserts the 503 string at
+   lines 225 and 457; those assertions encode the bug and must change with the behaviour. Add cases
+   for: Dataverse 403 -> 403 dataverse_forbidden; Dataverse 500 -> 503 unavailable; missing
+   resourceUrl -> the no-environment reason; and a guest with zero environments reaching the add
+   flow. Stub `globalThis.fetch`; **NO live calls to Microsoft, Dataverse or Stripe.**
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **NO PROD. NO MERGE TO main. NO PROMOTION.** Paxton is testing on the live site. PR only.
+ - Do NOT revert or weaken PR #102. It is correct and it is what surfaced this.
+ - Do NOT collapse `dataverse_forbidden` into `insufficient_permissions`.
+ - Failing CLOSED stays. This task changes how the failure is REPORTED and unblocks the
+   first-environment path - it does not hand anyone access they had not earned.
+ - Migrations dir tops out at `040_*`; **NO MIGRATION IS NEEDED** - do not add one.
+ - Env NAMES only, never values. **Do not paste audit rows containing user emails into the PR** -
+   describe the pattern; `mail#...` guest-UPN shape is fine to name.
+ - Commit by EXPLICIT PATH; never `git add -A`; check `git diff --stat` before opening the PR.
+ - PR to `develop`. DO NOT MERGE.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A PR against `develop` where a Dataverse 403 returns **403 with an actionable, permanent-state
+message** instead of 503 "try again shortly"; `!resourceUrl` reports a no-environment/config reason
+rather than `network`; a signed-in guest with zero environments can reach the add-an-environment
+flow, with the PR stating exactly what that path now permits and what still requires a role; the
+audit log distinguishes the new reasons; and tests cover 403 / 500 / missing-resource / guest-first-
+environment with `fetch` stubbed. Plus a one-line note in the PR body: **not deployed, awaiting
+Paxton's go.**

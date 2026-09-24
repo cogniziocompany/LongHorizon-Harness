@@ -1,0 +1,117 @@
+TASK 125c - The 2-hourly schedule, the non-overlap lock, and the backlog drain.
+
+*** SLICE 3 OF 3 of task 125. GATED ON 125a AND 125b. Do not start until one cycle is proven and its
+audit entry lands - a scheduler wrapped around an unproven cycle just fails twelve times a day. ***
+
+REPO / WORKSPACE: cognizioware-mcp-tools.
+125a = the data path. 125b = the audit entry. **125c = this.**
+
+================================================================================
+CADENCE: EVERY 2 HOURS (Paxton, 2026-09-10 15:30 PT - changed from 12h)
+================================================================================
+"can you move up the solution for this? ... have it run every 2 hours. first export."
+**"FIRST EXPORT" IS THE DESIGN AND MUST NOT BE WEAKENED.** Six times an hour instead of twice a day
+means the delete step runs six times more often, so verify-before-delete matters MORE, not less. Do
+not "optimise" it away because the batches are small.
+
+================================================================================
+THREE CONSEQUENCES OF 2 HOURS THAT ARE NOT JUST A SMALLER NUMBER
+================================================================================
+ 1. *** THE FIRST RUN IS NOT LIKE THE OTHERS AND WILL HURT IF YOU TREAT IT THE SAME. ***
+    Steady state a 2-hourly job with a 48h cutoff moves ~2 hours of aged-out rows - at the measured
+    5-11 GB/day that is only ~0.4-0.9 GB per run. **But the first run faces the whole accumulated
+    stock: ~18 GB of TOAST, 9.88M chunks, everything older than 48h back to 2026-03-29.** Exporting
+    and deleting that in one transaction against the LIVE prod router's database is exactly the kind
+    of long-running statement that causes the outage this task exists to prevent.
+    **REQUIRED: chunk the backlog drain.** Bound each pass by row count or a moving time window
+    (oldest day first), commit per chunk, and let the schedule work through the backlog over several
+    runs. **State the chunk size you chose and why.** A first run that tries all 18 GB at once is a
+    FAILED design, not an ambitious one.
+
+ 2. **`VACUUM FULL` IS OFF THE TABLE ENTIRELY, and plain autovacuum is the point.**
+    It takes an ACCESS EXCLUSIVE lock on a table the live gateway writes to on every single request.
+    Six times a day is not a "window", it is a recurring outage. The scheduled job does DELETE only
+    and relies on autovacuum marking pages reusable so Postgres REFILLS them - **that is what keeps
+    the table FLAT** once the stock is drained. Confirm `n_dead_tup` is not climbing run over run and
+    say so in the audit entry; if it climbs, the job is losing to the write rate and that is a
+    finding. The one-time reclaim of the existing 18 GB is `pg_repack` in an attended window with
+    Paxton's go - **do NOT fold it into the schedule.**
+
+ 3. *** NON-OVERLAP IS NOW A REAL RISK, NOT A FORMALITY. ***
+    At 12h a run could not realistically collide with the next. At 2h, a slow NAS transfer or a large
+    chunk can still be running when the timer fires. Implement the SKIP path with a **real lock** - a
+    lock file with a stale-lock timeout, or systemd single-instance semantics - and
+    **TEST IT BY DELIBERATELY OVERLAPPING TWO INVOCATIONS.** Two concurrent runs both deleting by
+    cutoff is how rows get deleted that were never verified at the far end.
+    A skipped run writes a **SKIPPED** audit entry (125b's path) and exits. It does not run silently.
+
+================================================================================
+WHERE TO PUT IT
+================================================================================
+Prefer a systemd timer or cron on a box that is **not CT202 itself** where practical, so a full disk
+cannot prevent the job that fixes the full disk from running. **State where you put it and why.**
+It must be idempotent.
+
+================================================================================
+HARD RULES
+================================================================================
+ - **Never `VACUUM FULL` unattended on a schedule.**
+ - The order from 125a is unchanged and binding: cutoff, export, transfer, VERIFY AT DESTINATION,
+   only then delete by the same predicate.
+ - Do NOT edit `infrastructure/litellm-config.yaml`.
+ - No secrets in the script, the audit entry, a doc, or a filename.
+ - Never `git add -A`; commit by explicit path. Do NOT merge. Do NOT post an `@claude` comment.
+
+DONE MEANS: an idempotent, non-overlapping 2-hourly job whose lock is **proven by a deliberate
+overlap test**, a chunked backlog drain with the chunk size justified, a SKIPPED audit entry on
+collision, `n_dead_tup` tracked run over run, `VACUUM FULL` never run, and a short runbook naming the
+manual recovery path if a transfer half-completes.
+
+================================================================================
+*** PAXTON 2026-09-10 23:45 PT: THE TRIGGER IS A DISK RATIO, NOT ONLY A CLOCK. ***
+================================================================================
+Verbatim: *"we dont want to stop the data colection we want to limit the overlaod of size,
+dynamicaklly based on the ratio discussed or lowest level of effort"* and *"or have it delete when
+it gets to a certain size"* and *"like a ratio available on the disk or something dir migrateable"*.
+
+**READ THIS AS A CONSTRAINT ON THE TRIGGER, NOT A NEW FEATURE.** Everything in 125a (cutoff ->
+export -> transfer -> VERIFY AT DESTINATION -> delete by the SAME predicate) is unchanged and still
+binding. This section only changes WHEN a cycle fires and HOW MUCH it drains.
+
+ 1. **NEVER REDUCE WHAT IS COLLECTED.** Paxton was explicit: *"we dont want to stop the data
+    colection"*. Do not add sampling, do not shorten retention at the writer, do not drop columns.
+    The volume is wanted; only its RESIDENCY on CT202 is being bounded.
+
+ 2. **FIRE ON A FREE-SPACE RATIO, WITH THE 2-HOURLY CLOCK AS THE FLOOR.** Keep the 2-hourly timer,
+    but let each tick decide how much to move based on **free space on the CT202 filesystem**, not
+    only on age. Suggested shape - state and justify whatever you choose:
+        - above a HIGH-WATER free ratio: drain the normal aged-out window only;
+        - below it: drain additional oldest-first chunks until back above the mark;
+        - the 48h floor from 125a still protects recent rows an operator needs live.
+    **MEASURED 2026-09-10 23:20 PT: CT202 root was 58% used, 34 G free of 80 G - comfortable.** Disk
+    was NOT the cause of that night's outage (memory was). So this is preventive; do not present a
+    ratio trigger as a response to a disk incident that did not happen.
+
+ 3. **"LOWEST LEVEL OF EFFORT" IS A DESIGN INSTRUCTION.** Prefer `df` plus a threshold in the script
+    you are already writing over any new agent, exporter, metric pipeline or dashboard. **RULE 2: do
+    not add a surface.** If a number needs to be visible, it goes in 125b's audit entry, which
+    already carries `CT202 disk used/total/percent BEFORE and AFTER`. Add the ratio and the decision
+    it produced to THAT entry - no new route, no new page.
+
+ 4. **"DIR MIGRATEABLE" - THE DESTINATION MUST NOT BE WELDED IN.** The archive path
+    (**`/Volume2/usbdrive/cognizioware-mcp-gateway/spendlogs/`** on terranas01, 192.168.21.128 -
+    CORRECTED 2026-09-11 by Paxton; the directory now exists and is proven writable. NOTE the older
+    `/Volume2/cognizioware-mcp-gateway/spendlogs/` still holds 5.5 GB of earlier exports and was NOT
+    moved; the two are on different filesystems. SSH port 9222 as
+    `prax211`) must come from ONE configurable value - env var NAME or a single constant - so the
+    archive can be relocated without touching the drain logic. Do not scatter the path through the
+    script. Do not reconfigure terranas01; Paxton manages it.
+
+ 5. **THE RATIO GOVERNS THE DRAIN, NOT THE SAFETY ORDER.** A low-disk condition is NOT a reason to
+    delete before verifying at the destination. If free space is critically low and an export cannot
+    complete, that is a **FAILED** cycle with a loud audit entry - never a delete-first shortcut.
+    This is the one rule that must not bend under disk pressure.
+
+**OPEN - PAXTON'S TO SET, DO NOT GUESS SILENTLY:** the actual high/low water percentages. Propose
+concrete numbers with the reasoning from the measured 58%/34 G baseline, implement them as named
+constants, and say plainly in the PR that they are a proposal awaiting his number.

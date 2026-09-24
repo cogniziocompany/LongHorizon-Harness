@@ -1,0 +1,58 @@
+RE-SCOPED 2026-09-10 03:50 (cognizioware-qa): finish the fleet-window UX gate. Work ONLY in the cognizioware-qa
+workspace on the EXISTING branch `feat/fleet-window-ux-gate` (run `git fetch origin` first; the branch is already
+correctly off `origin/master`, `a94c774` is an ancestor of HEAD); plain git; commit by EXPLICIT PATH; no push;
+READ-ONLY against every live system; env NAMES only.
+
+## READ THIS FIRST - WHAT ALREADY EXISTS, AND WHAT IS WRONG WITH IT
+Run `20260909T084909Z_a3aab6a0` used its whole round budget and reported its own state honestly. Start from that
+report rather than rediscovering it. **DO NOT REBUILD what is already good.**
+**GOOD, auditor-verified, keep it:**
+ - **FW-HEALTH** present (GET /health -> 200).
+ - **FW-OVERVIEW** present, asserting the full documented shape: `nodes`, `runs`, `gates` arrays,
+   `counts{nodes, active_runs, open_gates, events_24h}`, and `issues`.
+ - **9 hermetic unit tests, 9 pass, 0 fail**, reproduced BY THE AUDITOR rather than taken on the executor's word.
+ - Read-only throughout (GET-only), screenshots skipped in test mode, no secrets - env names only
+   (`LH_HARNESS_WEB_URL`, `LH_HARNESS_WEB_TOKEN`, `LH_HARNESS_FLEET_URL`) plus a `fake-bearer` test placeholder.
+ - `qa-gate.yml` and `gate-report.mjs` untouched, and no new `workflow_dispatch` input. Keep it that way.
+**BROKEN - fix before anything else:**
+ 1. **A FABRICATED SELECTOR.** FW-CONTENT asserts against a node-table selector that cites NO real fleet-admin
+    source - the executor invented it. **DELETE that assertion.** Re-add it only if you can cite the real selector
+    from on-disk fleet-admin source, with the citation inline. An invented selector passes forever and catches
+    nothing, which is the exact failure this gate exists to prevent.
+ 2. **A dirty, unaudited working tree** left by a timed-out round: a staged edit to `fleet-window.test.mjs`, an
+    unstaged edit to `fleet-window.ts`, an unrelated modification to `packages/runner/src/lib/api.ts`, and a stray
+    untracked `packages/runner/test-import.mjs`. **Discard all of it.** None is audited; none may be reused.
+ 3. **Two commits where one is required** (`74b0745` +780 and fixup `76617a6`). Final state: exactly one commit
+    for this slice.
+ 4. Missing inline selector citations throughout the committed flow.
+
+## THE PRIMARY DELIVERABLE, WHICH WAS NEVER STARTED: FW-AGREE
+This is the whole point of the task and no rounds have gone into it. The cross-plane agreement check must:
+ - read the harness API **directly** (base URL and bearer from env NAMES), and compare against the window's
+   overview;
+ - **FAIL when the harness reports non-terminal runs but the window reports zero nodes and zero active runs**,
+   with the exact cause string naming BOTH numbers;
+ - **PASS when the harness is genuinely idle** - an idle fleet and a broken window must not look alike;
+ - be **fixture-driven in BOTH directions**, so the failing case is proven to fail and the passing case to pass;
+ - carry the `drift` tag.
+
+## CUT FROM THIS TASK - do NOT start them
+**FW-PRODUCER** (freshness) and the **`fleet-window` CI job in `qa-gate.yml`** are removed from this slice. The
+previous run reached its budget with the primary deliverable unwritten; adding them back guarantees a repeat.
+They become a follow-up once FW-AGREE lands. Say in the report that they are deliberately out of scope.
+Also still out of scope, unchanged from the round-3 instruction: the freshness status line, disagreement banner,
+unreachable-GAP vs degraded states, session-id copy, per-node Environment/L3, Policies/L2, per-run Traces/L1, the
+queue view and the `/api/experience/*` endpoints - **verified 2026-09-10 by direct contents lookup: the experience
+module returns 404 on LongHorizon-Harness `main`, so those features do not exist.** Keep them in the
+"not yet assertable" README list with their dependency named.
+
+## HARD RULES
+**No fabricated selectors. No skipped or always-passing placeholder tests. No lowered thresholds.** A test that
+asserts nothing is worse than an absent test because it reports green. Read-only against every live system; no
+push; explicit-path commits; env NAMES only.
+Completion = commits (one per slice), diff stat, test counts baseline-first, the FW-AGREE fixtures in both
+directions, and every selector you assert on cited inline to its on-disk source. Auditor: read-only - verify the
+fabricated selector is gone, the dirty-tree contaminants are absent, exactly one commit per slice, that FW-AGREE
+fails on the disagreement fixture AND passes on the idle fixture, and that no live system was written to.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.

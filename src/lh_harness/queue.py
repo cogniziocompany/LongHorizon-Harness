@@ -46,6 +46,38 @@ _VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked"})
 _NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
 _VALID_TRIOS = frozenset({"kimi", "qwen"})
 
+# Body keys accepted by _normalize_request (task 233).  Anything else is
+# rejected with the offending key names in the message instead of being
+# dropped silently.  ``task_file`` and ``roles`` are alternative input keys
+# for ``task`` and ``trio`` respectively.
+KNOWN_REQUEST_KEYS = frozenset(
+    {
+        "name",
+        "task",
+        "task_file",
+        "workspace",
+        "max_rounds",
+        "trio",
+        "roles",
+        "priority",
+        "branch",
+        "continue_branch",
+        "base_check",
+        "requested_by",
+        "dedup_key",
+    }
+)
+
+
+class UnknownQueueFieldError(ValueError):
+    """An enqueue body carried keys outside ``KNOWN_REQUEST_KEYS``.
+
+    Subclasses ``ValueError`` so every existing caller (both stores, the
+    requeue path, the MCP tool) treats it as a validation failure; the REST
+    route (server.py ``create_queue_entry``) re-raises it as HTTP 400 with
+    the key names in the message.
+    """
+
 # Allowed queue-entry state transitions. Keyed by (from, to); the value is the
 # operation that performs the move. Read-only edges ("update (record_...)") are
 # not a first-class QueueStore method: they are applied by the launcher by
@@ -241,10 +273,21 @@ def _validate_workspace(value: Any) -> str:
 
 def _validate_trio(value: Any) -> str:
     if value is None:
-        raise ValueError("trio/roles is required")
+        # Optional (task 233): no default is invented here.  Persisting unset
+        # is safe because the launcher defers such an entry: remaining
+        # capacity exists only for configured trios (launcher.py
+        # _remaining_capacity), so _check_eligibility records an " at
+        # capacity" skip each pass and the entry stays pending, unlaunched;
+        # _launch/_shadow_launch_decision guard the same condition with an
+        # "unknown trio ..." skip.
+        return ""
     if isinstance(value, bool) or not isinstance(value, str):
         raise ValueError("trio/roles must be a string")
     text = value.strip().lower()
+    if not text:
+        # An explicitly empty trio is the same "not supplied" state as an
+        # omitted key (MCP clients may fill a declared default of "").
+        return ""
     if text not in _VALID_TRIOS:
         raise ValueError(f"trio must be one of: {', '.join(sorted(_VALID_TRIOS))}")
     return text
@@ -334,7 +377,20 @@ def _validate_continue_branch(value: Any) -> bool:
 
 
 def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
-    """Convert a POST /api/queue body into validated launch parameters."""
+    """Convert a POST /api/queue body into validated launch parameters.
+
+    Unknown body keys are rejected (task 233) with an error naming every
+    offending key -- they were previously dropped silently, which filed
+    continuation tasks as fresh ones when ``continue_branch``/``branch`` went
+    missing. ``KNOWN_REQUEST_KEYS`` is also the allowlist behind the MCP tool
+    schema and the REST 400 mapping (server.py ``create_queue_entry``).
+    """
+
+    unknown = sorted(set(body) - KNOWN_REQUEST_KEYS)
+    if unknown:
+        raise UnknownQueueFieldError(
+            "unknown field(s): " + ", ".join(unknown)
+        )
 
     task = body.get("task")
     task_file = body.get("task_file")
@@ -856,7 +912,9 @@ class QueueStore:
         if entry.status != "failed":
             raise ValueError("can only requeue failed entries")
 
-        # Create successor entry
+        # Create successor entry. The continuation opt-ins (branch /
+        # continue_branch) carry over (task 233): a retried continuation
+        # task stays a continuation task, not a fresh one.
         successor = QueueEntry(
             queue_id=f"q-{uuid.uuid4().hex[:16]}",
             name=entry.name,
@@ -866,6 +924,8 @@ class QueueStore:
             trio=entry.trio,
             priority=entry.priority,
             requested_by=entry.requested_by,
+            branch=entry.branch,
+            continue_branch=entry.continue_branch,
             base_check=entry.base_check,
             status="pending",
             retry_of=entry.queue_id,

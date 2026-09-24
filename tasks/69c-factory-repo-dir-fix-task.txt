@@ -1,0 +1,55 @@
+TASK 69c - Fix FACTORY_REPO_DIR, the identical latent defect that has not bitten yet. Slice 3 of 3.
+BLOCKED ON 69b: apply the SAME pattern 69b chose, so the two do not diverge.
+
+REPO / WORKSPACE: cognizioware-qa   BRANCH: fix/hydra-e2e-repo-dir (same branch as 69b)
+
+================================================================================
+WHY THIS EXISTS AS A SEPARATE SLICE
+================================================================================
+    repo variables on cognizioware-qa:
+        HYDRA_REPO_DIR   = C:\hydra-ci      <- Windows path, breaks hydra-e2e NOW   (slice 69b)
+        FACTORY_REPO_DIR = C:\factory-ci    <- THE SAME BUG, not yet hit            (THIS SLICE)
+
+The runner ct210-qa is LINUX. A `C:\...` value cannot resolve there. FACTORY_REPO_DIR carries the
+identical defect and is simply not exercised yet - which is exactly how the HYDRA one survived a
+runner migration unnoticed. Leaving a known-broken variable in place to be discovered later is the
+failure being fixed here, so it gets its own slice rather than being an afterthought.
+
+Measured on CT210: searched /home/runner and /opt to depth 3 - **no factory directory exists**, just
+as no hydra directory does. So repointing the variable at a local path is not available here either.
+
+================================================================================
+KEEP THE EPISODE SMALL
+================================================================================
+Task 69 failed three times by running its context up to 13.36 MB until the 3600 s budget expired.
+This slice is deliberately tiny. Touch the workflow/variable definition and nothing else. Do not
+survey the repository.
+
+================================================================================
+WHAT TO DO
+================================================================================
+ 1. Read what 69b actually implemented on this branch - checkout-based (a) or stated-skip (c).
+ 2. Apply THE SAME pattern to FACTORY_REPO_DIR. Consistency matters more than cleverness: two
+    different mechanisms for the same class of defect is how the next person gets it wrong.
+ 3. If nothing currently consumes FACTORY_REPO_DIR, say so explicitly and state whether the right
+    answer is to remove the variable rather than repoint it. Removing a dead broken variable is an
+    acceptable outcome - leaving it silently broken is not.
+ 4. Name which jobs would have failed once something did start consuming it.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Do NOT lower any threshold. Do NOT delete a checkpoint.
+ - Do NOT re-touch HYDRA_REPO_DIR - that is 69b, already done on this branch.
+ - No secrets in the repo or output - env var NAMES only. Do not invent a secret name.
+ - No live Hydra calls, no QA backend calls, no deploys.
+ - Plain git. Commit by EXPLICIT PATH. Never git add -A. Check git diff --stat first.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+
+DONE MEANS: the commit, diff --stat, what FACTORY_REPO_DIR is now (or that it was removed and why),
+which pattern you matched from 69b, and which jobs would have broken had it been exercised.

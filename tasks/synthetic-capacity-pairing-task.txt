@@ -1,0 +1,239 @@
+TASK 88 - maximise cloud subscription value: a SECOND Synthetic pack + local compute, and per-role spend attribution
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools.
+
+Paxton, 2026-09-09: "how do we either buy a second synthetic with 2500 requests in a week? And pair
+that with our local infrastructure LLM compute, so we can maximize our cloud expenditure /
+subscriptions."
+
+## WHY THIS IS URGENT - measured, not estimated
+
+The weekly Synthetic credit ran out on 2026-09-09 and took six concurrent runs to zero in under 60
+seconds. Paxton spent his once-a-month manual quota reset to recover; the page then read
+"0 usage resets available, next in 29 days and 23 hours" - NO second rescue until ~2026-10-09.
+
+Post-reset burn, measured from LiteLLM_SpendLogs on CT202:
+
+    18:00Z hour, 44 minutes post-reset: 647 requests, 32,793,097 Synthetic tokens = ~44.7M tokens/hour
+
+Against Synthetic's own reported 625.9M tokens over 7 days at exhaustion, that is roughly
+14-15 HOURS of credit. Local peaked at 5.9M tokens/hour - about 7x less throughput, so local-only is
+a real slowdown, not a substitute.
+
+CAVEAT ON THAT NUMBER, and it must be stated wherever it is used: the Synthetic limit is in DOLLARS
+(a ~$120 weekly credit on the $150/mo pack), not tokens. The 625.9M figure is the 7-day token total
+that COINCIDED with exhaustion, and different models cost different rates per token. So
+tokens-to-exhaustion is an APPROXIMATION, not a published allowance. Improving on it is part of this
+task.
+
+## PART 1 - THE DECISIVE QUESTION BEFORE ANY MONEY IS SPENT
+
+Does a second Synthetic subscription yield a SEPARATE API key with a SEPARATE quota, or does it just
+enlarge the existing pack limits?
+
+This is not academic. The config note records what happened last time:
+
+    Plan: Subscription Pack, $150/month ($5/day), SAME account - capacity was
+          added to the existing pack rather than a second key bought, so there is
+          still ONE SYNTHETIC_API_KEY and models need NO duplicate deployments.
+
+So last time, more money produced a BIGGER SINGLE BUCKET, not a second one. If that repeats, the
+load-balancing work in Part 2 is unnecessary and the correct answer is simply a larger pack.
+
+Determine this from the Synthetic billing/subscription surface and their docs, and report it plainly.
+DO NOT PURCHASE ANYTHING. If it cannot be determined without buying, say so - that is a legitimate
+finding and the decision returns to Paxton.
+
+## PART 2 - IF (and only if) a second key with a separate quota is available
+
+The pattern is ALREADY PROVEN in this very config - do not invent a new one. Ollama Cloud already
+fans out across SEVEN distinct keys:
+
+    os.environ/OLLAMA_CLOUD_KEY_1 .. OLLAMA_CLOUD_KEY_7
+
+with single model_names carrying 7-9 deployments each (kimi-k3:pool, glm-5.3-flash:cloud,
+kimi-k2.7-code:cloud). The LiteLLM router load-balances across them.
+
+Synthetic today has exactly ONE: os.environ/SYNTHETIC_API_KEY, shared via the YAML anchor
+&synthetic_params.
+
+So the change is: add SYNTHETIC_API_KEY_2, give each Synthetic model_name a second deployment using
+it, and let the router spread. NOTE THE ANCHOR - &synthetic_params is shared, so a second key needs
+either a second anchor or per-model duplication; say which you chose and why. Also update the derived
+knobs (SYNTHETIC_RPM, SYNTHETIC_MAX_PARALLEL) and the launcher cap comment, which is currently
+computed from ONE pack.
+
+## PART 3 - PER-ROLE SPEND ATTRIBUTION (this is what makes the pairing decision possible at all)
+
+RIGHT NOW WE CANNOT SEE WHICH ROLE SPENDS THE MONEY. Measured: every Synthetic request in the last
+3 hours - 1,093 requests, 51,183,416 tokens - carries the SAME virtual key hash ed67aa8efed8d2a0...,
+and request_tags is [] on all of them. The harness lh-run / round / role tags appear only on LOCAL
+traffic.
+
+So "move the executor to local and keep manager+auditor on Synthetic" CANNOT CURRENTLY BE COSTED - we
+cannot see what the executor actually spends. The overseer offered that option before checking, which
+was a mistake; this part exists so the next such answer is backed by data.
+
+LiteLLM_SpendLogs already has an api_key column, and LiteLLM attributes spend per virtual key
+natively. So ISSUE SEPARATE VIRTUAL KEYS PER ROLE - e.g. lh-harness-manager, lh-harness-executor,
+lh-harness-auditor - and point the harness role config at them. Attribution then falls out of the
+existing table with no new plumbing. team_id and end_user columns exist too; use whichever LiteLLM
+supports cleanly, and say which.
+
+Then answer the question that motivated this: WHICH ROLE BURNS THE CREDIT, and what does moving each
+one to local actually save? WITH NUMBERS. That is the input to the decision, and it does not exist
+today.
+
+## PART 4 - THE PAIRING: what should run where
+
+With Parts 1-3 answered, propose the routing:
+ - Which roles belong on Synthetic (large context, tool-calling quality) vs the local span.
+ - The local inventory is: cognizioware-ollama-span (2x RTX 3090, OLLAMA_NUM_PARALLEL=2, qwen3.8:27b
+   at 64k), an IDLE cognizioware-ollama-gpu1, Ollama on ptait07 (GPU3) and corsairai300 (ROCm).
+   SAY WHAT IS GENUINELY SPARE - ptait01 had ~10G RAM free and has OOM-killed the span before, so do
+   not assume headroom, measure it.
+ - A fallback ORDER, so credit exhaustion degrades throughput instead of stopping the fleet dead.
+ - The estimated cost per month and estimated runs per hour for each option, so it is a business
+   decision rather than a preference.
+
+## HARD RULES
+
+ - DO NOT purchase, upgrade, or modify any subscription. This task produces the recommendation;
+   Paxton spends the money.
+ - DO NOT trigger a Synthetic quota reset. It is spent until ~2026-10-09.
+ - Env NAMES only, never values - SYNTHETIC_API_KEY, SYNTHETIC_API_KEY_2, OLLAMA_CLOUD_KEY_n. No key
+   value in code, docs, PR body, commit message or test fixture.
+ - Any change to infrastructure/litellm-config.yaml FORCE-RECREATES the prod router - state it
+   prominently in the PR body so the merge is scheduled into a window with no active runs.
+ - No host-level changes on ptait01 or any PVE host. Measuring headroom is fine; changing it needs
+   explicit approval with a named rollback and a quiet window.
+ - Commit by explicit path; never git add -A. Check git diff --stat before opening the PR.
+ - PR to main, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR against main carrying: a plain answer on whether a second Synthetic subscription gives a separate
+key and quota (with the evidence, or an honest "cannot be determined without buying"); if yes, the
+second-key load-balancing config following the existing 7-key Ollama pattern; per-role virtual keys
+wired so LiteLLM_SpendLogs.api_key attributes spend by role; a MEASURED answer to "which role burns
+the credit"; and a routing proposal with cost per month and runs per hour for each option.
+
+## CORRECTION 2026-09-09 12:40 PT - THE "7x" FIGURE IS WRONG. USE THIS INSTEAD.
+
+Earlier in this file the local fallback is described as "about 7x less throughput". **That number is
+misleading and must not be used to justify a routing decision.** Paxton challenged it and the
+challenge was right.
+
+How it was derived: local's best hour was 5,919,070 tokens; Synthetic was running ~44.7M tokens/hour;
+44.7 / 5.9 = 7.6. That compares a PEAK to a RATE, across periods with different concurrency, and uses
+TOKENS as a proxy for WORK.
+
+The column that was not looked at, from LiteLLM_SpendLogs on CT202:
+
+| hour (Z) | syn reqs | syn tokens/req | local reqs | local tokens/req |
+|---|---|---|---|---|
+| 11:00 | 273 | 47,554 | 1,170 | 1,102 |
+| 12:00 | 326 | 52,039 | 3,606 | 1,162 |
+| 13:00 | 257 | 38,725 | 3,600 | 1,565 |
+| 14:00 | 0 | - | 3,531 | 1,676 |
+| 17:00 | 263 | 37,072 | 3,704 | 1,070 |
+| 18:00 | 777 | 49,945 | 5,179 | 255 |
+| 19:00 | 692 | 60,932 | 2,372 | 873 |
+
+**LOCAL MAKES MORE REQUESTS THAN SYNTHETIC** - 3,600/hr vs ~260/hr in several hours - but each local
+request carries roughly **1,000 tokens against Synthetic's ~50,000**. That is a **~40x difference in
+tokens PER REQUEST**, and it is what the "7x" was actually detecting.
+
+**So the token ratio measures CONTEXT SIZE, not throughput and not productivity.** Synthetic's volume
+is dominated by very large prompts being re-sent each round, consistent with 512k-context models.
+
+### WHAT THIS CHANGES ABOUT THE TASK
+
+**The cheapest lever may not be "move a role to local" at all.** If each Synthetic call carries ~50k
+tokens, then **prompt/context size is the dominant cost driver**, and reducing what is re-sent each
+round could save more credit than moving a whole role - without giving up model quality.
+
+So add to Part 3, alongside per-role attribution:
+
+ - **Measure tokens PER REQUEST per role**, not just totals. `LiteLLM_SpendLogs` has `prompt_tokens`
+   and `completion_tokens` separately - **use the split**. If prompt_tokens dominate, the cost is
+   context being re-sent, not work being done.
+ - **Establish what is IN those ~50k-token prompts.** Whole-file dumps? Repeated workspace context
+   every round? Accumulated conversation? Name it.
+ - Then compare, with numbers, the three levers: (i) move a role to local, (ii) shrink the context
+   sent per request, (iii) buy more capacity. **Do not assume (i) is cheapest** - that assumption is
+   what this correction exists to kill.
+
+**And do not repeat the original error:** never quote a tokens/hour ratio as a productivity or
+throughput comparison without also reporting requests/hour and tokens-per-request. Token volume is not
+work.
+
+## MEASURED 2026-09-09 12:43 PT - PROMPT vs COMPLETION SPLIT, AND A TRAP IN IT
+
+Ran the prompt/completion split this task asks for. Headline, 3-hour window, CT202:
+
+| backend | reqs | prompt_tok | completion_tok | avg prompt/req | avg completion/req |
+|---|---|---|---|---|---|
+| SYNTHETIC | 1,812 | 95,485,888 | **3,828** | **52,696** | **2** |
+| local | 12,466 | 7,529,207 | 160,240 | 604 | 13 |
+
+**DO NOT read this as "100% of the cost is prompt tokens".** An average of **2 completion tokens per
+request across 1,812 requests is not credible** - no useful model output is two tokens. That is
+almost certainly **the streaming spend-logging bug from TASK 82**: the logger dies on streamed
+responses (`cannot pickle '_thread.RLock'` inside `copy.deepcopy` in `spend_log_error_logger`), so
+completion tokens go unrecorded while prompt tokens survive.
+
+**Two conclusions, separated by confidence:**
+
+1. **HIGH CONFIDENCE - Synthetic prompts are genuinely enormous: ~52,700 tokens per request**, against
+   ~604 for local. That is ~87x more context per call, and it is the real cost driver to investigate.
+2. **LOW CONFIDENCE / DO NOT USE - the prompt-vs-completion RATIO.** The completion side is
+   under-recorded, so any "% prompt" figure is an artifact of the bug, not a property of the workload.
+
+**THIS MAKES TASK 82 A DEPENDENCY, NOT A SIDE ISSUE.** The spend-logging bug is corrupting the exact
+data needed to make this capacity decision. Until it is fixed:
+ - `completion_tokens` cannot be trusted for streamed traffic,
+ - and therefore neither can `total_tokens`, which means **every token figure in this task is a
+   prompt-weighted FLOOR**, not a total.
+
+**So the order matters: fix or characterise task 82's logging first, or state explicitly which of your
+numbers survive it.** Do not build a routing recommendation on a column that is silently dropping data.
+
+**What to do with the ~52,700-token prompts regardless:** that number does not depend on the broken
+column, so it is actionable now. Find out what is IN them - re-sent workspace context each round?
+whole-file dumps? accumulated conversation? - and whether the same work can be done with less context.
+Halving the prompt halves the bill without changing a single routing decision.
+
+## WHERE THE PROMPT CONTENT IS *NOT* - checked 2026-09-09 12:48 PT, do not repeat this
+
+To find out what is inside the ~52,700-token prompts, the obvious move is the `messages` column of
+`LiteLLM_SpendLogs`. **It is empty. Do not spend rounds there.**
+
+    SELECT jsonb_typeof(messages), count(*), avg(length(messages::text)), avg(prompt_tokens)
+      -> object | 1676 reqs | avg_chars = 2 | avg_prompt_tok = 55,076
+
+`avg_chars = 2` means every row holds `{}`. **LiteLLM does not persist request bodies by default**, so
+the spend table can tell you HOW BIG a prompt was but never WHAT WAS IN IT.
+
+(That query independently re-confirms the magnitude on a different window: **55,076** avg prompt tokens
+over 2 hours, against 52,696 over 3 hours. The number is stable and real.)
+
+**Use these instead, in this order:**
+
+1. **The harness's own trajectory artifacts** - `GET /api/runs/{run_id}/rounds/{n}/trajectory/{role}`
+   on the lh-harness API (CT110). This is the RIGHT source: it is per-round AND per-role, which is
+   exactly the breakdown this task needs, and it is our own data rather than a provider's. The
+   fleet-admin UI already consumes it (`fetchTrajectory` in
+   `infrastructure/docker/fleet-admin/web/src/lib/api.ts`), so the shape is known and stable.
+2. **Langfuse**, if traces there retain prompt bodies - per-key LiteLLM->Langfuse tracing is configured
+   on the lh-harness key with `x-litellm-tags` stamping run/round/role.
+
+**What to answer from them:** across a few representative rounds, what fraction of a ~53k-token prompt
+is (a) system/instructions, (b) workspace or file context re-sent every round, (c) accumulated
+conversation history, (d) tool definitions? **(b) and (c) are the compressible parts** - if either
+dominates, that is the saving, and it needs no routing change and no loss of model quality.
+
+**Handle the content carefully:** trajectories may contain repository contents. Report SIZES, SHAPES and
+PROPORTIONS. Do not paste prompt bodies into the PR, the docs, or the task report, and if anything
+resembling a credential appears in a trajectory, say that it appeared and where - do not reproduce it.

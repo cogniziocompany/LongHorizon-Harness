@@ -1,0 +1,21 @@
+TASK 202 - one run's child process must not be able to OOM-kill the whole lh-harness service (LongHorizon-Harness)
+
+MEASURED 2026-09-18 03:56 PT (overseer tick #597), do not re-derive:
+- CT110 (lh-harness, corsairai300) has memory 6144 MB, swap 512. lh-harness.service runs every run's
+  worker and every agent child in ONE cgroup (/lxc/110/ns/system.slice/lh-harness.service).
+- At 10:56:14Z a single python3 (a run's pytest, 5.7 GB anon rss) hit the memcg limit. systemd logged
+  "A process of this unit has been killed by the OOM killer", the unit failed with result 'oom-kill',
+  restarted 5 s later, and BOTH live runs (181, 200) died as "worker disappeared without a final report".
+- Nothing on any operator surface showed it; it was found by reading journalctl + host dmesg.
+
+SCOPE (one PR, base main, open the PR and STOP - no merge, no deploy, no service restart):
+1. Launch each run worker in its own transient systemd scope/cgroup with a MemoryMax (config key, default
+   3G, env override) so the kernel kills the offending run only. If systemd-run is unavailable (non-systemd
+   host, tests), fall back to RLIMIT_AS on the child and log which mechanism was used.
+2. Set OOMPolicy=continue in the shipped unit file so one OOM-killed child does not fail the unit.
+3. When a worker dies from a memory kill, record failure_reason "memory limit exceeded (<limit>)" instead
+   of "worker disappeared without a final report".
+4. Tests for 1 (fallback path) and 3. Every pytest call on CT110 MUST be wrapped
+   `( ulimit -v 2500000; timeout 900 ... )` using /home/harness/work/LongHorizon-Harness/.venv/bin/python.
+OUT OF SCOPE: growing CT110's memory, changing SYN_CAP, touching the running service.
+LIVE = CT110 deploy (overseer's, needs zero active runs).

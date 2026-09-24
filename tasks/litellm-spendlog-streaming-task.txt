@@ -1,0 +1,129 @@
+TASK 82 - spend logging silently drops streaming requests, so cost/usage data is incomplete
+
+REPO: cogniziocompany/cognizioware-mcp-tools. The prod router runs on CT202 (192.168.21.161:4000),
+uat on CT204. Workspace on CT110: /home/harness/work/cognizioware-mcp-tools.
+
+## THE FINDING - measured on the PROD router, 2026-09-09, over a 2-hour window
+
+The router serves traffic correctly. It does NOT record all of it. Counts from the live container log:
+
+    8422   HTTP 200 responses
+       2   HTTP 500/502/503 responses          <- the request path is FINE
+     533   "Spend tracking - update_database failed"
+     533   "Error creating spendlogs object - maximum recursion depth exceeded"
+     495   "TypeError: cannot pickle '_thread.RLock' object"
+
+The traceback head names the operation:
+
+    File ".../litellm/llms/openai/openai.py", line 1067, in async_streaming
+    -> spend_log_error_logger.py:81 - Error creating spendlogs object
+    -> File "/usr/lib/python3.13/copy.py", line 222, in _deepcopy_dict
+    -> TypeError: cannot pickle '_thread.RLock' object
+
+The spend logger deep-copies the request object to build a `LiteLLM_SpendLogs` row. On the STREAMING
+path that object holds a live client handle containing an `RLock`, which `deepcopy` cannot pickle.
+The response has already been served, so the user sees success and the cost row is lost.
+
+**Why this matters beyond tidiness:** the harness routes nearly all executor traffic through the
+streaming path. If streaming rows are the ones failing, `LiteLLM_SpendLogs` is missing most harness
+usage, and every ranking, budget check or cost attribution built on that table is wrong in a way that
+looks plausible. The overseer built a model-usage ranking on that table today and has withdrawn it.
+
+Router image is digest-pinned: `ghcr.io/berriai/litellm@sha256:c8756e7b9a61...` (see the compose file
+for the authoritative digest). Python 3.13 in-container.
+
+## SCOPE
+
+1. **Establish the true loss rate.** Compare, over one bounded window: the count of served requests
+   (HTTP 200 on completion endpoints) against the count of `LiteLLM_SpendLogs` rows inserted for the
+   same window, split by streaming vs non-streaming. State the numbers. If the loss is NOT
+   streaming-specific, say so - the hypothesis above is from a traceback, not from the table.
+
+2. **Determine whether this is fixed upstream.** This is a known shape of LiteLLM bug. Identify the
+   installed litellm version in the pinned image, search the upstream repo for this traceback
+   signature, and report whether a later release fixes it. **Do NOT bump the pinned digest as part of
+   this task** - report the candidate version and what changed. Digest pinning is a standing rule and
+   an upgrade is its own change with its own lane run.
+
+3. **If no upstream fix applies, propose the local mitigation** - a config-level change (e.g. what the
+   proxy is asked to log, or disabling the deepcopy-ing enrichment) that keeps rows being written.
+   Prefer configuration over patching vendored code. State the trade-off: what detail is lost.
+
+4. **Secondary finding, same window - report, do not fix blind.** 6529 occurrences of
+   `HTTPException in MCP tool call: 403: User not allowed to call this tool`, all from container IP
+   `172.18.0.45` = `cognizioware-mcp-tools-langfuse-mcp`. Timestamps cluster at 15:24-15:26; measured
+   rate at 17:30 was **0 in 60s**, so it was a burst, not a live loop. Determine which tool(s) and
+   which key alias were denied, and whether langfuse-mcp is SUPPOSED to have that access. If it is a
+   genuine missing grant, say which access group needs it. If it is a client retry storm against a
+   deliberate denial, say that instead - do not widen a key's access to silence a log line.
+
+## HARD RULES
+
+ - **Do NOT change the pinned LiteLLM image digest.** Report the candidate, do not bump it.
+ - **Never `docker compose up` for mcp-tools without `--env-file mcp-tools.env`.**
+ - Any change to `infrastructure/litellm-config.yaml` FORCE-RECREATES the prod router. Note that in
+   the PR body so the merge is scheduled into a window with no active harness runs.
+ - Do NOT restart the prod router to test a theory. uat (CT204) is the place to prove a change.
+ - Env NAMES only, never values. Do not paste a DSN, a master key or a virtual key into any file,
+   commit message, PR body or doc.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+ - PR to `main`, DO NOT MERGE - the overseer schedules the merge.
+
+## DONE MEANS
+
+A PR against main (unmerged) reporting: the measured served-vs-recorded row counts split by streaming,
+whether an upstream fix exists and at which version, either a config-level mitigation or a reasoned
+statement that the digest bump is the only fix, and a verdict on the langfuse-mcp 403s that says
+whether the grant is missing or the denial is correct. Numbers, not adjectives.
+
+================================================================================
+*** ROOT CAUSE FOUND 2026-09-10 22:15 PT - AND IT IS NOT WHAT THIS TASK WAS FILED ON.
+Source: session [8c54cf], verified independently by the overseer on the live CT202 router. ***
+================================================================================
+**THE PREMISE ABOVE IS NOT CURRENTLY REPRODUCING.** Measured over the last 6 hours on prod:
+
+    "update_database failed"      0 occurrences
+    "maximum recursion depth"     0
+    "spend_log_error_logger"      0
+    "Error creating spendlogs"    0
+
+Every symptom this task was written around is absent. Do not go looking for them.
+
+*** WHAT IS ACTUALLY HAPPENING: THE `cannot pickle` ERRORS ARE **OUR OWN HOOK**, NOT LITELLM. ***
+Same 6-hour window:
+
+    "cannot pickle"                        1,772
+    tracebacks at cache_namespacer.py      1,774      <- 1:1. They are the same event.
+
+The failing line is **OUR** file, confirmed in the repo:
+    infrastructure/docker/litellm/hooks/cache_namespacer.py:127   ->  `data = deepcopy(data)`
+    (import at line 35: `from copy import deepcopy`)
+The request dict carries `litellm_logging_obj`, which holds a `threading.RLock`. `deepcopy` cannot
+pickle an RLock, so the hook throws every time. The live container file matches the repo file.
+
+*** THE IMPACT IS RE-SCOPED, AND IT IS MORE SERIOUS THAN "MISSING COST ROWS". ***
+The hook FAILS OPEN, so **no calls are lost and no spend rows are dropped by this**. But a request
+whose hook threw is **never tenant-namespaced** - and the namespace is what prefixes the Redis cache
+key (`caching.py _add_namespace_to_cache_key` reads `kwargs['cache']['namespace']`).
+**So this is a CROSS-TENANT RESPONSE-CACHE ISOLATION GAP, not a cost-visibility bug.** That is a
+security concern and it raises this task's priority above the framing it was filed under.
+
+THE FIX IS HOOK-ONLY. **NO DIGEST CHANGE IS NEEDED FOR THIS.**
+  * Replace `deepcopy(data)` with a shallow `data = dict(data)`, and copy only the cache sub-dict
+    (`dict(...)` when it is a dict, else `{}`). **Nothing else in the function is mutated, so a
+    shallow copy is correct** - do not reach for a deeper copy "to be safe"; that is what caused this.
+  * Remove the now-unused `deepcopy` import and update the docstring.
+  * **A test directory already exists**: `infrastructure/docker/litellm/hooks/tests/` (it holds
+    `test_cache_namespacer.py` and `test_thinking_normalizer.py`). Add a case there whose `data`
+    contains a real `threading.RLock()`. Assert: the namespace IS set, NO warning is logged, and the
+    CALLER's dict and its original cache dict are UNCHANGED (the shallow copy must not leak mutations).
+
+*** SHIP IT INSIDE TASK 151's PR. *** Both fixes then ride one UAT pass and one drain window instead
+of two. Do not open a separate PR and do not take a second window.
+This finding also RETIRES task 151's caveat that "`cannot pickle` errors will CONTINUE after the
+upgrade" - they will not, because this fix removes their cause.
+
+*** PLACEMENT NOTE (overseer, 2026-09-10 22:20 PT): this entry sits in queue/blocked/ ONLY because it
+ships inside task 151's windowed PR - NOT because of executor capacity. The older "do NOT launch until
+a CLOUD executor is available" blocker in the queue note is SUPERSEDED: a hook-only change needs no
+executor at all. Do not wait for cloud capacity. ***

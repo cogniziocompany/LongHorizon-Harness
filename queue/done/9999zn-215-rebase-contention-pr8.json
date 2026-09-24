@@ -1,0 +1,17 @@
+{
+ "name": "9999zn-215-rebase-contention-pr8",
+ "task_file": "C:/tmp/rebase-contention-pr8-task.txt",
+ "task_source": "task_file",
+ "workspace": "/home/harness/work/LongHorizon-Harness",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "note": "Queued 2026-09-20 20:24 PT by the interactive overseer [5321285c], appended to the END of the active band. From iter 24's triage: PR #8 is one of the five open-PR leftovers, CONFLICTING/DIRTY since 2026-09-11 (+1900/-10, 19 files). CHECKED BEFORE QUEUEING that it is stale rather than superseded: #8 is cross-run OBSERVABILITY (four overlap tiers, warn-only) while tasks 195/201 merged a launch-time branch GUARD - complementary, and #8 matters more now because the guard puts dirty workspaces into linked worktrees, creating exactly the shared-git-directory tier it reports. Scope is rebase onto current main resolving in favour of main in launcher.py (which now carries prepare_workspace_base and record_skip), re-run the guard's tests as well as its own, and PROVE by test that a contention finding never blocks a launch. Same branch, same PR. Number read at write time.",
+ "run_id": "20260921T032752Z_bf4c09b9",
+ "roles_bound": {
+  "manager": "kimi-k3:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-21T03:27:52.714704+00:00",
+ "disposition": "STATE = PR, resolved 2026-09-20 21:07 PT by the scheduled overseer tick. Run completed round 6/6 and hit its end-of-run approval (06beb901d4e3); resolved action=stop, exit_code 0. Verified independently via `gh pr view 8`: headRefOid 45c2da5 matches the run's claimed final commit, mergeStateStatus=CLEAN, mergeable=MERGEABLE against main. Run reported guard tests + contention tests passing, one pre-existing failure (test_launcher_key_health_allows_kimi_when_threshold_met) not a regression. NOT merged - needs review per STEP 3 (no reviewer spent); merging is the overseer's after review, not this tick's."
+}

@@ -46,6 +46,31 @@ _MAX_REASON_LEN = 4_000
 
 logger = logging.getLogger(__name__)
 
+# Stall detector (task 230): when eligible queue entries exist but no launch
+# succeeds for this many consecutive cycles, the launcher stops being silent
+# about it (the 2026-09-24 cutover-168 incident ran ~4.5h with a refused head
+# entry, zero launches, and nothing surfaced it).  LH_HARNESS_LAUNCHER_STALL_CYCLES
+# is the only configuration surface and only its NAME is documented here, never
+# a deployment value; unset or unparseable falls back to the default.
+_ENV_STALL_CYCLES = "LH_HARNESS_LAUNCHER_STALL_CYCLES"
+_DEFAULT_STALL_CYCLES = 3
+
+
+def _stall_threshold_from_env() -> int:
+    """Resolve the stall-detector threshold from ``LH_HARNESS_LAUNCHER_STALL_CYCLES``.
+
+    The env var NAME is the only configuration surface (task 230); a blank,
+    unset, or unparseable value keeps every deployment on the default.
+    """
+
+    raw = (os.environ.get(_ENV_STALL_CYCLES) or "").strip()
+    if not raw:
+        return _DEFAULT_STALL_CYCLES
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_STALL_CYCLES
+
 # Failure causes that must never trigger a requeue.  Matched against the
 # launch-failure exception text and the terminal run report's
 # abort_reason/failure_reason.  Checked BEFORE the retryable patterns: a
@@ -293,6 +318,13 @@ class Launcher:
         self._lease: dict[str, Any] | None = None
         self._lease_logged = False
         self._lease_unavailable_logged = False
+        # Stall detector (task 230): counts consecutive cycles that had at
+        # least one eligible pending entry but launched nothing.  It resets
+        # whenever a launch succeeds.  ``_stall_fired`` is the flag surfaced
+        # through /api/meta so the stall is visible outside the event stream.
+        self._stall_threshold = _stall_threshold_from_env()
+        self._stall_cycles = 0
+        self._stall_fired = False
 
     @staticmethod
     def _load_project_queue_config() -> dict[str, Any]:
@@ -303,6 +335,18 @@ class Launcher:
         except Exception:
             pass
         return default_queue_config()
+
+    @property
+    def stall_fired(self) -> bool:
+        """True once the stall detector has fired (task 230, /api/meta flag)."""
+
+        return self._stall_fired
+
+    @property
+    def stall_cycles(self) -> int:
+        """Consecutive eligible-but-zero-launch cycles counted so far."""
+
+        return self._stall_cycles
 
     async def start(self) -> None:
         if self._task is not None:
@@ -408,11 +452,19 @@ class Launcher:
             self._emit_service_event("queue.error", {"error": f"contention check failed: {exc}"[:200]})
         capacities = self._remaining_capacity(active)
         launched = False
+        # Stall detector (task 230): an entry is ELIGIBLE this cycle when it is
+        # pending and the eligibility gate (capacity, workspace occupancy,
+        # active-run collision) does not refuse it — i.e. an entry the pass
+        # actually attempted to launch (or would have in shadow mode).  A cycle
+        # with eligible entries but zero successful launches is the stall
+        # symptom; a cycle with no eligible entry at all is simply idle and
+        # must not count toward it.
+        eligible_seen = False
         for entry in entries:
             if entry.status != "pending":
                 continue
             if launched:
-                # Once we have launched one entry this pass, any later pending
+                # Once one entry has LAUNCHED this pass, any later pending
                 # entry in the same trio must be skipped with an up-to-date
                 # capacity reason.
                 skip_reason = self._capacity_reason(entry, capacities)
@@ -425,6 +477,7 @@ class Launcher:
                 continue
             skip_reason = self._check_eligibility(entry, active, capacities)
             if skip_reason is None:
+                eligible_seen = True
                 if self._observe:
                     # Observe (shadow) mode, task 173 / migration §5 Step 2:
                     # the full decision (eligibility, capacity, key health and
@@ -439,13 +492,78 @@ class Launcher:
                     launched = True
                     capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
                     continue
-                self._launch(entry)
-                launched = True
-                capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
+                if self._launch(entry):
+                    launched = True
+                    capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
             elif self._observe:
                 self._shadow_skip(entry, skip_reason)
             else:
                 self._skip(entry, skip_reason)
+        # Stall evaluation runs at the END of the pass, after the launch
+        # outcome is known, so a successful launch always resets the counter
+        # in the same pass and a refused head entry (task 230's fix 1: it no
+        # longer consumes capacity) still counts as an eligible-but-unlaunched
+        # cycle only when NOTHING in the pass launched.
+        self._update_stall_detector(eligible_seen, launched)
+
+    def _update_stall_detector(self, eligible_seen: bool, launched: bool) -> None:
+        """Task 230 stall detector: N consecutive stalled cycles go loud.
+
+        A cycle counts toward the stall when at least one pending entry was
+        eligible (the pass attempted — or, in shadow mode, decided — a launch
+        for it) yet nothing launched.  A cycle with no eligible entry is idle,
+        not stalled, and leaves the counter alone.  Any successful launch
+        resets the counter and clears the fired flag.
+
+        On reaching the threshold (``LH_HARNESS_LAUNCHER_STALL_CYCLES``, env
+        var NAME only) three signals fire, mirroring the fleet-reporter's
+        fail-open style: a loud ``launcher.stalled`` service event in the
+        queue's event stream, a WARNING-level Seq log line through the
+        standard logging facility (shipped by ``seq_logging`` when it is
+        installed), and the ``launcher_stalled`` flag surfaced through
+        /api/meta.  The event is emitted once per stall episode; the flag
+        stays up until the next successful launch clears it.
+        """
+
+        if launched:
+            self._stall_cycles = 0
+            self._stall_fired = False
+            return
+        if not eligible_seen:
+            return
+        self._stall_cycles += 1
+        if self._stall_cycles < self._stall_threshold:
+            return
+        if not self._stall_fired:
+            self._stall_fired = True
+            self._emit_stall_signals()
+
+    def _emit_stall_signals(self) -> None:
+        """Emit the three stall signals: event, Seq log line, meta flag."""
+
+        payload = {
+            "stall_cycles": self._stall_cycles,
+            "threshold": self._stall_threshold,
+            "message": (
+                "launcher stalled: {cycles} consecutive cycles had eligible "
+                "queue entries but zero launches".format(
+                    cycles=self._stall_cycles
+                )
+            ),
+        }
+        # Signal 1 — loud service event, same stream as queue.skipped.
+        self._emit_service_event("launcher.stalled", payload)
+        # Signal 2 — Seq log line.  The standard logging facility is what
+        # seq_logging ships to Seq (fail-open: without SEQ_URL the line only
+        # reaches local logs, exactly like every other logger warning here).
+        logger.warning(
+            "%s (threshold=%s); inspect queue skip reasons and the "
+            "workspace-base guard",
+            payload["message"],
+            payload["threshold"],
+        )
+        # Signal 3 — the launcher_stalled flag read by /api/meta; no code
+        # needed here beyond the state flip above (stall_fired property).
 
     def _update_launched_entries(
         self, active: dict[str, dict[str, Any]]
@@ -762,11 +880,19 @@ class Launcher:
                 result[run_id] = {"status": status, "owner": self.supervisor.owner(run_id)}
         return result
 
-    def _launch(self, entry: QueueEntry) -> None:
+    def _launch(self, entry: QueueEntry) -> bool:
+        """Attempt to launch ``entry``; report whether a run was created.
+
+        Task 230: a False return (guard refusal, create_run failure, or a
+        missing run id) does NOT consume the pass's batch capacity — the pass
+        falls through to the next eligible entry instead of starving the whole
+        queue behind one refused head entry.  Refusals and skips are recorded
+        here exactly as before; only their capacity side effect changed.
+        """
         trio = self._config.get("trios", {}).get(entry.trio)
         if trio is None:
             self._skip(entry, f"unknown trio {entry.trio}")
-            return
+            return False
         agent = trio.get("agent", "codex")
         model = trio.get("model")
         mcp_profile = trio.get("mcp_profile")
@@ -815,7 +941,7 @@ class Launcher:
             if updated is not None:
                 updated.last_checked_at = _now()
                 self.queue_store.update(updated)
-            return
+            return False
         workspace = str(base.workspace if base.mode == "worktree" else entry.workspace)
         try:
             created = self.supervisor.create_run(
@@ -849,14 +975,14 @@ class Launcher:
             # would reproduce identically on a successor, so it stays failed.
             if updated is not None and self._is_retryable_cause(failure_reason):
                 self._handle_retry(updated, failure_reason)
-            return
+            return False
         if not run_id:
             failure_reason = "launch returned no run id"
             updated = self.queue_store.mark_failed(entry.queue_id, failure_reason)
             # Handle retry for retryable causes
             if updated is not None and self._is_retryable_cause(failure_reason):
                 self._handle_retry(updated, failure_reason)
-            return
+            return False
         launched = self.queue_store.mark_launched(entry.queue_id, run_id)
         self._emit_run_event(
             run_id,
@@ -873,6 +999,7 @@ class Launcher:
         if launched is not None:
             launched.last_checked_at = _now()
             self.queue_store.update(launched)
+        return True
 
     def _skip(self, entry: QueueEntry, reason: str) -> None:
         updated = self.queue_store.record_skip(entry.queue_id, reason)

@@ -1,0 +1,85 @@
+TASK 134 - Give the harness queue a DATABASE. Implement PgQueueStore behind the existing QueueStore
+surface, plus the harness schema migrations. LongHorizon-Harness side only. DO NOT MERGE.
+
+REPO / WORKSPACE: LongHorizon-Harness
+
+SOURCE: session longhorizon-harness-e9 [c5f606] (86de12d6-7eca-43be-b78e-70380de3aab5), read-only
+investigation, 2026-09-10. Paxton asked for it to be queued.
+
+================================================================================
+VERIFIED FIRST-HAND BY THE OVERSEER BEFORE QUEUEING - do not re-derive
+================================================================================
+  GET /api/queue on CT110 -> 200
+    {"entries":[],"groups":{...},"counts":{"done":0,"launched":0,"pending":0,"failed":0}}
+  GET /api/meta -> mcp_gateway_alias=lhharness; capabilities approvals/injections/create_run/
+    fleet_mcp_tools all true. NOTE: "queue" is NOT listed among capabilities even though the
+    endpoint serves - report that.
+
+THE QUEUE API IS ALREADY DEPLOYED AND EMPTY. The container the queue should live in is CT110 and it
+is already running. What is missing is the STORE behind it: one JSON file per entry on a drive.
+
+STALE FACTS IN THE SOURCE DOC, corrected 2026-09-10 12:20 PT:
+  - it says the PC launcher is pid 53332. It is 84692 (restarted twice today). Never act on pids
+    from that document.
+  - it says 14 active queue JSON. That number moves every tick; never hard-code it.
+
+================================================================================
+SCOPE CUT BY THE OVERSEER - two whole sections removed
+================================================================================
+The source plan Step 0.5 and its entire section E are a BMAD run (clone BMAD_Cognizioware, drive
+bmad-architecture, produce ARCHITECTURE-SPINE.md, PR it).
+
+OUT OF SCOPE. DO NOT ATTEMPT. Paxton said "A and b stop all work on it!!" about BMAD spec staging,
+and queue tasks 111 and 116 sit in C:/tmp/queue/blocked/ for that reason. Do not clone
+BMAD_Cognizioware, do not run bmad-* skills, do not write to _bmad-output/. If you believe the
+schema needs an architecture doc first, SAY SO IN YOUR REPORT AND STOP - do not start one.
+(If the overseer later tells you the hold is lifted, that arrives as an injected instruction.)
+
+ALSO NOT YOURS - overseer/ops work, not run work:
+  - Step 0, cutting the queue over off C:/tmp. It rewrites the overseer's own loop.
+  - Step 2, verifying the chat console wiring. Ops.
+  - Step 3, reading back runs 46 / 16a / 14e. Overseer's.
+  - Creating the role/database on CT103. Ops, and a PREREQUISITE you will not have.
+
+================================================================================
+YOUR SCOPE
+================================================================================
+1. PgQueueStore behind the EXISTING QueueStore surface. src/lh_harness/queue.py already isolates it:
+   create / list / mark_launched / mark_done / mark_failed / record_skip / update. Same surface,
+   Postgres behind it. Selected by queue_backend = "postgres" + database_url in config.toml.
+   THE FILE STORE STAYS THE DEFAULT. e2e/happy_path.py and tests/webapi/test_queue*.py are hermetic
+   and MUST stay hermetic. Postgres must never become a hard dependency of the test suite.
+2. Migrations for schema "harness" in database "lh_harness":
+     harness.queue         (host, queue_id) - columns mirroring QueueEntry.to_dict() EXACTLY
+                           (queue.py:58-79, documented field-by-field in docs/queue.md:128-146)
+                           so the two stores serialise identically
+     harness.queue_events  (host, queue_id, ts) - event, actor, rationale, payload jsonb
+   harness.decisions / facts / ticks are OPTIONAL STRETCH. Finish two tables properly rather than
+   half-finishing five.
+3. Add "blocked" to _VALID_STATUS (queue.py:28 has four states; the PC queue's fifth state is a
+   blocked/ directory, done by moving files). Include the transition table.
+4. CREDENTIALS BY ENV NAME ONLY. database_url in config carries the URL; the password comes from
+   LH_HARNESS_DB_PASSWORD. Never write a password into config.toml, a migration, a test fixture, a
+   doc or a commit message. Copy the pattern FLEET_HARNESS_NODES_JSON already uses.
+5. Test matrix: existing hermetic tests unchanged, PLUS the same matrix against Postgres behind a
+   skip when the DB env var is absent. A run with no database must still be green.
+
+================================================================================
+HARD RULES
+================================================================================
+ - DO NOT MERGE, DO NOT PUSH TO main. A LongHorizon-Harness release RESTARTS CT110 and kills every
+   in-flight run, including your own. Open the PR and STOP; the overseer merges in a
+   zero-active-runs window.
+ - NO BMAD. See the scope cut.
+ - Do not create the CT103 role or database and do not connect to 192.168.21.154 - ops step, and you
+   will not have the credential.
+ - Never git add -A; commit by explicit path; git diff --stat before the PR.
+ - Do not change fleet-admin or memory-mcp. The two databases share a host and nothing else:
+   fleet-admin mirrors via the harness API and must NEVER read lh_harness directly.
+
+DONE MEANS: PgQueueStore implemented behind the unchanged QueueStore surface with the file store
+still the default; migrations for harness.queue + harness.queue_events whose columns match
+QueueEntry.to_dict() field-for-field; "blocked" added to _VALID_STATUS with its transitions; the
+hermetic suite still green with NO database present; a PR opened and NOT merged; and a report saying
+plainly which of decisions/facts/ticks you did or did not deliver, and that "queue" is missing from
+/api/meta capabilities.

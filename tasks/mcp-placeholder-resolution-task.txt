@@ -1,0 +1,117 @@
+TASK 86 - resolve the placeholder MCPs, after a full review of the repos on desk03 and ptait09
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools.
+
+## THERE IS ALREADY A DOC. EXTEND IT. DO NOT WRITE A NEW ONE.
+
+`design docs/mcp-placeholder-services-audit-and-plan.md` - **1,291 lines**, already carrying a live-state
+matrix with three groups:
+
+    ✅ Healthy — returning a real tool surface (no action)
+    ⚠️ Reachable but EMPTY tool list — configured, not delivering
+    🔴 Placeholder URL (http://placeholder:*) — DNS-timeout hangs, no tools
+
+plus a secrets runbook (§10), connect runbooks (§3, §3a, §3b) and a 2026-07-06 regression note. **Read
+it fully before doing anything.** Its matrix was probed **2026-06-22/24** and re-probed 2026-07-06, so it
+is months stale - your first job is to refresh it, not to replace it. RULE 2: extend the existing
+surface, never duplicate it.
+
+## WHY NOW
+
+Paxton, 2026-09-09: *"create another task to resolve all the placeholder mcps after full review of repos
+on desk03 and ptait09 in the typical source spot"*. The point is that some of these placeholders may
+already HAVE an implementation sitting in a repo on a workstation that was simply never wired up. A
+placeholder that is really "built but not deployed" has a completely different resolution from one that
+was never written.
+
+## THE REPOS TO REVIEW
+
+Two Windows workstations, reachable through the **ssh gateway** (use the gateway's ssh tools; do not ask
+for credentials and do not be given any):
+
+| alias | address | notes |
+|---|---|---|
+| `ptait-desk03` | 192.168.21.144 | Windows, OpenSSH, user `svc-mcp`, **cmd.exe is the default shell** |
+| `ptait09` | 192.168.21.135 | Windows, OpenSSH, user `svc-mcp`, cmd.exe default. Use .135, NOT .146 |
+
+The "typical source spot" is **`C:\Users\PaxtonTait\source`** on both. Enumerate the repos there.
+Because the default shell is cmd.exe, use cmd-safe commands (`dir`, `type`) or invoke pwsh explicitly -
+POSIX one-liners will not work.
+
+## SCOPE
+
+1. **Refresh the live matrix.** Re-probe every MCP server the gateway declares (CT202 prod and CT204
+   uat) and rebuild the three groups with **counts**. Say which servers moved between groups since the
+   2026-06/07 probe. **Use the cheap per-server `tools/list`, not a bare gateway `/health`** - a bare
+   `/health` hits every model and costs real money and GPU time.
+
+2. **Enumerate the repos** under `C:\Users\PaxtonTait\source` on **both** desk03 and ptait09. For each
+   placeholder or empty-tool-list MCP, search those repos for an implementation: a matching service
+   directory, a Dockerfile, an MCP server entrypoint, a package name. **Report the path where you found
+   it, or state plainly that you found nothing.**
+
+3. **Classify every placeholder into exactly one of four dispositions:**
+   - **BUILT-NOT-WIRED** - an implementation exists in a repo. Give the host, the repo, the path, and
+     what wiring is missing.
+   - **PARTIAL** - something exists but is incomplete. Say precisely what is missing.
+   - **RETIRE** - nothing exists and nothing needs it. Give the evidence that nothing needs it.
+   - **UNIDENTIFIED** - you cannot tell what it was meant to be. **See the approval gate below.**
+
+4. **THE APPROVAL GATE - Paxton's explicit instruction, and it is a hard stop.**
+   *"part to the mcp placeholder task is it requires my approval on ones you can't identify"*.
+
+   **For every server you classify UNIDENTIFIED you must STOP and ask Paxton.** Do not guess its
+   purpose, do not retire it, do not delete its entry, do not repoint it, and do not quietly drop it
+   from the matrix. Collect them into a single clearly-headed list - **name, current URL/target, what
+   you searched, and what you could not determine** - and raise it as ONE question rather than a
+   trickle. An unidentified MCP that gets retired on a hunch is exactly the kind of silent loss this
+   estate keeps paying for; a placeholder left in place costs almost nothing by comparison.
+
+   **Proceed with the identified ones without waiting** - do not block the whole task on the gate.
+
+5. **Resolve the ones you CAN identify**, in the repo only: declare, wire, or mark for retirement with a
+   written reason. Update the existing doc's matrix in place with the new probe date.
+
+## HARD RULES
+
+ - **Do NOT deploy, restart, or repoint anything live.** This task produces a refreshed audit, a
+   disposition per server, and repo changes. Applying them to CT202/CT204 is a separate, gated step.
+ - **Do NOT retire, delete or repoint any server classified UNIDENTIFIED.** Paxton's approval first.
+ - No bare gateway `/health` probes (cost). Per-server `tools/list` only.
+ - **Never `docker compose up` for mcp-tools without `--env-file mcp-tools.env`.** No `down -v`.
+ - Any change to `infrastructure/litellm-config.yaml` force-recreates the PROD router - flag it
+   prominently in the PR body if you touch it, so the merge can be scheduled into a quiet window.
+ - **Env NAMES only, never values.** Several of these servers hold live third-party tokens. Do not
+   print, log, echo or commit a secret, and do not put one in the doc, the PR body or a test fixture.
+ - Do not ask for credentials for desk03/ptait09; use the ssh gateway tools.
+ - Read-only on the workstations: enumerate and read repos, change nothing on them.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+ - PR to `main`, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR against main that **updates the existing** `design docs/mcp-placeholder-services-audit-and-plan.md`
+with: a refreshed live matrix carrying a new probe date and counts per group, a note of which servers
+changed group since 2026-06/07, an enumeration of the repos found under `C:\Users\PaxtonTait\source` on
+both desk03 and ptait09, and a disposition (BUILT-NOT-WIRED / PARTIAL / RETIRE / UNIDENTIFIED) for every
+placeholder with the evidence behind it - plus a single consolidated **"Needs Paxton"** list of every
+UNIDENTIFIED server, untouched and awaiting his approval.
+
+
+================================================================================
+STANDING RULE ADDED BY THE OVERSEER 2026-09-16 08:2x PT (scheduled tick #280)
+================================================================================
+PUSH AND OPEN THE PR YOURSELF. Your run holds a scoped GH_TOKEN (push + PR only) since
+2026-09-14 16:21 PT. Commit by explicit path, check `git diff --stat`, then `git push` and
+`gh pr create`, and STOP. Do NOT ask for a GitHub credential, and do NOT merge - merging is
+the overseer's. (This REPLACES the older "PR to main" wording's silence on who pushes.)
+EXCEPTION - if your diff touches `.github/workflows/`, the scoped token refuses workflow-file
+pushes by permission: commit, then STOP and say the branch needs an overseer push.
+
+WHY YOU ARE SEEING THIS TASK AGAIN: the 2026-09-10 run (20260910T124756Z_82728467) died at
+`agent.runtime.failed` inside round 1's executor - a RUNTIME failure on the then-current
+backend, NOT a scope problem. Do not cut this task's scope on that account. Verified on
+origin/main 2026-09-16: `design docs/mcp-placeholder-services-audit-and-plan.md` is 1296 lines
+with ZERO occurrences of "ptait-desk03", ".144", ".135" or a "Needs Paxton" list - i.e. none of
+this task's output ever landed. Start from the existing doc and EXTEND it.

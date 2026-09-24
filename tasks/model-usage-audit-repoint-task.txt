@@ -1,0 +1,101 @@
+AUDIT FIRST, THEN BUILD (config + e2e + docs; cognizioware-mcp-tools): find every LiteLLM model that is DEPRECATED or has NOT BEEN USED in the last 30 days, REPOINT it to a living equivalent, and then remove it from the LiteLLM config, the e2e model testing and the old process/code it is wired into. Paxton's direction, 2026-09-09. Work ONLY in /home/harness/work/cognizioware-mcp-tools-b on branch feat/model-usage-audit-repoint (run `git fetch origin && git checkout -B feat/model-usage-audit-repoint origin/main` first); plain git; commit by EXPLICIT PATH; no push; env NAMES only.
+
+## THE ORDER MATTERS: AUDIT, THEN ASK, THEN CHANGE
+PAXTON ASKED FOR THE EXCEPTIONS AND QUESTIONS BEFORE THE DELETIONS. Phase 1 is READ-ONLY and produces a report. DO NOT delete or repoint anything until Phase 1's report exists in the branch and the open questions are listed. Deliver Phase 1 even if you run out of budget for Phase 2 - the audit is the valuable half, and a wrong deletion is expensive.
+
+## PHASE 1 - THE AUDIT (READ-ONLY, NO WRITES ANYWHERE)
+The router carries 204 deployments under 70 distinct model_names (counted 2026-09-09). Establish, for EACH distinct model_name, whether anything used it in the last 30 days, and from WHICH evidence. Cite the source per model; never infer usage from a name looking current.
+
+Evidence sources, in order of authority:
+ 1. THE ROUTER'S OWN USAGE DATA - the only source that answers "was it actually called". `GET /spend/logs?start_date=&end_date=` returns rows carrying a `models` map (verified working 2026-09-09; note the map also contains `MCP: <tool>` keys that are NOT models - exclude them). Also try `GET /global/activity/model?start_date=&end_date=` (returns 200 with dates; 400 without) and `GET /model/metrics`. Report which endpoint you used, its exact window, and its limits - if the retention window is shorter than 30 days, SAY SO and treat the gap as "unknown", never as "unused".
+ 2. LANGFUSE - per-key traces are enabled on the lh-harness key (x-litellm-tags carry lh-session/run/round/role). Use it to attribute harness usage per model.
+ 3. N8N - Paxton called this out specifically. Audit every n8n workflow (the n8n-cloud MCP on the gateway, and the workflow JSON committed in this repo) for model-name literals. n8n is the surface most likely to hold a quiet reference to a retired model that only fails when that workflow next fires.
+ 4. REPOS - grep the fleet repos for model-name literals: cognizioware-mcp-tools, cognizioware-powerplatform, mcp-cognizioware, cognizioware-qa, cognizioware-hydra-rsi, LongHorizon-Harness. Include e2e suites, eval configs, deploy scripts and docs.
+ 5. VIRTUAL KEY ALLOW-LISTS - `GET /key/info` per key. A model on a key's allow-list is a promise to a tenant even with zero traffic.
+
+## THE FIVE TRAPS - READ BEFORE CLASSIFYING ANYTHING AS UNUSED
+These are why this task is an audit and not a grep. Each one has already bitten this estate.
+ (a) A FALLBACK TARGET HAS NO DIRECT TRAFFIC BY DESIGN. `router_settings.fallbacks` and `context_window_fallbacks` name models that are only called when a primary fails. Zero usage is the EXPECTED state for a healthy fallback, and deleting one converts a recoverable failure into a dead run the next time the primary stumbles. On 2026-09-08 four `:synthetic` fallback tails did exactly this in reverse - they were present, 404'd on the route the caller used, and would have turned recoverable failures into dead runs. ENUMERATE every fallback chain and every context-window fallback FIRST, and treat membership as usage.
+ (b) NEWLY REGISTERED MODELS HAVE ZERO USAGE BECAUSE THEY ARE NEW. Eleven `:synthetic-anthropic` twins were registered on 2026-09-09 and are load-bearing for every harness run: `qwen3.8-27b`, `kimi-k3`, `glm-5.3-flash`, `glm-5.2`, `glm-4.7-flash`, `gpt-oss-120b`, `nemotron-3-super`, `syn:large:text`, `syn:small:text`, `syn:large:vision`, `syn:small:vision`, each `:synthetic-anthropic`. THEY MUST NOT BE RETIRED. Any "unused in 30 days" rule needs a registration-age carve-out; state the carve-out you used.
+ (c) TWO MODELS PER UPSTREAM IS DELIBERATE, NOT DUPLICATION. Each Synthetic upstream is registered twice on purpose: the `openai/`-prefixed `:synthetic` entry serves `/v1/chat/completions`, and the `custom_openai/`-prefixed `:synthetic-anthropic` twin serves `/v1/messages`. LiteLLM routes `/v1/messages` for an `openai` provider through the OpenAI RESPONSES API, which Synthetic does not implement (confirmed 404 at the provider itself), which is why the twin exists. Do NOT "de-duplicate" these. Paxton's instruction, 2026-09-09: both formats stay available.
+ (d) AN ALIAS IS NOT A BACKEND. Verified 2026-09-09: `kimi-k3:cloud` is SERVED BY `glm-5.3-flash:cloud` because a fallback chain redirects it. Usage attributed to one name may really belong to another. Where it matters, confirm by reading the model reported back in the `message_start` event.
+ (e) THE DATABASE IS AUTHORITATIVE, NOT THE YAML. `general_settings.store_model_in_db` is true, so editing `litellm-config.yaml` and restarting changes NOTHING on a running router; models must go through `POST /model/delete`. And a 200 from that API is not proof - it returned 200 twice on 2026-09-08 while silently discarding a key it did not recognise. ALWAYS read the catalogue back and diff. (Task 57 owns the config-authority documentation; reference it rather than restating it if it has landed.)
+
+## PHASE 1 OUTPUT - `docs/model-usage-audit-2026-09.md`
+A table: model_name | deployments | last used (date + evidence source) | referenced by (n8n workflow / repo path / e2e suite / key alias / fallback chain) | proposed action (KEEP / REPOINT / RETIRE) | confidence. Then three lists:
+ - CLEAR RETIREMENTS: no traffic, no reference, no chain membership, not newly registered.
+ - EXCEPTIONS AND QUESTIONS FOR PAXTON: anything where the evidence disagrees with itself, where a model is unused but referenced, where retention hid the answer, or where retiring it would need a judgement call about a tenant. THIS LIST IS A DELIVERABLE, NOT A FOOTNOTE - Paxton asked for it explicitly.
+ - ALREADY DECIDED, DO NOT RE-LITIGATE: harness task 20c already covers retiring every `qwen3.5:*` local tag and `qwen3.6`/`qwen3.6:*`, keeping `gpt-oss:20b`, `functiongemma`, `deepseek-ocr`, `glm-ocr`, the embedding and reranker models, and KEEPING `qwen3.5:397b-cloud` (it is a cloud relay). 20c edits the same config file in the same repo - say plainly in your report whether your branch collides with it so the two can be sequenced rather than merged on top of each other.
+
+## PHASE 2 - REPOINT, THEN REMOVE (only for the CLEAR RETIREMENTS list)
+REPOINT BEFORE REMOVING - this is Paxton's instruction and it is what keeps callers alive. For each retiring model, name a living equivalent and make the old name resolve there rather than vanish:
+ - in the LiteLLM config, so an existing caller of the old name keeps working;
+ - in every n8n workflow and repo reference found in Phase 1;
+ - in the e2e model testing, so suites assert against the model that actually serves.
+Then remove the dead entry from the config, the e2e testing and the old process/code. Where a model has no sensible equivalent, say so and leave it in the exceptions list rather than inventing one.
+Update the fallback chains and `context_window_fallbacks` in the same commit as the model they name - a chain pointing at a deleted model is the failure this task exists to prevent.
+
+## E2E
+Follow the numbering and structure of a neighbouring suite in this repo's e2e directory (READ ONE FIRST and match its shape exactly). Assert, read-only: every model named in a fallback chain or a context-window fallback EXISTS in the live catalogue; every model on a virtual key's allow-list exists; and no e2e suite references a model_name the router does not serve - that last assertion is the one whose absence let a retired model fail the acceptance gate for every caller (qa #23, 2026-09-08). NO WRITES.
+
+## TESTS
+Whatever this repo already uses; report counts, baseline first.
+
+## HARD RULES
+Phase 1 is READ-ONLY - no writes to any database, router, box or n8n workflow. No credentials, keys or database URLs in the repo or any output; redact anything key-shaped. Do NOT delete the `:synthetic-anthropic` twins or de-duplicate the two-route pairs. Do NOT re-decide 20c's scope. Do not restart any service. The overseer runs the live `/model/delete` and key repoint from your runbook - you write it, you do not execute it. Explicit-path commits; no push.
+Completion = commits, diff stat, test counts, the audit document, the three lists, which evidence source answered for how many models, the retention window you actually had, and a plain statement of whether this branch collides with 20c. Auditor: read-only - verify Phase 1 made no writes, that fallback-chain and key-allow-list membership were treated as usage, that the eleven newly registered twins are not on any retirement list, that no two-route pair was collapsed, that every retirement has a named repoint target, and that the exceptions list is genuinely populated rather than an empty formality.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.
+
+## ADDED 2026-09-09 22:40 - A LIVE, MEASURED REASON THIS TASK MATTERS MORE THAN IT LOOKS
+The prod router is logging a Python `TypeError: cannot pickle '_thread.RLock' object` **4877 times in 6 hours** - about 13 per minute - and it contributed to a router restart (`RestartCount=1`, clean exit, ~30-60s of edge 502s while it came back).
+
+**CORRECTION, 22:40 - the chain below was OVER-STATED and is being narrowed before you act on it.** It was built from
+ONE traceback in which the TypeError appeared directly after a weekly-limit RateLimitError. A later 5-minute window
+showed **88 TypeErrors and ZERO weekly-limit errors**, with the TypeError count instead tracking 78
+`async_data_generator` exceptions. So the quota limit is at most ONE trigger, not the cause. Treat the chain below as
+a plausible contributing path to CONFIRM or REFUTE, not as established fact - and if you refute it, say so plainly.
+The steps that ARE independently verified: the weekly limit is real and names two accounts, and `glm-5.3-flash:cloud`
+IS the first rung of essentially every cloud chain while being one of the exhausted models. That much stands on its
+own and is reason enough to repoint.
+
+The originally-proposed chain, now to be treated as a hypothesis:
+ 1. Ollama Cloud hit an ACCOUNT-level weekly usage limit. **Two accounts are affected, not one**: the error text names `prax211` AND `ai-dev02`.
+ 2. Every request to an exhausted `:cloud` model therefore raises `RateLimitError`.
+ 3. `router.py:7024 async_function_with_fallbacks()` tries the fallback chain.
+ 4. **`glm-5.3-flash:cloud` is the FIRST fallback target in essentially every cloud chain** - the deliberate "cheapest-first" design at `litellm-config.yaml:260` - and it is one of the exhausted models. So the fallback lands on another 429.
+ 5. Somewhere in that fallback path a `deepcopy` hits an un-picklable `RLock` and throws. Hence the flood.
+
+WHAT THIS MEANS FOR YOUR REPOINT WORK. A fallback chain pointing at an exhausted or retired model is not merely dead weight - it converts every failure into a **noisy failure**, and on this router into a crash path. So when you repoint, treat `router_settings.fallbacks` and `context_window_fallbacks` as first-class targets, not an afterthought:
+ - No chain may name a model that is retired, or that is currently unable to serve.
+ - The FIRST rung especially: a cheapest-first design concentrates all traffic onto one model, so if that rung is down, every chain in the estate is broken at once. That single-point-of-failure property should be called out in your report even if you keep the design.
+ - Propose (do not apply) a chain layout where the first rung is a model that is actually serving. The overseer applies it, because `store_model_in_db: true` means chains live in Postgres and a YAML edit alone does nothing.
+NOTE THE HONEST CAVEAT: the deepcopy TypeError is very likely a LiteLLM bug in the pinned version, and repointing the chains only stops us TRIGGERING it. Say so plainly rather than claiming the repoint fixes the crash - and if you can identify the upstream issue for the pinned version, cite it.
+
+## ADDED 2026-09-09 23:00 - CONCRETE EVIDENCE, MEASURED. START FROM THIS, DO NOT RE-DISCOVER IT.
+A full sweep of every `:cloud` alias registered on the harness key (probed on `/v1/messages`, 300-token budget,
+nonce, reading the served model name and `x-litellm-model-id`) turned up three categories. Each needs a DIFFERENT
+disposition, and conflating them is the main way this task can go wrong:
+
+ 1. **RETIRED UPSTREAM - delete, do not repoint.** `qwen3-coder-next` and `devstral-2:123b` return
+    `litellm.BadRequestError: Ollama_chatException - {"error":"<model> was retired at <date>"}`. The provider has
+    removed them. They are still registered in `infrastructure/litellm-config.yaml` and still reachable from the
+    harness key's allow-list. There is nothing to repoint them TO; they come out of the config, out of the e2e
+    model matrix, and out of any fallback chain that names them. Check every `fallbacks:` list before deleting -
+    a retired model sitting in a fallback chain is worse than a retired alias, because it silently costs a hop.
+ 2. **QUOTA-DEAD, NOT DEAD - do not delete.** Eight aliases return 429 against four exhausted Ollama accounts.
+    These are healthy registrations against an exhausted subscription; deleting them would destroy working config
+    to work around a billing state. Leave them, and let the outage log (task 70) carry the state instead.
+ 3. **ALIASES SERVED BY SOMETHING ELSE - the real finding.** `glm-5.3:cloud`, `glm-5.3-flash:cloud`,
+    `glm-5.2:cloud` and `kimi-k2.6:cloud` all answer 200 while being served by a different model, and the target
+    MOVES between probes (`glm-5.3:cloud` was `kimi-k2.7-code` at 22:48 and `glm-5.3-flash` at 23:02). Anything
+    that selects a model by name here - the e2e model matrix above all - is asserting against a name and
+    measuring a different backend. **Any e2e assertion that names a model MUST read back the served model and
+    fail when they differ**, or the suite is measuring nothing. That check is worth more than the deletions.
+
+USAGE EVIDENCE, NOT JUST REACHABILITY. Reachability says a model answers; it does not say anything USES it. Keep
+the original brief: audit n8n workflows and the repos for 30 days of actual traffic before proposing a deletion,
+and prefer the router's own request logs over grepping for a model name, since a name can be reached through a
+fallback chain without appearing anywhere in code. Present exceptions and questions rather than deleting anything
+whose usage you could not establish - a model nobody calls and a model called only through a fallback look the
+same in a grep and are not the same thing.

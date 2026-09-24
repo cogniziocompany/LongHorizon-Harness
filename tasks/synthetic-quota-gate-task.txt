@@ -1,0 +1,330 @@
+TASK 146 - Fix the Synthetic quota SIGNAL. The gate that consumed it is already disabled.
+
+*** OVERSEER-EXECUTED PORTION IS ALREADY DONE. THIS TASK IS THE REPO FIX. ***
+Paxton, 2026-09-10 18:55 PT: "do NOT flip to fail-closed - stop the doctor gating launches until
+its signal is fixed."
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+File: infrastructure/docker/ops-control-center/doctor/ops_doctor.py, check_synthetic_quota() ~L1123
+
+================================================================================
+WHAT IS ALREADY DONE, SO YOU DO NOT REDO IT
+================================================================================
+`synthetic_quota_exhausted()` in C:/tmp/launch_queue.py (the overseer's launcher, NOT a repo file)
+has been disabled with an early `return False` and a dated comment. The launcher no longer lets the
+doctor veto launches. That half needs nothing from you.
+
+**YOUR JOB IS THE SIGNAL, NOT THE GATE.**
+
+================================================================================
+THE DEFECT - read from the source, not inferred
+================================================================================
+`check_synthetic_quota()` DOES NOT ASK SYNTHETIC ANYTHING. Its own comments admit the API path was
+abandoned ("we know from task investigation that this returns 404 for API key auth"), so it falls
+through to:
+
+    SELECT COALESCE(SUM(total_tokens), 0) FROM "LiteLLM_SpendLogs"
+    WHERE model ILIKE '%synthetic%' AND created_at >= NOW() - INTERVAL '7 days'
+
+...compared against a hardcoded `WEEKLY_QUOTA_TOKENS = 625_900_000`.
+
+**That is a locally-summed token estimate measured against an invented ceiling, and it is presented
+on the operator surface as if it were the provider's own figure.**
+
+SYNTHETIC DOES NOT METER IN TOKENS. It has TWO meters, and this check models NEITHER:
+
+    1. REQUESTS  500 per five hours. Regenerates 5% of total (25 requests) every 15 minutes,
+                 so a full refill from zero takes five hours. -> +100 requests/hour.
+    2. CREDITS   a WEEKLY DOLLAR allowance. Regenerates ~2% (about $2.40) every ~2 hours,
+                 i.e. ~1%/hour. **This is the scarce one.**
+
+================================================================================
+WHAT IT COST - this is why the task exists
+================================================================================
+Measured 2026-09-10 18:45 PT, at the same instant the doctor reported
+"0 tokens remaining this week (625,900,000 used of 625,900,000)":
+
+    real dashboard : five-hour requests 100% UNUSED; weekly credits 3.28% and REGENERATING
+    real usage     : 66 requests in the last 5 hours against a cap of 500  = 13%
+                     47 in the last hour
+    regeneration   : +100 requests/hour
+
+So actual consumption was roughly HALF of what refills, while that false "exhausted" pinned the
+launcher at DEGRADED_CAP=2 with 23 tasks queued for an entire evening. The only reason any Synthetic
+work ran at all is that the launcher gate was written to FAIL OPEN - task 69a launched through it and
+completed in 8 minutes.
+
+The overseer also mis-stated this repeatedly on the strength of the bad signal: it reported "0 tokens,
+no reset until 2026-10-09" for hours. Credits regenerate continuously; there was never a month-long
+wall. **A wrong number on an operator surface does not stay on the surface - it becomes decisions.**
+
+================================================================================
+WHAT TO BUILD
+================================================================================
+ 1. Report BOTH meters, separately and by their real names - "requests (5h)" and "weekly credit" -
+    never a single undifferentiated "quota".
+ 2. **Show the REGENERATION RATE beside every level.** A number that refills is not the same kind of
+    number as one that does not, and presenting 3.28% without "+2% per 2h" invites exactly the
+    "we are out until October" error that was made.
+ 3. If the provider's real figures cannot be fetched, **SAY ON THE SURFACE that the number is a
+    LOCAL ESTIMATE**, with what it is estimated from. Do not print an estimate in the same visual
+    register as a measurement. This mislabelling is the whole defect.
+ 4. Re-examine whether the Synthetic API really cannot be read. The existing comment asserts a 404
+    for API-key auth from a prior investigation - VERIFY that rather than inherit it; an API that
+    reports the true meters would make items 1-3 trivial. If it genuinely cannot be read, say so
+    with the evidence.
+ 5. Do NOT re-enable any launcher gate. That decision is Paxton's and the launcher is not in this
+    repo. State in the PR what a CORRECT gate would key on if one is ever wanted again - the
+    request meter is measurable from SpendLogs; the credit meter currently is NOT.
+
+================================================================================
+TWO MEASUREMENT TRAPS IN THIS EXACT AREA
+================================================================================
+ * `spend` in LiteLLM_SpendLogs reads **$0.0000** for these models - no pricing is configured - so
+   the SCARCE meter (dollars) cannot be derived from our own data at all. Do not compute a credit
+   percentage from spend and present it as real.
+ * The doctor's own comment notes that **streaming spend rows FAIL TO INSERT** (task 82), so any
+   request or token count from SpendLogs is a **FLOOR, not an exact figure.** Label it as such.
+
+================================================================================
+RELATED - DO NOT DUPLICATE
+================================================================================
+Task 145 (1002-145-overseer-liveness-metrics-ux) carries the RENDERING of these metrics into the
+ops /overview surface, along with the rest of the overseer's per-tick numbers. **This task fixes the
+SIGNAL; 145 renders it.** If you find yourself editing a view template, you are in 145's scope.
+
+================================================================================
+HARD RULES
+================================================================================
+ - NEVER the bare gateway /health - it fans a completion out to every configured model including
+   paid and GPU ones. Use /health/liveliness.
+ - Do NOT edit infrastructure/litellm-config.yaml - any edit force-recreates the CT202 prod router.
+ - No secrets in code, fixtures, docs or commit messages - env var NAMES only. SYNTHETIC_API_KEY is
+   referenced by NAME in the existing code; keep it that way.
+ - Never git add -A; commit by explicit path; check git diff --stat first.
+ - Do NOT merge. Open the PR and STOP.
+
+DONE MEANS: the check reports requests and credits as two distinct meters with their regeneration
+rates, any locally-estimated figure is LABELLED as an estimate on the surface itself, the API-404
+claim is either re-verified or disproved, and no launcher gate is re-enabled.
+
+================================================================================
+*** THE DESIGN, ADDED BY THE OVERSEER 2026-09-10 21:45 PT. Source: Paxton, session [4aa9cb].
+This replaces "figure out what to report" with a specific contract. The section above says WHAT is
+wrong; this says WHAT TO BUILD. ***
+================================================================================
+Report THREE MEASURED SIGNALS and base the verdict ONLY on evidence.
+
+ 1. LIVE STATE - **this alone is the verdict.**
+    Send ONE cheap probe: `/v1/messages` to `nemotron-3-super:synthetic-anthropic`, `max_tokens: 1`,
+    a NONCE in the body, cache OFF. **Do not invent this probe** - `emit_ok()` in
+    `C:/tmp/launch_queue.py` (currently line 384) already does exactly it; copy its shape.
+    The nonce and cache-off are not optional: a cached 200 proves nothing about a backend.
+    Also count Synthetic 429s from the router's failure rows over the last 15 minutes.
+        probe 200  -> live=OK
+        probe 429  -> live=RATE_LIMITED
+        anything else -> live=ERROR
+
+ 2. FIVE-HOUR REQUEST METER - advisory, for pacing only.
+    Count SpendLogs rows with `api_base ILIKE '%synthetic.new%'` over the last 5h. **That query
+    already exists at `C:/tmp/remote_q.sh:5`** (verified present, 856 b) - reuse it.
+    Report `req_5h / 2500` and the current req/hr against the 500/hr pace.
+    *** LABEL IT A LOWER BOUND. *** Task 82's streaming rows fail to insert, so this UNDERCOUNTS. A
+    number presented as exact when it is a floor is the same class of defect this task exists to fix.
+
+ 3. WEEKLY CREDIT METER - advisory, and the SCARCE one.
+    Price SpendLogs tokens per model using `C:/tmp/prices.py` (verified present, 2,159 b), which is
+    derived from Synthetic's `/openai/v1/models`. Sum from a CONFIGURABLE reset anchor
+    `OPS_SYNTHETIC_WEEK_START` and compare against `OPS_SYNTHETIC_WEEKLY_CREDIT_USD=120`.
+    Configurable because the anchor moves; a hardcoded date becomes the next invented constant.
+
+ 4. CLASSIFY THE 429 - this is the part that matters operationally.
+        cause=credit       when the probe 429s while req_5h is well under 2500, OR the credit meter
+                           is >= 100%.  **This is a MULTI-DAY outage. It should page.**
+        cause=rate_window  otherwise. Clears within hours; do not page.
+    Getting this backwards is expensive in both directions: paging on a rate window trains people to
+    ignore it, and staying quiet on credit exhaustion hides a multi-day outage.
+
+ 5. DETAIL STRING - one stable, machine-parseable line, because the launcher parses it:
+        live=RATE_LIMITED cause=rate_window req_5h=2410/2500 (>=) credit=$84/$120 (est)
+    **DELETE the "0 tokens remaining" and "CRITICAL" phrasing, and REMOVE
+    `WEEKLY_QUOTA_TOKENS = 625_900_000` entirely.** Leaving the constant in place invites its return.
+
+TEST: add a unit test for the 429 CLASSIFIER using fake probe + meter inputs - both branches, and the
+boundary where req_5h is high AND credit is high.
+
+*** THE LAUNCHER HALF IS STILL NOT YOURS. *** Task 155 owns parsing this new detail. Ship the contract
+above exactly as specified so 155 has something stable to parse, and do not touch
+`C:/tmp/launch_queue.py`.
+
+================================================================================
+*** OVERSEER 2026-09-11 00:35 PT - TWO LAUNCHER DEFECTS FOUND BY READING THE CODE
+    AGAINST THE LIVE STATE. Both block Paxton's "both GPUs earning their keep". ***
+================================================================================
+Live state when found: `active=0 kimi=0 qwen=0 keys_ok=0 queued=28 synthetic=ok
+doctor_quota=EXHAUSTED(advisory)`. All 45 queue entries carry `"trio": "kimi"` explicitly, so the
+kimi path at line 655 governs EVERY launch. Neither defect is theoretical.
+
+**DEFECT 1 - THE LOCAL-EXECUTOR CAP IS DEAD CODE FOR ORNITH.**
+`active()` (line ~480) classifies a run by string:
+
+    if ":pool" in blob: kimi+=1
+    elif "qwen3.8" in blob: qwen+=1
+    else: kimi+=1
+
+The local executor is **`ornith-1.5:pool`**, which CONTAINS `:pool`. So every ornith run is counted
+as **kimi**, `qwen` is permanently **0**, and the guard at line 684
+
+    elif qw>=LOCAL_CAP and _local_exec(roles) and not _SYN_DOWN[0]:
+
+**can never fire.** `trio=="qwen"` is likewise never true (line 605 sets `trio` from the entry, and
+all 45 say `kimi`), so `qw+=1` at line 751 never runs either. The governing limit is therefore
+**CAP=6, not LOCAL_CAP=2** - up to six runs could take an `ornith-1.5:pool` executor at once.
+The comment block at lines 673-683 describes this EXACT failure (tasks 67 and 83, "three runs
+contending for a span that serves about ONE executor") and believes it was fixed. **It was fixed for
+`qwen3.8` and reintroduced when the local slot moved to `ornith-1.5:pool`.**
+
+**DEFECT 2 - WITH `keys_ok=0`, NOTHING EVER REACHES THE GPUs.**
+Line 670 fires FIRST and the LOCAL_CAP check is its `elif`:
+
+    if ok<2 and not _SYN_DOWN[0]:
+        roles=_trio_syn(_SEQ[0])      # all-Synthetic
+
+`keys_ok` is **0** right now, so EVERY launch is rewritten to an all-Synthetic trio and the ornith
+executor is never drawn. **Clearing DRAIN in this state produces zero GPU work** - the whole queue
+goes to Synthetic and both 3090s stay idle. That is the opposite of what Paxton asked for, and it is
+why DRAIN was NOT cleared.
+
+*** CORRECTION, SAME TICK: DO NOT READ `doctor_quota=EXHAUSTED(advisory)` AS "SYNTHETIC IS DEAD". ***
+The overseer briefly argued that clearing DRAIN would fire the queue into an exhausted provider.
+**That was wrong, and this file is the place it must not be repeated.** Precise statement, because
+"disabled" is ALSO wrong: `synthetic_quota_exhausted()` is **LIVE and can still return True** - the
+blanket `return False` that once sat there was REMOVED on 2026-09-10 19:12. What Paxton's 18:55
+decision changed is that it **no longer GATES launches**; it only prints `doctor_quota=` on the
+status line. So the function runs, may say True, and must be treated as ADVISORY ONLY, because the
+signal it reads is invalid: it
+SUM()s our own `LiteLLM_SpendLogs` tokens against a hardcoded `WEEKLY_QUOTA_TOKENS = 625_900_000`,
+and Synthetic does not meter tokens at all - it meters 500 requests/5h plus a weekly dollar credit.
+Measured at the very moment the doctor said "exhausted": **five-hour requests 100% UNUSED, weekly
+credits 3.28% and regenerating.** The launcher's live status line also reads `synthetic=ok`, which
+comes from a REAL probe (`synthetic_down()`), not from this gate. **Synthetic is answering.** The
+reason not to clear DRAIN is the GPU routing above, NOT provider exhaustion.
+
+**WHAT PAXTON ASKED FOR:** *"i want both GPUs earning their keep on future runs, the ask is for the
+harness to run slices concurrently."* Two concurrent ornith-executor runs = one request in flight per
+instance = both cards busy. `ornith-1.5:9b` is `n_seq_max=1`, so concurrency comes ONLY from more
+instances, never from parallel requests to one - and both `:11438` and `:11441` are up and serving
+31 models each (verified 00:20 PT).
+
+**THE SHAPE OF THE FIX - do not widen it:**
+ 1. Classify by the EXECUTOR's model, not by a substring of the whole blob. `:pool` matching
+    `ornith-1.5:pool` is the bug; `_local_exec(roles)` already has the right test and should be the
+    single source of truth for "is this a local run".
+ 2. Make local capacity a REAL count of live local-executor runs, and keep the cap at **2** - one per
+    ornith instance. Not 6.
+ 3. When Synthetic is exhausted or keys are short, prefer the LOCAL lane rather than all-Synthetic.
+    Today the precedence is backwards: the one lane that is free and available is the one skipped.
+**A FILE EDIT IS INERT UNTIL THE LAUNCHER RESTARTS** (PID 35540, started 2026-09-10 20:35) - that
+trap has already been hit once this session. Confirm the running code, not the file.
+
+================================================================================
+*** OVERSEER 2026-09-11 02:45 PT - DEFECT 3: THE LAUNCHER WILL LAUNCH INTO A
+    WORKSPACE WITH NO BUDGET CONFIG, AND THE HARNESS THEN SILENTLY USES 300s. ***
+================================================================================
+**MEASURED TONIGHT, NOT THEORISED.** Task 154 launched into
+`/home/harness/work/cognizioware-powerplatform-c`, which had **no `.lh-harness/` directory at all**
+(`ls` -> "No such file or directory"). The harness therefore fell back to the packaged defaults in
+`lh_harness/types.py`:
+
+    class EpisodeBudget:  max_duration_seconds: int = 1800      (line 59)
+    manager_budget = EpisodeBudget(max_duration_seconds=300)     (line 112)
+    auditor_budget = EpisodeBudget(max_duration_seconds=300)     (line 117)
+    cli_executor_budget = EpisodeBudget()            -> 1800
+
+**Its manager got 300s instead of the intended 1200s** and timed out twice (`duration_ms` 300,137
+and 300,215), burning rounds 1 and 5 of 8. By contrast task 125b, in a workspace that HAS a config,
+had its executor cut at exactly **3,600,148 ms** - the configured `cli_executor = 3600`, honoured to
+the millisecond.
+
+**WHY THIS IS WORTH A GUARD RATHER THAN A ONE-TIME FIX.** The overseer diagnosed this failure THREE
+times and was wrong twice - first "backend fault, same role repeatedly", then "oversized task, cut
+the scope". Both wrong readings pointed at **cutting task 154's scope**, which would have shrunk a
+task to fit a timeout that was itself misconfigured. A silent fallback that changes a budget by 4x
+and looks exactly like a scope problem is a trap that will catch the next reader too.
+
+**THE GUARD - keep it small:**
+ 1. Before launching, check `<workspace>/.lh-harness/config.toml` exists. If it does not, **HOLD the
+    task and say so on the status line** - do not launch. The queue entry keeps its position.
+ 2. Print which budget file was found, so the log records what actually governed the run.
+ 3. Do NOT have the launcher WRITE the config itself. Which budgets a workspace should get is a
+    judgement (the fleet uses 900/900/1800 and 1200/1800/3600 in different trees, and
+    `westhivecapital-hivemind` deliberately runs manager=300). Guessing one would be worse than
+    holding.
+
+**ALREADY DONE, so do not redo it:** configs were created for `cognizioware-powerplatform-c` and
+`mcp-cognizioware-b`, copied from their sibling workspaces and verified by read-back. All nine
+queue-targeted workspaces now have one. `cognizioware-nebo` and the `mcp-cognizioware-task74*`
+variants have zero queued entries and were deliberately left alone.
+
+**NOTE FOR WHOEVER IMPLEMENTS THIS:** budgets are read at RUN START, so writing a config while a run
+is live does not change that run. Task 154's remaining rounds may still time out at 300s - that is
+expected and is NOT evidence the guard or the config failed.
+
+================================================================================
+*** DEFECT 4, CONFIRMED 2026-09-11 10:57 PT - THE all-Synthetic FALLBACK IS OVERWRITTEN. ***
+================================================================================
+In `launch_queue.py`, the `if trio=="kimi":` block selects an all-Synthetic trio and SAYS SO:
+
+    if ok<2 and not _SYN_DOWN[0] and (qw>=LOCAL_CAP or not _local_exec(roles)):
+        roles=_trio_syn(_SEQ[0])
+        print("  KEYS SHORT ... -> all-Synthetic trio")
+    elif qw>=LOCAL_CAP and _local_exec(roles) and not _SYN_DOWN[0]:
+        roles=_trio_syn(_SEQ[0])
+        print("  SPAN FULL ... -> all-Synthetic trio")
+
+Then the probe dispatch OUTSIDE that block does:
+
+    if trio=="degraded":  ...
+    elif trio=="qwen":    ...
+    else:
+        for attempt in range(len(EXEC_POOL)):
+            roles=_trio(_SEQ[0]+attempt)     # <-- DISCARDS the all-Synthetic selection
+
+**`trio=="kimi"` always lands in that `else`, so the fallback is computed, logged, and thrown
+away.** PROVEN LIVE at 10:23: the log printed `KEYS SHORT -> all-Synthetic trio` and then probed
+`[trio 1]` = _TRIOS row 1 = glm-5.2 / **ornith-1.5:pool** / syn:large:vision - a LOCAL executor.
+`_trio_syn(1)` would have returned row 3 (nemotron). SYN_ONLY parses correctly as [2,3,4,5].
+
+*** THE SAME BUG WAS ALREADY FIXED FOR THE OTHER PATH AND THE COMMENT IS STILL THERE: ***
+  "2026-09-10 05:37: the first version of this fallback selected QWEN and then the rotation loop
+   overwrote `roles` with _trio(...) anyway ... Fixed by not entering the rotation at all when the
+   trio is local."
+They added a dedicated `elif trio=="qwen"` branch. **The all-Synthetic fallback never got one.**
+
+IMPACT - not cosmetic. With keys_ok=0 the launcher believes it is steering OFF the contended local
+lane and actually launches ONTO it. That is the mechanism the file's own comments blame for killing
+task 67 three times and task 83. MEASURED 2026-09-11: local ornith executor burned **3600 s = the
+entire cli_executor ceiling** on task 143 round 1, and 1648 s on task 153, versus **421 s** for a
+Synthetic executor on task 134. Roughly 4-8x, with the local rounds hitting ceilings not finishing.
+
+THE FIX (2 lines, mirroring the qwen fix): set a flag when the all-Synthetic fallback fires, and
+either skip the rotation entirely or rotate within SYN_ONLY instead of all of _TRIOS. Do NOT simply
+delete the rotation - it exists because holding the queue head over one slow backend silently
+reorders Paxton's priorities (the task-63 incident).
+
+VERIFY BY READING THE LOG BACK: after the fix, a cycle that prints `-> all-Synthetic trio` must be
+followed by an emit-probe whose executor contains `:synthetic-anthropic`. **Compare the probe line
+to the decision line - a fallback that announces one thing and probes another is the whole bug.**
+
+*** DEFECT 4 REFINEMENT 2026-09-11 10:58 PT - IT IS INTERMITTENT, ~1 IN 3. ***
+The overwrite is not always harmful, and that is the trap. `_trio(_SEQ[0]+attempt)` lands on:
+    rows 2,3,4,5 = all-Synthetic -> overwrite HARMLESS (4 of 6)
+    rows 0,1     = ornith executor -> overwrite WRONG  (2 of 6)
+OBSERVED: 10:23 _SEQ->row 1 (ornith, WRONG); 10:53 _SEQ->row 4 (all-Synthetic, right by luck).
+**A single correct-looking cycle is NOT evidence of a fix - there is a 2-in-3 chance of seeing the
+right answer from broken code.**
+
+VERIFICATION REQUIREMENT (binding): after the fix, check **at least 6 consecutive cycles that log
+`-> all-Synthetic trio`** and confirm EVERY following emit-probe executor contains
+`:synthetic-anthropic`. Better: assert it in code - if the fallback fired and the chosen executor
+is not Synthetic, log LOUDLY rather than launching.

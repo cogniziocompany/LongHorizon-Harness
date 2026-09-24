@@ -1,0 +1,8 @@
+{
+ "name": "05a-litellm-response-cache",
+ "task_file": "C:/tmp/litellm-response-cache-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 7,
+ "trio": "kimi",
+ "run_id": "20260908T000119Z_286aa6b4"
+}
