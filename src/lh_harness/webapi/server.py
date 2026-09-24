@@ -886,7 +886,12 @@ def create_app(
     allowed_origins: set[str] | list[str] | tuple[str, ...] | None = None,
     bind_host: str = "127.0.0.1",
 ) -> FastAPI:
-    """Create an API app over a live shared state or a historical runs root."""
+    """Create an API app over a live shared state or a historical runs root.
+
+    ``supervisor`` accepts the real :class:`RunSupervisor` or any stand-in
+    exposing the same surface (tests pass an in-memory fake so the launcher
+    the app builds can be driven without spawning workers).
+    """
 
     dashboard_state = state or DashboardState(
         log_dir,
@@ -1030,12 +1035,26 @@ def create_app(
         )
         reporter = get_reporter()
         fleet_state = reporter.registration_state() if reporter is not None else {}
+        # Launcher stall detector (task 230): read the launcher's own state,
+        # never a re-created one, so the flag reflects live passes.  Fail-open:
+        # a launcher that cannot report its stall state degrades to "not
+        # stalled" rather than aborting the metadata handshake.
+        launcher_stalled = False
+        launcher_stall_cycles = None
+        if launcher is not None:
+            try:
+                launcher_stalled = bool(launcher.stall_fired)
+                launcher_stall_cycles = launcher.stall_cycles or None
+            except Exception:
+                pass
         return build_meta(
             endpoint=endpoint,
             fleet_configured=bool(reporter is not None and reporter.configured),
             fleet_ever_succeeded=bool(fleet_state.get("ever_succeeded", False)),
             fleet_last_ok=fleet_state.get("last_ok"),
             fleet_last_error=fleet_state.get("last_error"),
+            launcher_stalled=launcher_stalled,
+            launcher_stall_cycles=launcher_stall_cycles,
             capabilities={
                 "approvals": live_control,
                 "injections": live_control,
