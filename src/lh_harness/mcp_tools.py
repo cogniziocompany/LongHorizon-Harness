@@ -9,8 +9,10 @@ routes, and returns plain JSON results that an HTTP MCP wrapper can forward.
 
 No native MCP server SDK is required.  The tools are advertised in
 ``GET /api/mcp/fleet/tools`` and invoked through ``POST
-/api/mcp/fleet/{tool_name}``; a separate LiteLLM-compatible MCP bridge (not in
-this repo) maps the gateway alias ``lhharness`` to those endpoints.
+/api/mcp/fleet/{tool_name}``.  The WebAPI also serves them as a real MCP
+server over streamable HTTP at ``POST /mcp`` (``webapi/mcp_jsonrpc.py``), so
+LiteLLM can register the gateway alias ``lhharness`` directly; both transports
+share this module's manifest and dispatcher.
 """
 
 from __future__ import annotations

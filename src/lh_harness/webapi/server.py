@@ -29,6 +29,7 @@ from ..dashboard.state import DashboardState
 from ..launcher import Launcher
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
+from . import mcp_jsonrpc as mcp_protocol
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
@@ -206,6 +207,16 @@ def _bearer_matches(value: str | None, token: str | None) -> bool:
         return False
     supplied = value.removeprefix("Bearer ").strip()
     return bool(supplied) and hmac.compare_digest(supplied, token)
+
+
+# Paths guarded by the same bearer boundary as /api.  The MCP streamable-HTTP
+# endpoint lives at /mcp (outside the /api/ prefix), so it is listed here to
+# share the authentication logic rather than duplicating it.
+_BEARER_GUARDED_PREFIXES = ("/api/", "/mcp", "/mcp/")
+
+
+def _path_requires_bearer(path: str) -> bool:
+    return any(path == prefix or path.startswith(prefix) for prefix in _BEARER_GUARDED_PREFIXES)
 
 
 def _decode_ws_token_protocol(value: str) -> str | None:
@@ -970,7 +981,7 @@ def create_app(
         ):
             return JSONResponse({"detail": "host is not allowed"}, status_code=403)
         authenticated = _bearer_matches(request.headers.get("authorization"), token)
-        if token and request.url.path.startswith("/api/") and not authenticated:
+        if token and _path_requires_bearer(request.url.path) and not authenticated:
             return JSONResponse(
                 {"detail": "invalid or missing bearer token"},
                 status_code=401,
@@ -1132,21 +1143,30 @@ def create_app(
     def mcp_fleet_tools() -> dict[str, Any]:
         return {"ok": True, "gateway_alias": "lhharness", "tools": tools_manifest()}
 
-    @app.post("/api/mcp/fleet/{tool_name}")
-    def mcp_fleet_invoke(
-        tool_name: str,
-        request: Request,
-        body: dict[str, Any] = Body(default_factory=dict),
-    ) -> dict[str, Any]:
-        result = _dispatch_mcp_tool(
+    def _invoke_fleet_tool(tool_name: str, arguments: dict[str, Any], request: Request) -> dict[str, Any]:
+        """Run one fleet MCP tool.
+
+        Single dispatch path shared by the REST bridge (``POST
+        /api/mcp/fleet/{tool_name}``) and the MCP streamable-HTTP endpoint
+        (``POST /mcp`` tools/call), so both transports behave identically.
+        """
+        return _dispatch_mcp_tool(
             tool_name,
-            body.get("arguments", {}),
+            arguments,
             queue_store=queue_store,
             registry=registry,
             supervisor=supervisor,
             auth_token=token,
             request_token=normalize_request_token(request.headers.get("authorization")),
         )
+
+    @app.post("/api/mcp/fleet/{tool_name}")
+    def mcp_fleet_invoke(
+        tool_name: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        result = _invoke_fleet_tool(tool_name, body.get("arguments", {}), request)
         status = result.get("code", 200)
         if status == 401:
             return JSONResponse(result, status_code=401, headers={"WWW-Authenticate": "Bearer"})
@@ -1155,6 +1175,31 @@ def create_app(
         if status >= 400:
             return JSONResponse(result, status_code=status)
         return result
+
+    @app.post("/mcp")
+    @app.post("/mcp/")
+    async def mcp_streamable_http(request: Request) -> Response:
+        """MCP streamable-HTTP (JSON-RPC 2.0) endpoint over the fleet tools.
+
+        Shares ``tools_manifest()`` and the fleet dispatch path with the REST
+        bridge above; see ``webapi.mcp_jsonrpc`` for the protocol layer.
+        """
+        raw = await request.body()
+        message = mcp_protocol.parse_message(raw)
+        if mcp_protocol.is_error_envelope(message):
+            return JSONResponse(message, status_code=400)
+
+        def call_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            return _invoke_fleet_tool(tool_name, arguments, request)
+
+        status, payload = mcp_protocol.handle_message(
+            message,
+            list_tools=tools_manifest,
+            call_tool=call_tool,
+        )
+        if payload is None:
+            return Response(status_code=status)
+        return JSONResponse(payload, status_code=status)
 
     @app.post("/api/queue/{queue_id}/priority")
     def update_queue_priority(queue_id: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
