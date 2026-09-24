@@ -1,0 +1,278 @@
+name: Deploy CT110 harness
+
+# TASK 224 / disconnect checklist D5: replace the PTAIT09-pushed deploy
+# (C:/tmp/optimistic_deploy_harness.py streaming deploy-harness-v2.sh into
+# `pct exec 110` over ssh) with a CI-owned, manually dispatched deploy that
+# runs entirely on the LAN runner (CT210, label `lan-deploy`).  Once PTAIT09
+# is disconnected this workflow is the ONLY way CT110 gets upgraded.
+#
+# Paid-for lessons from the old script that this workflow preserves (do not
+# remove the guards that encode them — see scripts/deploy/ct110/README.md):
+#   1. The deploy script travels as BYTES end to end.  A text pipe added
+#      CRLFs on 2026-09-18 and bash died with `$'do\r'`; we scp (binary
+#      protocol) + pct push and sha256-verify every hop instead.
+#   2. Exit code 2 is OVERLOADED: the inner script's own idle-recheck abort
+#      AND a bash syntax error both surface as rc=2.  The runner-side wrapper
+#      (scripts/deploy/ct110/run_on_ct110.sh) prints captured stderr BEFORE
+#      interpreting any nonzero rc.
+#   3. The deploy RESTARTS lh-harness.service and kills every in-flight run.
+#      We wait for a counted zero-active window (GET /api/runs) before
+#      touching the host, and the inner script re-checks idleness itself.
+#   4. A DEPLOY-HOLD hold file aborts the deploy so a known-bad main cannot
+#      ship (09-18 mechanism; path candidates in ct110_deploy.sh).
+#
+# NEVER auto-triggered: the only trigger is workflow_dispatch, so a push to
+# main ships nothing by itself.
+#
+# Prerequisites owned by a human (the values cannot live in git):
+#   - A self-hosted runner registered FOR THIS REPO with label `lan-deploy`
+#     (template lesson 2026-09-06: every repo with a lan-deploy job needs its
+#     own runner registration on CT210, user `runner`).
+#   - GitHub environment `ct110-prod` with secrets (referenced only by name):
+#       CT110_API_TOKEN   — bearer token for the CT110 web API
+#       CT110_PVE_SSH_KEY — ed25519 private key allowed to ssh to the PVE host
+#     and optional environment variables (defaults below match today's LAN):
+#       CT110_WEB_URL, CT110_PVE_HOST, CT110_PVE_SSH_USER, CT110_CT_ID
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Tag (vX.Y.Z) or full commit sha to deploy to CT110"
+        required: true
+        type: string
+      wait_timeout_minutes:
+        description: "Max minutes to wait for a zero-active-run window"
+        required: true
+        default: "30"
+        type: string
+      dry_run:
+        description: "Preflight + build only; never touches CT110"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  checks: read
+  statuses: read
+
+# One deploy at a time, and never cancel one mid-restart: a cancelled deploy
+# can leave the service down or half-upgraded with no rollback pass.
+concurrency:
+  group: deploy-ct110
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Preflight (ref resolves, tag==version, main green)
+    runs-on: [self-hosted, lan-deploy]
+    outputs:
+      sha: ${{ steps.preflight.outputs.sha }}
+      version: ${{ steps.preflight.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve ref and gate on main CI
+        id: preflight
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: python3 scripts/deploy/ct110/preflight.py
+
+  build:
+    name: Build deployable wheel (with Web bundle)
+    needs: preflight
+    runs-on: [self-hosted, lan-deploy]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Web dependencies
+        run: npm ci --prefix frontend/web --no-audit --no-fund
+
+      - name: Build Web frontend
+        # The bundle is git-ignored; hatchling only packs it via `artifacts`
+        # when it exists in the source tree (see pyproject.toml), so a wheel
+        # built without this step would silently ship NO Web UI.
+        run: npm run build --prefix frontend/web
+
+      - name: Verify the Web bundle was produced
+        run: test -f src/lh_harness/_frontend/web/dist/index.html
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel
+
+      - name: Verify wheel version matches preflight expectation
+        env:
+          EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          wheel="$(ls dist/lh_harness-*-py3-none-any.whl)"
+          echo "wheel: $wheel"
+          case "$(basename "$wheel")" in
+            "lh_harness-${EXPECTED_VERSION}-"*) ;;
+            *) echo "::error::wheel version does not match expected $EXPECTED_VERSION"; exit 1 ;;
+          esac
+          python - "$wheel" <<'PY'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as zf:
+              names = zf.namelist()
+          assert any(n.endswith("_frontend/web/dist/index.html") for n in names), \
+              "wheel is missing the Web bundle"
+          print("wheel carries the Web bundle")
+          PY
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct110-wheel
+          path: dist/lh_harness-*-py3-none-any.whl
+          retention-days: 30
+
+  deploy:
+    name: Deploy to CT110 (zero-active window, bytes-safe, verified)
+    needs: [preflight, build]
+    runs-on: [self-hosted, lan-deploy]
+    environment: ct110-prod
+    timeout-minutes: 90
+    env:
+      EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
+      CT110_API_TOKEN: ${{ secrets.CT110_API_TOKEN }}
+      CT110_PVE_SSH_KEY: ${{ secrets.CT110_PVE_SSH_KEY }}
+      WAIT_TIMEOUT_MINUTES: ${{ inputs.wait_timeout_minutes }}
+      # Connection facts are environment VARS (non-secret) with LAN defaults;
+      # they are resolved here, at the job that owns the environment.
+      CT110_WEB_URL: ${{ vars.CT110_WEB_URL || 'http://192.168.21.168:8799' }}
+      PVE_HOST: ${{ vars.CT110_PVE_HOST || 'corsairai300' }}
+      PVE_USER: ${{ vars.CT110_PVE_SSH_USER || 'root' }}
+      CT_ID: ${{ vars.CT110_CT_ID || '110' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ct110-wheel
+          path: stage
+
+      - name: Stage SSH key
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/ct110_pve_key"
+          install -m 600 /dev/null "$key_file"
+          printf '%s\n' "$CT110_PVE_SSH_KEY" > "$key_file"
+          echo "SSH_KEY_FILE=$key_file" >> "$GITHUB_ENV"
+
+      - name: Wait for a counted zero-active window (GET /api/runs)
+        if: ${{ !inputs.dry_run }}
+        run: |
+          python3 scripts/deploy/ct110/wait_zero_active.py \
+            --url "$CT110_WEB_URL" \
+            --consecutive 3 \
+            --interval-seconds 15 \
+            --timeout-minutes "$WAIT_TIMEOUT_MINUTES"
+
+      - name: Deploy (bytes-safe push + inner idle/hold recheck + restart)
+        id: deploy
+        if: ${{ !inputs.dry_run }}
+        run: |
+          scripts/deploy/ct110/run_on_ct110.sh deploy
+
+      - name: Verify lh-harness.service is active
+        if: ${{ !inputs.dry_run }}
+        run: |
+          state="$(scripts/deploy/ct110/run_on_ct110.sh exec systemctl is-active lh-harness.service || true)"
+          echo "systemctl is-active: $state"
+          if [ "$state" != "active" ]; then
+            echo "::error::lh-harness.service is not active after deploy (state=$state)"
+            exit 1
+          fi
+
+      - name: Verify installed lh_harness.__version__ == deploy target
+        if: ${{ !inputs.dry_run }}
+        run: |
+          installed="$(scripts/deploy/ct110/run_on_ct110.sh exec /home/harness/venv/bin/python -c 'import lh_harness; print(lh_harness.__version__)')"
+          echo "installed: $installed / expected: $EXPECTED_VERSION"
+          if [ "$installed" != "$EXPECTED_VERSION" ]; then
+            echo "::error::installed version $installed != deploy target $EXPECTED_VERSION"
+            exit 1
+          fi
+
+      - name: Verify GET /api/meta returns 200
+        if: ${{ !inputs.dry_run }}
+        run: |
+          code="$(curl -s -o "$RUNNER_TEMP/meta.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $CT110_API_TOKEN" "$CT110_WEB_URL/api/meta")"
+          echo "GET /api/meta -> HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::/api/meta returned $code, expected 200"
+            exit 1
+          fi
+          grep -q '"service"' "$RUNNER_TEMP/meta.json"
+
+      - name: DEPLOY OK
+        if: ${{ !inputs.dry_run }}
+        run: echo "CT110_DEPLOY_OK version=$EXPECTED_VERSION sha=${{ needs.preflight.outputs.sha }}"
+
+      # Automatic rollback.  Encodes lesson 3 twice over: the rollback also
+      # restarts the service, so it only runs after the deploy has actually
+      # STARTED — the deploy step ran and produced an outcome (`success` or
+      # `failure`; a step skipped by its `if` reports `skipped`).  A pre-deploy
+      # failure (wheel download, SSH key staging, zero-active wait) must abort
+      # the run with NO service restart: no window was confirmed and no deploy
+      # touched the host.  A failure at or after the deploy step still rolls
+      # back automatically — the service was already restarted inside a
+      # confirmed window, so restoring the previous version cannot widen the
+      # blast radius.
+      - name: Automatic rollback to previous version
+        id: rollback
+        if: ${{ failure() && !inputs.dry_run && (steps.deploy.outcome == 'success' || steps.deploy.outcome == 'failure') }}
+        run: |
+          set +e
+          scripts/deploy/ct110/run_on_ct110.sh rollback
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            # Fixed, greppable sentinel: this is the page-worthy state.
+            echo "::error::CT110_DEPLOY_ROLLBACK_FAILED rc=$rc — CT110 is on an UNKNOWN version; manual recovery required (scripts/deploy/ct110/README.md)"
+            echo "CT110_DEPLOY_ROLLBACK_FAILED rc=$rc"
+            exit 99
+          fi
+          echo "::warning::CT110_DEPLOY_FAILED_ROLLBACK_OK — rolled back to the pre-deploy version"
+
+      - name: Report rolled-back outcome
+        if: ${{ failure() && !inputs.dry_run && (steps.deploy.outcome == 'success' || steps.deploy.outcome == 'failure') && steps.rollback.outcome == 'success' }}
+        run: |
+          echo "CT110_DEPLOY_FAILED_ROLLBACK_OK version_restored"
+          exit 1
+
+      - name: Deployment record
+        if: ${{ always() }}
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome || 'not-run' }}
+        run: |
+          {
+            echo "## CT110 deploy — $(date -u +%FT%TZ)"
+            echo
+            echo "- target_ref: \`${{ inputs.target_ref }}\`"
+            echo "- resolved sha: \`${{ needs.preflight.outputs.sha }}\`"
+            echo "- expected version: \`$EXPECTED_VERSION\`"
+            echo "- dry_run: ${{ inputs.dry_run }}"
+            echo "- deploy step: $DEPLOY_OUTCOME / rollback step: $ROLLBACK_OUTCOME"
+          } >> "$GITHUB_STEP_SUMMARY"
