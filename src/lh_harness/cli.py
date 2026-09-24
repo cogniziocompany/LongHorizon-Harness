@@ -52,6 +52,9 @@ _EPILOG = f"Homepage: {HOMEPAGE}\nFound a bug? Please open an issue: {ISSUES_URL
 _DEFAULT_RUNS_ROOT = "./.lh-harness/runs"
 _DEFAULT_MAX_ROUNDS = DEFAULT_MAX_ROUNDS
 _MAX_TASK_FILE_BYTES = 100_000
+# Task 234 D2: cap on the rendered role-configuration snippets inside the
+# reservation-mismatch error (one per side), keeping the worker.log line sane.
+_ROLE_CONFIG_RENDER_LIMIT = 600
 
 # Agent backends as (choice, CLI binary, default model).  Kept literal so
 # `--help` needs no registry import; `_doctor_command` asserts it still agrees
@@ -326,7 +329,18 @@ def _adopt_supervised_run_dir(
     expected_roles = owner.get("role_configs")
     expected_roles = expected_roles if isinstance(expected_roles, dict) and expected_roles else None
     if expected_roles != role_configs:
-        raise ValueError("supervised run role configuration does not match its reservation")
+        # Task 234 D2: a transient config drift around the 2026-09-23 23:53
+        # cutover made this failure mode look like a bare "status 2" exit.
+        # Diagnosing it required reading the reservation off disk by hand, so
+        # the message now carries both sides: the role configuration the
+        # reservation stores (expected) and the one the worker recomputed from
+        # its arguments (actual).  Bounded so an oversized record cannot flood
+        # the worker log.
+        raise ValueError(
+            "supervised run role configuration does not match its reservation "
+            f"(expected/reservation-stored: {_format_role_configs(expected_roles)}; "
+            f"actual/recomputed: {_format_role_configs(role_configs)})"
+        )
     try:
         reserved_rounds = int(owner.get("max_rounds", max_rounds))
     except (TypeError, ValueError) as exc:
@@ -2179,6 +2193,34 @@ def _resolve_role_reasoning_effort(
             return None
         current = _ROLE_PARENTS.get(current) if current in _ROLE_PARENTS else _ROLE_ALIASES.get(current)
     return getattr(args, "reasoning_effort", None)
+
+
+def _format_role_configs(role_configs: dict[str, dict[str, str | None]] | None) -> str:
+    """Render a role-configuration mapping compactly for a failure message.
+
+    Task 234 D2: the reservation-mismatch error must show both the
+    reservation-stored (expected) and the recomputed (actual) role
+    configuration so a transient config drift is diagnosable from the worker
+    log alone.  Each role is rendered as ``role{agent=…, model=…, …}`` with
+    the fields sorted for a stable diffable ordering; ``None`` stays ``None``.
+    """
+
+    if not role_configs:
+        return "none"
+    parts = []
+    for role in sorted(role_configs):
+        spec = role_configs[role] or {}
+        fields = ", ".join(
+            f"{key}={value!r}" for key, value in sorted(spec.items())
+        )
+        parts.append(f"{role}{{{fields}}}")
+    rendered = "; ".join(parts)
+    if len(rendered) > _ROLE_CONFIG_RENDER_LIMIT:
+        # The expected side comes from the owner record, which is only
+        # checked to be a dict of dicts; keep a pathological record from
+        # flooding the worker log with one message.
+        return rendered[:_ROLE_CONFIG_RENDER_LIMIT] + "…(truncated)"
+    return rendered
 
 
 def _public_role_configs_from_args(

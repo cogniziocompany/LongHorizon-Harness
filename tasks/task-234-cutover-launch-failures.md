@@ -106,11 +106,44 @@ of writing, lives only on `feat/task-224-ci-deploy-ct110`) should invoke the smo
 script once both PRs merge, as a step between the `GET /api/meta` verification and the
 `DEPLOY OK` marker, gated `if: ${{ !inputs.dry_run }}`.
 
+## D2 — reservation-mismatch error prints expected vs actual (this commit)
+
+Code (`src/lh_harness/cli.py`):
+
+- The raise at the former `cli.py:329` (`_adopt_supervised_run_dir`) now reports the
+  failure with BOTH sides of the comparison, replacing the bare
+  `supervised run role configuration does not match its reservation`:
+  - `expected/reservation-stored:` the `role_configs` dict stored in the run's
+    `control/owner.json` reservation, and
+  - `actual/recomputed:` the role configuration the worker re-derived from its
+    arguments (`_public_role_configs_from_args`).
+- New helper `_format_role_configs` renders each mapping compactly and stably
+  (`role{agent=…, model=…}` per role, keys sorted) so the two sides are diffable
+  at a glance in `worker.log`; an absent/empty side renders as `none`.
+- Why it mattered (root cause, measured 2026-09-23 ~23:50–23:52Z around the 23:53
+  cutover): the two-line `worker.log` (`Cannot start run: …does not match its
+  reservation` + `Using config: …`) gave no hint WHICH binding differed, so the
+  five runs `20260923T235013Z_312781db`, `20260923T235030Z_9c347f23`,
+  `20260923T235047Z_769c09e4`, `20260923T235103Z_70ed3e28`,
+  `20260923T235120Z_7164fbff` had to be diagnosed by reading the reservation
+  record off disk by hand. With this change the next occurrence is
+  self-explaining in the log. See the root-cause record in the PR body.
+
+Tests (`tests/test_cli_isolation.py`):
+
+- `test_supervised_reservation_role_mismatch_reports_expected_and_actual` — a
+  reservation with a stale auditor model vs a recomputed live one: the message
+  contains both labelled sides with the differing models.
+- `test_supervised_reservation_role_mismatch_handles_missing_side` — a reservation
+  without stored `role_configs` renders the expected side as `none` while the
+  actual side still prints.
+
 ## Deliverable status
 
 - D1 (this commit round): implemented + tested + applied to the consumed config.
-- D2 (next round): `cli.py` reservation-mismatch error prints expected vs actual role
-  configuration; PR documents the root cause with the five run IDs above.
+- D2 (this commit round): implemented — `cli.py` reservation-mismatch error prints
+  expected (reservation-stored) vs actual (recomputed) role configuration, covered by
+  tests; root-cause narrative (five run IDs above) is in this carrier for the PR body.
 - D3 (following round): standalone smoke script + test; PR body notes the PR #49
   wiring.
 - Final round: push branch + open PR against `main`. DO NOT MERGE.
