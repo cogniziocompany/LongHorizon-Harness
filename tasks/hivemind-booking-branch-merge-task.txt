@@ -1,0 +1,85 @@
+TASK 103 - the booking-semantics work has never reached main, and that blocks task 80's eval gate.
+
+REPO: cogniziocompany/westhivecapital-hivemind. Workspace on CT110:
+/home/harness/work/westhivecapital-hivemind.
+
+## WHY THIS EXISTS
+
+Task 80 (hivemind booking eval gate) ran four rounds and then STOPPED AND ASKED rather than ship
+something dishonest. Its audit, and the overseer's independent verification, agree:
+
+    gh api repos/cogniziocompany/westhivecapital-hivemind/compare/main...406cfe4
+      -> status = ahead,  ahead_by = 83,  behind_by = 0
+
+`406cfe4` contains main PLUS 83 commits. It is **NOT an ancestor of main.** The three
+booking-semantics commits - `575e27b`, `a6ede47`, `406cfe4` - live only on
+`origin/docs/n8n-cloud-lan-reachability`.
+
+Task 80's audit of main's lineage found, repo-wide (excluding .git and .lh-harness):
+  - the three test function names appear NOWHERE
+  - `hive-mind/tests/test_api.py` has ZERO "booking" references and only 7 test functions
+    (health / evaluate / render / suppression)
+  - `hive-mind/tests/test_agent_prompts.py` DOES NOT EXIST
+  - `hive-mind/api/main.py` on origin/main has no booking logic
+
+So an eval case registered against those tests would point at something that does not exist on
+main and would **permanently red-line the gate**. Task 80 correctly refused. Commit `11c62b0` on
+its feature branch does exactly that and **must be abandoned, not fixed** - do not open a PR from
+it and do not cherry-pick from it.
+
+## WHAT THIS TASK IS
+
+Get the booking-semantics work onto `main`, or establish and state that it should not be.
+**Task 80 cannot be redone until this is settled**, so the answer matters more than the speed.
+
+1. **Characterise the 83 commits before proposing anything.** `main...406cfe4` is 83 ahead / 0
+   behind, so main is fully contained - this is not a divergence, it is unmerged work. But 83
+   commits on a branch named `docs/n8n-cloud-lan-reachability` is a branch that outgrew its name.
+   Report: how many are actually booking-semantics, how many are the n8n/LAN docs the branch was
+   named for, and how many are unrelated. **A single 83-commit merge and a narrow 3-commit
+   cherry-pick are very different risks and Paxton should be choosing between them, not
+   discovering afterwards.**
+
+2. **State what the three commits actually change** - `575e27b`, `a6ede47`, `406cfe4`. Files,
+   line counts, and whether they touch `hive-mind/api/main.py` runtime behaviour or only tests.
+
+3. **Recommend ONE path, with the reasoning:**
+     (a) merge the whole branch to main;
+     (b) cherry-pick only the booking-semantics commits onto a fresh main-based branch;
+     (c) leave it unmerged and instead narrow task 80's eval gate to behaviours that DO exist on
+         main today.
+   **(c) is a legitimate answer** - if the booking work is not meant to be on main, the eval gate
+   should not assert it, and saying so is better than merging code to satisfy a test.
+
+4. **Open the PR for whichever path you recommend, but DO NOT MERGE IT.** This one needs a human
+   read: it is 83 commits or a hand-picked subset of them into the trunk of a repo whose eval gate
+   depends on the outcome.
+
+## HARD RULES
+
+ - **Do NOT merge to main.** Open the PR and stop.
+ - **Do NOT reuse commit `11c62b0`** - it registers eval cases against tests that do not exist.
+ - **Do NOT invent or copy tests to make a gate pass.** That is the exact failure task 80 refused
+   to commit, and it is the reason this task exists.
+ - **Do NOT lower or loosen the eval gate** to accommodate missing tests.
+ - Branch from `origin/main`. Commit by EXPLICIT PATH; never `git add -A`; check
+   `git diff --stat` before opening the PR.
+ - Env NAMES only, never values.
+ - **DO NOT post an `@claude` comment.** (CORRECTED 2026-09-15, scheduled tick #183: this file used
+   to INSTRUCT posting one, on the premise that the reviewer was "BROKEN org-wide". That premise is
+   not something this run can rely on, and the ban does not depend on it - an `@claude` invocation
+   spends PAXTON'S PERSONAL SUBSCRIPTION. Task 117 bans it outright.) Open the PR, leave it
+   unreviewed, and say in your report that it needs a review.
+
+## DONE MEANS
+
+A written characterisation of the 83 commits split by purpose; what the three booking commits
+change; ONE recommended path with its reasoning and the rejected alternatives named; and an OPEN,
+UNMERGED PR implementing that path. Plus a one-line statement of what task 80 should do once this
+lands, so the dependency closes cleanly.
+
+## CREDIT
+
+The finding is task 80's run `20260909T225755Z_9244bcfc`, which audited it in round 3 and stopped
+to ask instead of shipping. The overseer verified `main...406cfe4` against GitHub independently
+before acting on it.

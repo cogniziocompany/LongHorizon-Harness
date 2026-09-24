@@ -1,0 +1,80 @@
+TASK 83 - WHY did the disks grow? Is the rate normal, or is something leaking?
+
+REPO: cogniziocompany/cognizioware-mcp-tools (this is where the ops/doctor and infra surfaces live).
+Workspace on CT110: /home/harness/work/cognizioware-mcp-tools.
+
+Paxton, 2026-09-09: investigate "why its space grew or typical". This is the FORENSIC question.
+It is NOT the capacity plan - that is task 75 (ptait07 root capacity), already queued ahead of this.
+**Do not duplicate task 75.** 75 answers "how much room should this box have"; 83 answers "what
+consumed the room, how fast, and is that rate expected".
+
+## WHAT PROMPTED IT - the numbers, so you are not starting from zero
+
+ptait07's root filesystem reached **90% full**, was grown, and now reads **50% (44G/94G)**. Nobody
+established what actually filled it. Current readings taken 2026-09-09 11:06 PT:
+
+| host / CT | used | size |
+|---|---|---|
+| CT202 (prod gateway) | 62% | 50G/80G |
+| CT204 (uat gateway) | 59% | 24G/40G |
+| CT210 (ci-runners, on ptait07) | 12% | 8.4G/79G |
+| CT110 (lh-harness) | 57% | 27G/50G |
+| ptait07 host | 50% | 44G/94G |
+| corsairai300 host | 10% | 9.9G/110G |
+
+CT202 at 62% matters most: **it silently reached 100% once, killed the prod LiteLLM router for about
+an hour and destroyed 23 harness runs, with nothing on any operator surface showing it.** So the
+question "is 62% stable or climbing" is the one with teeth.
+
+## SCOPE
+
+1. **Find what actually occupies the space.** On CT202, CT204, CT110 and the ptait07 host, produce a
+   ranked breakdown of the largest consumers (`du` on the real offenders, not a guess). Report the top
+   entries per host with sizes. Expect docker layers/volumes, logs, journal, build caches, model
+   blobs, old images. **Name them; do not summarise as "docker".**
+
+2. **Establish the RATE, not just the level.** A single reading cannot answer "is this typical" -
+   that is the whole question. Find historical evidence rather than sampling once:
+   - Does the ops doctor already record disk history anywhere? PR #119 (merged today) added a
+     `check_disk` function to `ops_doctor.py` and disk rows to the doctor's targets. **Read that
+     first** - if it already persists readings, use them and say so.
+   - Otherwise use what the filesystem itself remembers: file mtimes on the big directories, docker
+     image/volume creation timestamps, log rotation dates, journal disk usage over time.
+   - State a growth rate with units (GB/day or GB/week) and the window it was measured over. If the
+     evidence does not support a rate, **say that plainly rather than inventing one.**
+
+3. **Separate "normal" from "leaking".** For each large consumer, classify it: expected working set
+   (model blobs, current images), recoverable churn (old images, dangling volumes, build cache), or
+   an actual leak (something that grows without bound - a log with no rotation, a volume nothing
+   prunes, a container writing to its own filesystem). **A leak is the finding that matters**; a big
+   but bounded working set is not a problem.
+
+4. **If there is a leak, say exactly what to change** - the rotation policy, the prune job, the
+   volume, the setting. Propose it; do not apply it to any live host in this task.
+
+5. **Answer the operator-visibility gap.** CT202 hit 100% with nothing showing it. Given #119's
+   `check_disk` is now merged, state whether it would have caught this case - specifically whether
+   it covers CT202's root at the 80% threshold and whether its result renders on **ops.easybutt0n.ai
+   /overview** (the doctor's results render there - there is NO /doctor route; do not propose one).
+
+## HARD RULES
+
+ - **READ-ONLY on every live host.** No pruning, no deleting, no truncating logs, no `docker system
+   prune`, no restarting anything. This task produces a report and a proposal. Freeing space is a
+   separate, explicitly-approved action.
+ - Do NOT resize any filesystem or touch LVM/ZFS.
+ - **No host-level changes on any PVE host** - that needs Paxton's explicit go with a named change,
+   rollback and quiet window.
+ - Do not duplicate task 75, and do not create a new ops route or view - extend /overview if anything
+   is needed at all.
+ - Env NAMES only, never values. Commit by explicit path; never `git add -A`. Check `git diff --stat`
+   before opening the PR.
+ - PR to `main`, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR against main carrying a written finding that names the top space consumers per host with sizes, a
+growth rate with its measurement window (or an explicit statement that the evidence does not support
+one), each large consumer classified as working set / recoverable churn / leak, a concrete remediation
+proposal for anything classified as a leak, and a yes/no on whether the newly-merged `check_disk`
+would have caught CT202's 100% event before it took the router down.

@@ -1,0 +1,111 @@
+TASK 92 - the session bridge: a per-tick process for finding work other Claude sessions assume the overseer is doing, templated and surfaced on the web UX
+
+REPO: cogniziocompany/cognizioware-hydra (the ingest lives there). Cross-repo touches noted below.
+Workspace on CT110: /home/harness/work/cognizioware-hydra.
+
+## WHAT WENT WRONG - the concrete failure this exists to prevent
+
+2026-09-09: Paxton pasted a large, carefully-written implementation plan ("Copilot-funded AI PR review",
+now task 87). The overseer had ONLY its handoff header, and wrote into the task *"ask the overseer to
+retrieve the plan; do not invent the phases."*
+
+**The plan was sitting on disk the whole time**, in the session named IN that header:
+
+    C:\Users\PaxtonTait\.claude\projects\c--Users-PaxtonTait-source-cognizioware-mcp-tools\
+        1efc1e51-25f2-4269-846d-a528086b7066.jsonl        843,653 bytes
+
+Paxton: *"have you not been going back into each ptait09 session and retrieving the plan?"* and
+*"you have to go back at least one whole day, since this was assumed you were STILL doing it."*
+
+**That is the failure: another session produced work the overseer was assumed to be executing, and the
+overseer never went and looked.** Not once, across a whole day of five-minute ticks.
+
+**18 session transcripts were touched in the 30 hours to 2026-09-09 12:56** across cognizio-company,
+BMAD-cognizioware, cognizioware-powerplatform, cognizioware-mcp-tools, subagents and more. The overseer
+read exactly one of them - its own.
+
+## RULE 2 FIRST - MOST OF THE PIPE ALREADY EXISTS. DO NOT REBUILD IT.
+
+**`cognizioware-hydra/scripts/overseer-session-ingest.mjs` has been LIVE since 2026-09-05** (PRs #6,
+#7). It already:
+ - walks `~/.claude/projects/*/*.jsonl`,
+ - posts one memory per real user turn to **memory-mcp through the LiteLLM MCP gateway**,
+ - tags them tier/source `overseer`, session_id `<device>/<sessionId>`,
+ - runs every **5 minutes** as a Scheduled Task on PTAIT09
+   ("Cognizioware Hivemind Overseer Ingest", via `wscript.exe` + a VBS wrapper to stop the console
+   flashing), state in `~/.claude/hivemind-overseer-ingest-state.json`,
+ - authenticating with LiteLLM virtual key alias `overseer-ingest` (`mcp_access_groups: hive-mind`,
+   no models).
+
+**So the transcripts are ALREADY in hivemind memory. The missing half is that nothing ever READS them
+back.** The overseer has never once called `memory-recall` with `source: "overseer"` during a tick.
+
+**Build the read side and the process. Do not build a second ingest.**
+
+## SCOPE
+
+### 1. The per-tick process, written down
+Produce a short, concrete procedure the overseer runs **every tick**, cheap enough to actually run:
+ - **Recall step:** query memory-mcp (`memory-recall`, `source: "overseer"`) for turns since the last
+   tick, across ALL devices - not just this one.
+ - **Discovery step:** surface sessions active in the last N hours that the overseer has NOT already
+   accounted for, with their project/repo and last-activity time. **N must default to at least 24
+   hours** - the failure above happened inside a single day.
+ - **Triage step:** classify each as (a) a handoff/plan the overseer is expected to execute,
+   (b) informational, (c) already captured as a queued task. **Only (a) needs action.**
+ - **The rule that matters:** *if a plan names a session id or a scratchpad path, GO AND READ IT.*
+   Never ask a human to paste something that is on disk and addressable.
+
+### 2. Make it templated, not bespoke
+Paxton: *"templated based on the requests of your lh-harness templates."* The estate already has
+`tasks/TEMPLATE-overseer-hierarchy.md` in LongHorizon-Harness and a task-file convention every queued
+task follows. **Follow those conventions rather than inventing a new format**, so a handoff produced in
+ANY session lands in a shape the overseer can pick up mechanically. Define the minimum a handoff must
+carry to be executable: session id, working directory, repo, branch, status, scratchpad path, and an
+explicit statement of whether it has been executed.
+
+### 3. Surface it on the web UX - for everyone, not just the overseer
+Paxton: *"this should be instruction on the web UX for all."*
+ - **CHECK WHICH SURFACE FIRST.** Per RULE 2 there are exactly three and they do not overlap:
+   **fleet.easybutt0n.ai** = the wallboard for harness runs (run detail lives here and nowhere else);
+   **Hydra on corsairai300** = the device fleet and control plane, and the ONLY write surface;
+   **ops.easybutt0n.ai** = infrastructure health, seven routes, no new ones.
+   Session/handoff state is a **fleet/control-plane** concern, not infrastructure health. **State which
+   surface you chose and why. Do NOT add a new route to ops.**
+ - Show: active sessions by device, last activity, whether each has an unclaimed handoff, and the
+   instructions for writing one that the overseer will actually find.
+ - **Coordinate with task 90**, which extends `OverviewPage.tsx` with an expandable run -> round ->
+   session hierarchy. If session-bridge state belongs in that same view, say so and extend it rather
+   than adding a parallel panel.
+
+### 4. Close the device gap
+The ingest currently runs on **PTAIT09 only**. Memory records desk03 onboarding as *"pending fix - the
+repo's ps1 needs admin"*. **Fix or document that**, so a plan written on ptait-desk03 is discoverable
+too. desk03 is reachable via the ssh gateway (`ptait-desk03`, 192.168.21.144, user `svc-mcp`, cmd.exe
+default shell).
+
+## HARD RULES
+
+ - **Do NOT build a second ingest.** Extend `overseer-session-ingest.mjs` and read from memory-mcp.
+ - **Do NOT add a route to ops.easybutt0n.ai.** Pick an existing surface and extend it.
+ - Gateway rules that will otherwise cost you an hour: the MCP URL **must end in `/mcp/`** - the
+   gateway 307s `/mcp` and DROPS THE POST BODY; tool names are alias-prefixed
+   (`memory-remember_session`, `memory-recall`); memory-mcp's REST port (:3120 on CT202) is **not
+   reachable from PTAIT09**.
+ - **Transcripts contain everything a user typed, including secrets pasted in chat.** The recall/display
+   path must not surface credential-shaped content. If the ingest already stores such turns, say so as a
+   finding - **do not print an example.** Env NAMES only, everywhere.
+ - Scope keys by `mcp_access_groups`, never by server ID (IDs regenerate on config change and silently
+   turn an ID-scoped key deny-all).
+ - Do not change the PTAIT09 Scheduled Task's schedule or auth without saying so explicitly.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+ - PR to `main`, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR carrying: the per-tick procedure written down in the repo (recall -> discover -> triage, with the
+"if it names a session id, go read it" rule stated explicitly); a handoff template consistent with the
+existing lh-harness task conventions; the read-back path implemented against the EXISTING ingest; the
+instructions surfaced on the chosen web surface with a stated reason for choosing it; a verdict on the
+desk03 device gap; and an explicit note on how credential-shaped content in transcripts is kept off the
+display path.

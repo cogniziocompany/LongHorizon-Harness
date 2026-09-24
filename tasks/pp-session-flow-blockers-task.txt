@@ -1,0 +1,273 @@
+TASK 107 - PROD IS BLOCKING PAYING USERS. A new user cannot complete the session happy path at all.
+
+*** TOP PRIORITY, set by Paxton 2026-09-09: "top priority since it affects the single revenue
+generating live system, power platform." ***
+
+REPO: cogniziocompany/cognizioware-powerplatform. Workspace on CT110:
+/home/harness/work/cognizioware-powerplatform-c (ALREADY on develop - confirm before starting).
+
+================================================================================
+READ THIS FIRST OR YOU WILL CONCLUDE THE PLAN IS WRONG
+================================================================================
+
+**BASE BRANCH IS `origin/develop`, NOT main, NOT the branch you find checked out.**
+
+    git fetch origin && git switch -c fix/setup-wizard-prod origin/develop
+
+origin/develop @ 44208fb ("Merge PR #103 fix/prod-pin-and-billing-errors", 2026-09-09).
+
+A previous audit read a stale tree and concluded "the wizard does not exist" and "brownfield appears
+in zero lines of executable code". **Both are FALSE.** That audit was on a branch 128 commits behind.
+If you grep and find nothing, you are on the wrong branch - re-check before reporting an absence.
+
+**AND: powerplatform PROD IS SERVED FROM `develop`-DERIVED IMAGES.** Landing on develop is how this
+ships. Do NOT merge to main - main is 142 behind and separately held. Do NOT open a PR against main.
+
+This task comes from a full diagnostic handoff written by another session
+(`C:\Users\PaxtonTait\.claude\plans\publisher-cognizio-cgz-eager-gadget.md`, 704 lines). The overseer
+has read it. The file/line references below are FROM that handoff and were established against
+origin/develop - but **verify each one before you edit it**; the handoff itself flags which parts are
+confirmed and which are inference.
+
+================================================================================
+SCOPE - THREE ITEMS. THE OTHER FOUR ARE SEPARATE TASKS. DO NOT DO THEM.
+================================================================================
+
+This task is ONLY the chain that stops a user completing the happy path.
+  - Publisher card copy -> task 108. Do not touch SolutionStep copy.
+  - Admin probe fixes  -> task 108. Do not touch admin.routes.ts.
+  - E2E coverage + CI  -> task 109. Do not write new specs here.
+If you find yourself in those files, stop and re-read this section.
+
+--------------------------------------------------------------------------------
+ITEM A (CONFIRMED, BLOCKING, DO FIRST) - "Next - Requirements" is a silent no-op
+--------------------------------------------------------------------------------
+
+ROOT CAUSE - a route param name mismatch:
+
+  App.tsx:32          route pattern is  '/sessions/:id/setup'
+  SessionWizard.tsx:43  reads  useParams<{ envId?: string; sessionId?: string }>()
+
+React Router supplies **`id`**, so `envId` AND `sessionId` are both `undefined`. Then:
+
+  SessionWizard.tsx:115-116
+      async function persistStep(nextStep, patch) {
+        if (!token || !envId) return;    <- returns. no fetch, no setStep, no setError.
+
+The click does literally nothing. No request, no state change, no error banner. That matches the
+reported symptom exactly.
+
+**BEFORE YOU FIX IT, CONFIRM IT.** Open the page, DevTools -> Network, click Next.
+  ZERO requests  -> this bug, proceed.
+  ANY 4xx/5xx    -> something else. STOP and re-diagnose. Do not apply this fix blind.
+(The `static.cloudflareinsights.com` ERR_NAME_NOT_RESOLVED in console is UNRELATED - a Cloudflare edge
+beacon, not from this repo. Ignore it.)
+
+REPRODUCTION - deterministic and ENVIRONMENT-INDEPENDENT (confirmed by the reporter):
+
+  023aab18-5fa6-418c-a997-b3ab53529bff (trms99)  Cogniziodemo      Next is a no-op
+  70e438e4-1567-41ef-9725-0e8b4659514f (trms98)  Cogniziodemo      blank workspace, step 0
+  c28b0c27-d513-45bf-b561-ae0046aa128a           powerplatform-uat same failure
+  0ec72d7f-ad2a-4817-b220-6e6da7e70f97           Cogniziodemo      "Untitled Session", PO Failed
+
+It reproduces on a FRESH session in a DIFFERENT environment. **So it is NOT caused by Item C (the
+refresh lock).** Fixing the lock will not fix this. Do not conflate them.
+
+COLLATERAL FROM THE SAME TWO UNDEFINED VARS - fix these in the same change:
+  - SessionWizard.tsx:51  `useState(sessionId ?? null)` -> null, so the resume effect (71-95)
+    short-circuits and the wizard renders BLANK instead of saved setup.
+  - SessionWizard.tsx:182 passes `envId={envId!}` (non-null assertion over undefined) into
+    SolutionStep, which then calls `/api/environments/undefined/solutions`.
+  - SolutionStep.tsx:45-53 `.catch(() => setSolutions([]))` swallows that into
+    "No unmanaged solutions found." (:190) instead of an error. **This is why the brownfield path is
+    currently unreachable even by hand.**
+  - SolutionStep.tsx:107 `canNext = ... && (check?.available ?? true)` - when the check FAILS,
+    `check` is null and `?? true` makes the button ENABLED over a broken state.
+
+THE FIX:
+  1. SessionWizard.tsx:43 -> `const { envId, id: sessionId } = useParams<{envId?: string; id?: string}>();`
+     This restores resume but NOT envId - the /sessions/:id/setup route genuinely does not carry it.
+  2. Derive envId from the LOADED SESSION. The resume effect (71-95) already fetches it; take the
+     environment id off that response, hold it in state, pass THAT to SolutionStep instead of `envId!`.
+  3. Relax :116 to `if (!token) return;` and guard the CREATE branch (:123-136) separately on
+     "no session id yet" + defined envId. **WITHOUT THIS SPLIT a defined envId with a null
+     sessionIdLocal will POST A DUPLICATE NEW SESSION instead of PATCHing the existing one.** That
+     would be worse than the bug.
+  4. SolutionStep.tsx:107 - drop the `?? true` fallback or surface the failure.
+  5. SolutionStep.tsx:53 and :75 - make the swallowed catches set a rendered error state.
+  6. SessionWizard.handleCancel (:163-175) has try/finally with NO catch - a failed DELETE rejects
+     unhandled and never navigates. Add the catch while you are in the file.
+
+The error-banner machinery (SessionWizard.tsx:233-247) is already correct and wired. The bug is only
+that control never reaches it. Do not rebuild it.
+
+BACKEND NEEDS NO CHANGE. Listed for tracing only: session.routes.ts:388-437, environment.routes.ts:208-209,
+solutions.routes.ts:11-24.
+
+--------------------------------------------------------------------------------
+ITEM B (UNVERIFIED - VERIFY FIRST) - blank workspace, "Untitled Session", failed pipeline
+--------------------------------------------------------------------------------
+
+**The handoff explicitly marks this section as INFERENCE, not established. Its code trace was
+CANCELLED before completing. Verify every point against origin/develop before implementing. Do not
+treat these line numbers as confirmed the way Item A's are.**
+
+The proposed causal chain (plausible, unproven): persistStep early-returns -> the setup PATCH never
+fires -> the session keeps its default name and never receives requirements -> "Untitled Session" and
+step 0 -> something starts the pipeline anyway -> Product Owner has no requirements and fails
+instantly -> the failure reason is never surfaced, so the pane still says "Waiting for result...".
+
+DO, IN ORDER:
+  1. Inventory the WHOLE `/sessions/*` route family in App.tsx - at minimum `/sessions/:id`,
+     `/sessions/:id/setup`, `/sessions/:id/workspace`, `/sessions/:id/flow`. For each, compare the
+     declared param name against what the component destructures. Item A's fix is confirmed only for
+     the wizard; the same mismatch plausibly breaks the siblings and would explain the blank
+     workspace. **Fix them as ONE change and add a guard so the class cannot recur** - a typed
+     route-param helper, or `id` used consistently across every `/sessions/:id/*` pattern.
+  2. `grep "Untitled Session"`. Establish which column holds the real name and whether it is ONLY
+     written by PATCH /api/sessions/:id/setup. If so, Item A already fixes the naming symptom and
+     needs no separate change - say so rather than inventing one.
+  3. Find the pipeline-start trigger and check for a completeness guard. **A pipeline must not be
+     startable on a session at setup_step = 0 / gate `discovery_started` with no requirements. If no
+     such guard exists that is an INDEPENDENT DEFECT** - Item A would only make it rarer. Add it.
+  4. Surface stage failure reasons. A Failed stage currently renders "Waiting for result...". Find
+     where the reason is stored and render it. Until then, DOCUMENT the query an operator can run to
+     retrieve the real Product Owner error for the four sessions above.
+  5. Resolve the Resume Pipeline / Confirm / Steer / Stop / Let Run enabled conditions and how a
+     failed stage is retried. Reported disabled - confirm whether that is correct for a failed
+     session or another casualty of the undefined params.
+
+--------------------------------------------------------------------------------
+ITEM C - the Environments "Refresh" button is permanently wedged
+--------------------------------------------------------------------------------
+
+Rows say "Never refreshed - refresh before starting a session", and Refresh returns:
+"A refresh is already running for this environment. Please contact Cognizioware support..."
+
+TWO INDEPENDENT DEFECTS COMPOUND. A durable DB lock nothing can release, plus a frontend that never
+refetches while it is held - so the row keeps saying "Never refreshed" with the button ENABLED,
+guaranteeing the user re-clicks into the same 500 forever.
+
+C1 - BACKEND, a permanent lock (environment-refresh.service.ts):
+  - :244-246 guard throws when refresh_state === 'running'.
+  - **NO `finally`** - the lock is released only on the happy path (:252-271). The catch itself does
+    two DB writes; if either throws, the rejection is unhandled inside a bare setImmediate and the row
+    stays 'running' FOREVER.
+  - **The executor is in-process `setImmediate`** (:203-211, :253). The LOCK is durable (DB) but the
+    EXECUTOR is only in RAM. Any restart, deploy, OOM-kill or crash between setRefreshToken (:109-125,
+    called :250) and the terminal updateRefreshState wedges the environment permanently. Nothing binds
+    the lock to the owning instance. **This is the likely production trigger.**
+  - **No TTL, no reaper.** refresh_started_at is written (:120) and read (:84) but never compared
+    against NOW() anywhere in the tree.
+  - **No fetch timeouts.** fetchJson (:127-140) makes 4+ unbounded fetches to Dataverse (:155-158,
+    :188) with no AbortSignal - a hung Dataverse call holds the lock indefinitely.
+  - The check-then-set is **NOT ATOMIC**: SELECT :226-231, if :244, separate UPDATE :250, no
+    transaction, no FOR UPDATE. Two concurrent clicks can both pass.
+
+  FIX - one statement gets atomicity AND stale-lock expiry, with no separate reaper:
+      UPDATE ... SET refresh_state='running' ...
+       WHERE id=$1 AND user_email=$2
+         AND (refresh_state <> 'running' OR refresh_started_at < NOW() - INTERVAL '<ttl>')
+      -- treat "0 rows updated" as the conflict
+  Plus: wrap the scheduled work in try/catch/finally so the terminal state write happens on EVERY
+  path, and make the catch itself failure-tolerant (a throw in logRefreshIncident must not skip the
+  state write). Add AbortSignal.timeout(...) to fetchJson, sized UNDER the lock TTL.
+
+  **TTL is a judgement call - it must exceed the slowest legitimate refresh.** 15 minutes is the value
+  in the unblock SQL. Validate against real refresh durations before hardcoding; state what you chose
+  and why.
+
+C2 - BACKEND, the conflict is misclassified as a 500:
+  AppError('E901') is the INTERNAL error code - cgz-codes.ts E901 block ~:127 is httpStatus 500,
+  machineName 'internal_error', fixText "Please contact Cognizioware support and include the incident
+  number." That fixText is verbatim the banner's second line. **A routine concurrency conflict is
+  reported as a 500 with a logged incident, and the user is told to contact support for something that
+  should self-resolve.**
+  FIX: add a dedicated 409 conflict code (e.g. refresh_in_progress) with actionable fixText. No such
+  code exists today. Reserve E901 for genuine internal errors.
+
+C3 - FRONTEND, never refetches while the lock is held (EnvironmentList.tsx):
+  - button disabled={isRunning || isInactive || env.is_production}, isRunning from
+    env.refresh_state==='running' (:389, button :452-467)
+  - refreshEnvironment (:261-274) POSTs then only setPollingEnvId - it NEVER optimistically sets local
+    refresh_state='running'
+  - the 2s poll (:195-217) calls loadData() ONLY once status.refreshState !== 'running'
+  FIX: set refresh_state='running' locally on a successful POST (disables the button immediately), and
+  have the poll update the row's displayed state on EVERY tick, not only on completion.
+
+C4 - **MEASURED 2026-09-09 19:58 PT BY THE OVERSEER - NO LOCK IS CURRENTLY STUCK. DO NOT GO LOOKING
+FOR ONE.** Read directly from the prod database (read-only):
+
+    refresh_state counts:  done 2 | idle 8 | running 0
+    Cogniziodemo (demo/eval)  started 02:38:23.826Z  ended 02:38:24.993Z  -> 1.2s, no error
+    powerplatform-uat         started 02:27:04.581Z  ended 02:27:08.140Z  -> 3.6s, no error
+
+**Refresh WORKS and completes in seconds.** So the defects in C1-C3 are LATENT, not currently firing.
+That does not make them less real - a durable DB lock with an in-RAM executor, no `finally`, no TTL and
+a non-atomic check-then-set WILL wedge again on the next restart mid-refresh. **Fix the mechanism.
+Do not try to reproduce a live wedge; you will not find one, and you must NOT create one.**
+
+**DO NOT run any SQL against production, read or write.** The overseer has already taken the readings
+you need and they are above.
+Optionally ship a small admin endpoint/script for it - say so if you do.
+
+C5 - **The "these environments have never refreshed" premise in the source handoff is now ANSWERED and
+was a red herring.** Environments are scoped PER USER (`WHERE id=$1 AND user_email=$2`), and the prod
+table holds SEPARATE ROWS PER ACCOUNT for the same `environment_url`:
+
+    https://cogniziodemo.crm.dynamics.com   3 rows / 3 users   states: done, idle
+    https://orgff9dcfec.crm.dynamics.com    2 rows / 2 users   states: done, idle
+    https://org9130dfc5.crm.dynamics.com    2 rows / 2 users   states: idle
+
+**One account's row refreshed successfully today; the other account's row for the SAME environment has
+never refreshed and therefore renders "Never refreshed".** The reporter was signed in as the second
+account. So that symptom is an identity/visibility question, not a refresh failure.
+
+**Worth investigating as its own question - state a finding, do not silently "fix" it:** is per-user
+duplication of an environment intended, or should an environment be shared with per-user access? Do
+NOT merge or delete any environment row. Report what you find.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **Base off origin/develop. Do NOT merge to main.** Prod runs develop-derived images.
+ - Confirm Item A's zero-requests symptom in the browser BEFORE applying its fix.
+ - Item B is UNVERIFIED - verify against source before implementing, and say plainly which parts you
+   confirmed and which you could not.
+ - Do NOT run SQL against production. Do NOT restart prod services.
+ - Do NOT touch `prod.env`. It contains cleartext secrets; the overseer has that flagged separately.
+   **Never print, echo or commit any value from it.**
+ - Do not touch admin.routes.ts (task 108) or write E2E specs (task 109).
+ - Do NOT change the publisher identity logic. `cgz`/`cgzpublisher` is hardcoded in many backend
+   places and `publisher_prefix VARCHAR(10) DEFAULT 'cgz'` already exists in migration 037 unused by
+   the frontend. That is a separate project - note it, do not start it.
+ - Never `git add -A`; commit by explicit path and check `git diff --stat` before finishing.
+ - Run the existing suites and keep them green: packages/backend/tests/environment-refresh.test.ts,
+   env-to-session.test.ts; `npm run test -w packages/frontend`, `-w packages/backend`.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A branch off origin/develop with:
+  - Item A fixed, with the create/patch branch split done correctly (a PATCH on resume, NOT a
+    duplicate POST) and the swallowed catches surfacing errors;
+  - Item B's route-family inventory completed, with the pipeline-start guard added if absent, and an
+    explicit statement of what you verified vs what you could not;
+  - Item C's atomic acquire + TTL, the try/catch/finally, fetch timeouts, the 409 code, and the
+    frontend refetch;
+  - a regression test for the core lock bug: inject a scheduler that throws (startEnvironmentRefresh
+    takes a `schedule` option, environment-refresh.service.ts:203-211) and assert the row does NOT
+    stay 'running'. **That is the missing `finally` coverage and it is the single most valuable test
+    in this task.**
+  - existing suites green.
+
+**If you can only finish Item A, that is still a good outcome - it is the blocker.** Say what is done
+and what is not. Do not half-do Item C: a partial lock change is worse than none.

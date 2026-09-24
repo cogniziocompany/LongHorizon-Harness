@@ -1,0 +1,47 @@
+# TASK 209 — telnyx-mcp image build fails on `npm ci`: no lockfile is tracked
+
+## The defect, measured 2026-09-18 13:42 PT by SCHEDULED TICK #701 (not inferred)
+`infrastructure/docker/telnyx-mcp/Dockerfile` runs `npm ci` twice (line 14, and line 41 as
+`npm ci --only=production`). `npm ci` REQUIRES a `package-lock.json`. That lockfile is NOT tracked
+in the repo — `git check-ignore -v` resolves it to `infrastructure/.gitignore:50: package-lock.json`,
+which ignores the lockfile for every service. The Dockerfile's `COPY package*.json ./` therefore
+copies only `package.json`, and the build dies:
+
+    npm error code EUSAGE
+    npm error The `npm ci` command can only install with an existing package-lock.json
+
+Reproduced from a clean clone of the PR head with the lockfile absent: `NPM_CI_EXIT=1`.
+This is the same failure tick #665 recorded on CT202 PROD ("Both builds failed (telnyx-mcp npm ci)").
+
+## Scope: telnyx-mcp ONLY — enumerated, not sampled
+All 17 Dockerfiles changed by PR #174 were checked for (`RUN npm ci` AND no tracked lockfile):
+- **telnyx-mcp — the only failure.**
+- `ops-status-mcp` and `qa-run-mcp` also run `npm ci` but DO track a lockfile → fine.
+- The other 14 do not use `npm ci` → unaffected.
+
+## PRE-EXISTING ON MAIN — do not blame PR #174
+`main`'s copy of that Dockerfile already contains both `npm ci` lines; #174's only change to it is an
+appended `COPY otel-logger.mjs` line. The defect is latent on main because nothing rebuilds the image.
+It becomes ACTIVE the moment any PR changes that Dockerfile, because the deploy lane then rebuilds it.
+**This is what currently blocks merging PR #174** (task 191), which changes 17 Dockerfiles.
+
+## What to do
+Pick ONE and justify it in the PR body:
+(a) Commit `infrastructure/docker/telnyx-mcp/package-lock.json` and narrow `infrastructure/.gitignore:50`
+    so service lockfiles are tracked. Truest to `npm ci`'s reproducible-install intent. PREFERRED.
+(b) Change the two `npm ci` invocations to `npm install` / `npm install --omit=dev`. Smaller diff,
+    but gives up reproducible installs and diverges from ops-status-mcp / qa-run-mcp.
+
+Then PROVE it: from a clean clone, `docker build` the telnyx-mcp image (or at minimum run the exact
+install command the Dockerfile runs, with no pre-existing `node_modules` and no generated lockfile)
+and quote the exit line. A bare `npm install` locally is NOT evidence — it silently generates the very
+lockfile whose absence is the bug, which is how this tick nearly missed it.
+
+Check whether `ops-status-mcp`/`qa-run-mcp`'s tracked lockfiles are currently ignored-but-committed;
+if so, say so rather than "fixing" them.
+
+## Boundaries
+- Touch ONLY the telnyx-mcp build inputs and, for option (a), the one `.gitignore` line. This is not
+  an OTLP task and not a compose task.
+- **Do NOT touch `infrastructure/litellm-config.yaml`** — any edit force-recreates the CT202 prod router.
+- Open the PR and STOP. Do not merge; merging is the overseer's.

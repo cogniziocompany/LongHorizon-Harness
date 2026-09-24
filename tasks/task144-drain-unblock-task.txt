@@ -1,0 +1,201 @@
+TASK 147 - UNBLOCK TASK 144: MAKE the zero-active-run window instead of waiting for it.
+
+*** OVERSEER-EXECUTED. NOT FOR A HARNESS RUN. IT LIVES IN queue/blocked/ DELIBERATELY. ***
+A harness run must never edit the launcher that launches it, and task 144 needs the LiteLLM master
+key and prod credentials. A harness run is NEVER given credentials.
+
+Source: expert session [aab86b] (aab86b14-ca82-4acd-ae20-0e68a85b1a6d), plan-mode diagnosis, relayed
+by Paxton 2026-09-10 19:30 PT. The diagnosis is CORRECT and is adopted in full. Three corrections
+measured by the overseer at 19:28-19:35 are folded in, and CORRECTION 1 changes STEP B materially.
+
+================================================================================
+THE DIAGNOSIS - adopted from [aab86b]
+================================================================================
+Task 144 (queue/blocked/1002-144-quiet-window-merge-repack.json) needs ACTIVE=0, because both of its
+steps restart or reload the CT202 router and every harness run sends its model traffic through it.
+
+**THE WINDOW WILL NEVER ARRIVE ON ITS OWN.** The overseer recorded exactly that at LEDGER tick 05:41
+("a zero-active-runs window will NEVER occur on its own") and then went back to waiting for one from
+18:02 onward. launch_queue.py loops every 900 s and refills slots up to CAP from the queued tasks.
+**There is no pause, no drain, no hold switch** - searched: no PAUSE, no flag file, no hold check.
+It refilled underneath the overseer at 18:33 (ACTIVE 1->3) and again at 19:10.
+
+**The overseer's own 19:09 advisory-gate fix makes this harder, and that is NOT an argument against
+the fix.** Removing the doctor's false quota veto lifts the launcher out of DEGRADED_CAP=2 toward
+CAP=6. Measured at 19:25: zero HOLDs and THREE launches in one cycle, where 19:03 held 14 tasks at
+cap 2. More throughput is the point; it also means drifting into ACTIVE=0 is now essentially nil.
+
+144 is not blocked by a fault. It is blocked by a guard waiting on a state the system never reaches.
+**The fix is to drain ON PURPOSE.**
+
+================================================================================
+*** CORRECTION 1 - "LET THE RUNS DRAIN NATURALLY" WILL NOT WORK. READ BEFORE STEP B. ***
+================================================================================
+Measured 19:28 via /api/runs, full status histogram, nothing filtered out:
+
+    running           3     b9cfaaa8, e0de06b4, 4fd07c9c   (launched 19:25)
+    waiting_approval  3     07d6f078 (task 69b), c1298aa3 (task 111), bb12da51 (task 125)
+    incomplete        2     8e37d647 (from 2026-08-30), and `valtest-64k`
+    ----------------------
+    NON-TERMINAL      8
+
+**Tasks 111, 125 and 69b are NOT running and will NEVER finish on their own. They are PARKED AT
+APPROVAL GATES.** A drain switch stops NEW launches; it does nothing for a run waiting on a human.
+Setting the flag and walking away would hold at ACTIVE=3 indefinitely.
+
+  STEP B IS THEREFORE TWO ACTIONS: set the drain flag AND resolve the three open gates.
+  Resolving gates is STEP 2 of the standing goal and is auto-approved. It is the overseer's own job
+  and it is the thing that actually frees capacity.
+
+**THE APPROVAL IDS, read from the run snapshots at 19:35 - but RE-READ THEM, do not reuse these:**
+
+    run 20260911T003241Z_bb12da51  task 125   approval 034c6111f79e  pending  extra_rounds=False
+    run 20260911T003242Z_c1298aa3  task 111   approval 517d1d813b94  pending  extra_rounds=True
+    run 20260911T021035Z_07d6f078  task 69b   approval e3c9e0e3ee9e  pending  extra_rounds=False
+
+**READER TRAP, COST ONE WRONG CONCLUSION TODAY:** `GET /api/runs/<id>/approvals` returns **HTTP 404**
+- that route does not exist. Reading it returned an empty list and the overseer briefly concluded
+there were no approvals to resolve. **The approvals are in the run SNAPSHOT**, at `approvals[]` with
+`approval_id` and `status`. Resolution is still run-scoped:
+    POST /api/runs/<run_id>/approvals/<approval_id>/resolve
+Re-read the list every time - a run can carry several rows, and reusing a stale id returns
+"approval is missing, resolved, or read-only". Keep resolve notes ASCII.
+
+**READ WHAT EACH RUN ACTUALLY PRODUCED BEFORE RESOLVING IT.** Task 111's final_response opens:
+"All three flows are now validated... **BMAD did not run as a spec generator in this environment.**
+The skill sources are absent, its manifests point at directories that don't exist..." That is a
+substantive result that needs reading in full and recording, not a rubber stamp. The other two
+returned an EMPTY final_response in the snapshot summary - find out why before resolving either.
+
+**ALSO DECIDE what to do about the two `incomplete` runs** (8e37d647 from 2026-08-30, `valtest-64k`).
+They look like stale rows nothing will ever clear. If 144's precondition is written as
+"non-terminal == 0" they block it permanently; as "running + waiting_approval == 0" they do not.
+**State which definition you used and why. Do not silently pick the convenient one.**
+
+================================================================================
+*** CORRECTION 2 - THE RESTART IS THE STEP THAT ACTUALLY DEPLOYS. ***
+================================================================================
+[aab86b] flags this and is right. At 19:09 the launcher was found running code from 15:15 while the
+file on disk had been edited at 18:52. **Python reads its source at interpreter start, so a file edit
+is inert until restart.** Four hours of behaviour were attributed to a patch that never loaded.
+After Step A, prove the NEW process runs the NEW code by reading a log line only the new code emits.
+
+================================================================================
+*** CORRECTION 3 - A LIVENESS PROBE THAT RETURNS EMPTY IS NOT A DEATH. ***
+================================================================================
+A watcher written at 19:11 reported "LAUNCHER DIED" while PID 5288 was alive and healthy: its
+PowerShell `.Count` probe returned an empty string and the script treated empty as zero. If you write
+any watcher for the drain, **use log growth as the liveness signal**, and never let an unparseable
+probe result mean "dead".
+
+================================================================================
+STEP A - ADD THE DRAIN SWITCH (launcher edit)
+================================================================================
+In C:/tmp/launch_queue.py, at the top of the main loop, AFTER the active() call and AFTER the status
+print - so the log keeps emitting active= counts during the drain, which is how you watch for zero:
+
+    if os.path.exists("C:/tmp/queue/DRAIN"):
+        print(now,f"  DRAIN flag set - launching nothing (active={n}); remove C:/tmp/queue/DRAIN to resume",flush=True)
+        time.sleep(900); continue
+
+  * The flag MUST NOT match the task glob. Read the actual glob in the file before choosing the path;
+    a flag the launcher parses as a task would be a self-inflicted outage.
+  * LAUNCHER-EDIT DISCIPLINE - LEDGER tick 19:15, all of it:
+      - back up first: launch_queue.py.bak-<HHMM>-drain
+      - CRLF ONLY. Verify with python bytes.count: CRLF == totalLF, bareLF == 0, bareCR == 0.
+        **Appending a CRLF onto a line that already ends in CR produces CR CR LF** - that exact bug
+        was made and caught at 19:12. Check for it explicitly; ast.parse will NOT catch it.
+      - ast.parse must pass
+      - EXACTLY ONE launcher process afterwards, counted by command line, not `ps | grep python`
+      - launch_queue.log APPENDED, not truncated. Redirect with >> . A negative byte delta means the
+        17h-frozen-log fault has recurred.
+      - restart in the minutes just AFTER a poll, never mid-cycle
+
+================================================================================
+STEP B - START THE DRAIN *AND* CLEAR THE PARKED GATES
+================================================================================
+ 1. Create the empty flag file.
+ 2. **Next cycle, read the log line `DRAIN flag set ... active=N`. ONLY THAT LINE CONFIRMS IT.**
+    The file existing proves nothing - the running process must have seen it (Correction 2).
+ 3. Resolve the three gates above, after reading what each run produced.
+ 4. **DO NOT KILL RUNS.** Cancelling a productive run to manufacture a window is Paxton's call.
+    Ask; never decide it alone.
+
+================================================================================
+STEP C - CONFIRM ZERO, THEN EXECUTE 144 VERBATIM
+================================================================================
+ * GET /api/runs and COUNT, by the definition you stated in Correction 1. **COUNT, DO NOT INFER.**
+   The overseer got this wrong twice today: once by reasoning from whichever task it was watching,
+   and once by using a status filter that omitted `waiting_approval`, reporting ACTIVE=3 when it
+   was 6.
+ * No mcp-tools lane, promotion or QA gate in flight:
+   gh run list -R cogniziocompany/cognizioware-mcp-tools --status in_progress
+ * The launcher will not refill while the flag is set - confirm the poll gap anyway.
+ * Then follow 1002-144-quiet-window-merge-repack.json VERBATIM. **It is authoritative. This task
+   does not restate or override its steps or its refusals.** MERGE FIRST, THEN REPACK - a deploy
+   restarting containers mid-repack hits the one moment a repack must not be interrupted.
+ * If the window closes before the repack: STOP AFTER THE MERGE. A partial merge is fine; a partial
+   repack is not.
+
+================================================================================
+STEP D - RESUME
+================================================================================
+Delete the flag. **HERD RISK:** the RECOVERY RAMP only fires after a Synthetic outage, so it will NOT
+throttle this resume - expect up to CAP launches in one cycle. Either accept that deliberately, or
+add a one-launch ramp on flag removal. Say which you chose.
+
+================================================================================
+DONE MEANS
+================================================================================
+The drain flag works (proved by the log line, not the file); the three parked gates are resolved with
+what each run produced recorded; a COUNTED ACTIVE=0 was reached; PR #140 is merged with every lane
+job read INDIVIDUALLY (a green rollup can contain a hard-failing test) and the router proved live by
+/health/liveliness plus one real completion with a UNIQUE prompt (a cached 200 hides a dead backend -
+NEVER the bare gateway /health); pg_total_relation_size of the quoted LiteLLM_SpendLogs table
+measurably dropped from ~26 GB (the pg_repack exit code does NOT count); the flag is removed and
+launches resumed; and every step is in the LEDGER with the evidence IN the row.
+
+================================================================================
+*** DECISION RECORDED 2026-09-10 19:45 PT — THE ACTIVE=0 DEFINITION IS SETTLED. ***
+The open question above ("state which definition you used and why") is now ANSWERED with evidence.
+Do not re-derive it.
+================================================================================
+USE:  ACTIVE = count(status == running) + count(status == waiting_approval) == 0
+NOT:  ACTIVE = count(non-terminal) == 0
+
+WHY - both `incomplete` rows were read at 19:44 and they are DEAD ROWS, not work:
+
+    id         20260830T004759Z_8e37d647   and   valtest-64k
+    task       "In the current directory create a file named harness-validation-test.txt
+                containing the single line VALIDATION"
+    workspace  None          branch  None          round  None      abort_reason  None
+    updated    1788054520  = 12.0 DAYS AGO (both, within 6 milliseconds of each other)
+    CT110      no live process matches either id; no run dirs for them
+
+They are throwaway harness-validation smoke tests from 2026-08-30 that were never reaped. **Nothing
+will ever clear them**, so a `non-terminal == 0` precondition would block task 144 PERMANENTLY on two
+rows that represent no work and hold no resources. They route no model traffic through CT202, which
+is the only thing the precondition exists to protect.
+
+SEPARATELY WORTH DOING (not part of this task, do not scope-creep into it): these rows should be
+reaped so they stop distorting every future ACTIVE count. Queue it if you touch it.
+
+================================================================================
+*** PAXTON 2026-09-10 21:55 PT: THE DRAIN NOW SERVES **TWO** TASKS, AND 69b IS NO LONGER A GATE. ***
+================================================================================
+This drain is a COMBINED window for task 144 **and** task 151 (LiteLLM v1.100.1 + #38998 backport).
+Both require `running + waiting_approval == 0`. **Draining twice costs twice the lost run time for
+no benefit**, so do not schedule them separately.
+
+ORDER, once the count is a COUNTED zero:
+    #140 merge  ->  hydra #26 merge  ->  task 151 upgrade  ->  RE-MEASURE CT202 disk  ->  pg_repack
+**pg_repack is LAST and is the droppable step.** Every earlier step restarts the CT202 router, and a
+restart during a repack interrupts the table swap at the one moment that is unsafe. The 151 image
+pull also CONSUMES disk, and the margin was already only ~8 G - so measure free space AFTER the pull
+and refuse to start the repack if it is short. Skipping the repack leaves dead space; half-running it
+leaves a broken table.
+
+**STEP B CHANGES: 69b IS NO LONGER A BLOCKER.** It was resolved at 20:55 with an explicit fallback
+(if its CI checkout fails, its three checkpoints skip with a stated reason), and **its CI result does
+not touch CT202**. It mattered here only because a parked run counts as active - which the drain
+handles by answering its gate, not by waiting on its outcome.

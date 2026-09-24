@@ -1,0 +1,71 @@
+WIRE + TEST (cognizioware-qa): the guest purchase journey acceptance suite is merged and complete, and NOTHING RUNS
+IT. Finish the half that makes it a gate. Work ONLY in the cognizioware-qa workspace on branch
+`feat/guest-journey-gate-target` (run `git fetch origin && git checkout -B feat/guest-journey-gate-target
+origin/master` first); plain git; commit by EXPLICIT PATH; no push; NO writes to any live system; env NAMES only.
+
+## WHY THIS EXISTS - AND WHY IT IS NOT A REBUILD
+Harness run `20260909T050014Z_3499e546` delivered the suite: **18 files, +4206**, merged to `master` as
+**`a94c7746`** (PR #25) - `guest-purchase-acceptance/` with the journey test, a marker-scoped teardown helper, a
+fail-closed guard and 47/47 hermetic unit tests. That work is GOOD and it is DONE. **DO NOT REBUILD ANY OF IT.**
+Read it first. If you find yourself writing a test for the guest journey, stop - you are duplicating.
+What is missing is one thing, verified on master 2026-09-10: `guest-purchase-acceptance` appears in **ZERO**
+workflow files, and the gate's allowed-target list is `["litellm","billing","ce","chat-tier1","chat-tier2",
+"hydra","web-ux"]` - no guest target. So the suite is code sitting on master that no pipeline can invoke. A test
+nobody runs is not a gate; it is a file.
+
+## WHAT TO DO
+Add the guest journey as a gate target, following EXACTLY the pattern the existing targets already use in
+`.github/workflows/qa-gate.yml` and `qa-run.yml` - read `litellm` and `billing` first and copy their shape rather
+than inventing one. Concretely: extend the allowed-target validation, add the job with its own `concurrency` group
+and `defaults.run.working-directory`, run the suite, produce a gate report through the same
+`scripts/gate-report.mjs` path the others use, and upload the same artifact shape.
+
+## THE JUDGEMENT THIS TASK TURNS ON - DECIDE IT AND SAY WHY
+This suite touches **Stripe** and a real purchase journey. Say plainly in the report which mode it runs in and how
+that is enforced. The suite already ships a fail-closed guard that REFUSES a live-mode key - that guard is the
+most important thing in this PR and it must remain reachable from the wired path, not bypassed by the workflow.
+ - It must be **test-mode only**, and the workflow must not be able to pass a live key even by mistake.
+ - Decide whether this target belongs on **every deploy** or on an explicit dispatch only. A journey test that
+   creates Stripe objects on every deploy is not free. Recommend one, give the reason, and default to the SAFER
+   choice if you are unsure.
+ - The teardown is marker-scoped. State what happens when the suite fails **midway** and teardown does not run:
+   does the next run clean up, or does residue accumulate? If residue accumulates, that is a defect to report.
+
+## HARD RULES
+No real credentials anywhere - the existing fixtures are deliberately named `..._not_a_real_key_...` and that
+convention stays. No writes to any live system; do not run the journey against a live Stripe account from this
+task. Do not lower any threshold and do not delete or skip an existing check to make a pipeline green. Explicit-path
+commits; no push.
+Completion = commits, diff stat, which files you READ before writing, the workflow diff, the mode decision with its
+reason, the dispatch-vs-every-deploy recommendation with its reason, and the answer to the mid-failure teardown
+question. Auditor: read-only - verify NOTHING from PR #25 was rebuilt or modified without cause, that the
+fail-closed guard is still reachable from the wired path, that no live-mode credential can flow in from the
+workflow, and that no existing check was weakened to make the target pass.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.
+
+
+## EXTENDED 2026-09-10 04:40 - A SECOND SUITE NEEDS THE SAME WIRING. DO BOTH IN ONE PASS.
+This task now covers TWO suites, because they need the identical change to the identical files and splitting them
+would mean two runs editing `qa-gate.yml` and `qa-run.yml` in parallel - a guaranteed collision.
+**Suite 2: the fleet-window UX gate.** Merged to `master` as **`9e9295e7`** (PR #26): `fleet-window.ts` (25617
+bytes) and `fleet-window.test.mjs` (16776 bytes) under `packages/runner/src/flows/`. Verified on master
+2026-09-10: **`fleet-window` appears in ZERO workflow files** - same gap as the guest suite.
+What it contains, so you do not rediscover it: **FW-HEALTH**, **FW-OVERVIEW**, and **FW-AGREE** - a cross-plane
+agreement check that reads the harness API directly (env NAMES `LH_HARNESS_WEB_URL`, `LH_HARNESS_WEB_TOKEN`,
+GET-only) and fails when the harness reports non-terminal runs while the window shows zero nodes and zero active
+runs, naming BOTH numbers in the cause. It passes on a genuinely idle fleet. Four fixtures cover both directions.
+Tests: `npm run test:flows` 29 pass / 0 fail; fleet-window 17/17.
+**Wire it the same way as the guest target and as the existing `litellm`/`billing` targets** - extend the
+allowed-target validation, add the job with its own concurrency group and working-directory, report through the
+same `scripts/gate-report.mjs` path, upload the same artifact shape.
+**JUDGEMENT CALLS FOR THIS ONE - decide and say why:**
+ - FW-AGREE reads the LIVE harness API. State how the base URL and token reach the job **by env name**, and
+   confirm no token value can end up in a log or an artifact.
+ - It is READ-ONLY (GET only). Confirm the wired path cannot become a write path.
+ - Decide whether it belongs on every deploy or on dispatch. Unlike the guest suite it creates nothing and costs
+   almost nothing, so every-deploy is defensible here - but say which you chose and why.
+ - **FW-PRODUCER (freshness) was deliberately cut from PR #26 and is NOT part of this task either.** Do not add it.
+**Report both wirings separately** so each can be judged on its own: what changed, the mode/dispatch decision, and
+the safety reasoning. If wiring one of the two turns out to be unsafe, wire the other and say so - a partial,
+explained result beats a bundled one that hides a problem.

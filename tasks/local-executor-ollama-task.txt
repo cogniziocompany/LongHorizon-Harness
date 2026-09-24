@@ -1,0 +1,410 @@
+TASK 95 - seat the harness EXECUTOR on a local long-context Ollama backend, so Synthetic
+carries only manager + auditor.
+
+REPO: cogniziocompany/LongHorizon-Harness (role wiring) + cogniziocompany/cognizioware-mcp-tools
+(router alias). Workspaces on CT110: /home/harness/work/LongHorizon-Harness,
+/home/harness/work/cognizioware-mcp-tools.
+
+Source: plan written by session `longhorizon-harness-58` (ref de5356), relayed by Paxton
+2026-09-09. Contact that session with
+SendMessage({to: "longhorizon-harness-58", message: "..."}) - address by NAME, never by a UUID.
+A session's scratchpad-directory UUID is NOT its session id; that mistake already sent two
+messages to the wrong peers.
+
+================================================================================
+STOP GATE 0 - THIS TASK IS DEPENDENT. DO NOT START UNTIL BOTH ARE TRUE.
+================================================================================
+
+Paxton, 2026-09-09: "make sure its behind the dependant upgrades we need for lhharness."
+
+Before touching ANY host, container, router or config, verify and state:
+
+  (a) TASK 94 (history caps) has MERGED and is DEPLOYED on CT110. Check that
+      `role_history_chars` / `role_verified_context_chars` / `auditor_output_chars` are
+      overridable in the INSTALLED lh_harness, not just in a branch. Reading a merged PR
+      is NOT proof it is deployed - deploying lh-harness restarts CT110 and is gated on
+      zero active runs, so a merged PR can sit undeployed for a long time.
+
+  (b) Branch `perf/role-context-caps` (commit 92806f2, LongHorizon-Harness) has landed.
+      It is behaviour-neutral by design - it makes the three caps configurable with
+      today's values preserved.
+
+WHY THIS ORDER IS NOT NEGOTIABLE. Measured executor prompts on 2026-09-09 (real calls,
+sub-1k probes excluded):
+
+    nemotron-3-super (executor)   p50 58,446   p90 133,060   max 222,019   44.9% over 64k
+
+p90 already exceeds a 128K window. Until the caps come down, a 128K local executor
+truncates on more than 10% of calls, and a 256K one runs near its ceiling. Seating the
+executor locally BEFORE the context work lands buys a truncation bug, not capacity.
+
+If (a) or (b) is not satisfied: STOP, report which one, and do nothing else.
+
+================================================================================
+RETRACTION YOU MUST CARRY - do not build on the withdrawn figure
+================================================================================
+
+An earlier handoff (C:/tmp/HANDOFF-trajectory-prompt-composition.md) claimed a
+"~33k byte-identical fixed prefix, ~60% of volume, prefix-cacheable". THAT CLAIM IS
+WITHDRAWN by the session that made it, and independently disproved. Manager percentiles
+(glm-5.2, 09-09, calls >= 1000 tokens, 796 calls):
+
+    floor 2,994   p25 12,354   p50 28,954   p90 80,405   max 149,043
+
+A floor of 2,994 makes a 33k constant impossible - it was a MEAN of a right-skewed
+distribution read as a floor. Consequence: task 91 (prefix caching) is demoted; task 94
+(history caps) is the real lever. If you read the old handoff, read this paragraph first.
+
+================================================================================
+CONTEXT - why this work exists
+================================================================================
+
+Synthetic's weekly credit was exhausted on 2026-09-09; the monthly manual reset is SPENT
+until ~2026-10-09. Measured on CT202 SpendLogs: the lh-harness key put 11,885 requests /
+643M prompt tokens through in 18 hours - more than the 625.9M/7-days that exhausts the
+weekly credit. The binding constraint was REQUEST RATE: 1,000-1,400 req/hr sustained
+against a 500/hr cap (2500 per 5h), peaking at 1,409 = 2.8x.
+
+The executor is ~80% of all requests (51-63 calls/round vs 1 for the manager, 9-19 for the
+auditor). Moving ONLY the executor off Synthetic removes most of the request pressure.
+
+GOAL: predictable daily velocity with CAP=1-2 on Synthetic, instead of credit-exhaustion
+cycles.
+
+================================================================================
+PART A - fix KV over-reservation (blocks everything else)
+================================================================================
+
+Ollama reserves KV as num_ctx x OLLAMA_NUM_PARALLEL. A 131,072 request at NUM_PARALLEL=6
+reserves 786,432 tokens of KV - about 58 GB even at q8_0. Every backend is currently
+mis-sized for long context regardless of which model is chosen.
+
+SCOPE: the two RTX 3090s on ptait01 ONLY. No other GPU or host is in scope.
+
+--------------------------------------------------------------------------------
+MEASURED STATE - the overseer re-verified this read-only on 2026-09-09, AFTER the plan
+was written. TWO OF THE PLAN'S FACTS CHANGED. Re-measure again before acting.
+--------------------------------------------------------------------------------
+
+  service         port    cards           ctx     PARALLEL  KV    FA   loaded
+  ollama-span     11442   both, SPREAD=1  65536   2         q8_0  yes  qwen3.8:27b
+                                                                       20.6 GB, ctx 65536
+  ollama-gpu1     11441   3090 #1         16384   8         f16   no   EMPTY
+  ollama-cloud    11438   3090 #0         16384   8         f16   no   *** NOT EMPTY ***
+                                                                       nomic-embed-text,
+                                                                       mxbai-embed-large,
+                                                                       nomic-embed-text-v2-moe
+
+*** CORRECTION 1 - THE PLAN IS WRONG ABOUT :11438. *** The plan states both idle services
+hold nothing (models: []) and that "configuring them takes nothing away". That is FALSE
+for ollama-cloud :11438, which is serving THREE EMBEDDING MODELS. Dropping its
+NUM_PARALLEL from 8 to 1 would cut embedding concurrency EIGHT-FOLD for whatever consumes
+them (memory-mcp / hivemind ingest are the likely consumers - CONFIRM before touching it).
+
+  => Do :11441 (gpu1) FIRST - it is genuinely empty and takes nothing away.
+  => Before touching :11438, identify its consumers and state the concurrency impact.
+     If embeddings are load-bearing, the second local executor instance may not be free.
+     Say so plainly rather than degrading the embedding path silently.
+
+*** CORRECTION 2 - the model name is settled. *** The plan hedged between "qwen3.6" and
+"qwen3.8:27b". Measured: span holds qwen3.8:27b, 20.6 GB, context_length 65536,
+size_vram == size. The audit was right. Still read /api/ps immediately before acting.
+
+Also noted (not in scope, but the plan's inventory is incomplete): the router serves
+`qwen3.5:27b` from `http://192.168.21.151:11440` - that is **corsairai300**, a DIFFERENT HOST
+carrying a FOURTH Ollama service the plan does not list. Do not assume the three ptait01
+services above are the whole Ollama estate, and do not assume freeing ptait01 VRAM is the only
+local capacity question.
+
+--------------------------------------------------------------------------------
+ACTION - add, do not modify
+--------------------------------------------------------------------------------
+
+  service              action
+  ollama-gpu1  :11441  NUM_PARALLEL 8 -> 1, CONTEXT_LENGTH 16384 -> 262144,
+                       add KV_CACHE_TYPE=q8_0, add FLASH_ATTENTION=1
+  ollama-cloud :11438  SAME - but ONLY after the embedding-consumer check above
+  ollama-span  :11442  keep_alive ONLY. No other change.
+
+FLASH_ATTENTION=1 is REQUIRED because q8_0 KV depends on it; neither idle service has
+either set today. NUM_PARALLEL 8 -> 1 is what makes long context possible at all: at 8, a
+262144 request reserves 2,097,152 tokens of KV and cannot fit on any card at any
+quantization.
+
+--------------------------------------------------------------------------------
+THE ONLY CHANGE TO ANYTHING CURRENTLY WORKING
+--------------------------------------------------------------------------------
+
+Shrink the long-lived 27B's keep_alive: 30m -> about 60s. ONE VALUE.
+
+PREFER the per-request form (keep_alive: "60s" on the calls that load the model) over
+editing OLLAMA_KEEP_ALIVE on the service - the per-request form needs no restart of a
+service that is currently working and serving.
+
+Nothing else about span changes: it keeps both cards, SCHED_SPREAD=1, NUM_PARALLEL=2,
+CONTEXT_LENGTH=65536, q8_0, flash attention, and the model stays where it is. span is not
+retired, not moved, not consolidated onto one card, not restarted for any other reason.
+
+WHY: models are demand-loaded and release VRAM once idle. At 30m the 27B holds ~20.5 GB for
+half an hour after its last request, so a second model must squeeze into ~11.5 GB and the
+fit is marginal and order-dependent. At ~60s the cards free almost immediately and the two
+workloads stop colliding.
+
+TRADE-OFF, stated so it is a choice: a 20.6 GB model reloads in tens of seconds. A ~60s
+keep_alive means intermittent 27B use pays a reload each time; tight bursts pay nothing. If
+reload latency hurts, raise it to 2 min - the knob stays available.
+
+Live VRAM measurement 2026-09-09:
+    Card 0: 24576 MiB total, 11284 used, 12852 free
+    Card 1: 24576 MiB total, 12554 used, 11582 free
+
+================================================================================
+PART B - model selection
+================================================================================
+
+Requirement ranking for the executor seat: TOOL CALLING > CONTEXT WINDOW > VISION. The
+executor issues 51-63 tool calls per round; a model that cannot reliably emit tool calls is
+unusable here no matter how good its window.
+
+  model              ctx    vision       disk       agentic evidence
+  ornith-1.5:35b     256K   undocumented 23 GB      Terminal-Bench 2.1 67.8, ClawEval 72.5,
+   (35B-A3B)                             (Q4 21.7)  BrowseComp 67.6; beats Qwen3.6-35B,
+                                                    Gemma 4-31B, Muse-Glimmer-30B on agentic
+                                                    coding. MIT. MoE 36B total / ~3B active
+  qwen3-vl:8b        256K   YES          6.1 GB     Apache 2.0; text perf reportedly matches
+                     (1M YaRN)                      Qwen3-235B-A22B-2507. No agentic score
+  granite4.2:8b      128K   no           5.3 GB     hybrid Mamba-2 9:1, >70% long-context RAM
+                                                    cut; IBM-tuned for function calling
+  ornith-1.5:9b      256K   contradicted 6.6 GB     FAILED an independent agentic test - below
+  qwen3.8:27b        256K   yes          18 GB      already deployed on span (dense 27.8B)
+
+READ THE ORNITH BENCHMARKS CAREFULLY - THE VARIANT MATTERS ENORMOUSLY. Every headline
+number on ornith.ai/ornith_1_5.html (Terminal Bench 86.1, DeepSWE 56, MCP-Atlas 80,
+Toolathlon 71.2, vs Claude Opus 4.8 at 85.0) is for the 397B MoE - 242 GB, irrelevant here.
+The 9B dense is a DIFFERENT MODEL, and independent local testing had it burn ~43,000 tokens
+over 7 minutes failing an EC2 provisioning task - repeated CLI typos, could not properly
+invoke shell tools, finally hallucinating Chinese text instead of a command - while the MoE
+variant executed the same test cleanly.
+
+DECISION (the plan's, carried faithfully): ornith-1.5:9b is PRIMARY, because 256K is the
+requirement. The 35B-A3B has the better agentic score but at 21.7 GB of weights cannot hold
+a real 256K window on these cards without crowding everything else.
+
+Why the 9B fits: only 8 of its 32 layers keep a KV cache; the other 24 hold a fixed
+recurrent state. Estimated ~32 KiB/token:
+
+  config                            weights  256K KV(est)  total    fits
+  ornith-1.5:9b @ 256K, q8_0 KV     6.6 GB   ~4.3 GB       ~11 GB   one 3090, large headroom
+  ornith-1.5:9b @ 256K, f16 KV      6.6 GB   ~8.6 GB       ~15 GB   one 3090, comfortable
+  ornith-1.5:35b @ 256K, q8_0       21.7 GB  ~5-8 GB       ~27-30   both cards, no headroom
+
+The 9B fits on a SINGLE 3090 at full 256K even without KV quantization - so each card can
+host its own instance: TWO concurrent local executors instead of one. That RAISES cap
+rather than merely relieving token pressure. (But see CORRECTION 1: the second instance
+depends on :11438 being free to reconfigure.)
+
+These KV numbers come from a SECONDARY SOURCE ("8 of 32 layers"), not from the model config.
+MEASURE THEM AT VERIFICATION STEP 2 BEFORE COMMITTING TO 256K.
+
+THE RISK WE ARE ACCEPTING, AND HOW IT IS BOUNDED. Independent testing of this exact 9B had
+it fail agentic tool use outright. The published Ornith agentic numbers describe the 397B.
+There are no published long-context benchmarks for ANY variant. So both tool-calling
+ability and 256K retrieval quality are UNVALIDATED here. That is a legitimate bet given the
+VRAM win, but it must FAIL FAST - see Gate 1.
+
+VISION IS UNPROVEN. No Ornith HF card or the official technical report mentions vision,
+despite Ollama's "Text, Image" label. If GUI/visual work matters, seat gui_executor on
+qwen3-vl:8b (6.1 GB, documented vision, 256K, Apache 2.0) - cli.py:78-92 treats
+cli_executor and gui_executor as separate roles, so this needs no code change.
+
+================================================================================
+PART C - wiring the local executor (NO harness code change)
+================================================================================
+
+Per-role MODEL is fully supported; per-role ENDPOINT is not. cli.py:1811-1812 passes one
+global args.api_key / args.base_url into every role adapter, and supervisor/service.py
+lines 124-126 hard-reject any role key outside {agent, model, reasoning_effort, mcp_profile}.
+
+So the no-code path is: register the Ollama model as another deployment/alias on the SAME
+LiteLLM router, then set roles.executor.model to that alias.
+
+ROUTER REGISTRATION (CT202) - required, and the step most likely to be fumbled. Add ONE
+alias backed by both Ollama instances as two deployments, so LiteLLM load-balances across
+the cards and the harness sees a single model name:
+
+  alias          e.g. ornith-1.5:9b-256k   (one name, two deployments)
+  deployment A   http://192.168.21.110:11438   (3090 #0, ollama-cloud)
+  deployment B   http://192.168.21.110:11441   (3090 #1, ollama-gpu1)
+  route prefix   custom_openai/  - openai/ BREAKS /v1/messages, which is what Claude Code
+                 speaks. See memory `litellm-route-prefix-mapping`.
+  access         MUST be in the lh-harness key's allowed model list, or runs get 403.
+
+THREE KNOWN TRAPS ON THIS ROUTER, ALL PREVIOUSLY HIT:
+  1. openai/ vs custom_openai/ - the wrong prefix fails ONLY on /v1/messages, so it looks
+     fine in a chat test and breaks only under the harness.
+  2. An alias can SILENTLY SERVE A DIFFERENT MODEL than its name implies - verify by asking
+     the served model to identify itself, not by trusting the alias.
+  3. Editing the LiteLLM yaml FORCE-RECREATES CT202's prod router even for comment-only
+     changes (the deploy job hashes the DEPLOYED file's content, not the git diff).
+     SCHEDULE THIS into a window with no active runs; do not slip it in mid-run.
+
+Then seat the role, per tasks/TEMPLATE-litellm-qwen-local.md lines 53-60:
+
+  "roles": {
+    "manager":  {"agent": "claude_code", "model": "<synthetic alias>"},
+    "executor": {"agent": "claude_code", "model": "<new local alias>"},
+    "auditor":  {"agent": "claude_code", "model": "<synthetic alias>"} }
+
+Pointing the executor at a RAW Ollama endpoint would need a --<role>-base-url /
+--<role>-api-key pair threaded through 5 sites (_ROLE_OPTIONS parsing, a
+_resolve_role_option-style resolver honouring the "do not cross an agent boundary" rule,
+build_role_agent -> _build_agent, config.py role-key allowlist, supervisor/service.py
+validator + command builder). Raw Ollama also does not speak the Anthropic /v1/messages
+shape Claude Code needs (docs/handoffs/local-executor-and-cloud-capacity-handoff-2026-09-06.md
+line 13), so the LiteLLM alias route is the functionally correct one regardless.
+DO NOT take the code path.
+
+KNOWN LOCAL-EXECUTOR HAZARDS TO CARRY OVER (2026-09-06 handoff + TEMPLATE-litellm-qwen-local.md):
+  - --strict-mcp-config is REQUIRED. MCP tool inventories blow out the window and produce
+    hallucinated tool lists. (The gateway exposes 973 tools / 737,226 bytes, about 184k tokens.)
+  - MAX_THINKING_TOKENS=0 works around thinking-block failures.
+  - The 300s auditor/manager timeout default is too small for local models - raise it via
+    the existing --auditor-timeout / --manager-timeout flags.
+
+================================================================================
+PART D - how this joins the token work already in flight
+================================================================================
+
+92806f2 on perf/role-context-caps makes the three context-injection ceilings configurable
+(--role-history-chars, --role-verified-context-chars, --auditor-output-chars), wired through
+run_default so project config works too. Values deliberately unchanged; behaviour-neutral.
+Lowering them is a separate EVIDENCED change (task 94), because truncation is a CORRECTNESS
+risk: drop an auditor's rejection reason and the manager repeats the mistake.
+
+The auditor-report injection is the real compressible term. role_prompts.py lines 678-705
+read the flattened string item.auditor_report and inject the assigned subtask (<=1,600 chars)
+plus _clip_preserve(report, 5000) of raw prose per round - about 1,650 tokens/round until it
+hits the 100,000-char ceiling. Meanwhile AuditReport (types.py lines 75-88) ALREADY CARRIES
+exactly the fields that must stay verbatim: status, missing, blockers, integrity_status,
+contract_audit_status, plus pre-compacted state_summary / action_guidance. The harness
+computes the compact memory and then DISCARDS it. Replacing the prose blob with the
+structured fields plus retrieval-on-demand is about 10 lines/round instead of about 1,650 -
+roughly a 16x cut on the dominant term. Only `supersedes` is missing from the schema.
+
+Lowering the executor's prompt size that way is what makes a 128K local executor viable. If
+the 256K option holds up, it is still worth doing for cost but stops being a blocker.
+
+================================================================================
+VERIFICATION - each of these is pass/fail, not an observation
+================================================================================
+
+0. CONFIRM ptait01 IS HEALTHY BEFORE ANYTHING. It stopped answering SSH during read-only
+   checks on 2026-09-09 (three attempts; ptait07 answered normally on the same gateway, so
+   it was host-specific). Host RAM is 42 Gi with ~6.6 Gi free and ZERO SWAP - see memory
+   `ptait01-host-ram-oom`. Do not start until it is reachable and `free` looks sane.
+
+1. EMBEDDING-CONSUMER CHECK (new, from CORRECTION 1). Identify what calls :11438's three
+   embedding models and state the impact of NUM_PARALLEL 8 -> 1. If load-bearing, do gpu1
+   only and report that the two-instance plan is reduced to one.
+
+2. KV SIZING - do this first among the GPU steps; it validates the whole model choice. With
+   NUM_PARALLEL=1, KV_CACHE_TYPE=q8_0 and FLASH_ATTENTION=1 set on :11441, load
+   ornith-1.5:9b at num_ctx=262144 and confirm via /api/ps that it reports the full
+   context_length AND that size_vram == size. If size_vram < size, part of it went to CPU
+   and IT DID NOT FIT. Compare actual nvidia-smi usage against the ~11 GB estimate.
+
+3. REGRESSION TEST ON THE 27B - the one that protects working state. The risk is not that
+   ornith fails to load; it is that ornith is resident when the 27B next needs its ~20.6 GB
+   and the 27B SILENTLY SPILLS TO CPU. Force that case deliberately:
+     a. Record span's baseline: /api/ps -> size, size_vram, context_length.
+        (Baseline as of 2026-09-09: qwen3.8:27b, 20.6 GB, size_vram == size, ctx 65536.)
+     b. Let the 27B expire (watch expires_at), then load ornith at 256K.
+     c. Drive a request at span :11442 to force the 27B to reload.
+     d. Confirm size_vram == size AND context_length unchanged from (a).
+   If size_vram drops below size, the 27B has spilled to CPU - REJECT THE CONFIG, reduce
+   ornith's num_ctx or weight quantization, and repeat. PASS/FAIL GATE. The tuned Qwen setup
+   is not ours to degrade.
+
+4. ROUTER REACHABILITY - before involving the harness, confirm the new alias answers on
+   /v1/messages (NOT just /v1/chat/completions) through the lh-harness key, and that the
+   model identifies ITSELF correctly rather than an alias silently serving something else.
+
+5. GATE 1 - TOOL-CALLING SMOKE TEST. Before any real run: drive 20-30 tool calls through the
+   executor seat on a throwaway task and measure malformed-call rate. This is the documented
+   failure mode for this exact model and it surfaces within minutes - CLI typos, unusable
+   shell invocations, non-English hallucination.
+   NAMED FALLBACK IF GATE 1 FAILS: ornith-1.5:35b @ 128K (agentic score is real, context
+   halves), or granite4.2:8b @ 128K (hybrid Mamba-2, IBM-tuned for function calling).
+   Do NOT continue to a real run on a model that failed Gate 1.
+
+6. PREFIX/KV REUSE - confirm sequential executor calls reuse the KV prefix. Without it,
+   re-prefilling a 100k+ context on every one of 63 calls makes round times explode. GO/NO-GO
+   for local viability, and easy to miss because it just looks like "the model is slow".
+
+7. 256K RETRIEVAL QUALITY - Ornith publishes no long-context benchmarks, so confirm the
+   window is USABLE, not merely allocatable: needle-in-haystack probes at 128K and 256K. A
+   model that accepts 256K but cannot retrieve from it is WORSE than one that refuses.
+
+8. BAKE-OFF - queue an lh-harness run per candidate on the SAME task, executor seat only,
+   manager/auditor unchanged on Synthetic. Compare tool-call success rate, rounds-to-
+   completion, auditor pass rate, wall-clock per round.
+
+9. CONTEXT FIT - from /api/runs/{run_id}/rounds/{n}/trajectory/executor on CT110, compute
+   peak assembled context per round and confirm it stays inside the window. Round 4 of
+   reference run 20260909T181244Z_9d20e133 peaked at ~101k; p90 across the day was 133,060 -
+   inside 256K, nowhere near inside 128K. (In that run, rounds 1 and 4 have all three roles;
+   rounds 2-3 are manager-only and 404 on executor/auditor - that means "role did not run",
+   NOT "endpoint broken".)
+
+10. RATE RELIEF - re-run the hourly SpendLogs breakdown and confirm Synthetic req/hr drops to
+    roughly manager+auditor only (~60-67 req/hr per run) versus today's 278-367.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - STOP GATE 0 above is binding. Do not start until task 94 is MERGED AND DEPLOYED.
+ - ALL changes here are OLLAMA CONTAINER-ENV level. NO host-level changes to ptait01 - that
+   needs Paxton's explicit go naming the change + rollback + quiet window. See memory
+   `no-host-level-changes-ptait01`. A swap-on-zvol change previously hung the host and took
+   out pihole DNS.
+ - DO NOT STAGE LARGE PULLS ON ptait01. Host RAM is 42 Gi total / ~6.6 Gi available with
+   ZERO SWAP - the exact oversubscription that previously OOM-killed the qwen span. Pulling
+   6.6 GB is far safer than 21.7 GB, but stage it deliberately and watch `free`.
+ - The 27B on span is WORKING, TUNED AND OFF-LIMITS except for the one keep_alive value.
+   Its NUM_PARALLEL=2 is deliberate tuning, not a defect to fix.
+ - A live run OWNS its branch and its backend. Do not recreate a service a run is currently
+   using. Check active runs on CT110 before any container restart.
+ - Editing infrastructure/litellm-config.yaml FORCE-RECREATES the prod router. Flag it
+   prominently in the PR body and merge in a window with no active runs.
+ - NEVER give a harness run credentials. Env NAMES only, never values - in the PR, the task
+   file, any doc, and any commit.
+ - Do not trigger a Synthetic quota reset - it is SPENT until ~2026-10-09.
+ - sonar-pro on the router is load-balanced across two deployments and one is missing
+   PERPLEXITY_API_KEY with no fallback group - use `sonar-pro:perplexity` until fixed.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening a PR.
+ - PR to `main`, DO NOT MERGE.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+STOP GATE 0 evidenced as satisfied (task 94 merged AND deployed, read back from the
+INSTALLED lh_harness on CT110, not from a PR page); the embedding-consumer impact of
+:11438 stated; :11441 (and :11438 if cleared) reconfigured and MEASURED per verification 2;
+the 27B regression gate (3) passed with before/after size_vram == size; the router alias
+answering on /v1/messages under the lh-harness key with the model identifying itself;
+Gate 1 tool-calling smoke test passed OR the named fallback taken and said so; prefix/KV
+reuse confirmed; 256K retrieval probed at 128K and 256K; a bake-off comparing candidates on
+one task; and a measured Synthetic req/hr drop to manager+auditor only.
+
+If any gate fails, the correct outcome is a REPORT SAYING WHICH AND WHY - not a partial
+rollout. A degraded 27B or a truncating executor is worse than staying on Synthetic.
+
+================================================================================
+CREDIT
+================================================================================
+
+Plan by session `longhorizon-harness-58` (ref de5356). The 33k-prefix retraction is that
+session's own. Corrections 1 and 2 (:11438 is NOT idle; span holds qwen3.8:27b) are the
+overseer's, measured read-only against ptait01 on 2026-09-09 after the plan was written.

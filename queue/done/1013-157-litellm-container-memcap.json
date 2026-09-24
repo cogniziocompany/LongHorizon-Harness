@@ -1,0 +1,8 @@
+{
+  "name": "1013-157-litellm-container-memcap",
+  "task_file": "C:/tmp/litellm-container-memcap-task.txt",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 1,
+  "trio": "kimi",
+  "note": "*** CLOSED VERIFIED 2026-09-11 11:36 PT by the overseer (audit [fe2679] item B2). *** PR #143 (6 GiB mem_limit on litellm-router) MERGED and APPLIED LIVE with zero downtime. Read from the running container today: 'cognizioware-mcp-tools-litellm 1.3GiB / 6GiB'. Containment proven over 40/40 surface samples across two OOM kills; litellm 0 restarts in 8+ h. || PRIOR NOTE: *** OVERSEER 2026-09-11 00:45 PT: STEP 1 DONE - PR #143 IS OPEN (https://github.com/cogniziocompany/cognizioware-mcp-tools/pull/143), branch fix/litellm-container-memcap @ f90a101, 1 file +12/-0, MERGEABLE/CLEAN, litellm-config.yaml NOT touched. NEXT STEP IS PAXTON'S: post the @claude comment (task 117 bans overseer invocations). Then the overseer reads the verdict and merges at ACTIVE RUNS = 0. *"
+}

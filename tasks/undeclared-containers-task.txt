@@ -1,0 +1,74 @@
+TASK 85 - undeclared containers on CT202 break every deploy. Reconcile the running stack with compose.
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools.
+
+## WHAT HAPPENED - this already cost a failed production deploy
+
+`stripe-mcp` had been running on CT202 since **2026-07-17T07:05:36Z** with **no compose labels** - it was
+created by hand and `docker compose` did not own it. Nothing declared it in `docker-compose.yml`.
+
+PR #113 (merged 2026-09-09) added that declaration. The very next production deploy then failed:
+
+    Container cognizioware-mcp-tools-stripe-mcp
+    Error response from daemon: Conflict. The container name
+    "/cognizioware-mcp-tools-stripe-mcp" is already in use by container "c37a3af3bc04..."
+    ::error::compose up failed
+
+**Deploy to CT202 failed, and Post-deploy Smoke Test + QA Verify (prod) were SKIPPED as a result.**
+The LiteLLM config had already been applied and verified live before the failure, so the failure was
+partial - which is its own hazard: a red deploy that had already changed production.
+
+**Interim action already taken by the overseer** (do not redo, but do verify the end state): the orphan
+was **renamed** to `cognizioware-mcp-tools-stripe-mcp-orphan-20260909` and **stopped** - deliberately
+reversible (`docker start` + `docker rename` restores it), image `cognizioware-stripe-mcp:latest`
+retained. The deploy was then re-run.
+
+## SCOPE
+
+1. **Confirm the end state of stripe-mcp.** Is there now a compose-OWNED `cognizioware-mcp-tools-stripe-mcp`
+   (i.e. carrying `com.docker.compose.*` labels), running and healthy, built from
+   `infrastructure/docker/stripe-mcp`? Report its labels as the evidence. If it is healthy and owned,
+   say explicitly that the renamed orphan is safe to delete - **but do not delete it in this task.**
+
+2. **ENUMERATE the general problem. This is the real deliverable.** stripe-mcp is unlikely to be the only
+   one. For **every** container on CT202 **and CT204**, report whether it carries
+   `com.docker.compose.project` labels and whether a matching service exists in the deployed
+   `docker-compose.yml`. Produce a table with three groups:
+   - **compose-owned and declared** (fine),
+   - **running but NOT declared** (a future deploy failure, exactly like stripe-mcp),
+   - **declared but not running** (a silent gap).
+   **Counts, not adjectives.** One sample does not characterise the estate - enumerate all of them.
+
+3. **For each undeclared container, say what it is and what should happen** - declare it in compose,
+   retire it, or leave it deliberately unmanaged with a written reason. Do not blanket-declare things
+   you have not identified; an unidentified container declared into compose is a worse outcome than one
+   left alone.
+
+4. **Make this class of failure impossible to ship silently.** The deploy discovered it at the worst
+   possible moment - mid-production-deploy, after production had already been changed. Add a check that
+   detects a name collision **before** `compose up` runs, and fails with a message naming the container.
+   PR #119 merged an ops-doctor `check_disk` pattern today; **follow that pattern** and surface the
+   result on **ops.easybutt0n.ai /overview** where the doctor renders. **Do NOT add a route** - RULE 2.
+
+## HARD RULES
+
+ - **Do NOT delete the renamed orphan** `cognizioware-mcp-tools-stripe-mcp-orphan-20260909` in this
+   task. It is the rollback. Recommend its removal; leave the removal to an operator.
+ - Read-only enumeration on live hosts. No `docker rm`, no `docker system prune`, no
+   `docker compose down`, and **never `docker compose down -v`**.
+ - **Never `docker compose up` for mcp-tools without `--env-file mcp-tools.env`.**
+ - Any change to `infrastructure/litellm-config.yaml` force-recreates the PROD router. Avoid it here; if
+   unavoidable, flag it prominently in the PR body so the merge is scheduled into a quiet window.
+ - Env NAMES only, never values. `stripe-mcp` handles payment keys - do not print, log, or commit any
+   Stripe key, and do not enable live writes.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+ - PR to `main`, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR against main carrying: the verified end state of stripe-mcp with its compose labels as evidence; a
+complete enumerated table of every container on CT202 and CT204 in the three groups above with counts; a
+stated disposition for each undeclared container; and a pre-flight collision check following
+`ops_doctor.py`'s existing pattern that renders on /overview, so the next undeclared container is caught
+before a production deploy is already half-applied.

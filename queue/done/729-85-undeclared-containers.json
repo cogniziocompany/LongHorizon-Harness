@@ -1,0 +1,15 @@
+{
+  "name": "729-85-undeclared-containers",
+  "task_file": "C:/tmp/undeclared-containers-task.txt",
+  "workspace": "cognizioware-mcp-tools-b",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "stripe-mcp orphan (created 2026-07-17, no compose labels) failed the prod deploy on 2026-09-09 after #113 declared it. Overseer renamed+stopped it as -orphan-20260909 (reversible) and re-ran. DO NOT delete the orphan - it is the rollback. Real deliverable is the full CT202+CT204 enumeration + a pre-flight collision check. || *** BLOCKED ON TASK 136 — 2026-09-16 08:55 PT, SCHEDULED TICK #283. NOT a plain stranding; do NOT requeue yet. Cause read from run 20260910T021652Z_87fc7c08's failure_reason, not inferred: `No fallback model group found for original model_group=kimi-k3:synthetic-anthropic` (429 from Synthetic with no fallback to land on). Died at round 4/8. This is ONE cause shared by 14 of the 18 undispositioned strandings — ENUMERATED this tick across all 18 snapshots, not sampled; the other 4 are 2x `403 key not allowed`, 1x Ollama 400, 1x `worker disappeared`. REQUEUEING THIS NOW REPRODUCES THE IDENTICAL DEATH, because the fallback groups are still missing on the live router. UNBLOCK WHEN: task 136 (`002-136-litellm-fallbacks-db-write`, run 20260916T144554Z_96563c4c) lands the `:synthetic-anthropic` fallback groups in the LiteLLM Postgres config AND the row is read back and diffed (the DB row wins over the YAML). Then requeue this entry at its ORIGINAL prefix with identity fields (run_id, roles_bound, launched_at) stripped. Only Paxton reorders.",
+  "run_id": "20260910T021652Z_87fc7c08",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "syn:large:vision:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-10T02:16:52.955693+00:00"
+}

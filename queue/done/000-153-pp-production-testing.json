@@ -1,0 +1,16 @@
+{
+ "name": "000-153-pp-production-testing",
+ "task_file": "C:/tmp/pp-production-testing-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-c",
+ "max_rounds": 10,
+ "trio": "kimi",
+ "note": "*** REQUEUED 2026-09-11 12:14 PT - stopped at a 3-strikes gate (route/completion errors) during the drain for the RTX 4090 install. Workspace -c keeps 2345aca + 6afcc66 + uncommitted frontend files; 47b00cb duplicates PR #107 (c485cc9b) and must NOT be carried over. Held by DRAIN. || *** REQUEUED 2026-09-11 07:05 PT - PAXTON'S TOP PRIORITY, and it FAILED without being noticed. Run 20260911T040628Z_bce96e8f failed and the launcher had already filed this entry into done/ on LAUNCH, so it would never have retried. ITS FOUR FAILURES, ALL INFRASTRUCTURE, NONE TASK CONTENT: round 1 executor timeout at 1800s; round 3 MANAGER TIMEOUT AT 300s - the PACKAGED DEFAULT, because this run started 21:06 PT Sep 10, BEFORE the overseer created .lh-harness/config.toml in cognizioware-powerplat",
+ "task_source": "task_file",
+ "roles_bound": {
+  "manager": "ornith-1.5:pool",
+  "executor": "ornith-1.5:pool",
+  "auditor": "ornith-1.5:pool"
+ },
+ "run_id": "20260911T201033Z_a9a6d195",
+ "launched_at": "2026-09-11T20:10:33.495244+00:00"
+}

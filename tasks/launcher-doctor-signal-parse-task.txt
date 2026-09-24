@@ -1,0 +1,107 @@
+TASK 155 - Launcher: consume the doctor's NEW measured signals, and stop treating every failure as a 429.
+
+*** OVERSEER-EXECUTED. NOT A HARNESS RUN. IN queue/blocked/ DELIBERATELY. ***
+It edits `C:/tmp/launch_queue.py` — the LIVE launcher that launches harness runs. A run must never
+edit the thing that launches it, and the file is not in any repo.
+
+Source: Paxton, 2026-09-10, plan from session [4aa9cb]. **This task exists because task 146 forbids
+it**: 146 line 76 says "Do NOT re-enable any launcher gate. That decision is Paxton's and the launcher
+is not in this repo." So the launcher half had no owner. This is it.
+
+================================================================================
+*** GATED ON TASK 146. DO NOT START BEFORE IT LANDS. ***
+================================================================================
+146 rewrites `check_synthetic_quota()` to emit a stable, machine-parseable detail line:
+
+    live=RATE_LIMITED cause=rate_window req_5h=2410/2500 (>=) credit=$84/$120 (est)
+
+**There is nothing to parse until that ships.** If 146 has not landed, STOP and say so — do not
+write a parser against a format you have not seen emitted, and do not "temporarily" parse the old
+"0 tokens remaining" string, which 146 deletes.
+
+================================================================================
+WHAT TO CHANGE — four items
+================================================================================
+1. **PARSE THE NEW DETAIL.** `synthetic_quota_exhausted()` (currently ~L497 — VERIFY, the file moves)
+   reads `ops.easybutt0n.ai/api/doctor`. Change it to read the `live=` and `cause=` fields.
+   **It stays ADVISORY.** It must NOT gate launches. Paxton, 2026-09-10 18:55: *"do NOT flip to
+   fail-closed — stop the doctor gating launches until its signal is fixed."* The signal being fixed
+   does not by itself re-arm the gate; probe-based gating stays as it is.
+
+2. **SURFACE IT ON THE STATUS LINE.** Today it prints `doctor_quota=EXHAUSTED(advisory)|ok|unread`.
+   Replace with the richer, still-advisory form:
+       doctor=RATE_LIMITED/rate_window req_5h=2410/2500 credit=$84/$120
+   Keep it on the SAME line as `active=`/`synthetic=` so one grep still shows the whole cycle state.
+
+3. *** TIGHTEN `synthetic_failing_real_work()` (~L553) — THIS IS THE REAL BUG. ***
+   Today it counts ANY failed run whose `role_configs` mention `:synthetic`. It should count only
+   runs with **`abort_reason == provider_rate_limit`**.
+   Why it matters: tonight a task-114 run failed on a genuine 429 and a task-107 run failed on a
+   different provider's monthly cap — but a run that fails on a bad path, a timeout, or an oversized
+   task ALSO counts today, so the gate can trip on failures that have nothing to do with Synthetic
+   capacity. Threshold 2-in-30-minutes on a noisy signal is a false-positive generator.
+   *** WHERE THE VALUE COMES FROM - RESOLVED BY THE OVERSEER 21:55 PT, AND THERE IS A TRAP IN IT. ***
+   The source plan's citation is CORRECT: `src/lh_harness/provider_errors.py` (11,302 b).
+       line 137  `abort_reason=f"provider_{kind}"`      <- the value is BUILT BY INTERPOLATION
+       line  63  `"rate_limit"`                          <- one of the `kind` values
+       line  79  `classify_agent_runtime_failure()`      <- the producing function
+   **SO A LITERAL GREP FOR `provider_rate_limit` FINDS NOTHING ANYWHERE IN THE REPO.** The overseer's
+   own first check concluded the path was unconfirmed for exactly that reason, and that conclusion was
+   WRONG. Do not repeat it: the string is assembled at runtime, so search for the f-string, the `kind`
+   list, or `classify_agent_runtime_failure`, never for the composed value.
+   Corroboration that it reaches the wire: `launch_queue.py:543` records "every one
+   abort_reason=provider_rate_limit, 429" from measured incidents.
+
+4. **HOLD ON CREDIT EXHAUSTION.** When `cause=credit`, skip Synthetic trios for the WHOLE cycle
+   instead of probing them every 900 s. Credit exhaustion is a multi-day outage; re-probing it every
+   cycle burns requests against the very meter that is exhausted. When `cause=rate_window`, keep
+   probing — that clears within hours.
+
+================================================================================
+EDIT PROCEDURE — this file has THREE other owners and is edited live
+================================================================================
+ * **BEFORE EDITING, CONFIRM BOTH ARE STILL PRESENT** (they were at 21:45: SPEC_PENDING x2, DRAIN x4):
+       the SPEC_PENDING spec gate (~L438-459, from the spec-staging work)
+       the DRAIN switch (~L579-590, task 147)
+   If either is missing, someone's edit was lost — STOP and reconcile against the `.bak-*` files
+   before writing anything.
+ * Take `launch_queue.py.bak-<HHMM>-doctorparse` FIRST, and **diff the live file against the NEWEST
+   existing .bak** — another session edits this file too, and at 20:30 two independent edits landed
+   within 11 minutes of each other.
+ * CRLF ONLY. Verify with python bytes.count: CRLF == totalLF, bareLF == 0, bareCR == 0.
+   **Appending a CRLF onto a line that already ends in CR produces CR CR LF** — that exact bug was
+   made and caught twice on 2026-09-10, and `ast.parse` does NOT catch it.
+ * `ast.parse` must pass.
+ * **A FILE EDIT IS INERT UNTIL RESTART.** Proven at 19:09, when the launcher had been running 15:15
+   code for four hours while the file on disk said otherwise.
+ * RESTART USING THE DRAIN-PROOF METHOD, because neither change emits output under normal conditions:
+   arm `C:/tmp/queue/DRAIN`, restart, confirm the `DRAIN flag set` line appears from the new process,
+   **clear the flag**, and confirm exactly ONE launcher process. Log must be APPENDED (`>>`), never
+   truncated — a negative byte delta means the 17h-frozen-log fault has recurred.
+ * Before restarting, confirm how many queue entries carry `spec_file`/`spec_status`. At 20:30 it was
+   0 of 21, so the spec gate fell through harmlessly. **If entries now carry draft specs, a restart
+   GATES them and the queue stops launching** — decide deliberately, do not discover it after.
+
+================================================================================
+VERIFICATION
+================================================================================
+ 1. `ast.parse` OK; CRLF clean; exactly one launcher process; log appended.
+ 2. The next cycle's status line shows the new `doctor=` field with real meter values.
+ 3. **`synthetic=` and `doctor=` AGREE across a cycle.** If they disagree, say which one the launcher
+    acted on — they measure different things and the disagreement is itself information.
+ 4. No run launches on a Synthetic trio while the doctor reports `cause=credit`.
+ 5. Confirm the tightened failure counter does not trip on a non-429 failure: find a failed run with
+    a different `abort_reason` and confirm it is NOT counted.
+
+================================================================================
+HARD RULES
+================================================================================
+ - The doctor stays ADVISORY. Do not re-arm it as a gate — that is Paxton's decision, not this task's.
+ - Do not touch the SPEC_PENDING gate or the DRAIN switch; they belong to other tasks.
+ - Do not leave DRAIN armed. Arming it halts the whole queue.
+ - No credentials in the file, the log, or the ledger.
+
+DONE MEANS: the launcher parses `live=`/`cause=` and prints the new advisory `doctor=` field;
+`synthetic_failing_real_work()` counts ONLY `provider_rate_limit` with its producer cited by real
+path; Synthetic trios are skipped for the cycle on `cause=credit`; exactly one launcher runs the new
+code, proven by a DRAIN line rather than assumed; and DRAIN is cleared.

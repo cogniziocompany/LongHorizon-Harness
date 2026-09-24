@@ -1,0 +1,54 @@
+TASK 125b - Write the export's audit entry to the EXISTING ops audit surface.
+
+*** SLICE 2 OF 3 of task 125. GATED ON 125a - there is nothing to report until one real cycle has
+run. If 125a has not landed, STOP and say so rather than inventing a payload shape. ***
+
+REPO / WORKSPACE: cognizioware-mcp-tools.
+125a = the data path. **125b = this.** 125c = the schedule.
+
+================================================================================
+*** THE SCOPE DECISION IS ALREADY MADE. DO NOT RE-OPEN IT. ***
+================================================================================
+Paxton, 2026-09-10 20:25 PT, answering this exact question:
+
+  **OPTION (a): a new action-name write path on the EXISTING ops-control-center audit ingest
+  service.** It extends the existing surface and adds NO new page, view or route.
+  NOT option (b) - do not add a field to `/ingest/e2e`.
+
+**ops.easybutt0n.ai already has an `audit` route** (the seven are /, overview, catalog, e2e, certs,
+admin-centres, audit). **EXTEND IT.** RULE 2 forbids duplicating surfaces and this has been violated
+before. If you find yourself adding a route, stop.
+
+**BUILD AND OPEN THE PR - but do NOT deploy to CT202.** Paxton, same message: the prod router restart
+stays behind the zero-active-run window, which the overseer takes, not you.
+
+================================================================================
+WHAT EVERY ENTRY MUST CARRY
+================================================================================
+One entry per run, **success or failure**:
+    timestamp start and finish; outcome **SUCCESS / FAILED / SKIPPED**; on failure WHICH STEP failed
+    and the error; the cutoff timestamp used; rows exported; rows deleted (**and a loud marker if
+    they differ**); bytes written; destination path and filename; CT202 disk used/total/percent
+    BEFORE and AFTER; table size before and after.
+
+*** A RUN THAT FAILS MUST STILL WRITE AN ENTRY. *** A silent failure here is the original problem
+repeating: CT202 filled to 100%, killed the prod router for an hour and destroyed 23 runs, and
+**nothing on any operator surface showed it.** That is the entire reason this slice exists.
+
+**MAKE `outcome` THE PRIMARY SORTABLE FIELD.** At the eventual 2-hourly cadence this is 12 entries a
+day; an operator must be able to find the failures without reading 84 rows a week.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Extend the existing audit route. **No new page, view or endpoint.**
+ - No secrets in the entry - the exported rows contain full request/response bodies, so never put row
+   CONTENT in an audit record. Counts, sizes, paths and outcomes only.
+ - Do NOT edit `infrastructure/litellm-config.yaml`.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat`.
+ - **Do NOT merge and do NOT deploy to CT202.** Open the PR and STOP.
+ - Do NOT post an `@claude` comment - it bills Paxton's personal subscription.
+
+DONE MEANS: one action-name write path on the existing audit ingest, an entry written for a real 125a
+cycle carrying every field above, `outcome` sortable, a FAILED path proven by forcing a failure, and
+no new route anywhere.

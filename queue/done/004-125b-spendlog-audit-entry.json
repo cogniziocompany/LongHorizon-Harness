@@ -1,0 +1,16 @@
+{
+ "name": "004-125b-spendlog-audit-entry",
+ "task_file": "C:/tmp/125b-spendlog-audit-entry-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "note": "*** SLICE OF TASK 125, sliced 2026-09-10 22:35 PT. Its run bb12da51 ran FIVE HOURS without finishing - round 6 of 10 with all three roles on ornith-1.5:pool (the LOCAL single-slot lane, because synthetic was DOWN) at roughly 50 min/round. Unsliced task 69 failed three times at 3600s; sliced, 69a finished in 8 minutes. Same medicine. The parent run was stopped as superseded. *** 125b = THE AUDIT ENTRY. GATED ON 125a. *** SCOPE ALREADY DECIDED by Paxton 20:25 PT: OPTION (a), a new action-name write path on the EXISTING ops-control-center audit ingest. NOT option (b), no field on /ingest/e2e, and NO new page/view/route - ops.easybutt0n.ai already has an audit route, extend it. *** Build and PR only; do NOT deploy to CT202 (the router restart stays in the overseer's window). Every run writes an entry INCLUDING FAILURES - a silent failure here is the original outage repeating, when CT202 hit 100%, killed the router for an hour and destroyed 23 runs with nothing on any operator surface. Make `outcome` the primary sortable field.",
+ "task_source": "task_file",
+ "run_id": "20260911T081935Z_e0f6e5bc",
+ "roles_bound": {
+  "manager": "ornith-1.5:pool",
+  "executor": "ornith-1.5:pool",
+  "auditor": "ornith-1.5:pool"
+ },
+ "launched_at": "2026-09-11T08:19:35.085186+00:00"
+}

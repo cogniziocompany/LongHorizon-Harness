@@ -1,0 +1,81 @@
+TASK 132 - Add the @claude PR reviewer to cognizioware-powerplatform. HIGHEST BLAST RADIUS OF THE
+THREE. Open the PR and STOP.
+
+REPO / WORKSPACE: cognizioware-powerplatform   (default branch `main`; `main` is this repo's PROD)
+
+Source: interactive session [418504] (4185044e-c1cc-4c9f-a6c6-38d2600f04fd), plan mode, 2026-09-10.
+
+================================================================================
+OVERSEER CORRECTIONS - read before the source plan's framing
+================================================================================
+1. **THREE repos are missing the reviewer, not four.** LongHorizon-Harness got it 11:12 PT today
+   (PR #15, `7b27032`, read back at 2,491 bytes). Missing: hydra, powerplatform (this), qa.
+2. **The reference file demonstrably posts real reviews.** LHH run `34512622903`,
+   `completed/success` in 2m 45s, posted a review that found a real security defect. A correct copy
+   works; the false-green risk is specifically the EMPTY-CREDENTIAL case.
+3. **No secret to provision.** `CLAUDE_CODE_OAUTH_TOKEN` is an ORG secret, `visibility: all`
+   (2026-09-10T02:04Z). Verified.
+4. **The always-true gate bug is real and was caught in the wild today**: the collapsed
+   `author_association == 'OWNER' || 'MEMBER' || 'COLLABORATOR'` is ALWAYS TRUE in Actions
+   expression syntax and silently disables the write-access gate. **COPY BYTE-FOR-BYTE.**
+
+================================================================================
+THE RISK, STATED CORRECTLY - the source plan already corrected the blunter version, keep its version
+================================================================================
+`ci.yml` has a `deploy` job: `if: github.event_name == 'push' && vars.LAN_DEPLOY_ENABLED == '1'`,
+`runs-on: [self-hosted, lan-deploy]`, running `scripts/deploy/rollout.sh`. **`LAN_DEPLOY_ENABLED` is
+live at `1`.**
+
+BUT there is a SECOND, independent guard (`ci.yml` ~lines 116-130, "Guard prod against unpromoted
+push-to-main") requiring the pushed SHA to equal repo variable `PROD_PROMOTED_SHA` - **and that
+variable does not currently exist.** So a push to `main` today does NOT silently roll out: it hits
+the guard and errors (a failed CI run, not a deploy).
+
+**Do not treat that as a safety net.** It is incidental current state, not a designed guard for this
+PR: `promote.yml` sets `PROD_PROMOTED_SHA`, and an unrelated promotion could set it to match a fresh
+`main` HEAD at any time. **RE-CHECK IT IMMEDIATELY BEFORE ANY MERGE, never assume it is stable.**
+The `lan-deploy` self-hosted runner is also occupied briefly just for the guard step to run and fail.
+
+CORRECTION THE SOURCE PLAN MAKES AND YOU MUST KEEP: there is **no `behind` field in
+`instances.json`** - the real "is main ahead of what is promoted" signal is comparing
+`PROD_PROMOTED_SHA` against `origin/main` HEAD. Do not grep `instances.json` for a field that does
+not exist.
+
+For completeness: `rollout.sh` (368 lines) ships `docker-compose.yml`, pins `APP_IMAGE_TAG` into the
+host `.env`, and restarts only the app container (`--no-deps`). It does not touch the DB, and it
+independently refuses a `tier: prod` deploy unless the tag's resolved SHA matches
+`PROD_PROMOTED_SHA`.
+
+**`issue_comment` workflows only ever run from the DEFAULT BRANCH.** There is no "try it on develop
+first" - the file must land on `main` to ever fire. Say so in the PR body.
+
+================================================================================
+WHAT TO DO
+================================================================================
+  1. Copy `cognizioware-mcp-tools/.github/workflows/claude-code.yml` byte-for-byte (2,491 bytes) via
+     the GitHub API. Do not retype. It carries `fetch-depth: 0` and job-level `timeout-minutes: 20`,
+     both of which were paid for once each - the PR body should say why they matter.
+  2. **The false-green precondition step: INHERIT, do not invent.** Task 130 (cognizioware-qa) is the
+     designated proving ground for a step that fails non-zero on an empty credential. If task 130 has
+     landed a proven version, copy it. If it has not, note it in the PR body as an explicit
+     fast-follow rather than designing a second competing version here.
+  3. **Choose and JUSTIFY one merge strategy in the PR body** - this is the real deliverable:
+       (a) quiet-window merge;
+       (b) temporarily set `LAN_DEPLOY_ENABLED=0` and restore it - reversible, but it MASKS a real
+           deploy while flipped, which is its own hazard;
+       (c) rely on `PROD_PROMOTED_SHA` being unset - **flagged fragile**, must be re-verified
+           immediately pre-merge.
+     Recommend one, say why, and state the re-check command.
+  4. Open the PR against `main`. Then STOP.
+
+================================================================================
+HARD RULES
+================================================================================
+ - **DO NOT MERGE. EVER, from this task.** Paxton decides, in a quiet window.
+ - **Never flip `LAN_DEPLOY_ENABLED`** without saying so loudly in the PR body - and never leave it
+   flipped.
+ - **Never touch `PROD_PROMOTED_SHA`.**
+ - **Do NOT merge to `main` while task 59 is unlanded** - there is a standing hold on pp `main`.
+   If your strategy requires a main merge, say so and STOP; do not do it.
+ - Copy the reference file; do not retype the gate.
+ - Never `git add -A`; commit by explicit path; `git diff --stat` first. No credentials in files.

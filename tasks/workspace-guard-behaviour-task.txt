@@ -1,0 +1,44 @@
+# Task 195 — The workspace branch guard itself (behaviour), sliced out of task 180
+
+## Provenance
+Sliced from task 180 by scheduled tick #446 (2026-09-17) after run 2d94e58d lost three full
+executor rounds to the 1800 s budget and committed nothing. Task 180 kept ONLY the read-only
+round-zero record; this task carries the behaviour. **Task 180 must land first** — this task
+consumes the record it emits.
+
+## Why the original defect exists (measured 2026-09-16, tick #284, in 2 of 2 live runs)
+1. Run 7784478f (task 98) committed 8b8ac4a and ad5a164 onto `fix/setup-wizard-prod`, which already
+   carries OPEN PR #108 for a DIFFERENT task. Not yet pushed, so nothing leaked — but a push would
+   have added task 98's work to PR #108.
+2. Run 96563c4c (task 136) was checked out on `fix/mcp-namespace-contract`, whose commits PREDATE the
+   run and which is ALREADY PUSHED under OPEN PR #154. A commit+push there goes straight into another
+   task's PR. The tree also held a third task's uncommitted `fleet-admin/**` changes.
+Both were corrected by overseer injection. This task removes the need for an overseer to notice.
+
+## Deliverables (in this order; if you run short, land 1 and stop)
+1. If the checked-out branch is NOT the repo's default branch, do not silently launch on it. Check
+   out the default branch fresh from origin and cut the run's own branch from there.
+2. NEVER destroy work to do it. If the tree is dirty or the branch is ahead of its remote, the
+   leftover MUST survive: named stash, or leave the branch alone and branch from `origin/<default>`.
+   **Deleting another task's uncommitted work is a worse failure than the one being fixed.**
+3. A run that cannot get a clean base must FAIL LOUDLY naming the branch and any colliding PR —
+   never proceed onto whatever was checked out.
+
+## Also carried here (cut from 180's 00:35 PT amendment) — land LAST, drop it first if you run short
+Assert `.lh-harness/config.toml` exists, parses, and yields `run.timeouts.<role>`; if missing or
+inert, write the standard 1200/1800/3600 and say so in the launch log. Do not launch on the 300 s
+code default (`types.py:112`, `:117`) and do not fail the launch.
+*** THE SECTION IS `[run.timeouts]`, NOT `[budgets]`. *** `[budgets]` parses as valid TOML and is
+silently INERT — the overseer wrote it that way first and it looked fixed while the 300 s default
+stayed in force. Assert the PARSED PATH, never file presence.
+
+## Audited locations — do not re-derive (paid for by run 2d94e58d round 1, auditor-confirmed)
+- `launcher.py:377-418` `_launch` -> `supervisor.create_run`.
+- `supervisor/service.py:1747` `subprocess.Popen(command, cwd=str(workspace_path), ...)` in
+  `_launch_worker` (`service.py:1679`) — the handoff point.
+- `C:/tmp/launch_queue.py` does not exist on CT110; the live launcher is `src/lh_harness/launcher.py`.
+
+## Scope discipline
+No new operator surface. Do NOT fix the 429 `failure_cause` regression here — it is a separate
+defect that merely shares this code path. Prove the git paths in `/tmp` scratch clones, never
+against a live `cognizioware-*` workspace. Open the PR and STOP.

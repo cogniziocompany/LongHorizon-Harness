@@ -1,0 +1,73 @@
+OPS + DOCS (LongHorizon-Harness): raise CT110's CPU and RAM so the harness can run more concurrent tasks without errors, and record the evidence for the number chosen. Paxton's direction, 2026-09-09: "if we need it add more compute and ram on this ... for higher output without errors". Work ONLY in /home/harness/work/LongHorizon-Harness-b on branch ops/ct110-capacity (run `git fetch origin && git checkout -B ops/ct110-capacity origin/main` first); plain git; commit by EXPLICIT PATH; no push.
+
+## THE TASK ITSELF DOES NOT RESIZE ANYTHING
+This run produces the PLAN and the runbook. **The overseer performs the resize**, because CT110 hosts every live harness run and stopping it kills them. Do NOT run `pct set`, do NOT reboot, do NOT touch corsairai300. If you catch yourself about to change a live box, stop and write the step down instead.
+
+## WHY, WITH THE NUMBERS MEASURED 2026-09-09
+The launcher cap is no longer limited by the model provider. Synthetic was upgraded to **2500 requests / 5 hours and 5 concurrent per model**, which allows roughly ten concurrent runs. **CT110 is now the constraint.**
+Measured on the box:
+ - `nproc` = **4**, RAM = **6 GB** total (about 4 GB available), running Debian in an LXC on corsairai300 (pve151).
+ - At **4 concurrent runs**: 10 `claude` processes, load average **1.31-1.45** on 4 cores (~35%), ~1 GB used.
+ - At **5-6 concurrent runs**: 13 processes, load **1.74-1.87** (~47%), **2460 MB** used.
+ - So each run costs roughly **2.5 processes, ~0.35 load, ~0.25-0.4 GB**.
+Extrapolating: 10 concurrent runs is ~25 processes and load ~3.5 on 4 cores (~87%) with 3-4 GB - CPU-bound and close to thrashing, before counting the eval work that also lands on this estate.
+
+## WHAT TO DETERMINE AND WRITE DOWN
+ 1. The target vCPU and RAM for CT110 to sustain **10 concurrent runs with headroom**, derived from the per-run figures above rather than picked round. State the arithmetic.
+ 2. What corsairai300 can actually spare - read the host's total and committed CPU/RAM across all guests before proposing a number. **A number the host cannot honour is worse than no number**: over-committing this host is how the ptait01 OOM incidents started, and CT110 is the one box whose failure stops all harness work.
+ 3. Whether RAM or CPU binds first. The evidence says CPU: memory sat at 2.4 GB of 6 while load was already at half.
+ 4. Whether the resize needs a STOP or can be done live. `pct set <id> --cores N` applies live; `--memory` growth is usually live, shrinking is not. Say which parts need downtime and how long.
+ 5. The exact commands, and the ROLLBACK - the previous values, so a bad change is one command from reverted.
+ 6. Where the harness itself would need to change to use the extra capacity: `C:/tmp/launch_queue.py` carries CAP and a comment block deriving it from the box. Say what CAP should become and why.
+
+## HARD RULES
+No live changes of any kind from this run. Nothing that stops, reboots or reconfigures a container or a host. No `pct set`, no `systemctl`, no docker restarts. Record env NAMES only, never values. Explicit-path commits; no push.
+Completion = the commit, the target numbers with their arithmetic, what the host can spare with the figures you read, which parts need downtime, the exact commands, the rollback values, and the CAP the harness should move to. Auditor: read-only - verify NOTHING was executed against a live box, that the proposed numbers are justified by measurements rather than asserted, that host capacity was actually checked before proposing, and that a rollback is stated.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.
+
+================================================================================
+PRE-ANSWERED MEASUREMENTS (added by the overseer 2026-09-10 07:05 PT)
+
+A previous attempt at this task stopped to ask for these. Do NOT ask again - they are below,
+read live from the hosts. Do not ask for credentials or SSH access either.
+
+HOST corsairai300 (192.168.21.151), which runs CT110:
+  CPU cores: 16
+  RAM: 46 GB total, 6 GB used, 40 GB available
+  Load average: 1.45 / 1.36 / 1.35
+  Committed to running guests:
+    CT105 cognizioware-powerplatform  4 cores,  8192 MB, swap 2048 MB
+    CT106 pihole2                     1 core,    512 MB, swap  256 MB
+    CT110 lh-harness                  4 cores,  6144 MB, swap  512 MB
+    TOTAL: 9 of 16 cores, 14.75 of 46 GB. Headroom: 7 cores, ~31 GB.
+  No running VMs.
+
+CT110 current config: cores 4, memory 6144 MB, swap 512 MB, rootfs local-lvm 50G.
+
+LAUNCHER C:/tmp/launch_queue.py: 437 lines. CAP is assigned three times as the reasoning was
+revised; the LAST assignment wins and the live value is CAP=6.
+
+THE PREMISE OF THIS TASK IS WRONG AND MUST BE CORRECTED IN THE OUTPUT.
+CAP is NOT derived from CT110's CPU or RAM. It is derived from the PROVIDER. The comment block
+says so directly: "the cap is Synthetic's"; "Provider-side ceiling is therefore
+floor(6 backends * 5 concurrent / 3 roles) = 10 runs"; "CAP=6 is a measured step, not a jump to
+the provider ceiling"; "Tool-heavy runs can exhaust the 5-hour budget without ever hitting
+concurrency". Local capacity is separate and small: ONE qwen3.8 spanning both RTX 3090s,
+single-stream at ~45 tok/s, so 1-2 concurrent executors.
+
+EVIDENCE THAT THE BOX IS NOT THE BOTTLENECK, measured 2026-09-10:
+Four runs launched at 13:29 UTC and ALL FOUR died in round 1 on provider limits - three with
+HTTP 429 "You've exceeded your subscription rate limit" and one with HTTP 402 "Insufficient
+quota and token balance". At that moment the host was at load 1.45 on 16 cores with 40 GB RAM
+free. Separately, 7 of 7 Synthetic models returned 429 on a direct probe.
+
+SO: raising CT110 vCPU and RAM will NOT raise throughput. Two honest options - pick one:
+ (a) Recommend NO resize and record the measurements above as the evidence for why. This is
+     what the data currently supports.
+ (b) If you still recommend a modest headroom increase (there IS room: 7 cores, ~31 GB
+     uncommitted), justify it on something measurable ON CT110 ITSELF - worker memory during
+     concurrent runs, or swap pressure at only 512 MB - and state plainly that it does not
+     move the concurrency ceiling.
+Either way the document must say the throughput ceiling is provider-side.
+================================================================================

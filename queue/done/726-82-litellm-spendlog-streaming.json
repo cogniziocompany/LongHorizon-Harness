@@ -1,0 +1,15 @@
+{
+  "name": "726-82-litellm-spendlog-streaming",
+  "task_file": "C:/tmp/litellm-spendlog-streaming-task.txt",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "*** CLOSED VERIFIED 2026-09-11 10:36 PT by the overseer. *** PR #142 'fix(litellm): v1.100.1 + PR #38998 arity backport, and the cache_namespacer isolation gap' MERGED 2026-09-11T06:25:36Z. PROVEN BY READING THE LIVE SYSTEM, not the merge: CT202 runs image sha256:d85c0b36e2fd (v1.100.1), restarts=0, up since 07:29:21Z; the arity backport is bind-mounted READ-ONLY at /opt/cognizioware-mcp-tools/hooks/litellm_v1_100_1_common_request_processing.py -> site-packages/litellm/proxy/common_request_processing.py; main's cache_namespacer.py line 133 reads 'data = dict(data)' with the comment naming the deepcopy pickle TypeError. LIVE LOG EVIDENCE, last 30 min across 19,094 lines: 'cannot pickle' 0, 'cache_namespacer' 0, arity TypeError 0. A 2026-09-11 plan [8c54cf] proposed doing this work again; it was written against the pre-#142 state and was NOT queued. || PRIOR NOTE: *** ROOT CAUSE FOUND 2026-09-10 22:15 PT - THE PREMISE THIS TASK WAS FILED ON IS NOT REPRODUCING. Verified by the overseer on the live CT202 router. *** Over 6h: 'update_database failed' 0, 'maximum recursion depth' 0, 'spend_log_error_logger' 0, 'Error creating spendlogs' 0. The 'cannot pickle' errors (1,772 in 6h) are OUR OWN HOOK, not LiteLLM: 1,774 tracebacks at infrastructure/docker/litellm/hooks/cache_namespacer.py:127, `data = deepcopy(data)` - the request dict carries litellm_logging_obj which holds a threading.RLock, and deepcopy cannot pickle it. 1:1 with the 'cannot pickle' count, s",
+  "run_id": "20260909T231816Z_b8cd0dd8",
+  "roles_bound": {
+    "manager": "glm-5.2:synthetic-anthropic",
+    "executor": "qwen3.8-nothink",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-09T23:18:16.408135+00:00"
+}

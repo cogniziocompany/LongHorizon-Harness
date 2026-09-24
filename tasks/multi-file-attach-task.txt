@@ -1,0 +1,217 @@
+TASK 99 - attaching more requirement documents REPLACES the ones already picked instead of adding
+to them.
+
+REPO: cogniziocompany/cognizioware-powerplatform. Workspace on CT110:
+/home/harness/work/cognizioware-powerplatform. Branch from **origin/develop**.
+
+Paxton, 2026-09-09: "it does not allow multiple files uploads. yes it uploads each file in folder
+but it doesnt add more. we should allow this to the limit ... please do not change prod for this
+app as I am testing but push that task into lower envs asap with a queue task."
+
+================================================================================
+PROD DEPLOY IS AUTHORISED. PAXTON LIFTED THE HOLD 2026-09-09.
+================================================================================
+
+Paxton: "get these deploy all the changes needed for powerplatform prod since i cannot test
+anymore and need these bugs fixed as they are blockers."
+
+The earlier "DO NOT DEPLOY - Paxton is testing" instruction in this task is **SUPERSEDED**. He can
+no longer test AROUND these bugs, so shipping them is what unblocks him. Build it, prove it on dev,
+then ship it.
+
+WHAT "SHIP" MEANS HERE - AND IT IS NOT "MERGE TO main":
+**Production already runs DEVELOP-derived images.** The live container is
+`app:sha-f2a3633`, and `f2a3633` is on `origin/develop` and `fix/prod-pin-and-billing-errors` -
+it is NOT on `origin/main`. Measured independently twice on 2026-09-09.
+  - `develop` is **142 commits ahead of and 33 behind `main`**, so a develop->main promotion is not
+    a fast-forward and is not this task's job.
+  - The standing hold on powerplatform `main` still stands. **Do NOT merge to main.**
+  - Ship the way prod already got f2a3633: land on `develop`, then deploy through the normal
+    pipeline. **NEVER hand-deploy** - that is exactly how the unpromoted-code finding arose.
+
+STILL BINDING:
+ - **Verify on dev FIRST** (`http://192.168.21.163:3000`). A fix that has not run on dev does not
+   go to prod.
+ - **DO NOT TOUCH CT110** - other agents run deployment-pipeline work there.
+ - Prod is the corsairai300 **host-level** stack, NOT CT105. CT105 is a stale decoy with identical
+   container names whose newest session is 2026-06-09. Deploying to CT105 changes nothing a user
+   can see.
+ - Report, don't act on, the CT105 stack and the duplicate cloudflared replica.
+ - If a gate goes red, STOP and report. "He said ship it" is not a reason to push past a failing
+   gate - a broken prod is worse than a blocked test.
+
+================================================================================
+THE DEFECT - one line, already located
+================================================================================
+
+Session setup, "Attach requirement documents (optional) - .md .txt .pdf .docx .csv .json; their
+text is added to the design input". Paxton picked 3 files
+(`Task_2_2_Design_Requirements_Doc_v1_3.md`, `Task_2_2_DRD_v1_3_Updates.md`,
+`Task_2_3_Functional_Requirements_Doc_v1_2.md`) and could not add a fourth without losing them.
+
+`packages/frontend/src/sessions/SessionList.tsx`:
+
+    line 131   const [files, setFiles] = useState<File[]>([]);
+    line 478   type="file"
+    line 479   multiple
+    line 481   onChange={e => setFiles(Array.from(e.target.files ?? []))}
+    line 484   {files.length > 0 && (
+
+**Line 481 REPLACES the array on every selection.** A file input's `FileList` only ever contains
+the files chosen in THAT dialog, so a second pick discards the first. `multiple` lets you select
+many at once - it does not accumulate across selections. Exactly what Paxton described: a folder's
+worth goes in, but you cannot then add more.
+
+There is no removal control either, so a mis-picked file can only be cleared by re-picking the
+whole set - which is the same defect from the other direction.
+
+================================================================================
+RULE 2 - CHECK BEFORE YOU BUILD. THERE ARE ALREADY TWO UPLOADERS.
+================================================================================
+
+`git grep` on origin/develop finds the file input in **two** places:
+
+    packages/frontend/src/sessions/SessionList.tsx                     :478   <- the screen Paxton hit
+    packages/frontend/src/features/session/setup/SpecUploader.tsx      :215   <- newer, HAS TESTS
+        packages/frontend/src/features/session/setup/__tests__/SpecUploader.test.tsx  (4+ cases)
+
+**FIRST TASK: establish which is canonical.** `SpecUploader.tsx` has a dedicated test suite and a
+`(fileList: FileList | null)` handler at line 161; `SessionList.tsx` carries an inline one-liner.
+Strong prior: **SpecUploader is the intended component and SessionList predates it.**
+
+  - If SpecUploader is canonical: fix the accumulation THERE and make SessionList use it. That
+    removes a duplicated surface instead of adding a second fixed copy.
+  - If they are genuinely different surfaces: fix both, and say in the PR why two exist.
+  - **Do NOT fix the one-liner in SessionList and leave SpecUploader with the same bug.** Two
+    uploaders drifting apart is how this class of bug survives.
+
+Check SpecUploader for the same defect before assuming it is fine - it may already accumulate, in
+which case the answer is simply to use it.
+
+================================================================================
+SCOPE
+================================================================================
+
+1. **Accumulate across selections.** Append newly chosen files to the existing list rather than
+   replacing it. Sketch, not a prescription:
+
+       onChange={e => {
+         const picked = Array.from(e.target.files ?? []);
+         setFiles(prev => mergeWithinLimit(prev, picked));
+         e.target.value = '';        // let the SAME file be re-picked after removal
+       }}
+
+   **That `e.target.value = ''` matters** - without it, re-selecting a file you just removed fires
+   no `change` event and looks broken.
+
+2. **De-duplicate.** Same name + size + lastModified = same file; do not add it twice. Picking a
+   folder twice must not double every entry.
+
+3. **Per-file removal.** An x on each listed file. This is what makes accumulation usable; without
+   it a wrong pick still forces starting over.
+
+4. **"To the limit" - find the REAL limit, do not invent one, and TRUNCATE WITH A WARNING.**
+
+   *** PAXTON CORRECTED THIS REQUIREMENT 2026-09-09 - READ IT, IT OVERRIDES AN EARLIER DRAFT. ***
+   "we dont want them to upload twice and wipe out the first. that is a requirement. it must
+   continue to build uploads into text. ALSO it should warn them when its truncated the limit of
+   text."
+
+   So the behaviour is: **keep accepting files and keep building their text into the design input.
+   When the text limit is reached, TRUNCATE - and TELL THE USER, clearly and specifically.**
+   An earlier draft of this task said to REFUSE an over-budget pick instead of truncating. That was
+   the overseer's judgement and **Paxton has overruled it. Truncate + warn. Do not refuse.**
+
+   Determine and state, in the PR:
+     - any per-request body/upload cap on the session-create route (Express `json`/`urlencoded`
+       limits, multer limits, any reverse-proxy `client_max_body_size` in front of the app);
+     - the DOWNSTREAM model-context ceiling the concatenated attachment text feeds into -
+       **this is the binding limit and it is not a file count.** Ten small `.md` files may be fine
+       where two large `.pdf`s are not.
+
+   THE WARNING IS THE DELIVERABLE, not a nicety. A silent truncation is the failure mode to
+   prevent: a user whose spec was quietly halved gets a build against requirements they never
+   agreed to and has no way to know. The warning must be **specific enough to act on**:
+     - state that truncation happened, before the session is created - not in a log;
+     - name WHICH files were cut or partially included, not just "some content was truncated";
+     - show how much was included vs dropped (bytes or characters, and the limit itself);
+     - stay visible next to the Create Session control so it cannot be missed.
+
+   Show remaining budget in the UI as files accumulate, so the user can see the ceiling coming
+   rather than discovering it at the end.
+   If no explicit server cap exists, say so plainly and propose one with the reasoning; do not
+   quietly pick a number.
+
+5. **Validate against the accepted extensions** (.md .txt .pdf .docx .csv .json) at pick time and
+   reject with a clear message, rather than failing later in extraction.
+
+6. **Tests.** Extend `SpecUploader.test.tsx` (or add the equivalent where the canonical component
+   ends up): two successive selections accumulate; duplicates collapse; removal works and the same
+   file can be re-picked afterwards; **content over the text limit is TRUNCATED and a warning is
+   raised naming the affected files and the amount dropped** (not refused - see item 4); a
+   disallowed extension is refused at pick time. Frontend tests only - no live upload.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **NO PROD. NO MERGE TO main. NO PROMOTION.** Paxton is testing on the live site.
+ - Do NOT raise any server-side body limit as part of this task. If the real cap is lower than is
+   useful, REPORT IT with a recommendation - raising an upload ceiling on a live service is its own
+   change with its own risk.
+ - Do NOT add a third uploader component. See RULE 2 above.
+ - No migration - the migrations dir tops out at `040_*`.
+ - Env NAMES only, never values.
+ - Commit by EXPLICIT PATH; never `git add -A`; check `git diff --stat` before opening the PR.
+ - PR to `develop`. DO NOT MERGE.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A PR against `develop` where successive picks ADD to the attachment list instead of replacing it
+(**Paxton: "that is a requirement"**), all accepted files keep building into the design input text,
+duplicates collapse, each file can be removed individually and re-picked afterwards, and the cap is
+the one the backend genuinely enforces - stated in the PR with where it comes from, surfaced in the
+UI as remaining budget, measured in total bytes rather than a guessed file count, and **when the
+text limit is hit the content is truncated AND the user is warned before the session is created,
+naming which files were cut and how much was dropped.** Exactly ONE
+uploader component ends up owning this, with the PR saying which and why. Tests cover accumulate /
+dedupe / remove-and-repick / over-budget / bad-extension. Plus a one-line note in the PR body:
+**not deployed, awaiting Paxton's go.**
+
+
+================================================================================
+=== CORRECTION APPENDED BY SCHEDULED TICK #298, 2026-09-16 11:55 PT - READ THIS
+=== LAST; IT OVERRIDES ANYTHING ABOVE THAT CONTRADICTS IT.
+================================================================================
+
+WHY YOU ARE SEEING THIS HERE: the queue entry's `note` field is NEVER sent to you.
+Verified this tick by reading the launcher: the string `note` does not appear in
+launch_queue.py at all; you receive ONLY this file. Corrections that earlier ticks
+wrote into the note were therefore invisible, which is why they are being restated
+here. Nothing below is new scope - it is narrowing and path correction only.
+
+1. THE FILE PATH IN THE TEXT ABOVE IS WRONG. The uploader is
+   packages/frontend/src/sessions/SessionList.tsx
+   NOT src/components/... . A read against the wrong path returns EMPTY, which looks
+   exactly like "already fixed" - do not conclude the defect is gone from an empty read.
+
+2. THE LINE NUMBER IS NOW 515, not 481.
+
+3. BASE ON `develop`. (Per the branch-per-env pipeline: develop -> dev only.)
+
+4. THE DEFECT IS CONFIRMED STILL PRESENT (read off develop 2026-09-15): still
+   onChange={e => setFiles(Array.from(e.target.files ?? []))} - no accumulate, no
+   truncation warning.
+
+5. PUSH AND OPEN THE PR YOURSELF, THEN STOP. This SUPERSEDES any text above saying
+   "do not push" / "do not open the PR" / "the overseer opens it". Since 2026-09-14
+   16:21 PT this run holds a scoped GH_TOKEN (push + PR only). Do NOT merge - merging
+   stays the overseer's. Do not ask for a GitHub credential; you already have one.
+
+6. WHY YOUR PREDECESSORS DIED - not your fault and not a reason to cut scope:
+   run 20260910T143324Z_a83921a8 died in round 3 and run 20260916T181937Z_1531322a
+   died in round 4 on PROVIDER faults (429 rate limit, then 402 insufficient quota on
+   nemotron-3-super:synthetic-anthropic). SCOPE IS UNCHANGED. If you hit a 402/429,
+   that is the provider, not the task - do not respond by narrowing the work.

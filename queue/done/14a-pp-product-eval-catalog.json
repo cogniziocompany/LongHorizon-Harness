@@ -1,0 +1,8 @@
+{
+ "name": "14a-pp-product-eval-catalog",
+ "task_file": "C:/tmp/product-eval-catalog-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 12,
+ "trio": "kimi",
+ "run_id": "20260908T102208Z_c666abc0"
+}

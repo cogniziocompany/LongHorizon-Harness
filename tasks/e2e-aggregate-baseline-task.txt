@@ -1,0 +1,110 @@
+TASK 76 - the aggregate-collapse guard is calibrated to a world 21x smaller than the live one
+
+WHAT WAS OBSERVED - ALL READ OFF THE LIVE SYSTEM 2026-09-10, DO NOT RE-DERIVE IT
+
+`e2e/suites/22-aggregate-baseline.test.js` is the direct guard against the 2026-07-03 incident where the
+aggregate tools/list collapsed from ~500 tools to 30. Its own header says the aggregate assertion "does NOT
+soft-fail". It is currently near-useless, for a reason that is invisible from the test itself.
+
+ - Live aggregate, measured via JSON-RPC `tools/list` POST to the prod gateway `/mcp`: **963 tools**.
+   (Top prefixes: ruflo 243, langfuse 87, pac 70, playwright 46, n8n 39, telnyx 36, proxmox* 31 each.)
+ - The baseline the suite asserts against is supposed to be authoritative in the admin API.
+   `e2e/lib/admin-baseline.js` fetches `${ADMIN_API_BASE_URL}/api/v1/admin/e2e/baseline`, and the lane sets
+   `ADMIN_API_BASE_URL=https://mcp-cognizioware.easybutt0n.ai` (deploy-mcp-tools.yml line 158).
+ - **That endpoint returns HTTP 404 on ALL THREE lanes** - prod :20251, dev :20252, uat :20253. Measured
+   directly on CT100.
+ - The backing rows do not exist either: `app_configuration` in the billing database has **zero** rows with
+   `category` like '%E2E%' or `config_key` like '%AggregateMinTools%'. (Note the real column names are
+   snake_case: `config_key`, `config_value`, `category` - not the PascalCase the docs imply.)
+ - So `fetchBaseline()` takes its documented fallback path, logs "admin baseline HTTP 404 - using committed
+   fallback baseline.json", and asserts against the committed snapshot: **`aggregateMinTools: 45`**.
+
+45 versus a live surface of 963. The guard fires only on a ~95% collapse. Losing ruflo (243) plus langfuse
+(87) plus pac (70) plus playwright (46) - a catastrophic 46% loss - passes silently. Worse, the library
+comment says that with no baseline at all it returns "a permissive zero so the harness doesn't crash", so
+the failure mode degrades toward asserting nothing.
+
+This is the pattern this estate has already lost weeks to: a test that reports green forever.
+
+SCOPE - pick the smallest change that makes the guard mean something. Do NOT build a new surface.
+
+1. Decide and justify: should the authoritative baseline live in the admin API at all? The endpoint has
+   apparently never existed. Either
+     (a) implement `GET /api/v1/admin/e2e/baseline` in the billing service reading `app_configuration`
+         (category 'E2E-Monitoring'), and seed the rows - note this is a change in the mcp-cognizioware
+         repo, NOT this one, so if you choose this, produce the exact seed rows and endpoint contract and
+         say plainly that a second PR in that repo is required; or
+     (b) drop the admin-API indirection and make the committed `e2e/baseline.json` authoritative, with a
+         documented procedure for refreshing it.
+   Recommend one. Do not implement both.
+2. Whichever you choose, the baseline number must be derived from the CURRENT live surface with a stated
+   margin, not left at 45. Say how you chose the margin. A per-server floor already exists in
+   `baseline.json` under `servers.*.minTools` - use the same shape rather than inventing a second one.
+3. **Make the fallback LOUD.** Right now a 404 silently downgrades to a stale snapshot and the suite still
+   reports green. Falling back must be visible in the result the lane records - at minimum a distinct
+   skipped/stale marker rather than a pass. Do NOT make it a hard failure without saying why; the fallback
+   exists so offline CI can run.
+4. Do not touch the blocking deploy gate (`13-litellm-model-inference` Phase 0). Suite 22 is advisory and
+   stays advisory - the fix here is calibration and visibility, not promotion to a blocker.
+
+CONSTRAINTS
+ - Branch off main, PR to main, DO NOT MERGE. Work only in the cognizioware-mcp-tools workspace.
+ - `infrastructure/litellm-config.yaml` MUST NOT be touched - any change to it force-recreates the
+   production LiteLLM router. If you believe it needs changing, stop and say so instead.
+ - No credentials anywhere; env NAMES only. Do not ask for the master key - the numbers you need are above.
+ - Do not run a deploy, and do not dispatch any workflow.
+
+DONE MEANS
+A PR against main with the recommendation stated and justified, the baseline calibrated against 963 with the
+margin explained, the fallback made visible in the recorded result, and a plain statement of whether a
+companion PR in mcp-cognizioware is required.
+
+================================================================================
+CORRECTION FROM THE OVERSEER, 2026-09-09 08:12 PT - THE PREMISE ABOVE IS WRONG IN ONE IMPORTANT WAY.
+READ THIS BEFORE ACTING ON OPTION (a) OR (b).
+
+The brief above says the admin endpoint "has apparently never existed". **That is wrong.** It exists.
+
+`src/McpCognizioware.BillingService/Controllers/AdminE2eController.cs` is present on the **`main`** branch of
+mcp-cognizioware, added by PR #93 ("feat(admin-e2e): model registry GET/PUT on the existing admin
+controller", 2026-09-09).
+
+It 404s in every environment for a structural reason, not a missing-implementation reason:
+
+  - `main` and `develop` have **DIVERGED**: `ahead_by=67, behind_by=16`. Not a fast-forward.
+  - The deployed lanes run the **develop -> release -> prod** lineage (dev=develop, uat=release, prod=prod).
+  - `develop` does NOT contain AdminE2eController. So the controller has never been in any deployed build.
+
+**The endpoint is implemented on a branch that never deploys.** That is a different problem with a different
+fix, and it changes what this task should recommend:
+
+ - Option (a) in the brief - "implement the endpoint" - is largely ALREADY DONE. Do not re-implement it.
+   Read `AdminE2eController.cs` on `main` first and report what it actually exposes: whether it serves an
+   e2e BASELINE (aggregateMinTools / per-server minTools) or only the MODEL REGISTRY, which is a different
+   thing that PR #112 in cognizioware-mcp-tools also touches. **These may be two different features sharing
+   a name.** Say plainly which it is before recommending anything.
+ - If it does serve the baseline, then the fix is not code at all - it is getting that branch's work into the
+   deployed lineage, which is task 59 (branch reconciliation), NOT this task. Say so and stop, rather than
+   duplicating it.
+ - If it does NOT serve the baseline, option (b) - make the committed `e2e/baseline.json` authoritative -
+   becomes the clear recommendation, because the indirection points at something that will not exist in a
+   deployed build for the foreseeable future.
+
+**Everything else in the brief stands and is still measured fact**: the live aggregate is 963 tools, the
+committed fallback is `aggregateMinTools: 45`, the endpoint 404s on prod :20251, dev :20252 and uat :20253,
+and `app_configuration` has zero rows for category '%E2E%' or config_key '%AggregateMinTools%' (columns are
+snake_case: `config_key`, `config_value`, `category`).
+
+**The most important deliverable is unchanged and is point 3: make the silent fallback LOUD.** A 404
+downgrading to a stale snapshot while the suite still reports green is the actual defect, and it is a defect
+whichever branch the endpoint lives on.
+================================================================================
+
+--- OVERSEER CORRECTION, 2026-09-09 09:01 PT -------------------------------------------------
+The correction above says "the fix is branch reconciliation (task 59), NOT this task". **That pointer is
+wrong.** Task 59 is scoped to the **cognizioware-powerplatform** repo. The divergence that hides
+AdminE2eController is in **mcp-cognizioware**, a different repo, and task 59 does not cover it.
+
+The mcp-cognizioware divergence is now its own task (78). If you conclude the endpoint exists on main and
+simply never deploys, point at TASK 78, not 59, and stop - do not attempt the reconciliation yourself.
+Everything else in the correction stands.

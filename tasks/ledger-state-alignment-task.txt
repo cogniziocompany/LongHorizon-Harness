@@ -1,0 +1,121 @@
+*** CORRECTION 2026-09-15 07:12 PT (scheduled tick #106 [ec14da]) - DO NOT RELAUNCH AS WRITTEN ***
+Run 20260915T140349Z_ec2ec4fc proved this task cannot run on CT110: C:/tmp/queue/LEDGER.md, its .bak-states
+backup and the source plan exist only on PTAIT09. The run was stopped and the entry moved to blocked/.
+The line anchors below are stale (ledger is now ~1.79 MB). The ledger is written by the overseer tick,
+so this work belongs to an overseer-local pass, never a harness run.
+TASK 119 - align C:/tmp/queue/LEDGER.md with the corrected eleven-state machine. Mostly a careful
+relabel, and the trap is that ONE of the three fixes is ALREADY DONE - verify it, do not redo it.
+
+SOURCE PLAN: C:\Users\PaxtonTait\.claude\plans\ledger-state-alignment.md
+  (exact filename on disk: `ledger-state-table-alignment.md`, written 2026-09-09 ~23:45 PT)
+READ THAT PLAN FIRST. This task file records what has changed since it was written.
+
+WORKSPACE: none of the repos - this operates on C:/tmp/queue/LEDGER.md, a local file.
+If the harness cannot run against a non-repo path, say so and stop rather than inventing a target.
+
+================================================================================
+THE CORRECTED STATE MACHINE - the authority
+================================================================================
+
+Eleven happy-path states, in this order:
+  QUEUED -> RUNNING -> GATED -> BRANCHED -> PUSHED -> PR -> REVIEWED -> MERGED -> LANE -> LIVE -> VERIFIED
+
+Four legal off-path states, each requiring its reason IN the row:
+  HELD (why) - BLOCKED (on what, by name) - FAILED (cause, not symptom) - SUPERSEDED (by which task)
+
+COMMITTED and DONE are NOT states. COMMITTED is BRANCHED. DONE must become whichever of
+MERGED / LANE / LIVE / VERIFIED the evidence actually supports.
+
+THE SUBTLE TRAP, and it is why this drift went unnoticed for so long:
+the OLD `BRANCHED` evidence was `git log origin/<base>..HEAD`, which **passes before a push too**.
+It therefore never distinguished "committed locally" from "on the remote". The new `PUSHED` evidence
+must compare against **`origin/<branch>`**, not `origin/<base>`. Preserve that distinction exactly;
+it is the whole point of splitting the two states.
+
+================================================================================
+FIX 1 - ALREADY APPLIED BY THE OVERSEER 2026-09-09 23:33 PT. VERIFY ONLY.
+================================================================================
+
+The plan says LEDGER.md lines 6-18 still enumerate the original nine states. **They no longer do.**
+The overseer replaced that table with the eleven-state table plus a second table for the four
+off-path states, plus a note on BRANCHED-vs-PUSHED. A backup of the pre-edit file is at
+`C:/tmp/queue/LEDGER.md.bak-states`.
+
+YOUR JOB ON FIX 1 IS TO VERIFY, NOT TO EDIT:
+  - the table lists exactly the eleven names above, in that order
+  - a second table lists HELD / BLOCKED / FAILED / SUPERSEDED with a "Must record" column
+  - the PUSHED row's evidence references `origin/<branch>` (NOT `origin/<base>`)
+If any of that is wrong, fix only what is wrong. **Do not restore the plan's version wholesale** -
+it would undo the off-path table.
+
+================================================================================
+FIX 2 - relabel rows that used non-states  ** THIS IS THE REAL WORK **
+================================================================================
+
+  - Task 58 (around LEDGER.md:5308): `DONE - TASK RETIRED, NOT BUILT` -> `SUPERSEDED (by 61)`.
+    KEEP the existing evidence text verbatim; only the state label changes.
+  - Any row reading `COMMITTED` -> `BRANCHED`.
+  - ENUMERATE FIRST, THEN EDIT. Grep the whole file for `DONE` and `COMMITTED` and report the count
+    and line numbers BEFORE changing anything. One sample does not characterise a population - there
+    may be more than the two the plan names.
+
+  ** DO NOT REWRITE HISTORICAL TICK PROSE. ** Only row/table cells. Task 83's recorded path at
+  ~line 7680 describes what happened at the time and stays exactly as written. If a `DONE` appears
+  inside a narrative sentence rather than as a state label, LEAVE IT. When you cannot tell which it
+  is, leave it and list it in your report as ambiguous - a wrong edit to the historical record is
+  worse than an unmade one.
+
+================================================================================
+FIX 3 - the ornith row, and the plan is STALE here. Use these facts instead.
+================================================================================
+
+The plan says to add an ornith row with blocker text about moving the branch off
+`feat/provider-quota-links` to `feat/ornith-128k-pool`. **That is out of date.** As of 23:35 PT the
+overseer has already verified the real state:
+
+  - Branch is **`feat/ornith-1.5-pool-128k`**, cut off **origin/main** (not off the quota-links
+    branch - the agent found that branch already fully merged). No rename is needed.
+  - Commits: `0786a35` (infrastructure/litellm-config.yaml, +71/-3) and `d21fbee` (e2e suite 45 +
+    suite 36b + the npm script). Ahead 2, **not pushed**.
+  - So the correct state is **BRANCHED**, and the correct off-path label is **HELD** - not BLOCKED,
+    because nothing is missing. It is a deliberate hold: merging edits litellm-config.yaml, which
+    FORCE-RECREATES the CT202 prod router, and harness runs were live. It releases when active
+    runs = 0.
+  - There is a SECOND ornith row that is already **VERIFIED** and must not be conflated with the
+    branch row: the live router registration. Evidence: GET /model/info shows `ornith-1.5:pool`
+    (db_model true, max_input_tokens 131072); POST /v1/messages with the HARNESS key returns 200
+    with resolved model `ornith-1.5:pool`; POST /v1/chat/completions returns 200 with tool_calls
+    working. The registration is LIVE; the repo mirror is not. Two rows, two states.
+
+================================================================================
+NOT CONFLICTS - checked, leave alone
+================================================================================
+
+  - `lh_harness` code has its OWN run statuses (starting/running/waiting_approval/completed/failed,
+    src/lh_harness/webapi/server.py:622). Nothing in code consumes the ledger chain. Do not try to
+    make them match - they are different vocabularies for different things.
+  - The Ship Plane artifact never enumerates states. Leave it.
+  - Past rows that went BRANCHED -> PR stay valid. PUSHED is a refinement, not a retroactive defect.
+  - LOOP-PROMPT.md is ALREADY CORRECT. Do not re-edit it.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - LEDGER.md is ~643 KB and is APPENDED TO EVERY FIVE MINUTES by the live overseer, which rewrites
+   line 1 and uses `cat >>`. **Work on a copy, and apply your edits by line-anchored patch, not by
+   rewriting the whole file** - a wholesale rewrite will silently discard ticks appended while you
+   worked. Re-check the file's size/mtime immediately before writing and abort if it grew.
+ - Back up before editing (a `.bak-` copy with a timestamp).
+ - Never `git add -A`.
+ - Report the BEFORE and AFTER counts for every label you change.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+Fix 1 verified (and only corrected if actually wrong). Every non-state label enumerated with line
+numbers, then relabelled, with historical prose untouched and ambiguous cases listed rather than
+guessed. The two ornith rows present and distinct - registration VERIFIED, repo mirror
+BRANCHED + HELD. A closing report giving before/after counts and every line you chose NOT to touch
+and why.

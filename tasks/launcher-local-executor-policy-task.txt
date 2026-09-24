@@ -1,0 +1,46 @@
+# Task 196 — Stop seating executors on the local Ollama span while it keeps costing rounds
+
+## The measurement that produced this task (scheduled tick #446, 2026-09-17)
+Enumerated across ALL 20 runs launched today, grouped by the executor each was bound to, counting
+`agent.runtime.failed` events bucketed by their exact budget (1800 s IS the cli_executor budget;
+1200/3600 s are manager, 900 s auditor):
+
+  executor lane                          runs   runs losing a round to the 1800 s executor budget
+  ornith-1.5:pool            (LOCAL)      4      3 of 4   — 6 such rounds
+  kimi-k3:synthetic-anthropic             3      1 of 3   — 3 rounds (all in task 172)
+  nemotron-3-super:synthetic-anthropic    9      0 of 9
+  syn:large:vision:synthetic-anthropic    4      0 of 4
+
+Nemotron has the LARGEST sample and zero. The local lane, with a quarter of nemotron's sample,
+carries two thirds of the fleet's executor-budget timeouts.
+
+## This is a known failure mode that the existing guard does not cover
+`launch_queue.py` already says so in its own comments (~line 208): *"Trios 0 and 1 seat the EXECUTOR
+on the local span. The span is effectively a ONE-executor resource while it is also serving the CI
+eval gate, and task 67 died on it THREE times ... while Synthetic sat at 48.97% weekly credit and
+answered every probe."*
+
+The mitigation exists but is conditioned wrongly. `SYN_ONLY` / `_trio_syn` is forced only when
+Ollama keys are SHORT (`ok<2`, line 729) or when the span is already at `LOCAL_CAP` (line 743).
+**When keys are healthy and the span is merely slow, nothing diverts** — so the rotation happily
+seats an executor on it. That is exactly how task 180 drew trio 0
+(`syn:large:vision` / `ornith-1.5:pool` / `kimi-k3`) and then lost three rounds, 2026-09-17.
+
+## Deliverable
+Make executor-lane selection reflect that the local span is a one-executor resource, not a peer:
+1. Stop seating the EXECUTOR on the local span while Synthetic is healthy, regardless of key count —
+   i.e. `_local_exec(roles)` should divert to `_trio_syn` on the executor seat whenever Synthetic is
+   up, not only under `ok<2` or `qw>=LOCAL_CAP`. Manager/auditor seats on the span are fine.
+2. Keep the opposite fallback intact: when Synthetic is DOWN and keys are fine, local is still correct.
+   Do not reintroduce the 2026-09-09 bug where degraded mode fell back ONTO the failing backend.
+3. Log, at selection time, which trio index was chosen and why, so a later timeout is diagnosable
+   from the launcher log instead of by reading the trio table by hand.
+
+## Verification
+Re-run the enumeration above over the runs launched after the change and show the ornith executor
+count at zero while Synthetic is healthy. **Do not** assert it from the table; count real runs.
+
+## Constraint
+`launch_queue.py` is a LONG-RUNNING process on the Windows box: an edit is NOT a deploy. The running
+launcher must be restarted for any change to take effect, and its start time compared against the
+file mtime to prove it. Open the PR and STOP.

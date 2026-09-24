@@ -1,0 +1,170 @@
+TASK 158 - FIND THE LITELLM ROUTER MEMORY LEAK (cognizioware-mcp-tools). Diagnosis + proposed fix, no merge.
+
+Queued by Paxton 2026-09-10 ~23:40 PT via session [4c0be38b]. Source: C:/tmp/ct202-memory-handoff.md.
+Containment (container mem_limit) is task 157, overseer-executed. THIS task is the actual fix.
+
+================================================================================
+THE FACTS YOU START FROM (measured by the overseer, do not re-measure what you cannot reach)
+================================================================================
+- Container `cognizioware-mcp-tools-litellm` on CT202 (ptait01, 192.168.21.110). One litellm process
+  reached 12,669,460 KB RSS in 8h20m (~1.5 GB/h under harness load).
+- After the OOM restart it grew 831 MB -> 914 MB in 21 minutes with ZERO harness runs, Ollama keys
+  exhausted, DRAIN armed. ~240 MB/h IDLE. So the leak is NOT proportional to run volume alone -
+  something on a timer or a health/probe path allocates and never frees.
+- CT202 cgroup: oom 230, oom_kill 123. Chronic.
+- Live router_settings in the DB DIFFER from the YAML (routing_strategy simple-shuffle, allowed_fails
+  50, cooldown 20, fallbacks list missing the G1 pool entries). Reason from the LIVE settings where
+  you can see them; say plainly where you cannot.
+- PR #142 (cache_namespacer deepcopy on an RLock -> 1,772 "cannot pickle" errors in 6 h) is a
+  candidate: per-request exception objects with tracebacks retained is a classic leak shape.
+  Check whether #142 is merged and deployed BEFORE hunting elsewhere.
+
+================================================================================
+DEDUP - these tasks touch the same box; do not redo them
+================================================================================
+- 121 puppeteer-chromium-leak: different process (chromium), different container.
+- 122 litellm-mcp-crash-loop: crash loop, not memory growth - but read its findings; same binary.
+- 82 / 151 spendlog streaming + 1001 stream logging: if the leak is the spend-log or request-log
+  buffer, the fix may ALREADY be one of these. Cross-reference, do not fork.
+- 142 cache_namespacer: candidate cause, see above.
+- 157: containment. Do not add a mem_limit here.
+
+================================================================================
+WHAT TO DO
+================================================================================
+1. Pin the version: read the litellm image tag / pip version from the compose file and lockfile.
+   Search the LiteLLM changelog and issues for memory-leak fixes AFTER that version (in-memory
+   cache unbounded, spend log buffer, prometheus label cardinality, langfuse/callback queues,
+   httpx client churn). Cite issue numbers.
+2. Enumerate every allocation-retaining feature enabled in this deployment: cache type and
+   max size / ttl, callbacks (success_callback, failure_callback, prometheus, langfuse, custom),
+   spend logging (store_model_in_db, disable_spend_logs), in-memory rate-limit maps per key/model,
+   and any custom middleware in this repo (cache_namespacer, quota/synthetic signal code from #140,
+   #146). For each: bounded or unbounded? Freed on what condition?
+3. Explain the IDLE growth. Something runs with no traffic: health checks (`/health` iterates every
+   deployment and builds clients), the router cooldown/allowed_fails bookkeeping, background
+   spend-log flush, prometheus scrape. Name the most likely one with evidence from the code paths.
+4. Produce a RANKED list of candidate causes with, for each: the evidence, the one measurement that
+   would confirm it (e.g. tracemalloc top-10 at t0 vs t+1h, `/metrics` series count, cache key
+   count), and the fix (a config bound, a version bump, or a code change in this repo).
+5. Write the fix as a DIFF ON A LOCAL BRANCH, by explicit path, then `git push` and `gh pr create`
+   YOURSELF - your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14 16:21 PT, so the
+   retired '(CT110 has no gh/token)' note no longer applies. Do NOT merge. Do NOT edit infrastructure/litellm-config.yaml - if the fix is a
+   router-settings change, write it as a proposed YAML snippet in the report and say it needs
+   Paxton's rule lifted plus a zero-active window.
+6. Anything requiring host access (tracemalloc inside the container, docker stats sampling,
+   /sys/fs/cgroup reads) goes in a "NEEDS OVERSEER" section as exact commands, one per line, with
+   the expected reading. The overseer has SSH; you do not.
+
+Output: docs/handoff/LITELLM-LEAK-2026-09-10.md in the repo (committed on the branch) containing
+sections: Version, Enabled retainers, Idle-growth explanation, Ranked causes, Proposed fix (diff
+path), NEEDS OVERSEER. Plain statements only. If you cannot determine the cause from code alone,
+say so and stop at the ranked list - a wrong confident answer costs more than an honest short one.
+Never git add -A. Secrets by name only.
+
+================================================================================
+*** PAXTON 2026-09-10 23:50 PT - A NAMED HYPOTHESIS, AND IT OUTRANKS GUESSING. ***
+================================================================================
+Verbatim: *"if you find the data colect point, look into db option in the app as a buffer"* and
+*"or simpler maintainable"*.
+
+**TREAT THIS AS HYPOTHESIS #1 AND TEST IT BEFORE ANY OTHER.** LiteLLM does not write every spend
+log straight through - it **queues them in memory and flushes in batches**. If flushes fall behind
+the arrival rate, that in-memory queue grows without bound. That single mechanism would explain
+BOTH measurements this task starts from, which no traffic-only or cache-only theory does:
+  - the **idle drift** (~240-300 MB/h with DRAIN armed and zero harness runs) - a backlog draining
+    slowly, or retrying, while nothing new arrives; and
+  - the **traffic-correlated spike** (914 MB -> 16.5 GB in ~5 minutes under the deploy lane's E2E
+    and health-check traffic) - arrivals outrunning flushes.
+
+**HOW TO TEST IT - cheap, and it is a MEASUREMENT, not a code read:**
+ 1. Find the flush/queue settings actually IN EFFECT. **RULE 1 applies hard here:** five config
+    sections are DB-shadowed on this router and the DB row WINS over the YAML, so reading
+    `litellm-config.yaml` proves nothing. Read the live value back.
+ 2. Correlate queue depth / flush lag against RSS over one growth episode. If RSS tracks backlog,
+    the cause is found.
+ 3. **CHECK WHETHER POSTGRES IS THE REAL BOTTLENECK.** `LiteLLM_SpendLogs` on this same CT202
+    Postgres carries ~18 GB of TOAST and 9.88M chunks (see tasks 125a/b/c). A table that large makes
+    inserts slower, which lengthens the queue, which grows memory. **If that is the chain, the leak
+    and the spendlog bloat are ONE problem, and 125 is already the remedy for half of it.**
+
+**"SIMPLER MAINTAINABLE" IS A CONSTRAINT ON THE ANSWER.** If a bounded buffer, a flush interval, or
+a batch size is the fix, prefer that ONE setting over new code. Do not propose a new service, a new
+queue, or a new surface. A configuration change with a measurement behind it beats an architecture.
+
+DEDUP, UNCHANGED: this task still does NOT touch the container cap (task 157) and does NOT edit
+`infrastructure/litellm-config.yaml`. Report, do not deploy.
+
+================================================================================
+*** MEASURED 2026-09-11 00:05 PT - POSTGRES IS HEALTHY. PART OF THE HYPOTHESIS
+    ABOVE IS THEREFORE WEAKENED, AND THAT IS RECORDED HONESTLY HERE. ***
+================================================================================
+Step 3 of the test plan above guessed that a bloated `LiteLLM_SpendLogs` slows inserts, lengthening
+the in-memory flush queue. **Measured against the live database, that chain is NOT supported:**
+
+    LiteLLM_SpendLogs          295,826 live rows   n_dead_tup = 0    26 GB
+    pg_stat_activity           1 active, 16 total, **0 waiting on locks**
+    container                  Up 2 days (healthy); a bad credential was refused in 0.417 s
+
+`n_dead_tup = 0` means **autovacuum is fully keeping up** - there is no bloat to reclaim and no
+vacuum backlog. Nothing is lock-blocked. A database in that state is not the thing throttling
+inserts. **So do not start from "Postgres is slow" - it is measurably not.** If the buffer
+hypothesis survives, the backlog must come from somewhere else (flush interval, batch size, a retry
+loop, or a failure path that never drains), and THAT is what to look for.
+
+**CREDENTIALS CORRECTION THAT WILL COST YOU AN HOUR IF MISSED:** the role is **`litellm_user`** and
+the database is **`litellm_mcp_tools`**. An earlier task draft said role `llmproxy`, database
+`litellm` - **neither exists**; psql fails with `FATAL: role "llmproxy" does not exist`. Read
+POSTGRES_USER / POSTGRES_DB from the container, never from a task file.
+
+**THE REAL SIZE LEVER, AND IT IS NOT THE DATABASE ENGINE:** 26 GB across 295,826 rows is
+**~92 KB per row**. That is TOAST - each row carries full request AND response bodies. Paxton's
+constraint is *"we dont want to stop the data colection we want to limit the overlaod of size"*, and
+those are compatible: the COUNTS, COSTS, LATENCIES, MODELS and TAGS are tiny; the BODIES are the
+26 GB. Reducing or truncating stored bodies keeps every operational metric and removes almost all of
+the volume. **Check whether that is a LiteLLM setting before proposing any new storage.**
+
+**ON "COMMENT OUT POSTGRES" (Paxton asked):** flag, do not silently act. This router runs
+`store_model_in_db: true` - five config sections live in Postgres and the DB row WINS over the YAML,
+plus virtual keys, teams and budgets. Removing Postgres would remove the router's config authority
+and every virtual key, not just the spend sink. A local/embedded DB is defensible for the SPEND-LOG
+SINK specifically; it is not a drop-in for the router's database. Say so plainly in the report.
+
+================================================================================
+*** THE LEAK IS REPRODUCIBLE ON DEMAND. YOU DO NOT HAVE TO WAIT FOR IT. ***
+   Observed TWICE by the overseer, 2026-09-11 00:10-00:30 PT.
+================================================================================
+**TRIGGER:** run the `Deploy MCP Tools Stack` lane's **"Full E2E suite (advisory)"** step against
+the CT202 router.
+
+**RESULT, both times:**
+
+| | episode 1 | episode 2 |
+|---|---|---|
+| fresh RSS at start | 440 MB | 768 MB |
+| RSS after ~7 min | **16,503 MB** | **16,338 MB** |
+| CT202 memcg | pinned at **20.000 GB** (the cap) | pinned at **20.000 GB** |
+| `oom_kill` counter | 123 | **124** (a new kill) |
+| ptait01 load | 319 | 229 |
+| surfaces | router + ops + fleet all `HTTP 000` | router + ops + fleet all `HTTP 000` |
+
+**~16 GB in ~7 MINUTES OF E2E TRAFFIC.** That is four orders of magnitude above the idle drift, so
+whatever leaks is driven by REQUEST HANDLING, not by a background timer. Reproduce it deliberately
+and profile the live process - do not sit and wait for a slow drift.
+
+**THE DEADLOCK YOU WILL HIT (it cost the overseer two cycles):** the deploy job that would replace
+the router sits BEHIND the advisory E2E step in the same lane. The suite kills the router, so the
+lane never reaches the deploy that would fix it. **Do not simply re-run the lane - it reproduces
+the outage every time.** Land task 157's `mem_limit` FIRST so the router dies alone instead of
+taking the operator surfaces with it, then the lane can be run safely.
+
+**RESTART PATH, because the documented one fails:** under this load `docker restart` inside CT202
+hangs and silently does nothing. Signal the PID from the host instead - and note **SIGTERM was
+ignored BOTH times and SIGKILL was required**, which is itself evidence the process is stuck in
+kernel reclaim rather than merely busy:
+
+    PID=$(ps -eo pid,args --sort=-rss | awk '/[l]itellm --config/{print $1; exit}')
+    ps -o pid,args -p "$PID"      # CONFIRM before signalling
+    kill -TERM "$PID" || kill -9 "$PID"
+
+`restart=unless-stopped` brings it back in ~30 s at ~500-800 MB.

@@ -1,0 +1,16 @@
+{
+  "name": "9999zg-203-auditor-readonly-worktree-metadata",
+  "task_file": "C:/tmp/auditor-readonly-worktree-metadata-task.txt",
+  "task_source": "task_file",
+  "workspace": "LongHorizon-Harness",
+  "max_rounds": 6,
+  "trio": "kimi",
+  "note": "TICK #636 2026-09-18 07:23 PT: created after the read-only check voided clean audits on task 200 (r3+r4) and task 201 (r3), all on `.git/worktrees/<name>` metadata. Appended at END of band. Same tree as 201/202: never two runs on one working tree. Develop-only harness code; LIVE is an overseer CT110 deploy at zero active. | LIVE CORROBORATION, tick #684 2026-09-18 11:30 PT, read from run 205's snapshot (`20260918T174419Z_b7b071bd`), not inferred: this defect is ACTIVELY BURNING ROUNDS RIGHT NOW. Rounds 1 AND 2 of run 205 both carry `Status: blocked / Integrity: violation / Contract audit: unknown` for the SAME cause - round_001's auditor mutated `.git/worktrees/lh-task202-base`, round_002's mutated `.pytest_cache/v/cache/nodeids`. Both are incidental tool artifacts, NOT deliverables, and the work itself was complete at `a8490e1` throughout. Two of four rounds lost to a false integrity violation. By the three-strikes discriminator this is the SAME role failing the SAME way twice = harness fault, not oversized scope. PR #31 is the fix and it is OPEN/MERGEABLE/unreviewed on `main`. Also still true from #676: `manager._workspace_mutation_detected` now returns False when the flag is set but the mutations dict lists no path, while `auditor_agent` still flags that case - the two layers disagree. | TICK #692 2026-09-18 12:33 PT - PR #31 IS MERGED -> task 203 PR -> MERGED. Merged by **prax211 (Paxton himself)** at 2026-09-18T19:24:22Z, i.e. DURING this tick, between #691 reading it OPEN at 12:13 and my re-read. Not an overseer merge. Evidence read three ways, not from the PR summary alone: gh reports state=MERGED mergedAt=19:24:22Z mergeCommit=dbf365fc; and locally `git merge-base --is-ancestor 3254a8e origin/main` = YES with an EMPTY diff, so the head commit is now contained in main. Only review on it remains the Copilot quota-limit stub - it merged unreviewed, which is the known 117 condition, not a new fault. **The STEP-3 build started at #691 is therefore MOOT and I stopped it** (leg A was ~85 pct through, 171F/402P from #691s run; the failures were never attributed and MUST NOT be read as a verdict on #31 - see the repo defect below). NEXT STATE: 203 is MERGED, not LANE - LHH lane is a PyPI release + CT110 deploy that restarts lh-harness.service and kills every in-flight run, and 2 runs are live (206, 207), so the deploy cannot run now and 203 advances no further this tick. REPO DEFECT still open and now more valuable, since main is what everyone clones: a fresh single-branch LHH clone CANNOT run its own suite from declared metadata - `pip install -e .[dev]` warns no extra dev yet EXITS 0, then conftest.py:7 dies on starlettes httpx. Test deps are undeclared. Worth its own task.",
+  "run_id": "20260918T164246Z_eca8dccd",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "syn:large:vision:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-18T16:42:46.209919+00:00"
+}

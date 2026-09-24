@@ -1,0 +1,84 @@
+TASK 77b - the fleet e2e suite and the page wording, in mcp-tools
+
+THIS IS STEP 3 OF 3. Paxton set the sequence explicitly on 2026-09-09:
+  1. TASK 77a - change the lh-harness code (separate task, separate repo)
+  2. the overseer deploys lh-harness and verifies fleet.easybutt0n.ai actually shows the node
+  3. (THIS TASK) the e2e suite + page wording, then the overseer re-runs the mcp-tools pipeline
+
+## DO NOT START THIS UNTIL THE OVERSEER CONFIRMS STEP 2 IS DONE
+
+This ordering is not bureaucracy, it is the whole reason the sequence exists. Today:
+
+    GET https://fleet.easybutt0n.ai/api/fleet/nodes  ->  200  []
+
+The suite you are about to write is SUPPOSED to fail against an empty fleet. If you write it before the
+harness is deployed and registering, your own PR goes red for the correct reason at the wrong time, and
+whoever reads it cannot tell your suite from a broken one. If the overseer has not told you step 2 is
+complete, STOP and say so rather than writing a test you cannot see pass.
+
+Check it yourself before you begin: the nodes endpoint must return a NON-EMPTY array. If it is still `[]`,
+stop.
+
+## WHERE EVERYTHING LIVES - established, do not go looking
+
+  - The fleet service IS IN THIS REPO: infrastructure/docker/fleet-admin, built by
+    infrastructure/docker-compose.yml as `cognizioware-mcp-tools-fleet-admin` on port 8787.
+  - Caddy routes it: `fleet.easybutt0n.ai { ... reverse_proxy fleet-admin:8787 }`.
+  - Its database is FLEET_DATABASE_URL (agent-db, schema `fleet`) - NOT the LiteLLM DATABASE_URL that
+    mcp-tools.env carries. Do not confuse them.
+  - Measured 2026-09-09: /api/fleet/nodes returns 200. /api/fleet/summary, /api/fleet/events, /api/nodes
+    and /api/meta all return 404 on fleet. The surface is essentially that one route - do not assume
+    richer endpoints exist.
+
+  A real ambiguity you may hit: the Caddyfile comment calls fleet-admin the "easysvc FleetAgent registry
+  (enroll/checkin/ssh-host-map export)" - a DEVICE registry - while the page renders as "Fleet Window" and
+  doctrine treats fleet.easybutt0n.ai as the lh-harness RUN wallboard. One service, two roles. If enrolled
+  easysvc agents and registered harness nodes are different record types, SAY SO in the report and assert
+  about the harness node specifically. Do not silently conflate them and do not redesign the service.
+
+## PART 1 - THE SUITE: e2e/suites/47-fleet-registration.test.js
+
+Use suite number 47. Do NOT use 44, 45 or 46 - PR #112 adds 44/45/46 and PR #119 adds another 44, so those
+numbers are contested on open branches. Read two or three existing suites first and follow their
+conventions (e2e/lib/api-client.js for config and auth, and how they soft-skip).
+
+Paxton chose the pass condition: the named node present AND online AND heartbeat fresh.
+
+ 1. GET <fleet>/api/fleet/nodes returns 200 AND a NON-EMPTY array. Report the count.
+ 2. The expected node is present BY NAME. The name is whatever LH_HARNESS_FLEET_NODE is set to on CT110 -
+    do NOT hardcode a guess. Read it from an e2e env var, add it to e2e/.env.example with a comment, and
+    soft-skip loudly if unset, exactly as the other suites handle missing config.
+ 3. That node reports online.
+ 4. That node's heartbeat is FRESH, within a threshold you choose and JUSTIFY in a comment. This is the
+    assertion that catches a node which registered once and then died, and a stale entry that never
+    de-registered.
+ 5. A separate, clearly-named test asserting the failure mode explicitly: an empty array is a FAILURE, not
+    an empty state, and its message tells an operator what to do about it.
+
+ADVISORY in the mcp-tools lane, like the rest of the full matrix - that is Paxton's choice. Do NOT touch the
+blocking gate (13-litellm-model-inference Phase 0) and do not try to make this block there.
+
+## PART 2 - THE PAGE (in this repo: infrastructure/docker/fleet-admin)
+
+"No nodes have registered" and "cannot reach the fleet API / the harness is not configured to register" are
+different sentences and must not both render as an empty list. The "connected" pill currently describes the
+browser-to-API link and says nothing about registration - that is exactly what misled the reader into
+reporting the site as down. Make it impossible to read as "everything is fine".
+
+## HARD RULES
+
+ - Branch off main, PR to main, DO NOT MERGE.
+ - infrastructure/litellm-config.yaml MUST NOT be touched - any change to it force-recreates the production
+   LiteLLM router.
+ - Do NOT restart lh-harness, do not deploy, do not dispatch a workflow, do not touch CT110 or Hydra.
+ - Env NAMES only, never values. Do not ask for credentials.
+ - RULE 2: fleet.easybutt0n.ai is the run wallboard and run detail lives there and nowhere else. No node
+   view on ops.easybutt0n.ai, no second harness status route. Extend what exists; if you find yourself
+   creating a surface, STOP and say so.
+
+## DONE MEANS
+
+A PR against main with suite 47 and its five assertions, the page-wording fix applied in fleet-admin, the
+heartbeat threshold stated with its justification, and - if harness nodes and easysvc agents turn out to be
+different record types - a plain statement of that. Report test counts, baseline first. The overseer re-runs
+the mcp-tools pipeline after merge and verifies the suite passes against the live fleet.
