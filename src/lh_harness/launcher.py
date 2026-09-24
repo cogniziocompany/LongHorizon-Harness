@@ -525,12 +525,42 @@ class Launcher:
             return f"{entry.trio} at capacity"
         return None
 
+    def _drain_skip_reason(self) -> str | None:
+        """Drain skip reason while the operator flag is set, else None.
+
+        Task 242: the drain flag (POST /api/queue/drain) stops NEW launches so
+        a deploy can find a zero-active window without deleting the backlog.
+        Live runs are deliberately out of scope here — they are only ever
+        reconciled by ``_update_launched_entries`` above, which the drain
+        does not touch.  A store without drain support (the PG backend
+        before it grows the method) reads as not drained: the flag is an
+        explicit operator action, so a missing mechanism must fail open
+        rather than freeze every launch.
+        """
+
+        get_drain = getattr(self.queue_store, "get_drain", None)
+        if get_drain is None:
+            return None
+        try:
+            drain = get_drain()
+        except Exception:
+            return None
+        if not drain.get("enabled"):
+            return None
+        reason = drain.get("reason")
+        if reason:
+            return f"queue drained: {str(reason)[:200]}"
+        return "queue drained"
+
     def _check_eligibility(
         self,
         entry: QueueEntry,
         active: dict[str, dict[str, Any]],
         capacities: dict[str, int],
     ) -> str | None:
+        drain_reason = self._drain_skip_reason()
+        if drain_reason is not None:
+            return drain_reason
         capacity = self._config.get("capacity", {})
         if entry.trio == "kimi" and capacity.get("key_health_url"):
             min_healthy = int(capacity.get("min_healthy_keys", 2))

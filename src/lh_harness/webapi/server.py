@@ -1019,6 +1019,17 @@ def create_app(
         )
         reporter = get_reporter()
         fleet_state = reporter.registration_state() if reporter is not None else {}
+        # Drain state (task 242): surfaced here so the fleet window, Hydra and
+        # deploy tooling see a maintenance window in the same handshake they
+        # already poll.  A store without drain support reports not-drained —
+        # the flag is an explicit operator action, so absence must fail open.
+        drain: dict[str, Any] = {"enabled": False, "reason": None, "since": None}
+        get_drain = getattr(queue_store, "get_drain", None) if queue_store is not None else None
+        if get_drain is not None:
+            try:
+                drain = get_drain()
+            except Exception:
+                pass
         return build_meta(
             endpoint=endpoint,
             fleet_configured=bool(reporter is not None and reporter.configured),
@@ -1035,6 +1046,7 @@ def create_app(
                 "abort": supervisor is not None,
                 "fleet_mcp_tools": queue_store is not None,
             },
+            drain=drain,
             mcp_gateway_alias="lhharness",
             agents=catalogue["agents"],
             models=catalogue["models"],
@@ -1083,6 +1095,45 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"ok": True, "queue_id": entry.queue_id}
+
+    @app.post("/api/queue/drain")
+    def set_queue_drain(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        """Set/clear the queue drain flag (task 242).
+
+        ``{"enabled": true, "reason": "deploy 228"}`` stops NEW queue launches
+        (live runs are untouched) and ``{"enabled": false}`` resumes.  The
+        flag persists across service restarts — a deploy must come back up
+        still drained until it is verified and an operator clears it.  The
+        current state is always visible in GET /api/meta under ``drain``.
+
+        This inherits the single bearer-token boundary that guards every
+        /api/ route (no separate role-token layer exists in this codebase).
+        """
+
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        set_drain = getattr(queue_store, "set_drain", None)
+        if set_drain is None:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "queue drain is not available for the "
+                    f"{type(queue_store).__name__} queue store"
+                ),
+            )
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            raise HTTPException(status_code=422, detail="enabled must be a boolean")
+        reason = body.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise HTTPException(status_code=422, detail="reason must be a string")
+        if enabled and not (reason or "").strip():
+            raise HTTPException(status_code=422, detail="reason is required when enabling drain")
+        try:
+            state = set_drain(enabled, reason if isinstance(reason, str) else None)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"could not persist drain state: {exc}") from exc
+        return {"ok": True, "drain": state}
 
     @app.get("/api/queue")
     def list_queue(

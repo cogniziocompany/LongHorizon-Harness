@@ -12,9 +12,11 @@ the LAN runner (CT210, label `lan-deploy`).
 | --- | --- | --- |
 | preflight | runner | `preflight.py`: ref resolves to a sha; a `vX.Y.Z` tag matches `pyproject.toml` version; default-branch tip has no red/in-flight checks |
 | build | runner | npm Web bundle + `python -m build --wheel`; wheel version and bundled Web UI verified |
+| drain | runner | `set_drain.py --enable`: POST `/api/queue/drain` stops NEW queue launches (TASK 242); live runs finish untouched, and the flag survives the restart so a failed verify leaves CT110 drained rather than refilling the slots |
 | wait | runner | `wait_zero_active.py`: counted consecutive zero-active polls of `GET /api/runs` |
 | deploy | runner → PVE → CT110 | `run_on_ct110.sh` pushes bytes (sha256-verified at both hops) and runs `ct110_deploy.sh deploy` |
-| verify | runner / CT110 | `systemctl is-active` == active; installed `lh_harness.__version__` == target; `GET /api/meta` == 200 |
+| verify | runner / CT110 | `systemctl is-active` == active; installed `lh_harness.__version__` == target; `GET /api/meta` == 200 AND `meta.drain.enabled == true` (the restarted service must come back drained) |
+| resume | runner | `set_drain.py --disable`: clears the drain and verifies `meta.drain.enabled == false` — runs whenever the flag was set (success or failure path), so a failed deploy never leaves the queue frozen |
 | rollback | runner → CT110 | automatic on any failure AFTER the deploy step has started (a skipped deploy step — wheel download, SSH key staging, zero-active wait — aborts the run with NO service restart); loud sentinel if the rollback itself fails |
 
 Greppable terminal markers: `CT110_DEPLOY_OK`, `CT110_DEPLOY_FAILED_ROLLBACK_OK`,
@@ -35,6 +37,14 @@ Greppable terminal markers: `CT110_DEPLOY_OK`, `CT110_DEPLOY_FAILED_ROLLBACK_OK`
    `ct110_deploy.sh` re-checks idleness on-host immediately before
    `systemctl restart` — a run launched between the two checks aborts the
    deploy with rc=2 instead of being killed.
+   TASK 242: with a normal backlog that window may never open on its own
+   (the kimi slots refill the moment one frees). The runner now sets the
+   queue drain flag first (`POST /api/queue/drain`, operator bearer token)
+   so the backlog stops launching; the zero-active wait then only has to
+   outlive the already-running runs. The flag persists in
+   `runs_root/queue/drain.json` across the restart, the verify step proves
+   the new service came back still drained, and `set_drain.py --disable`
+   resumes launching once everything is verified.
 4. **DEPLOY-HOLD.** `ct110_deploy.sh` aborts when a hold file exists (its
    contents are the human reason). Rollback deliberately ignores the hold:
    it only runs after a failed deploy and must not be blocked from restoring

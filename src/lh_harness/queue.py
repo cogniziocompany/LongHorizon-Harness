@@ -886,6 +886,77 @@ class QueueStore:
         return counts
 
     # ------------------------------------------------------------------
+    # Drain flag — task 242.
+    #
+    # One JSON file at ``runs_root/queue/drain.json``.  While ``enabled`` is
+    # true the launcher launches NOTHING new (the eligibility gate returns a
+    # "queue drained" skip for every pending entry) but live runs are never
+    # touched — they keep running and keep being promoted to done/failed by
+    # the normal reconciliation pass.  The flag lives next to the entries so
+    # it survives a service restart: a deploy comes back up drained (new
+    # launches still blocked) until an operator explicitly clears it.
+    # ``since`` records when the current drain period started and is kept
+    # across repeat enable calls so an operator flipping the reason does not
+    # re-age an open maintenance window.
+    # ------------------------------------------------------------------
+
+    _DRAIN_FILE = "drain.json"
+
+    def _drain_path(self) -> Path:
+        return self._root / self._DRAIN_FILE
+
+    def get_drain(self) -> dict[str, Any]:
+        """Return the persisted drain state; disabled defaults when absent."""
+
+        state: dict[str, Any] = {"enabled": False, "reason": None, "since": None}
+        try:
+            raw = self._drain_path().read_text(encoding="utf-8")
+        except OSError:
+            return state
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return state
+        if not isinstance(data, dict):
+            return state
+        if data.get("enabled") is True:
+            reason = data.get("reason")
+            since = data.get("since")
+            state["enabled"] = True
+            state["reason"] = str(reason) if reason is not None else None
+            state["since"] = float(since) if isinstance(since, (int, float)) else None
+        return state
+
+    def set_drain(self, enabled: bool, reason: str | None = None) -> dict[str, Any]:
+        """Persist the drain flag and return the resulting state.
+
+        ``reason`` is operator-facing text bounded to the queue reason limit.
+        Disabling clears ``reason``/``since``; a fresh enable starts a new
+        ``since`` while a re-enable of an already-drained queue keeps it.
+        """
+
+        now = _now()
+        bounded_reason = str(reason)[:_MAX_QUEUE_REASON_CHARS] if reason else None
+        if enabled:
+            previous = self.get_drain()
+            since = (
+                float(previous["since"])
+                if previous.get("enabled") and isinstance(previous.get("since"), (int, float))
+                else now
+            )
+            payload = {
+                "enabled": True,
+                "reason": bounded_reason,
+                "since": since,
+                "updated_at": now,
+            }
+        else:
+            payload = {"enabled": False, "reason": None, "since": None, "updated_at": now}
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+        _atomic_bytes_write(self._drain_path(), text.encode("utf-8"))
+        return self.get_drain()
+
+    # ------------------------------------------------------------------
     # Shadow (observe) log — task 173.
     #
     # One JSON line per shadow decision, appended to
