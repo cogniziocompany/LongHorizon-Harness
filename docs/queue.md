@@ -184,6 +184,16 @@ idempotent across restarts (a launched entry is never launched again).
 ## Example `config.toml` block
 
 ```toml
+# TASK 234 (2026-09-24): the auditor role must be bound to a read-only MCP
+# profile.  The supervisor refuses `roles.auditor.mcp_profile` when the
+# resolved profile is not read-only; before the launcher pre-burn check
+# (launcher.py) that refusal escaped into create_run and burned a queue
+# attempt.  Bind the auditor explicitly to a read-only profile — the built-in
+# "audit" profile (kb, guides, skills, memory, langfuse) — so the run-wide
+# trio profile can stay richer for the manager/executor.
+[run.roles.auditor]
+mcp_profile = "audit"
+
 [queue.trios.kimi]
 agent = "claude_code"
 model = "kimi-k2.7-code:cloud"
@@ -201,6 +211,19 @@ min_healthy_keys = 2
 key_health_url = "https://litellm.easybutt0n.ai/health"
 poll_seconds = 15
 ```
+
+The launcher's pre-burn eligibility check resolves the auditor's effective
+profile with the same precedence the worker uses
+(`mcp_profiles.resolve_profile`): an explicit
+`[run.roles.auditor] mcp_profile` wins over the trio's run-wide profile, then
+the `LH_HARNESS_WEB_DEFAULT_AUDITOR_MCP_PROFILE` /
+`LH_HARNESS_WEB_DEFAULT_MCP_PROFILE` environment variable names (values are
+supplied out-of-band), then the built-in default (`audit` for the auditor).
+An ineligible combination is refused with the exact supervisor reason
+(`roles.auditor.mcp_profile '<name>' is not read-only; auditor roles require
+a read-only MCP profile`) appended to the queue entry's `skip_reasons`
+without consuming an attempt; eligible launches proceed with their role
+specs stripped of `mcp_profile` (cutover 168 reservation rule).
 
 ## Queue entry contract
 

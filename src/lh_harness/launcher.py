@@ -31,6 +31,7 @@ from .queue import (
     read_lease,
 )
 from .supervisor.lifecycle import ACTIVE_STATUSES, canonical_lifecycle_status
+from .supervisor.service import auditor_read_only_violation
 from .workspace_guard import WorkspaceBaseError, prepare_workspace_base, probe_open_pr_gh
 from .workspace_identity import resolve_many
 
@@ -335,6 +336,25 @@ class Launcher:
         except Exception:
             pass
         return default_queue_config()
+
+    @staticmethod
+    def _project_role_mcp_profile(role: str) -> str | None:
+        """Return ``[run.roles.<role>] mcp_profile`` from the project config.
+
+        The same cwd-relative path ``_load_project_queue_config`` already
+        resolves; unreadable/missing config reads as unset.  Task 234: the
+        pre-burn auditor check honours this binding so a deployment can fix
+        the auditor's profile in config without touching the trio profiles.
+        """
+
+        try:
+            project = load_run_defaults(PROJECT_CONFIG_PATH)
+        except Exception:
+            return None
+        value = project.get(f"{role}_mcp_profile")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
 
     @property
     def stall_fired(self) -> bool:
@@ -898,6 +918,51 @@ class Launcher:
         mcp_profile = trio.get("mcp_profile")
         role_configs = _role_configs(agent, model, mcp_profile, trio.get("auditor_mcp_profile"))
         run_id: str | None = None
+        # Eligibility guard, pre-burn (task 234): a role/profile combination
+        # the supervisor would reject (auditor with a non-read-only MCP
+        # profile) must be refused BEFORE any attempt is consumed.  Measured
+        # 2026-09-23: the refusal escaped ``create_run`` and reached
+        # ``mark_failed``, so the entry died on a burned attempt with no
+        # chance to fix its configuration.  The trio profile is checked as the
+        # auditor's role override — the shape ``_normalise_role_configs``
+        # rejects — while the launch itself keeps the stripped specs that pass
+        # the reservation check (cutover 168).  An explicit read-only
+        # ``[run.roles.auditor] mcp_profile`` in the project config takes
+        # precedence over the run-wide profile (worker-side precedence, step 3
+        # over 4/5), which is how deployments bind the auditor to a read-only
+        # profile without changing the executor's profile.  Like the
+        # workspace-base refusal below, this keeps the entry pending and
+        # appends the clear refusal to skip_reasons; ``mark_failed`` is never
+        # reached.
+        auditor_spec: dict[str, str] = dict(role_configs["auditor"])
+        auditor_mcp_profile = trio.get("auditor_mcp_profile") or mcp_profile
+        config_auditor_profile = self._project_role_mcp_profile("auditor")
+        if config_auditor_profile:
+            auditor_spec["mcp_profile"] = config_auditor_profile
+        elif auditor_mcp_profile:
+            auditor_spec["mcp_profile"] = str(auditor_mcp_profile).strip()
+        refusal = auditor_read_only_violation(
+            {"auditor": auditor_spec},
+            agent=agent,
+            model=model,
+            mcp_profile=None,
+        )
+        if refusal is not None:
+            reason = refusal[:_MAX_REASON_LEN]
+            updated = self.queue_store.record_skip(entry.queue_id, f"launch refused: {reason}")
+            self._emit_service_event(
+                "queue.skipped",
+                {
+                    "queue_id": entry.queue_id,
+                    "trio": entry.trio,
+                    "workspace": entry.workspace,
+                    "reason": f"launch refused: {reason}",
+                },
+            )
+            if updated is not None:
+                updated.last_checked_at = _now()
+                self.queue_store.update(updated)
+            return
         # Workspace branch guard: never launch onto another task's branch
         # (measured defect, 2026-09-16: runs 7784478f under PR #108 and
         # 96563c4c under PR #154).  A non-default checked-out branch must not

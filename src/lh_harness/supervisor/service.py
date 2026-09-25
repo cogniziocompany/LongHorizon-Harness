@@ -204,6 +204,38 @@ def _normalise_role_configs(
     return result
 
 
+def auditor_read_only_violation(
+    role_configs: object,
+    *,
+    agent: str,
+    model: str | None,
+    mcp_profile: str | None = None,
+) -> str | None:
+    """Return the refusal reason an auditor profile violation would raise.
+
+    Mirrors the ``_normalise_role_configs`` auditor read-only rule: for the
+    given launch arguments it re-resolves the auditor profile the same way
+    (with a dummy gateway key and the service default
+    ``allow_auditor_write_mcp=False``) and returns the exact ``ValueError``
+    text ``create_run`` would raise, or ``None`` when the launch validates.
+    Callers that resolve an entry ahead of the supervisor (the queue
+    launcher) use this to refuse before an attempt is consumed.
+    """
+
+    try:
+        _normalise_role_configs(
+            role_configs,
+            agent=agent,
+            model=model,
+            mcp_profile=mcp_profile,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if "is not read-only" in message and "auditor" in message:
+            return message
+    return None
+
+
 def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
