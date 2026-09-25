@@ -223,21 +223,25 @@ def park_workspace(
             return result
         result["backup_ref"] = backup_ref
 
-        stash_message = f"lh-harness park {run_id}"
-        try:
-            _git(
-                repo,
-                "stash",
-                "push",
-                "-u",
-                "-m",
-                stash_message,
-            )
-        except WorkspaceParkError as exc:
-            result["error"] = f"created backup ref {backup_ref} but stash failed: {exc}"
-            _maybe_emit(record_event, run_id, result)
-            return result
-        result["stash"] = stash_message
+        # A dirty tree has work to stash; a merely-unpushed clean tree has
+        # none, and `git stash push` on it is an error, not a stash.  Either
+        # way the backup ref preserves every commit, so nothing is lost.
+        if dirty:
+            stash_message = f"lh-harness park {run_id}"
+            try:
+                _git(
+                    repo,
+                    "stash",
+                    "push",
+                    "-u",
+                    "-m",
+                    stash_message,
+                )
+            except WorkspaceParkError as exc:
+                result["error"] = f"created backup ref {backup_ref} but stash failed: {exc}"
+                _maybe_emit(record_event, run_id, result)
+                return result
+            result["stash"] = stash_message
 
     try:
         _git(repo, "checkout", "--detach", f"origin/{default_branch}")
