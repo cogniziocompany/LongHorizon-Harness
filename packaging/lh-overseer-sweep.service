@@ -72,7 +72,14 @@ Environment=LH_OVERSEER_TICK_MODE=read-only
 # Kernel flock releases on process death, so there is no stale-lock state to
 # age out — the failure mode the archived PTAIT09 age-based lock
 # (tools/overseer_tick.ps1:10-14) had to work around with a 55-minute TTL.
-ExecStart=/usr/bin/flock -n -E 0 /home/harness/.overseer-sweep/tick.lock /home/harness/.overseer-sweep/bin/tick.sh /home/harness/.overseer-sweep/bin/tick_notify.py
+#
+# The tick entrypoint takes NO positional argument: tick.sh rejects unknown
+# arguments with exit 2 (its "invalid configuration" contract), and its
+# telemetry module path comes from the TICK_NOTIFY env name (defaulting to
+# tick_notify.py installed next to it in /home/harness/.overseer-sweep/bin/).
+# Passing tick_notify.py here positionally would make EVERY unit fire fail
+# with rc=2 before claude ever ran.
+ExecStart=/usr/bin/flock -n -E 0 /home/harness/.overseer-sweep/tick.lock /home/harness/.overseer-sweep/bin/tick.sh
 
 # A headless tick can legitimately run for many minutes; the archived PTAIT09
 # guard treated a lock younger than 55 minutes as "previous tick still
