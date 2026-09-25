@@ -28,6 +28,7 @@ from typing import Any
 from .control_bus import (
     ControlBus,
     RevisionConflict,
+    _append_jsonl,
     _atomic_bytes_write,
     _ensure_dir_fd_nofollow,
     _ensure_dir_nofollow,
