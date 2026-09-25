@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,85 @@ _RUN_KEYS = {
     "timeouts",
 }
 _QUEUE_TRIOS = {"kimi", "qwen"}
+# Per-caller tool scoping and budget ceilings (task 174). The complete set of
+# tool names the MCP dispatch exposes; a caller's ``tools`` allowlist is
+# validated against it. Granting a tool here is what also unlocks its REST
+# twin (the resolve route checks the same allowlist).
+_MCP_TOOL_NAMES = frozenset(
+    {
+        "harness_enqueue_task",
+        "harness_list_queue",
+        "harness_run_status",
+        "harness_resolve_gate",
+        "harness_list_contentions",
+    }
+)
+# Task 235: read-only overseer-state tools over the migrated apparatus archive.
+# They are known to the dispatcher but deliberately NOT scoping-eligible: the
+# overseer calls them from an authenticated loopback session that carries no
+# caller identity, so requiring a ``tools`` grant would 401 them.  ``tools``
+# allowlists keep validating against _MCP_TOOL_NAMES only (merged with 174).
+_OVERSEER_TOOL_NAMES = frozenset(
+    {
+        "get_queue_entry",
+        "list_queue",
+        "get_task_history",
+        "read_ledger",
+        "list_open_asks",
+        "get_handoff",
+    }
+)
+# The full dispatcher surface: unknown-tool 404 decisions use this set.
+_MCP_DISPATCH_TOOL_NAMES = _MCP_TOOL_NAMES | _OVERSEER_TOOL_NAMES
+_CALLER_KEYS = {
+    "secret_env",
+    "tools",
+    "max_entries_per_hour",
+    "max_rounds_clamp",
+    "rest_run_control",
+}
+# ``anon`` is synthesized by the auth path whenever the HMAC over (caller, ts)
+# is missing or bad; it always has an empty allowlist and must never be
+# configurable.
+_RESERVED_CALLER = "anon"
+_CALLER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+# Defaults from the migration doc's caller table (section 3.4/3.5): chat-agent
+# gets the three queue tools and the tight ceilings; operator/overseer/hydra
+# get every tool and no ceilings. ``rest_run_control`` marks the overseer's
+# extra REST run-control routes (beyond the resolve twin, which follows the
+# tools allowlist). Hydra enforces its own rationale + identity on top, so it
+# needs no extra REST surface here. ``secret_env`` is derived per name below.
+_ALL_TOOLS = sorted(_MCP_TOOL_NAMES)
+_CALLER_DEFAULTS: dict[str, dict[str, Any]] = {
+    "chat-agent": {
+        "tools": ["harness_enqueue_task", "harness_list_queue", "harness_run_status"],
+        "max_entries_per_hour": 10,
+        "max_rounds_clamp": 50,
+        "rest_run_control": False,
+    },
+    "operator": {
+        "tools": _ALL_TOOLS,
+        "max_entries_per_hour": None,
+        "max_rounds_clamp": None,
+        "rest_run_control": False,
+    },
+    "overseer": {
+        "tools": _ALL_TOOLS,
+        "max_entries_per_hour": None,
+        "max_rounds_clamp": None,
+        "rest_run_control": True,
+    },
+    "hydra": {
+        "tools": _ALL_TOOLS,
+        "max_entries_per_hour": None,
+        "max_rounds_clamp": None,
+        "rest_run_control": False,
+    },
+}
+
+
+def _caller_secret_env(name: str) -> str:
+    return f"LH_HARNESS_CALLER_{name.upper().replace('-', '_')}_SECRET"
 _QUEUE_CAPACITY_KEYS = {
     "kimi_max",
     "qwen_max",
@@ -204,6 +284,35 @@ auditor = 300
 #                       # not on origin/main as an OCCUPIED workspace. Per-
 #                       # environment overseer override; active-run ownership
 #                       # always applies.
+
+# Per-caller tool scoping and budget ceilings (task 174; migration doc
+# section 3.4-3.5). Every caller presents its name via the X-Harness-Caller
+# REST header or the MCP `caller` field, plus an HMAC over (caller, ts) signed
+# with the secret stored in the environment variable named by `secret_env`.
+# THE CONFIG HOLDS THE ENV VARIABLE NAME ONLY -- never a secret value.
+# Missing/bad signatures are treated as the "anon" caller, whose allowlist is
+# empty (401). Defaults (used for callers omitted here):
+#   chat-agent: tools = [harness_enqueue_task, harness_list_queue,
+#                        harness_run_status],
+#               max_entries_per_hour = 10, max_rounds_clamp = 50
+#   operator:   all tools, no ceilings
+#   overseer:   all tools, no ceilings, rest_run_control = true
+#   hydra:      all tools, no ceilings
+#
+# [callers."chat-agent"]
+# secret_env = "LH_HARNESS_CALLER_CHAT_AGENT_SECRET"
+# tools = ["harness_enqueue_task", "harness_list_queue", "harness_run_status"]
+# max_entries_per_hour = 10   # 429 + Retry-After past this many enqueues/hour
+# max_rounds_clamp = 50       # enqueue with more rounds -> 422, never truncated
+#
+# [callers.operator]
+# secret_env = "LH_HARNESS_CALLER_OPERATOR_SECRET"
+#
+# [callers.overseer]
+# secret_env = "LH_HARNESS_CALLER_OVERSEER_SECRET"
+#
+# [callers.hydra]
+# secret_env = "LH_HARNESS_CALLER_HYDRA_SECRET"
 """
 
 
@@ -235,7 +344,7 @@ def load_run_defaults(path: str | Path = PROJECT_CONFIG_PATH) -> dict[str, Any]:
         raise ProjectConfigError(f"could not read {source}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ProjectConfigError(f"{source} must contain a TOML table")
-    unknown_root = set(payload) - {"run", "queue"}
+    unknown_root = set(payload) - {"run", "queue", "callers"}
     if unknown_root:
         raise ProjectConfigError(f"unknown top-level key(s): {_names(unknown_root)}")
     run = payload.get("run", {})
@@ -245,7 +354,126 @@ def load_run_defaults(path: str | Path = PROJECT_CONFIG_PATH) -> dict[str, Any]:
     queue = payload.get("queue", {})
     if isinstance(queue, dict):
         result["queue"] = _flatten_queue_table(queue)
+    result["callers"] = _flatten_callers_table(payload.get("callers", {}), source)
     return result
+
+
+def config_defines_callers(path: str | Path) -> bool:
+    """True only when the config file explicitly carries a [callers] table.
+
+    Used by the WebAPI to decide whether per-caller scoping (task 174) is
+    active: scoping is OFF unless the deployment declares [callers], which
+    keeps the pre-174 bearer-only behavior for unconfigured deployments
+    (merged decision -- see the server comment and PR).
+    """
+    source = Path(path)
+    if not source.is_file():
+        return False
+    try:
+        with source.open("rb") as handle:
+            payload = tomllib.load(handle)
+    except Exception:
+        return False
+    return isinstance(payload.get("callers"), dict)
+
+
+def load_caller_configs(path: str | Path = PROJECT_CONFIG_PATH) -> dict[str, dict[str, Any]]:
+    """Return the merged per-caller authorization table (task 174).
+
+    Every key is a caller name ("anon" is never present: the auth path
+    synthesizes it with an empty allowlist). Each value has:
+
+    - ``secret_env``: name of the environment variable holding the caller's
+      HMAC secret (name only -- the value is read only when a signature is
+      verified, never from config).
+    - ``tools``: MCP tool names this caller may dispatch; the REST resolve
+      route is gated on ``harness_resolve_gate`` being in this list.
+    - ``max_entries_per_hour``: enqueue ceiling, or None for unlimited
+      (429 + Retry-After past the ceiling).
+    - ``max_rounds_clamp``: highest max_rounds an enqueued entry may request,
+      or None for unlimited (over it -> 422, never silently truncated).
+    - ``rest_run_control``: True only for callers allowed on the overseer's
+      extra REST run-control routes.
+    """
+    source = Path(path)
+    if not source.is_file():
+        return _flatten_callers_table({}, source)
+    return load_run_defaults(source)["callers"]
+
+
+def _flatten_callers_table(callers: Any, source: Path) -> dict[str, dict[str, Any]]:
+    if not isinstance(callers, dict):
+        raise ProjectConfigError(f"[callers] in {source} must be a TOML table")
+    # Every configured name overlays the named-caller defaults; unknown names
+    # start from deny-all (empty tools, no ceilings, no REST run control).
+    merged: dict[str, dict[str, Any]] = {}
+    names = set(_CALLER_DEFAULTS) | set(callers)
+    for name in sorted(names):
+        if name == _RESERVED_CALLER:
+            raise ProjectConfigError(
+                f"[callers.{name}] is reserved: the auth path always synthesizes "
+                "'anon' with an empty allowlist"
+            )
+        if not isinstance(name, str) or not _CALLER_NAME_RE.match(name):
+            raise ProjectConfigError(
+                f"caller name {name!r} must match {_CALLER_NAME_RE.pattern!r}"
+            )
+        base = _CALLER_DEFAULTS.get(
+            name,
+            {
+                "tools": [],
+                "max_entries_per_hour": None,
+                "max_rounds_clamp": None,
+                "rest_run_control": False,
+            },
+        )
+        spec: dict[str, Any] = {
+            "secret_env": _caller_secret_env(name),
+            "tools": list(base["tools"]),
+            "max_entries_per_hour": base["max_entries_per_hour"],
+            "max_rounds_clamp": base["max_rounds_clamp"],
+            "rest_run_control": base["rest_run_control"],
+        }
+        overrides = callers.get(name, {})
+        if not isinstance(overrides, dict):
+            raise ProjectConfigError(f"[callers.{name}] must be a TOML table")
+        unknown = set(overrides) - _CALLER_KEYS
+        if unknown:
+            raise ProjectConfigError(
+                f"unknown [callers.{name}] key(s): {_names(unknown)}"
+            )
+        if "secret_env" in overrides:
+            # Env NAME only; refusing empty/whitespace keeps mistakes loud.
+            spec["secret_env"] = _string(overrides["secret_env"], f"callers.{name}.secret_env")
+        if "tools" in overrides:
+            tools = overrides["tools"]
+            if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+                raise ProjectConfigError(
+                    f"callers.{name}.tools must be an array of tool names"
+                )
+            unknown_tools = set(tools) - _MCP_TOOL_NAMES
+            if unknown_tools:
+                raise ProjectConfigError(
+                    f"callers.{name}.tools: unknown tool(s): {_names(unknown_tools)}"
+                )
+            spec["tools"] = sorted(set(tools))
+        if "max_entries_per_hour" in overrides:
+            value = overrides["max_entries_per_hour"]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ProjectConfigError(
+                    f"callers.{name}.max_entries_per_hour must be a non-negative integer"
+                )
+            spec["max_entries_per_hour"] = value
+        if "max_rounds_clamp" in overrides:
+            spec["max_rounds_clamp"] = _positive_int(
+                overrides["max_rounds_clamp"], f"callers.{name}.max_rounds_clamp"
+            )
+        if "rest_run_control" in overrides:
+            spec["rest_run_control"] = _boolean(
+                overrides["rest_run_control"], f"callers.{name}.rest_run_control"
+            )
+        merged[name] = spec
+    return merged
 
 
 def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
