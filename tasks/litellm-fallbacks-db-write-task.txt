@@ -1,0 +1,183 @@
+TASK 136 - HIGH PRIORITY. The five :synthetic-anthropic fallback entries must go into the
+DATABASE, not the YAML. The YAML edit alone is DEAD.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+
+================================================================================
+WHY THIS EXISTS - measured live 2026-09-10, do not re-derive
+================================================================================
+Task 110 correctly diagnosed that the harness's own :synthetic-anthropic aliases had NO
+fallback entry, so a Synthetic 402/429 blip killed runs outright at round zero instead of
+degrading. On 2026-09-09 that took out five runs in seven minutes, every one carrying the
+identical line "No fallback model group found for original model_group=<X>:synthetic-anthropic".
+
+The overseer then queried the live Postgres directly. THE DECISIVE FACT:
+
+    LiteLLM_Config row `router_settings` EXISTS and its keys are:
+      allowed_fails, context_window_fallbacks, cooldown_time, default_fallbacks,
+      fallbacks, model_group_alias, num_retries, retry_after, routing_strategy, timeout
+
+    fallbacks in that DB row: 22 entries
+    :synthetic-anthropic among them: 0
+
+`router_settings` is one of the five DB-SHADOWED sections and THE DB ROW WINS OVER THE FILE.
+So PR fix/synthetic-anthropic-fallbacks (commit 0079e7d, +17 lines) would force a CT202 prod
+router recreate and CHANGE NOTHING - exactly the 2026-09-09 failure where nine merged alias
+edits were dead on the live router. The YAML and DB have already drifted independently: the
+file carries 24 original entries, the DB row 22.
+
+Also measured: all five source groups EXIST on the live router but NONE are in the YAML
+model_list - they are DB-sourced deployments. The :cloud groups are in both. That asymmetry is
+why a file-only fix looks right and is not.
+
+================================================================================
+THE FIX
+================================================================================
+POST /config/update on the CT202 router with router_settings.fallbacks containing the
+EXISTING 22 entries PLUS these five, then READ THE ROW BACK AND DIFF IT.
+
+    {"syn:large:vision:synthetic-anthropic": ["glm-5.3-flash:cloud", "kimi-k2.6:cloud"]}
+    {"nemotron-3-super:synthetic-anthropic": ["glm-5.3-flash:cloud", "kimi-k2.6:cloud"]}
+    {"kimi-k3:synthetic-anthropic":          ["glm-5.3-flash:cloud", "kimi-k2.6:cloud"]}
+    {"glm-5.3-flash:synthetic-anthropic":    ["glm-5.3-flash:cloud", "kimi-k2.6:cloud"]}
+    {"glm-5.2:synthetic-anthropic":          ["glm-5.3-flash:cloud", "kimi-k2.6:cloud"]}
+
+Targets are copied verbatim from each group's EXISTING :cloud chain - Ollama-family relay
+only. NO paid-provider reroute. NO qwen3.8 local floor for the executor: the local pool serves
+roughly one request per instance, so a stampede onto it turns a rate limit into a queueing
+collapse.
+
+================================================================================
+*** SCOPE SPLIT - READ THIS. THE PROD WRITE IS NOT YOURS. ***
+================================================================================
+STANDING RULE: a harness run is NEVER given credentials. You will not have
+LITELLM_MASTER_KEY and you must not ask for one, hunt for one, or read one out of a container.
+
+YOU PREPARE AND PROVE. THE OVERSEER EXECUTES. Deliver:
+
+ 1. A script that READS the current router_settings row, adds ONLY the five missing entries to
+    fallbacks WITHOUT disturbing the other 22 or any other key in the row, and prints the
+    exact POST body it would send. It must take the key from an env var NAME at runtime and
+    must never print it.
+ 2. A read-back-and-diff script: after the write, fetch the row again and diff it field by
+    field against the intended body. A 200 IS NOT PROOF - POST /config/update returned 200
+    twice on 2026-09-09 and silently discarded the key both times. The diff is the proof.
+ 3. An IDEMPOTENCE guard: running it twice must not duplicate entries. Check before appending.
+ 4. A ROLLBACK body: the exact row content to restore the 22-entry state.
+ 5. A statement of what a successful fallback actually looks like in practice, so the overseer
+    knows what to watch for - which log line or metric shows a request degrading rather than
+    dying.
+
+DO NOT call /config/update. DO NOT call /model/update, /model/new or /model/delete.
+DO NOT restart or recreate any container.
+
+================================================================================
+HARD RULES
+================================================================================
+ - NEVER put LITELLM_MASTER_KEY in a file, a script literal, a test fixture, a doc, a commit
+   message or a workflow. Env var NAMES only.
+ - NEVER the bare gateway /health - it fans a completion out to every configured model,
+   including paid and GPU ones. Use /health/liveliness or /health?model=.
+ - Do NOT edit infrastructure/litellm-config.yaml. PR fix/synthetic-anthropic-fallbacks
+   (0079e7d) already carries the file-side change and is deliberately NOT the fix; it stays as
+   the reviewable seed for rebuild-from-scratch. Editing the file again force-recreates the
+   prod router for no benefit.
+ - Never git add -A; commit by explicit path; check git diff --stat first.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+
+DONE MEANS: an idempotent prepare script, a read-back-diff script that would catch a silently
+discarded write, a rollback body, and a plain statement of the observable signal that proves a
+fallback fired. Nothing written to the live router by this run.
+
+================================================================================
+CORRECTION — 2026-09-15 16:47 PT, scheduled overseer tick #173. MEASURED, NOT INHERITED.
+================================================================================
+Everything below supersedes any conflicting number or instruction above.
+
+1. THE PREPARE HALF ALREADY SHIPPED, AND IT IS BUILT ON THE WRONG SCHEMA.
+   PR #140 (merge 05505c4) put three scripts on origin/main:
+       infrastructure/scripts/prepare-synthetic-anthropic-fallbacks.py
+       infrastructure/scripts/read-back-synthetic-anthropic-fallbacks.py
+       infrastructure/scripts/rollback-synthetic-anthropic-fallbacks.py
+   prepare-...py builds each new entry as   {"source": <group>, "fallbacks": [targets]}
+   The LIVE router_settings.fallbacks row does NOT use that shape. Verified against the
+   CT202 Postgres row at 16:41 PT: all 22 entries are single-key maps
+       {"minimax-m2.7:cloud": ["glm-5.3-flash:cloud", "kimi-k2.6:cloud"]}
+   22/22 single-key, 0/22 carrying a "source" key.
+   => --apply would POST five entries LiteLLM does not read as fallbacks, get HTTP 200,
+      and change nothing behaviourally.
+   => read-back-...py line 249 matches on  f.get("source") == g , so it would find the
+      malformed entries it just wrote and report GREEN. A SELF-CERTIFYING FALSE PASS.
+   The overseer therefore did NOT run --apply. Do not "just run it" either.
+
+2. IT IS TEN GROUPS AND ALL TEN ARE UNCOVERED — 0 of 10, not 5 of 10.
+   Live :synthetic-anthropic groups, enumerated from LiteLLM_ProxyModelTable:
+       glm-4.7-flash, glm-5.2, glm-5.3-flash, gpt-oss-120b, kimi-k3,
+       nemotron-3-super, syn:large:text, syn:large:vision, syn:small:text, syn:small:vision
+   Nothing was ever applied, so the earlier "five still uncovered" is wrong.
+   This defect has been miscounted THREE times (one -> five -> ten).
+   ENUMERATE FROM THE LIVE ROUTER YOURSELF. Inherit no count from any doc, this one included.
+
+3. ANSWER THIS BEFORE PRESCRIBING ANY WRITE:
+   The row ALREADY carries  default_fallbacks = ["glm-5.3-flash:cloud", "kimi-k2.6:cloud"]
+   yet all three 2026-09-15 deaths still logged "No fallback model group found for
+   original model_group=<X>:synthetic-anthropic". If default_fallbacks is genuinely inert
+   for these groups, show the evidence. If it SHOULD have fired, the real bug is elsewhere
+   and adding a fallbacks entry is treating the symptom. Resolve this first.
+
+4. DELIVERABLE NOW: rebuild the three scripts against the real single-key-map schema,
+   covering ALL TEN groups, check-before-append idempotent, disturbing no other key in the
+   row (the row has 10 top-level keys: timeout, num_retries, retry_after, allowed_fails,
+   cooldown_time, routing_strategy, default_fallbacks, model_group_alias,
+   context_window_fallbacks, fallbacks).
+   Targets remain the Ollama-family relay pair ["glm-5.3-flash:cloud","kimi-k2.6:cloud"].
+   No paid-provider reroute. No local qwen3.8 floor (the local span serves ~one request
+   per instance; a stampede turns a rate limit into a queueing collapse).
+   State plainly the OBSERVABLE SIGNAL that proves a fallback actually FIRED — not that a
+   row changed.
+
+5. ROLLBACK BODY IS ALREADY CAPTURED (you do not need to make one):
+   ptait01:/root/router-backups/router_settings-20260915-164100.json
+   Verified: parses, 22 fallbacks, 10 top-level keys.
+
+6. UNCHANGED CONSTRAINTS (Paxton, HIGH PRIORITY): a harness run is NEVER given credentials.
+   You will NOT have LITELLM_MASTER_KEY. Do not ask for one, do not read one out of a
+   container, do not call /config/update or /model/*, do not restart anything.
+   YOU PREPARE AND PROVE, THE OVERSEER EXECUTES.
+   Do NOT edit infrastructure/litellm-config.yaml — any edit force-recreates the CT202
+   prod router. Open the PR and STOP. Do not merge.
+
+7. BRANCH TARGET - ADDED BY THE OVERSEER (scheduled tick #297, 2026-09-16 11:59 PT).
+   THIS NARROWS WHERE YOUR WORK LANDS. IT ADDS NO SCOPE. DO NOT RE-PLAN.
+   The previous run of this task (20260916T144554Z_96563c4c) was stopped because it did its
+   work on ANOTHER TASK'S BRANCH, twice, after two injected corrections. Measured live on
+   CT110 at 11:46 PT: the workspace cognizioware-mcp-tools is checked out on
+   fix/mcp-namespace-contract at HEAD a1989fb.
+   - That branch is NOT yours. It is already pushed to origin and carries OPEN PR #154.
+     NEVER commit to it and NEVER push it. A commit there goes straight into someone
+     else's open PR.
+   - FIRST ACTION, before any other work: cut your own branch from origin/main -
+       git fetch origin && git checkout -b fix/litellm-fallbacks-db-write origin/main
+     Do NOT carry commits a1989fb or 7f869d1 - they are the mcp-namespace alias contract
+     and belong to PR #154.
+   - The tree also carries EIGHT pre-existing modified files under
+     infrastructure/docker/fleet-admin/** plus scratch files (.behind.py, .ci_gather.py,
+     .triage_dump.py, .venv-audioqa/, "design docs/*", *.backup). THESE BELONG TO OTHER
+     TASKS. Stage FILE BY FILE. Never `git add -A`, never `git add .`, never `git commit -a`
+     in this workspace.
+   - You hold a scoped GH_TOKEN: push your branch and open your own PR yourself. Do not ask
+     the overseer to push for you. Then STOP - do not merge.
+
+8. WHY THIS IS URGENT - A THIRD CASUALTY, MEASURED 2026-09-16 11:39 PT.
+   Run 20260916T181937Z_1531322a (task 99) died mid-round with
+     'API Error: 402 ... Insufficient quota and token balance' on
+     model_group=nemotron-3-super:synthetic-anthropic, immediately followed by
+     'No fallback model group found for original model_group=nemotron-3-super:synthetic-anthropic'.
+   The 402 body ENUMERATES the router's whole fallback table: every entry targets a ':cloud'
+   group and NOT ONE ':synthetic-anthropic' group has a fallback. Task 100 died this way
+   twice; task 99 has now died this way once. That is the defect this task fixes.

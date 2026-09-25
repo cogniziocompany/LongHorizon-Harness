@@ -1,0 +1,16 @@
+{
+  "name": "1005a-148a-trios-provider-classifier",
+  "task_file": "C:/tmp/148a-trios-provider-classifier-task.txt",
+  "task_source": "task_file",
+  "workspace": "ptait09-easybutt0n-ai",
+  "max_rounds": 6,
+  "trio": "kimi",
+  "note": "*** PR OPEN 2026-09-14 21:12 PT: ptait09-easybutt0n-ai #49, feat/provider-classifier-slice1 -> feat/harness-fleet-report, 2 files +121 (providers.ts + providers.test.ts). Opened by the RUN itself with the scoped token - the first. Verified with gh. NEXT: review, merge at source, then 148b/148c. ***\nSliced from task 148 by the overseer 2026-09-14 12:40 PT after 148 looped 8 rounds with 'Completed: None'. Base branch feat/harness-fleet-report (the deployed pinned source), PR base the same; never main. Smallest slice: the pure classifier plus tests, including the glm-5.3:pool -> Unknown trap.",
+  "run_id": "20260914T232906Z_a714f6b7",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "kimi-k3:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-14T23:29:05.985168+00:00"
+}

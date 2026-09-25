@@ -1,0 +1,325 @@
+BUILD + TEST (code; the overseer performs the operator steps and the lane deploys UAT then prod): enable LiteLLM response caching on the gateway with a Redis container in the mcp-tools stack and PER-TENANT cache namespacing, per the plan below. Work ONLY in /home/harness/work/cognizioware-mcp-tools on branch feat/litellm-response-cache (run `git fetch origin && git checkout -B feat/litellm-response-cache origin/main` first); plain git; commit by EXPLICIT PATH; no push; never touch /home/harness/venv; no docker here; NO live calls to CT202/CT204 (the overseer runs the CT204 isolation probe and the deploy). infrastructure/docker-compose.yml is CRLF - change only the intended lines and verify with `git diff --stat`. Do NOT change the pinned image digest or any .github workflow. Secrets are os.environ/ references only (REDIS_HOST, REDIS_PORT, REDIS_PASSWORD).
+READ FIRST: the plan below, infrastructure/docker-compose.yml (litellm-router ~:21-172, postgres ~:250-276), infrastructure/litellm-config.yaml (litellm_settings ~:38-190, callbacks ~:69-70), infrastructure/docker/litellm/hooks/thinking_normalizer.py (the CustomLogger seam, async_pre_call_hook signature verified for v1.100.0) and its tests, infrastructure/scripts/safe-recreate.sh, e2e/suites/01-litellm-health.test.js (compose parser pattern), e2e/run-all.sh (suite discovery), e2e/package.json, design docs/mcp-placeholder-services-audit-and-plan.md (S11 template), CLAUDE.md.
+SLICES (one per round; code + tests + explicit-path commit each):
+ (1) compose: `redis` service (redis:7-alpine, container_name cognizioware-mcp-tools-redis, requirepass from REDIS_PASSWORD, maxmemory + allkeys-lru, no volume, healthcheck redis-cli ping, log tag redis-mcp-tools) placed after postgres; litellm-router gets REDIS_HOST/REDIS_PORT/REDIS_PASSWORD env (defaults redis/6379/empty-string never; password required) and depends_on redis (condition service_healthy). Do NOT add redis to extra_hosts. Mirror non-secret values into compose per the repo rule (mcp-tools.env is overwritten by deploys). Commit: build(redis): response-cache + coordination store.
+ (2) config: `cache: true` + `cache_params` (type redis, host/port/password via os.environ, ttl 300, supported_call_types completion/acompletion/embedding/aembedding) inside litellm_settings after drop_params/enable_pre_call_checks, with the MULTI-TENANCY comment from the plan; register `hooks.cache_namespacer.cache_namespacer_instance` after the thinking normalizer in callbacks. YAML must parse. Commit: feat(litellm): response cache config.
+ (3) hooks/cache_namespacer.py next to thinking_normalizer.py: CustomLogger whose async_pre_call_hook derives a stable namespace (user_api_key_dict.team_id if present, else first 16 hex of sha256(user_api_key_dict.api_key)) and sets it on the request so the cache key is per tenant (primary mechanism: the per-request cache namespace/cache-control field LiteLLM honours in v1.100.0 - cite the source line you verified from the LiteLLM changelog/source if reachable, else mark UNVERIFIED; fallback mechanism, implemented behind a config flag, injects the discriminator into a field that provably participates in the cache key, e.g. a stable metadata/user field); fail-open like the existing hook. Unit tests: team_id path, api-key path, missing both (unchanged data), fallback flag, no exceptions escape. Commit: feat(hooks): per-tenant cache namespacer.
+ (4) e2e/suites/38-litellm-response-cache.test.js (auto-discovered; soft-fail when unreachable; RUN_LIVE_REGRESSION=1 escalates): static (compose has redis; litellm-router depends_on it; config cache true, type redis, numeric ttl), health (admin cache-health reports healthy), behavioural (identical completion twice -> second is a hit), isolation (same completion under two different virtual keys must NOT share a cache entry; env names LITELLM_QA_KEY_A / LITELLM_QA_KEY_B, soft-skip when unset). Add "test:cache" to e2e/package.json. Commit: test(e2e): response cache + tenant isolation.
+ (5) docs: S12 in design docs/mcp-placeholder-services-audit-and-plan.md following the S11 template (prose -> os.environ snippet -> 12.1 generate REDIS_PASSWORD -> 12.2 apply to CT204 then CT202 incl. `docker compose --env-file mcp-tools.env up -d --no-deps redis` BEFORE merge because the UAT lane never creates new services, and safe-recreate.sh for the router - never a bare compose up -> Guards -> 12.3 verify: isolation probe FIRST, cache-health healthy, DBSIZE grows, TTL ~300 s, test:cache + run-all --ci green; rollback: cache: false + safe-recreate); CLAUDE.md CT202 line mentions the cache. Commit: docs(litellm): response cache runbook.
+HARD RULES: no secrets; no thresholds lowered; compose CRLF preserved; no image/workflow changes; explicit-path commits; no push. Completion = commit hashes, `git diff --stat origin/main..HEAD`, unit-test summary, the exact operator sequence (CT204 first: env var, redis up, safe-recreate, isolation probe; then merge; then CT202 the same after qa-gate-uat) and what is UNVERIFIED (the namespacing mechanism). Auditor: no git fetch; verify password never defaults to empty, the hook is fail-open, YAML parses, compose diff touches only intended lines, and the isolation test exists.
+
+
+=== PLAN (verbatim, C:/Users/PaxtonTait/.claude/plans/fancy-wondering-codd.md, session 3fbf60f8) ===
+# Enable LiteLLM response caching on the CT202 gateway
+
+| | |
+|---|---|
+| **Date** | 2026-09-07 |
+| **Session ID** | `3fbf60f8-149a-43e7-a36c-56a7184bc5dc` |
+| **Repo** | `cogniziocompany/cognizioware-mcp-tools` (https://github.com/cogniziocompany/cognizioware-mcp-tools) |
+| **Working dir** | `c:\Users\PaxtonTait\source\cognizioware-mcp-tools` |
+| **Branch / HEAD** | `main` @ `8809c88` |
+| **Plan file** | `C:\Users\PaxtonTait\.claude\plans\fancy-wondering-codd.md` |
+| **Deploy targets** | CT204 UAT `192.168.21.162:4000` → CT202 prod `192.168.21.161:4000` (both on ptait01 `192.168.21.110`) |
+| **Status** | Plan only — nothing implemented or deployed |
+
+---
+
+## Context
+
+The AI Gateway admin UI's **Response Cache → Cache Health** panel reports:
+
+```
+Cache Status: unhealthy
+Error Message: Cache not initialized. litellm.cache is None
+litellm_settings.cache_params: {}
+```
+
+This is not a fault — it is an accurate report that caching was **never configured**.
+Verified live on CT202 (2026-09-07):
+
+- 48 containers running; **none is a Redis/valkey/keydb**.
+- `cognizioware-mcp-tools-litellm` has **no `REDIS_*` or `CACHE_*` env**.
+- `infrastructure/litellm-config.yaml` has **no `cache:` / `cache_params:` key** — the word
+  "cache" appears only in comments (`:66`, `:634`). Live copy on CT202 matches the repo.
+- Recursive grep for `redis|valkey|keydb` across `infrastructure/**` → **zero hits**. This
+  would be the stack's first cache backend.
+- Good news: **`redis-py 5.3.1` is already inside the pinned LiteLLM image**, so no image
+  rebuild or digest change is required.
+
+**Outcome wanted:** a real, persistent-across-restarts response cache so the health panel
+reports healthy, repeated/retried completions and embeddings stop re-billing upstream
+providers, and the "Coordination Redis" tab has a backend.
+
+### Decisions taken (confirmed with the user)
+
+| Decision | Choice |
+|---|---|
+| Backend | **Redis container on CT202** (not in-memory; Postgres is not a supported LiteLLM cache backend) |
+| Multi-tenant isolation | **Namespace per key/team** — this router is shared across 20+ virtual keys/teams, and LiteLLM's default cache key is derived from model+messages+params, *not* the caller. Without namespacing, tenant A can be served tenant B's completion. |
+| Scope + TTL | **All supported call types, 300 s TTL** — primarily deduplicates retry storms and identical repeated calls rather than acting as a long-lived cost cache. |
+
+---
+
+## The hard constraint: the UAT lane does not create services
+
+`.github/workflows/deploy-mcp-tools.yml` job `deploy-uat-litellm` (lines 306-453) targets
+**CT204 (192.168.21.162:4000)**. It syncs `litellm-config.yaml`, `hooks/`, and
+`docker-compose.yml`, pulls the pinned digest, then runs:
+
+```
+docker compose up -d --no-deps --force-recreate litellm-router
+```
+
+`--no-deps` means **a new `redis` service in compose is never created on CT204.** The
+prod `deploy` job is gated on `qa-gate-uat` succeeding, so if CT204's router comes up with
+a cache pointing at an unresolvable `redis` host, the whole pipeline blocks — or worse,
+passes while silently degraded. This is the same class of hazard documented in
+`design docs/handoff-docs/pac-mcp-and-dataverse-data-mcp-handoff.md:269-300`.
+
+**Mitigation, and it is a required operator step before merge:** stand the Redis container
+up on CT204 *by hand* first (§3 below), so the config lands on a host that already has a
+backend. Do not rely on the workflow to do it.
+
+Second constraint, from `infrastructure/scripts/safe-recreate.sh:5-19`: that script
+snapshots the **running** container's resolved env and feeds it back as `--env-file`. A
+brand-new `REDIS_PASSWORD` will resolve to empty on a safe-recreate unless it is written
+into the on-box `mcp-tools.env` **first**. Order matters.
+
+Third, the **live-env durability rule** (CLAUDE.md): CT202's `mcp-tools.env` is gitignored
+and overwritten by every deploy (`deploy-mcp-tools.ps1:97-101`). Non-secret values must be
+compose defaults; secrets must be a runbook entry. Applied below.
+
+---
+
+## Implementation
+
+### 1. Add the Redis service — `infrastructure/docker-compose.yml`
+
+Insert after the `postgres` service (`:250-276`), mirroring its conventions exactly.
+**No named volume**: this is a pure cache, deliberately non-persistent — CT202's rootfs is
+at **79% (8.5 G free)**, and cache data is disposable by definition.
+
+```yaml
+  # ── Redis — LiteLLM response cache + coordination (added 2026-09-07) ─────
+  # Pure cache: no RDB snapshots, no AOF, no volume. Data is disposable by
+  # design; CT202 rootfs is tight (79% used). maxmemory + allkeys-lru bounds
+  # RAM so a cache blowout can never OOM the container the way the 2026-06-25
+  # incident 502'd every endpoint.
+  redis:
+    image: redis:7-alpine
+    container_name: cognizioware-mcp-tools-redis
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory ${REDIS_MAXMEMORY:-512mb}
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD}
+    env_file:
+      - /opt/cognizioware-mcp-tools/mcp-tools.env
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+    # Not published to the host: only the compose network needs it. (Postgres
+    # publishes 127.0.0.1:5432 for admin psql; there is no equivalent need here.)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: journald
+      options:
+        tag: redis-mcp-tools
+    networks:
+      - cognizioware-mcp-tools
+```
+
+### 2. Wire it into `litellm-router` — same file, `:21-172`
+
+Two edits to the existing service block:
+
+- **`environment:`** — add these near the "Core keys" group. They *must* be explicit `${}`
+  refs, not env_file-only: `register-mcp-tools-stack.py:91-101` strips `env_file:`
+  directives before sending compose to Portainer. Host/port/db are non-secret → compose
+  defaults per the durability rule; the password is a secret with no default.
+
+  ```yaml
+      # Response cache (2026-09-07). Host/port are non-secret compose defaults
+      # per the live-env durability rule; REDIS_PASSWORD is a secret and lives
+      # ONLY in mcp-tools.env (runbook: design docs/mcp-placeholder-services-audit-and-plan.md §12).
+      REDIS_HOST: "${REDIS_HOST:-redis}"
+      REDIS_PORT: "${REDIS_PORT:-6379}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+  ```
+
+- **`depends_on:`** — add alongside the existing `postgres` condition:
+
+  ```yaml
+      redis:
+        condition: service_healthy
+  ```
+
+Do **not** add a `redis` entry to `extra_hosts:`. That list is only for hostnames with no
+compose service — the comment at `:143-147` records that a stale `cloudflare-mcp` entry
+overrode Docker network DNS and left a healthy backend reporting 0 tools for weeks.
+
+### 3. Add `REDIS_PASSWORD` to both containers' on-box env — operator step, before merge
+
+Generate once (`openssl rand -hex 32`), then apply to **CT202 and CT204**, following the
+§11 runbook shape in `design docs/mcp-placeholder-services-audit-and-plan.md:720-748`:
+back up `mcp-tools.env` to `.bak-$(date +%Y%m%d)-redis-cache` first, append the var, then
+bring the service up. On CT204 the Redis container must be created explicitly — the
+workflow will not do it:
+
+```
+pct exec 204 -- docker compose --env-file mcp-tools.env up -d --no-deps redis
+```
+
+This step must complete on CT204 *before* the config change merges to `main`.
+
+### 4. Configure the cache — `infrastructure/litellm-config.yaml`
+
+Insert inside the existing `litellm_settings:` block (`:38-190`), after `drop_params` /
+`enable_pre_call_checks` (`:76-77`). Secrets are `os.environ/` refs only, matching the
+file's existing convention.
+
+```yaml
+  # ── Response cache (added 2026-09-07) ────────────────────────────────────
+  # Backing store: in-stack `redis` service (docker-compose.yml). Purpose is
+  # de-duplicating retry storms and identical repeated calls, NOT long-lived
+  # cost caching — hence the deliberately short 300s TTL.
+  #
+  # MULTI-TENANCY — READ BEFORE EDITING. This router is shared across 20+
+  # virtual keys/teams. LiteLLM derives the cache key from model+messages+
+  # params, NOT from the caller, so a flat global cache would let one tenant
+  # be served another tenant's completion. The per-caller namespace is applied
+  # by the cache_namespacer hook (hooks/cache_namespacer.py) — do not remove
+  # it from litellm_settings.callbacks below.
+  cache: true
+  cache_params:
+    type: redis
+    host: os.environ/REDIS_HOST
+    port: os.environ/REDIS_PORT
+    password: os.environ/REDIS_PASSWORD
+    ttl: 300
+    supported_call_types:
+      - completion
+      - acompletion
+      - embedding
+      - aembedding
+```
+
+### 5. Per-tenant namespacing — new `hooks/cache_namespacer.py`
+
+The repo already has exactly the right seam: `hooks/thinking_normalizer.py` is a
+`CustomLogger` bind-mounted at `/app/hooks` (compose `:40`) and registered at
+`litellm-config.yaml:69-70`. Its `async_pre_call_hook(user_api_key_dict, cache, data,
+call_type)` signature is verified against LiteLLM v1.100.0 (comment at `:65-68`).
+
+Add a second, small hook next to it that derives a stable namespace from the caller —
+`user_api_key_dict.team_id` when present, else a truncated SHA-256 of
+`user_api_key_dict.api_key` — and sets it on the outgoing request, then register it:
+
+```yaml
+  callbacks:
+    - hooks.thinking_normalizer.thinking_normalizer_instance
+    - hooks.cache_namespacer.cache_namespacer_instance
+```
+
+Keep it fail-open in the same style as the existing hook: if the namespace cannot be
+derived, log and return `data` unchanged rather than raising.
+
+> **Verify the mechanism on CT204 before trusting it.** Per-request cache namespacing is
+> the one part of this plan I have not confirmed against the running v1.100.0 build. Step 1
+> of verification below is an explicit cross-tenant isolation probe, not a formality. If
+> per-request `namespace` turns out not to be honoured, the fallback is to have the hook
+> inject the tenant discriminator into a field that provably participates in the cache key
+> (e.g. a stable `user` / metadata field), re-probed the same way. Do not ship §4+§5 to
+> CT202 until that probe passes.
+
+### 6. Regression coverage — new `e2e/suites/38-litellm-response-cache.test.js`
+
+Suites are auto-discovered by `e2e/run-all.sh:149-176` (no registry to update). Follow the
+soft-fail-when-unreachable pattern; `RUN_LIVE_REGRESSION=1` escalates skips to failures.
+Model the static assertions on `01-litellm-health.test.js:13-28`, which already parses
+`docker-compose.yml`.
+
+Cover:
+- **Static**: compose has a `redis` service; `litellm-router` `depends_on` it; config has
+  `litellm_settings.cache: true` with `type: redis` and a numeric `ttl`.
+- **Health**: the admin cache-health endpoint reports healthy (the inverse of the symptom
+  that started this).
+- **Behavioural**: identical completion twice → second response is a cache hit.
+- **Isolation**: the same completion issued under **two different virtual keys** must
+  *not* hit each other's cache. This is the test that protects the multi-tenant property.
+
+Add a `"test:cache"` convenience script to `e2e/package.json` (`scripts`, `:6-34`).
+
+### 7. Docs
+
+- New runbook section **§12** in `design docs/mcp-placeholder-services-audit-and-plan.md`
+  (append at the bottom; the file's sections are chronological, not numeric), following the
+  §11 template: prose → config snippet showing `os.environ/` refs only → `12.1` generate →
+  `12.2` apply to CT202/CT204 → `Guards:` → `12.3` verify. Never print the real password.
+- Update `CLAUDE.md`'s CT202 line to mention the response cache, consistent with how other
+  in-stack services are listed.
+
+---
+
+## Files to modify
+
+| File | Change |
+|---|---|
+| `infrastructure/docker-compose.yml` | new `redis` service after `postgres` (`:250-276`); `REDIS_*` env + `depends_on` on `litellm-router` (`:21-172`) |
+| `infrastructure/litellm-config.yaml` | `cache` + `cache_params` in `litellm_settings` (`:38-190`); register the new callback (`:69-70`) |
+| `infrastructure/hooks/cache_namespacer.py` | **new** — per-key/team cache namespace |
+| `e2e/suites/38-litellm-response-cache.test.js` | **new** — static + health + behavioural + isolation |
+| `e2e/package.json` | `"test:cache"` script |
+| `design docs/mcp-placeholder-services-audit-and-plan.md` | new §12 secrets runbook |
+| `CLAUDE.md` | note the cache in the CT202 description |
+
+Not touched: the pinned image digest (redis-py is already present), `.github/workflows/`,
+any `.env` file in the repo.
+
+---
+
+## Verification
+
+**On CT204 (UAT) first — this gates everything.** Per the UAT-first hard rule, no
+hand-deploys to CT202.
+
+1. **Cross-tenant isolation probe (do this before anything else).** Create two throwaway
+   virtual keys on CT204. Send byte-identical `POST /v1/chat/completions` under key A, then
+   under key B. Assert B is **not** a cache hit, while a repeat under A **is**. If this
+   fails, stop and switch to the fallback in §5 — do not proceed to CT202.
+2. `docker compose --env-file mcp-tools.env up -d --no-deps redis` on CT204, then
+   `redis-cli -a … ping` → `PONG`.
+3. Recreate the router via `infrastructure/scripts/safe-recreate.sh` (**not** a bare
+   `docker compose up`, which resolves every `${VAR}` to empty and wipes the master key —
+   `safe-recreate.sh:5-19`). Confirm `REDIS_PASSWORD` is non-empty in the resolved env.
+4. `GET /health/liveliness` → 200, then the authenticated `/health` → the cache-health
+   panel reports **healthy**, `cache_params` no longer `{}`.
+5. Repeat the same completion twice; assert a hit and check `redis-cli DBSIZE` grew.
+6. Confirm TTL: a key set now is gone after ~300 s (`redis-cli TTL <key>`).
+7. `cd e2e && RUN_LIVE_REGRESSION=1 npm run test:cache`, then the **full** suite via
+   `run-all.sh --ci` — green before merge, per the UAT-first rule.
+
+**Then CT202**, only after the pipeline's own `qa-gate-uat` passes: apply the §12 runbook,
+`up -d --no-deps redis`, `safe-recreate.sh`, re-run steps 4-7 against
+`litellm-gateway-api.cognizioware.com`, and confirm the admin UI panel that started this
+now reads healthy.
+
+**Rollback:** set `cache: false` in `litellm-config.yaml` and safe-recreate the router.
+The Redis container can stay — it is inert without the config, holds no persistent state,
+and has no volume to clean up.
+
+---
+
+## Out of scope (observed, not addressed)
+
+`cognizioware-mcp-tools-audioqa-mcp` on CT202 is in a **restart loop**
+(`Restarting (2) Less than a second ago`). Unrelated to caching; flagging it because it
+surfaced while probing the box. Worth a separate look.

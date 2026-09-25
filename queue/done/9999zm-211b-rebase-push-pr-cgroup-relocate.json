@@ -1,0 +1,16 @@
+{
+ "name": "9999zm-211b-rebase-push-pr-cgroup-relocate",
+ "task_file": "C:/tmp/ct110-cgroup-relocate-rebase-task.txt",
+ "task_source": "task_file",
+ "workspace": "LongHorizon-Harness",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "note": "Queued 2026-09-18 20:1x PT by SCHEDULED TICK #750, appended to the TAIL of the active band (priority is Paxton's alone). Follow-up to task 211 (run 20260919T002249Z_d860a9e7), which hit its round ceiling with the self-relocation fix WRITTEN AND COMMITTED (1a8a4bd, 906409e) only in CT110's local workspace, never pushed -- origin/feat/task-208-rss-bound has since diverged 7 commits touching the same 3 files (RSS-default-sizing corrections), so this is a real reconciliation, not a mechanical push. See C:/tmp/ct110-cgroup-relocate-rebase-task.txt for full detail; do not redo the design, read the two existing commits first. ALL-SYNTHETIC trio per Paxton 2026-09-17 13:45 PT (lands on main -> CT110 deploy): trio set to \"kimi\" deliberately, matching task 211's own convention -- launch_queue.py only recognises \"kimi\"|\"qwen\" for the trio-selection branch. Overseer must confirm roles_bound after launch. Task ends at PR-opened + STOP: the live ACTIVE=0 proof (A3) is explicitly NOT part of this task's scope, it needs an overseer-scheduled deploy window and must be called out as outstanding in the PR body.",
+ "run_id": "20260919T031259Z_f59810aa",
+ "roles_bound": {
+  "manager": "kimi-k3:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-19T03:13:01.258850+00:00"
+}

@@ -1,0 +1,82 @@
+FIX + TEST (CI; cognizioware-qa): the `hydra-e2e` job in QA CI is failing and has been for some time - 3 of 13 checkpoints fail, score 76.92 against a passing bar. The job passes a WINDOWS path to a LINUX runner. Work ONLY in /home/harness/work/cognizioware-qa on branch fix/hydra-e2e-repo-dir (run `git fetch origin && git checkout -B fix/hydra-e2e-repo-dir origin/main` first); plain git; commit by EXPLICIT PATH; no push; NO live Hydra calls and no deploys.
+
+## WHAT WAS OBSERVED
+QA CI run `34294460756` (2026-09-09T00:18Z): `build` success, `oidc-shield` success, `oidc-acceptance` success, **`hydra-e2e` FAILURE**.
+The suite reports:
+
+    hydra checkpoint suite did not fully pass: score=76.92 failed=3
+    {"status":"partial","score":76.92,"passed":10,"failed":3,"total":13,"durationMs":54464}
+
+And the step's own environment shows the defect:
+
+    HYDRA_ORCHESTRATOR_URL: https://hydra.cognizioware.com
+    QA_API_URL: http://localhost:8400
+    **HYDRA_REPO_DIR: C:\hydra-ci**
+
+while the job is executing on a Linux runner at `/home/runner/qa/_work/cognizioware-qa/cognizioware-qa/packages/runner`. A `C:\...` path cannot resolve there, so every checkpoint that touches the Hydra repo directory fails while the ten that do not still pass - which is exactly the 10/3 split.
+
+## WHAT TO DO
+ 1. **Identify the three failing checkpoints by name** from `src/flows/hydra-checkpoint-suite.ts` and confirm they are the ones that dereference `HYDRA_REPO_DIR`. If they are NOT, say so plainly and stop before changing anything - the diagnosis above would then be wrong and must not be built on.
+ 2. Fix where the value comes from. `C:\hydra-ci` is a path on a Windows host; the Linux runner needs either the correct Linux path or the variable removed and the dependent checkpoints skipped explicitly. Read how the workflow sets it and follow the repo's existing convention for per-runner values rather than hardcoding a second literal.
+ 3. If those checkpoints genuinely cannot run on the Linux runner, make them **SKIP with a stated reason** rather than fail. A checkpoint that can never pass in the environment it runs in is the same defect as a test asserting against an endpoint that does not carry the field - it trains people to ignore a red suite. Do not paper over it with a lowered threshold.
+ 4. Say what the score becomes after the change and whether the job then passes its bar.
+
+## THE WIDER POINT, WORTH ONE LINE IN THE REPORT
+This suite has been failing while the other three jobs in the same workflow pass, so QA CI has carried a permanent red for a while. Note in the report how long the failure goes back (check earlier runs of the workflow) so the cost of the blind spot is on the record.
+
+## TESTS
+Whatever this repo already uses. Report counts, baseline first. NO live Hydra calls from the run itself - the suite is dispatched by CI, not by this task.
+
+## HARD RULES
+Do not lower a threshold to make the suite green. Do not delete a checkpoint to make it pass - skip with a reason, or fix the path. No secrets or tokens in the repo or in output, env NAMES only. No deploys, no live Hydra or QA backend calls. Explicit-path commits; no push.
+Completion = commits, diff stat, test counts, the three checkpoint names, where `HYDRA_REPO_DIR` is set and what it is now, the resulting score, and how far back the failure goes. Auditor: read-only - verify no threshold was lowered and no checkpoint deleted, that skips carry a stated reason, that no secret literal appears, and that the three named checkpoints really are the ones that depended on the path.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.
+
+
+================================================================================
+REQUEUE 2026-09-09 17:25 PT - THE OVERSEER MEASURED SOMETHING THIS TASK ASSUMED
+================================================================================
+
+The first attempt (run 20260909T170320Z_c9ae9eef) ran TWO ROUNDS AND PRODUCED NO PR. QA CI has
+stayed red on EVERY scheduled run since: 09-09 12:10, 18:08, 21:04, 21:40, and 09-10 00:16. The
+`pull_request` runs pass only because they run `build` alone and never reach `hydra-e2e`.
+
+*** STEP 2 ABOVE SAYS "the correct Linux path OR remove the variable". THERE IS NO CORRECT LINUX
+PATH. Measured on the runner itself: ***
+
+    runner ct210-qa   status=online   **os=Linux**   labels=self-hosted,X64,qa-host,Linux
+
+    repo variables on cognizioware-qa:
+        HYDRA_REPO_DIR   = C:\hydra-ci      <- Windows path, breaks hydra-e2e NOW
+        FACTORY_REPO_DIR = C:\factory-ci    <- THE SAME BUG, not yet hit. Fix both.
+
+    On CT210, searched /home/runner and /opt to depth 3:
+        no *hydra* directory        no *factory* directory
+        `find / -name fake-agent.js -path "*design*"` -> NOTHING
+
+**So the checkout the job depends on does not exist on this runner at all.** The exact error is a
+Windows path CONCATENATED onto a Linux one, which is what a relative join against a `C:\` value
+produces:
+
+    Cannot find module '/home/runner/qa/_work/cognizioware-qa/cognizioware-qa/packages/runner/C:\hydra-ci/design/fake-agent.js'
+
+WHAT THIS CHANGES ABOUT THE FIX. Repointing the variable at some other directory is not enough -
+there is nothing to point it at. Choose deliberately and say which you chose and why:
+
+  (a) **Have the workflow check the repo out itself** (`actions/checkout` with
+      `repository: cogniziocompany/cognizioware-hydra` into a known path, then set the variable
+      from `${{ github.workspace }}`). **This is the better answer.** A job that depends on
+      somebody having manually cloned a sibling repo onto a runner is exactly the fragility that
+      caused this: the runner moved from Windows to CT210 and the assumption died silently.
+      Note it is a PRIVATE repo, so it needs a token - state which one and whether it exists
+      before relying on it.
+  (b) Create the checkout on CT210 and repoint the variable. Works, but re-creates the same
+      hand-maintained dependency that just broke. If you pick this, say why (a) was rejected.
+  (c) Skip the dependent checkpoints WITH A STATED REASON, per step 3 above.
+
+**FACTORY_REPO_DIR carries the identical defect and is not yet failing.** Fix it in the same PR or
+say explicitly why not - leaving a known-broken variable in place to be discovered later is how
+this one survived a runner migration.
+
+**Do NOT lower the 76.92 threshold to make the job green.** The bar is not the problem.

@@ -1,0 +1,9 @@
+{
+ "name": "9999d-164-claude-subscription-route-settings-db",
+ "task_file": "C:/tmp/claude-subscription-route-settings-db-task.txt",
+ "task_source": "task_file",
+ "workspace": "LongHorizon-Harness",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "note": "Bridged 2026-09-11 ~11:20 PT by session [fe2679] via /claude-bridge (Paxton: 'can you try that now'). Discovery: 40 transcripts touched in 30 h, all read; 4 class-(a) handoffs + 1 cancelled task re-surfaced. Source [3f5e1b]. Per-role Claude-subscription route THROUGH LiteLLM (auth=subscription, x-litellm-api-key + forwarded OAuth header) + settings store. BLOCKED ON: Phase 0 STOP GATE (overseer proves the route on CT202 with POST /model/new + a unique-prompt probe) AND a SPEND decision from Paxton (harness rounds bill the same subscription the reviewer does). Part 2 (settings store) is independent: the overseer may release it as 164a immediately by copying Part 2 into its own task text. Secrets by env NAME only."
+}

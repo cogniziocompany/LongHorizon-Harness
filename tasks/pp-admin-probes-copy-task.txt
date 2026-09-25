@@ -1,0 +1,138 @@
+TASK 108 - the Admin dashboard lies about prod in BOTH directions, plus the Publisher copy change.
+
+*** HIGH PRIORITY - part of the same prod handoff as task 107 (Paxton, 2026-09-09: top priority,
+it affects the single revenue-generating live system). ***
+
+REPO: cogniziocompany/cognizioware-powerplatform. Workspace on CT110:
+/home/harness/work/cognizioware-powerplatform.
+
+**BASE BRANCH IS `origin/develop`, NOT main.** `git fetch origin && git switch -c fix/admin-probes-copy
+origin/develop`. Prod runs develop-derived images; main is 142 behind and separately held. Do NOT
+merge to main.
+
+Source: `C:\Users\PaxtonTait\.claude\plans\publisher-cognizio-cgz-eager-gadget.md`, read by the
+overseer. This task is Items 3 and 1 of that handoff. **Task 107 owns the session-flow blockers and
+task 109 owns E2E/CI - do not touch SessionWizard.tsx, environment-refresh.service.ts, or write specs.**
+
+================================================================================
+ITEM 1 - Admin > Setup and diagnostics misreports production
+================================================================================
+
+All six probes live in ONE file: `packages/backend/src/routes/admin.routes.ts:281-426`
+(`GET /api/admin/setup-checks`, fanned out via Promise.all at :416-426).
+Frontend: admin/panels/SetupPanel.tsx:16 -> SetupChecklist.tsx:36, registered AdminPage.tsx:941.
+
+    Check                     Reported            Reality
+    Auth service reachable    healthy             FAKE - hardcoded 'healthy', ZERO I/O (:293-302).
+                                                  Will show green with auth completely down.
+    Billing adapter health    degraded, HTTP 404  Adapter is UP; probe uses the wrong path.
+    LiteLLM health            degraded, HTTP 401  Gateway is UP; probe sends no auth header.
+    Dataverse connectivity    unavailable         genuine stub (:372-392) - LEAVE IT
+    Secondary database lag    unavailable         genuine stub (:394-403) - LEAVE IT
+    Stripe webhook inbox      unavailable         genuine stub (:405-414) - LEAVE IT
+
+**PROD IS NOT DOWN.** Two false alarms and one false all-clear. An operator looking at this dashboard
+cannot tell what is actually happening - which is exactly what let the task-107 defects sit unnoticed.
+
+1a. BILLING 404 - :317 hits `${BILLING_API_URL}/health` -> https://mcp-cognizioware.easybutt0n.ai/health.
+    The adapter's health route is **`/api/health`** (design/handoffs/mcp-cognizioware-billing-api-handoff.md:5,
+    unauthenticated per :14). ASP.NET returns 404 for the unmapped path - exactly the observed value.
+    Every other caller already uses the /api prefix: billing.service.ts:101, :139.
+    FIX: probe `/api/health`.
+
+1b. LITELLM 401 - :351 hits `${LITELLM_BASE_URL}/health` with `{method, signal}` and NO HEADERS.
+    LiteLLM's `/health` is an ADMIN endpoint needing a key; `/health/liveliness` and
+    `/health/readiness` are the unauthenticated ones. LITELLM_API_KEY IS present in prod - the probe
+    just never reads it.
+    FIX: **reuse the helper that already exists rather than writing a third one** -
+    `packages/backend/src/index.ts:44-53` `canReachJson(url, apiKey)` sends `Authorization: Bearer`,
+    and is already called at :165 as
+    `canReachJson(\`${env.LITELLM_BASE_URL}/health/liveliness\`, env.LITELLM_API_KEY)`.
+    Export it (or lift it to a small shared module) and have BOTH probes use it.
+    **Cheap probes only - never the bare gateway /health, which bills a completion against every
+    model including paid and GPU ones.**
+
+1c. Both probes read `process.env.*` directly while the rest of the backend uses the zod-validated
+    `env` object (config/env.ts:22-27, all four vars `.min(1)` required). Switch the probes to `env`
+    so a missing var fails at BOOT instead of silently degrading a dashboard tile.
+
+1d. AUTH PROBE - either make it genuinely call `/api/auth/verify`, or set it to `unavailable` with an
+    honest explanation. **A hardcoded green is worse than an honest gap**, and it contradicts the
+    project's own written bar (design/plans/cognizioware-guest-launch-backlog.md:52, item A01:
+    "unconnected panels say unavailable, not mock healthy"). Pick one and say which.
+
+1e. LEAVE the three genuine stubs alone. They correctly report `unavailable` with honest explanations.
+    Implementing them is OUT OF SCOPE.
+
+1f. WHY IT SHIPPED GREEN - `packages/backend/tests/guest-slice-5.admin.test.ts:66-69` runs with the
+    adapter URLs UNSET, so it only ever exercises the `unavailable` branches; **nothing asserts the
+    requested path or headers.** This was pre-acknowledged in
+    design/plans/guest-launch/SLICE-1-HANDBACK.md:118-126.
+    **THE TEST IS THE POINT OF THIS TASK.** Extend that suite to set the URLs and assert the requested
+    PATH and HEADERS with a mocked fetch. Without it, both defects can silently return.
+
+================================================================================
+ITEM 2 - Publisher card copy (a requested change, copy ONLY)
+================================================================================
+
+File: `packages/frontend/src/sessions/wizard/SolutionStep.tsx` - Publisher card at lines 243-261,
+helper text at **line 259**.
+
+Confirmed with the requester:
+  - KEEP the `Publisher` heading and the `Cognizio (cgz) - cognizio.company` identity line (:256).
+  - Replace **ONLY** helper line 259.
+  - Domain string is **powerplatform.easybutt0n.ai** (the real host, not the marketing spelling).
+  - "Contact us" is a LINK to the cognizioware.com contact page.
+
+New helper line:
+    This is set by default on individual accounts to powerplatform.easybutt0n.ai.
+    [Contact us](https://cognizioware.com/contact) for Enterprise features.
+
+  - Render a real `<a href="..." target="_blank" rel="noopener noreferrer">`.
+  - **CONFIRM THE EXACT CONTACT URL BEFORE FINISHING.** `cognizioware.com/contact` is an ASSUMPTION;
+    if the marketing site uses /contact-us or #contact, use that. If you cannot reach the site from
+    CT110, say so and leave the assumed URL with a note - do not guess silently.
+  - The file uses inline styles from ui/tokens.ts (palette, radius, spacing). Style the anchor with an
+    existing `palette` token - **do NOT introduce a raw hex.**
+  - The helper line is muted grey; keep that, but make the link visually distinguishable (underline or
+    accent) so it does not read as dead text.
+
+**SCOPE GUARD - copy only.** Do NOT touch publisher identity logic. `cgz`/`cgzpublisher` is hardcoded
+across session-setup.service.ts, session.routes.ts, docs.service.ts, build-extract.service.ts,
+environment-refresh.service.ts and deriveUniqueName() at SolutionStep.tsx:286-296. The DB already has
+`publisher_prefix VARCHAR(10) DEFAULT 'cgz'` (migrations/037_session_setup.sql:14) which the frontend
+ignores. Making the publisher per-tenant is a SEPARATE PROJECT. Note it as follow-up; do not start it.
+
+There is currently **no SolutionStep test at all** (only __tests__/ReviewStep.billing-restriction.test.tsx).
+Add a small RTL test asserting the helper text and the anchor href.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - Base off origin/develop. Do NOT merge to main.
+ - Do NOT touch prod.env. It carries cleartext secrets - the overseer has that flagged separately.
+   **Never print, echo or commit any value from it.** Env NAMES only.
+ - Do NOT restart or reconfigure any live service. This task changes how prod is OBSERVED, not what
+   prod does.
+ - Stay out of task 107's files (SessionWizard.tsx, SolutionStep logic beyond line 259,
+   environment-refresh.service.ts, EnvironmentList.tsx) and do not write E2E specs (task 109).
+ - Never `git add -A`; commit by explicit path; check `git diff --stat` before finishing.
+ - Keep existing suites green: `npm run test -w packages/backend`, `-w packages/frontend`.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A branch off origin/develop with: billing probing /api/health; LiteLLM probing /health/liveliness
+through the EXISTING `canReachJson` helper with its key; both probes reading the validated `env`
+object; the auth probe either genuinely probing or honestly `unavailable`; the three real stubs
+untouched; **guest-slice-5.admin.test.ts extended to assert the requested path AND headers**; and the
+Publisher helper line replaced with a real, token-styled link whose URL you have confirmed or
+explicitly flagged as unconfirmed.

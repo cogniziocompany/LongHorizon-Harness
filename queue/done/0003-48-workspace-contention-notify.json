@@ -1,0 +1,9 @@
+{
+  "name": "48-workspace-contention-notify",
+  "task_file": "C:/tmp/contention-notify-task.txt",
+  "workspace": "LongHorizon-Harness-b",
+  "max_rounds": 6,
+  "trio": "kimi",
+  "run_id": "20260908T174858Z_23f802db",
+  "note": " || STATE = PR, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in the same triage. The run ended without a disposition, but its branch feat/workspace-contention is on origin at 088c3a7 with LongHorizon-Harness PR #8 STILL OPEN. It needs review and a merge decision, NOT a relaunch. || 2026-09-21 00:25 PT INTERACTIVE [5321285c]: STATE = MERGED. Task 215 rebased PR #8 onto main (six linear commits on 40b2dd8) and the overseer merged it as cd63f2a after confirming the workspace guard is intact and the check is warn-only by test."
+}

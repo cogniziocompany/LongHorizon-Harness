@@ -1,0 +1,59 @@
+TASK 213 - THE azmcp / supergateway LEAK ITSELF. THE 4 GiB CAP IS A SHIELD, NOT A CURE, AND NOTHING OWNS THE CURE.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+
+WHAT IS MEASURED (CT202, 2026-09-19 04:25 PT, interactive overseer - do not re-derive):
+  container cognizioware-mcp-tools-azure-mcp-backend, started 2026-09-18 06:50, running ~22 h
+    docker stats            : 3.979 GiB / 4 GiB   (99.5% of its cap, continuously)
+    cgroup memory.peak      : 4,295,237,632 bytes (it has touched the ceiling)
+    cgroup memory.events    : oom 4246, oom_kill 2024, oom_group_kill 0
+    container RestartCount  : 0   <- the container never died; its CHILDREN are being killed
+    CT202 available memory  : ~11.9 GiB of 20 GiB   <- the cap is holding the blast radius
+    litellm router          : RestartCount 0, OOMKilled false, /health/liveliness 200
+So roughly two thousand child-process kills a day, indefinitely. The cap (mem_limit 4g +
+memswap_limit 4g, now DECLARED in the deployed docker-compose.yml, merged as part of task 122) is doing
+exactly what it was built for - on 2026-09-11 the same leak took the whole gateway down by making the
+kernel pick the 6 GiB litellm router as its victim. That incident cannot recur. But the service itself
+is not healthy: it thrashes at its ceiling and its workers are killed continuously, so the azure MCP
+namespace is unreliable rather than restored.
+
+THE SERVICE, for orientation (from the compose block):
+  image node:22-slim, and at START-UP it runs:
+    apt-get update && apt-get install -y libssl3 &&
+    npm install -g @azure/mcp supergateway &&
+    npx supergateway --stdio 'azmcp server start' --port 3001 --outputTransport streamableHttp
+  Note what that means: the container installs its toolchain from the network on EVERY start, then runs
+  a Node supergateway that spawns azmcp as a stdio child. There are at least three candidate leaks -
+  supergateway's session/buffer handling, azmcp itself, and the unbounded npm/npx layer - and they are
+  distinguishable by measurement, not by reading.
+
+DELIVERABLE
+ 1. LOCATE THE LEAK, do not guess between the three candidates. Suggested and cheap: read
+    /sys/fs/cgroup/.../memory.stat inside the container's cgroup over time; get per-process RSS with
+    `docker exec ... ps -eo pid,rss,etimes,args --sort=-rss` on a cadence; and check whether the killed
+    children are azmcp processes, supergateway workers, or npm. Say which process grows, how fast, and
+    against what traffic - the namespace is reachable, so correlate with requests if you can.
+ 2. NAME THE FIX AND ITS COST. Plausible shapes, to be chosen on evidence: pin and vendor the toolchain
+    into a built image instead of installing at runtime (this also removes a network dependency from
+    every restart); bound supergateway's session lifetime or buffer; move azmcp to a per-request child;
+    or, if the leak is upstream and unfixable today, a SUPERVISED periodic restart with the reason
+    recorded - which is at least honest, unlike a container that silently kills its own workers.
+ 3. WHETHER THE NAMESPACE IS ACTUALLY SERVING. Measure it: list the azure tools through the gateway
+    aggregate and call one. A capped, thrashing container may be answering some requests and failing
+    others; "the azure namespace is down" and "the azure namespace is degraded" are different findings
+    and the fleet's records currently say the former.
+ 4. A GUARD so a regression is visible: the ops doctor already carries memory checks (task 184) - add a
+    row that goes amber when a container sits above ~90% of its own cap for a sustained window, naming
+    oom_kill counts. A container pinned at its ceiling with 2,000 kills a day must not look green.
+
+HARD RULES: do NOT raise the 4 GiB cap to make the symptom go away - that cap is sized from CT202's
+20 GiB against a 6 GiB router and a 2026-09-11 outage, and Paxton approved it explicitly
+(ACK CAP-AZUREMCP-20260917-1440). Do NOT edit infrastructure/litellm-config.yaml (it force-recreates
+the prod router). Any compose change deploys through the lane, which is now UNHELD, so treat a merge as
+a real CT202 deploy. Never print a secret; env var NAMES only. NEVER git add -A; commit by explicit
+path; git diff --stat before every commit. No @claude comment (task 117). Open the PR and STOP.
+
+DONE MEANS: the growing process is named with numbers behind it, the fix (or the honest supervised
+workaround) is implemented or precisely specified with its cost, the azure namespace's real state is
+measured rather than assumed, and a container pinned at its cap no longer reads as healthy on the ops
+surface.

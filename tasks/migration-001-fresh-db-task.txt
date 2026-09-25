@@ -1,0 +1,11 @@
+TASK 218 - migrations/001_harness_queue.sql fails on a fresh database (LongHorizon-Harness)
+
+Measured 2026-09-22 00:36 PT applying migrations/001 to CT103 lh_harness (empty schema harness) as role lh_harness with ON_ERROR_STOP=1: CREATE TABLE ok, CREATE TYPE ok, then
+  ALTER TABLE harness.queue ALTER COLUMN status TYPE harness.queue_status USING status::text::harness.queue_status;
+fails with: ERROR: default for column "status" cannot be cast automatically to type queue_status. The statement after it (the dedup partial index) is never reached. The overseer fixed the live DB by hand: DROP DEFAULT, ALTER TYPE, SET DEFAULT 'pending', CREATE INDEX. 002 applied cleanly afterwards.
+
+Deliverables (branch + PR to main, never merge yourself, no @claude review):
+1. Make 001 idempotent and correct on a fresh DB: drop the default before the type change and restore it after (or declare the column as the enum from the start), keep IF NOT EXISTS semantics, and make re-running 001 on the already-fixed CT103 schema a no-op.
+2. A test that applies 001 then 002 to an empty database (pg in CI or a documented local check) and asserts the final shape: enum queue_status, status default 'pending', harness_queue_dedup_key_idx present.
+3. Update docs that describe the migration order.
+Constraints: env NAMES only, never the password; never git add -A; PR only.

@@ -1,0 +1,275 @@
+TASK 140 - Wire LH-Harness orchestration into Fleet Chat (Open WebUI) via the BMAD_cognizioware
+spec process. FOR DEPLOYMENT. Phases run IN ORDER 0 -> 6; do not reorder them.
+
+REPO / WORKSPACE: BMAD_Cognizioware  (the spec runs here; the code lands in the repos named below)
+Source: Paxton 2026-09-10, session [193031] (193031cf-56c6-42b9-a218-6d2a300cc976), plan mode.
+
+================================================================================
+*** BLOCKED-ON-STAGING WARNING - READ BEFORE PLANNING. THIS ALREADY KILLED TASK 111. ***
+================================================================================
+Task 111 (bmad-flow-spec-validation) was STOPPED at 2026-09-10 16:0x PT for exactly the reason this
+task will hit: the BMAD inputs live on WINDOWS paths a Linux harness cannot reach, and the run
+correctly refused to invent substitutes. Its gate said, verbatim, that it could not reach the
+publisher doc at `C:\\Users\\PaxtonTait\\.claude\\plans\\...`, the `_bmad/` tree, or a place to put
+`_bmad-output/`.
+
+SO: if `_bmad/`, `_bmad-output/` and the source plan are NOT present in your workspace, STOP AT ONCE
+and say so. **DO NOT hand-write BMAD-looking documents.** The entire point of routing this through
+BMAD is to PROVE the toolchain runs; fabricated output is worse than none and will be rejected.
+The overseer stages those inputs; that is not your job and not your failure.
+
+================================================================================
+CONTEXT
+================================================================================
+Fleet Chat (chat.easybutt0n.ai, Open WebUI on corsairai300 at /opt/fleet-chat) is REPLACING Claude
+Code as the full overseer of LH-harness. Open WebUI's built-in tools (Knowledge Bases, Memory,
+Notes, Automations, delegate_task) should be backed by the stores already running. Today most are
+not:
+  - TOOL SERVER: the cognizioware tool server (mcpo -> LiteLLM /mcp/) exposes only
+    ssh, cloudflare, n8n, graphify, plus possibly hydrafleet and memory (UNVERIFIED). It does NOT
+    include kbuat (knowledge articles in billingservice) or lhharness.
+  - KNOWLEDGE: holds only a one-time manual fleet-tasks.md upload. Nothing syncs articles, doctrine
+    or graphs.
+  - GRAPHS: graphify-mcp serves ONE graph (mcp-tools). LongHorizon-Harness has NEVER been graphed.
+  - OVERSEER INSTRUCTIONS: live in files Open WebUI cannot see - C:/tmp/queue/LOOP-PROMPT.md,
+    LEDGER.md, ~/.claude/skills/claude-bridge, tasks/TEMPLATE-overseer-hierarchy.md.
+  - SKILLS: Open WebUI has no Claude-style skills, so the "lhharness skill" becomes a Workspace
+    Model (system prompt + knowledge + tools) backed by a SKILL.md in the gateway skills catalog.
+
+PAXTON'S DECISIONS:
+  - AUTHORITY: full overseer. The chat resolves gates and stops, resumes and migrates runs.
+  - MEMORY: hivemind is CANONICAL. Built-in memory holds only per-user preferences plus a nightly
+    hivemind digest.
+  - GRAPHIFY: every repo gets a graph. Reports go into Knowledge; ONE merged graph served over MCP.
+
+================================================================================
+WHAT FLEET CHAT ALREADY HAS - measured from its own self-report 2026-09-10. DO NOT REDO THESE.
+================================================================================
+  ssh        LIVE - lists ptait01, ptait07, ptait09, ptait-desk03, corsairai300, terranas01,
+             cognizioware01, htpc01. Do not re-add.
+  cloudflare LIVE - account easybutt0n-production, Turnstile, DNS, Tunnels, Access. Do not re-add.
+  n8n        LIVE - search, execute, executions. Do not re-add.
+  memory     LIVE on mcpo (hivemind + pgvector + LiteLLM embeddings). CAP-4 therefore SHRINKS to:
+             confirm the outlet capture is applied, add the skill rule, add the nightly digest.
+             DO NOT repeat the tool wiring.
+  built-ins  KB, Notes, Automations, Calendar, Memory all present - but the Knowledge collections
+             are EMPTY of our content, so CAP-3 stands.
+  hydrafleet NAMED in the tool-server description but NO hydrafleet tools actually surfaced.
+             VERIFY against the mcpo openapi listing; wire it ONLY if genuinely missing.
+  graphify / kbuat / lhharness / skills catalog - not mentioned. THIS IS THE REAL CAP-1 GAP.
+
+*** THE SELF-REPORT ALSO EXPOSED THE CONTEXT GAP, AND IT IS THE POINT OF CAP-2. *** The model
+GUESSED at the fleet: it called corsairai300 "a Corsair laptop", said cognizioware01/terranas01
+"sound like gaming rigs", and expanded ptait as "PetaIT". It did not know it drives an LH-harness at
+all. So the lhharness skill MUST carry a FLEET MAP - each host's role and IP, which CTs run which
+services, which lanes are off-limits - sourced from cognizioware-how-to.md and
+C:/tmp/OVERSEER-HALT-2026-09-10.md, NEVER from guesses.
+NOTE, and re-measure rather than inheriting: the CT map CHANGED on 2026-09-10. CT204 moved to
+ptait07 (container IP .162) and billing moved from CT100 on ptait01 to CT120 on corsairai300
+(IP .153). See C:/tmp/HANDOFF-CT-MAP-2026-09-10.md.
+
+================================================================================
+EXECUTION - bmad-spec -> stories -> bmad-build. QUICK PATH, not PRD -> architecture -> epics.
+================================================================================
+The repo is a stock BMAD v6.12 and `_bmad-output/` is empty. The plan below is already rich and
+brownfield, so take the quick path.
+
+ 1. STAGE THE SOURCE: copy the "SOURCE PLAN" section into
+    `_bmad-output/planning-artifacts/fleet-chat-orchestrator-plan.md`. It is the bmad-spec input,
+    listed under `sources:`.
+ 2. RUN bmad-spec from the BMAD repo root per `.claude/skills/bmad-spec/SKILL.md`:
+    - interactive mode, slug `fleet-chat-orchestrator`
+    - resolve config/customization via `uv run _bmad/scripts/resolve_*.py`
+    - WRITE THE MEMLOG: `memlog.py init`, then append each decision, constraint and capability as it
+      lands. `.memlog.md` is CANONICAL; SPEC.md is DERIVED from it and NEVER hand-edited.
+    - draft the kernel in EXPRESS mode (the input is rich). Capability IDs are STABLE once logged:
+        CAP-1 scoped tool surface (mcpo + harness-ops key: kbuat, lhharness, hydrafleet, memory,
+              graphify, skills)
+        CAP-2 lhharness skill + an `lh-orchestrator` Workspace Model built from it
+        CAP-3 Knowledge sync (lh-doctrine, kb-articles, repo-graphs)
+        CAP-4 hivemind as canonical memory (outlet capture, skill rule, nightly digest)
+        CAP-5 @knowledge-article flow on kbuat tools (kb-article.md updated)
+        CAP-6 every repo graphified, one merged graph served over MCP
+        CAP-7 safe full-overseer authority (gate/stop/resume auth, single-orchestrator lease,
+              ledger on CT110, claude-bridge replaced by hivemind recall)
+        CAP-8 Automation cutover (15-minute tick, 24-hour shadow, then lease handover)
+    - CONSTRAINTS: no hardcoded secrets; recreate ONLY open-webui/mcpo, NEVER the Hydra
+      orchestrator (it carries the tunnel); LiteLLM yaml edits recreate the prod router so deploy in
+      a quiet window; stay within the Synthetic budget and ornith rpm=20; a live run OWNS its
+      branch; stopping cron f91de072 needs Paxton's EXPLICIT GO.
+    - NON-GOALS: the n8n -> LangGraph migration; a graphify-mcp container per repo; two-way memory
+      sync; rotating credentials.
+    - COMPANIONS: brownfield.md (live state + file map), tool-map.md (which backend sits behind each
+      built-in tool), architecture-diagrams.md (mermaid: chat -> mcpo -> gateway -> servers, plus the
+      sync jobs), failure-modes.md (mcpo $ref limit, PersistentConfig override, tunnel drop, dual
+      orchestrator, cache hiding a dead backend).
+    - ADOPTED: LongHorizon-Harness/docs/handoffs/orchestrator-migration-2026-09-08.md
+    - self-validate with TWO passes (coherence, preservation) and LOG the verdicts.
+ 3. STORY BREAKDOWN (interactive): about ONE STORY PER PHASE 0-6, IN ORDER. Set spec_checkpoint,
+    done_checkpoint and invoke_dev_with for each. Output `stories.yaml`.
+ 4. STOP AND REPORT: spec folder path, capability count, companions, open questions, story list.
+    bmad-build per story (clarify -> plan -> implement -> review) happens in LATER turns, ONE STORY
+    AT A TIME. Do not run them all now.
+ 5. GIT: work on branch `spec/fleet-chat-orchestrator`, COMMITTED and NOT MERGED until Paxton
+    reviews.
+
+================================================================================
+SOURCE PLAN (the bmad-spec input) - PHASES RUN IN THIS ORDER
+================================================================================
+PHASE 0 - READ LIVE STATE FIRST, NO CHANGES. Check on the LIVE BOX, not the repo copy:
+  - /opt/fleet-chat/mcpo.config.json: the ACTUAL x-mcp-servers header on the cognizioware backend
+  - webui.db: the `config` table (PersistentConfig OVERRIDES env) and registered tool servers
+  - LiteLLM DB (LiteLLM_MCPServerTable): whether an `lhharness` alias exists
+  - whether the `harness-ops` virtual key exists
+  - pull ptait09 PR #46 branch (easybutt0n-runner-v2: openwebui/prompts/fleet-tasks.md,
+    knowledge/fleet-tasks.md, mcpo.config.example.json)
+  - pull hydra origin/main openwebui/ files and scripts/openwebui-apply.mjs
+  PHASE 0 IS A DIFF, not a rebuild: pull openapi.json from mcpo and compare against the target alias
+  set. NO re-wiring of ssh, cloudflare, n8n or memory.
+
+PHASE 1 - TOOL SURFACE (one scoped key, no hardcoded tokens)
+  - Mint `harness-ops` with access groups fleet-runners (hydrafleet + lhharness), memory-writers,
+    kb, repo-tools (graphify), plus the gateway skills/guides servers. Store it ONLY as
+    OPENWEBUI_GATEWAY_KEY in /opt/fleet-chat env.
+  - Register `lhharness` in the config file. If it exists only in the DB, add it to
+    litellm-config.yaml mcp_aliases/mcp_servers. EVEN A COMMENT-ONLY EDIT RECREATES THE PROD ROUTER:
+    deploy in a quiet window with zero active runs.
+  - Widen the mcpo header to ssh,cloudflare,n8n,graphify,hydrafleet,memory,kbuat,lhharness,<skills>.
+    ONLY ADD THE MISSING ALIASES and KEEP THE EXISTING x-mcp-servers VALUES INTACT - the list is
+    replaced WHOLESALE, not merged, so a careless write drops working tools.
+    mcpo can fail on large aggregates ($ref AssertionError). If it does, SPLIT into two backends:
+    `cognizioware` (infra) and `cognizioware-orch` (hydrafleet, lhharness, memory, kbuat, graphify,
+    skills).
+  - RECREATE ONLY open-webui/mcpo. NEVER the Hydra orchestrator - that drops the tunnel.
+
+PHASE 2 - THE lhharness SKILL
+  - Single source of truth: `skills/lhharness/SKILL.md` in
+    cognizioware-mcp-tools/infrastructure/docker/gateway-skills-mcp/skills/. Distils
+    tasks/TEMPLATE-overseer-hierarchy.md (hierarchy, task-text rule, playbook, standing rules, model
+    doctrine), C:/tmp/queue/LOOP-PROMPT.md (sweep steps 0-6 and the ELEVEN-state ledger),
+    docs/queue.md (the 18-field entry contract), claude-bridge SKILL.md, a tool map of which
+    <alias>-<tool> to use per step and which built-in tool to use for what, AND THE FLEET MAP.
+  - Move the sweep prompt into the repo: copy LOOP-PROMPT.md to docs/overseer/loop-prompt.md so it
+    is versioned, reachable by Knowledge sync, and free of secrets.
+  - Create the Workspace Model `lh-orchestrator` THROUGH openwebui-apply.mjs so it is IDEMPOTENT and
+    not hand-clicked: system prompt = the SKILL.md core; native function calling ON; tools = the
+    cognizioware backend(s); knowledge = the Phase 3 collections; base model per router doctrine.
+  - Add an Open WebUI Prompt `/lhharness` that loads the full skill on demand.
+
+PHASE 3 - KNOWLEDGE COLLECTIONS AND A SYNC JOB
+  Add scripts/openwebui-knowledge-sync.mjs in hydra beside openwebui-apply.mjs, same
+  WEBUI_BASE_URL/WEBUI_ADMIN_TOKEN. Upsert BY CONTENT HASH; run on corsairai300 cron nightly plus on
+  demand. Three collections:
+    lh-doctrine  <- harness tasks/TEMPLATE-*.md, docs/queue.md, docs/overseer/*,
+                    cognizioware-how-to.md, the migration handoff, fleet-tasks.md
+    kb-articles  <- published billingservice articles via kb-mcp-uat REST (:3114), one markdown file
+                    per article with id, category and tags; SUPERSEDED ARTICLES ARE REMOVED
+    repo-graphs  <- every repo's graphify-out/GRAPH_REPORT.md, named by repo
+  Embeddings already route through LiteLLM (nomic-embed-text); nothing new is needed for RAG.
+
+PHASE 4 - MEMORY: HIVEMIND IS CANONICAL
+  - Apply hydra's hivemind_session_capture.py outlet filter through openwebui-apply.mjs; it captures
+    every chat as source=openwebui. RETIRE the duplicate
+    cognizioware-mcp-tools/openwebui/functions/hivemind_outlet.py or mark it superseded.
+  - Skill rule: fleet facts/decisions -> memory-remember_session; lookups -> memory-recall (filters
+    repo, source, since). Built-in add_memory is ONLY for this user's preferences.
+    @knowledge-article content -> kbuat-create_article; feedback -> kbuat-record_feedback.
+  - Nightly digest: the sync job runs memory-list_recent/recall for the top N durable facts and
+    writes them into the orchestrator user's Open WebUI memory (/api/v1/memories/add, DEDUPED) so
+    built-in search_memories sees them too.
+  - Update kb-article.md: kbuat MCP tools become the PRIMARY path, ssh+psql the fallback; fix the
+    stale migrations/ path and the empty table row.
+  *** DO NOT re-wire the memory tool - it is already live on mcpo. ***
+
+PHASE 5 - GRAPHIFY EVERY REPO, ONE MERGED MCP GRAPH
+  - Add scripts/graphify-all.ps1 in mcp-tools: run `graphify .` in each repo under ~/source missing
+    or with a stale graphify-out/, STARTING WITH LongHorizon-Harness. Follow each repo's existing
+    convention for committing vs gitignoring graphify-out/.
+  - Merge: check whether graphify 0.8.36 has a NATIVE merge. If not, write a small Python merge
+    unioning nodes and edges with `repo:`-prefixed ids into one graph.json.
+  - Deploy: deploy-mcp-tools.ps1 (L311-318) pushes the MERGED file instead of mcp-tools' own. If the
+    merged graph is too large for graphify-mcp, fall back to 2-3 containers by domain.
+  - Add the graphify trigger to each repo's CLAUDE.md where absent. Refreshes feed repo-graphs sync.
+
+PHASE 6 - FULL-OVERSEER CUTOVER  *** the parts needing Paxton's explicit go are marked ***
+  - Close the gate-auth gap (migration doc 3.4) in mcp_tools.py and the CT110 server:
+    harness_resolve_gate / stop / resume / migrate MUST require an overseer-scoped token or caller
+    identity (harness-ops plus requested_by=lh-orchestrator), AUDITED to the run's events.
+  - Add a SINGLE-ORCHESTRATOR LEASE (migration doc 4): CT110 POST /api/overseer/lease issues a TTL
+    lease and every tick must hold it. This stops Claude's /loop and the chat Automation both acting.
+  - Move the ledger OFF the PC: C:/tmp/queue/LEDGER.md -> CT110, served via a new lhharness
+    read/append ledger tool. The chat cannot reach C:/tmp.
+  - Replace claude-bridge: the chat cannot read ~/.claude transcripts, but the PTAIT09
+    overseer-session ingest already puts them in hivemind. The tick runs
+    memory-recall source=overseer since=<last tick> instead.
+  - Automation `create_automation` with the lh-orchestrator model and the loop prompt:
+    START AT A 15-MINUTE RRULE on a local or low-cost route, NOT every 5 minutes - the Synthetic
+    budget and ornith rpm=20 make a paid 5-minute tick risky.
+    RUN IN SHADOW MODE FIRST (report only, lease NOT acted on) FOR 24 HOURS beside Claude's loop.
+    THEN hand over the lease.
+    *** STOPPING CRON f91de072 IN SESSION 5321285c NEEDS PAXTON'S EXPLICIT GO AT CUTOVER. ***
+  - Remove hardcoded secrets: take the CT110 bearer tokens out of C:/tmp/launch_queue.py and
+    overseer_status.py and the key out of .mcp.json; read them from env.
+
+================================================================================
+CRITICAL FILES
+================================================================================
+ harness:   src/lh_harness/mcp_tools.py, the server (lease + gate auth), kb-article/kb-article.md,
+            NEW docs/overseer/loop-prompt.md,
+            docs/handoffs/orchestrator-migration-2026-09-08.md (update section 3 to full overseer)
+ mcp-tools: infrastructure/litellm-config.yaml, infrastructure/deploy-mcp-tools.ps1,
+            infrastructure/docker/gateway-skills-mcp/skills/lhharness/SKILL.md,
+            NEW scripts/graphify-all.ps1 plus the merge script
+ hydra:     scripts/openwebui-apply.mjs (add model, prompt, function),
+            NEW scripts/openwebui-knowledge-sync.mjs, openwebui/functions/hivemind_session_capture.py
+ box:       /opt/fleet-chat/mcpo.config.json and env (in NO repo - mirror into ptait09 openwebui/)
+
+================================================================================
+VERIFICATION - read the live system, never a status code
+================================================================================
+ - mcpo: GET http://mcpo:8000/cognizioware/openapi.json lists kbuat-*, lhharness-*, hydrafleet-*,
+   memory-* and graphify-*. Run e2e/fleet-chat-tools.mjs (PR #46).
+ - In chat on the lh-orchestrator model:
+     "list the harness queue"                        -> lhharness-harness_list_queue
+     "what's the kb article on the ZFS overlay deadlock" -> query_knowledge_bases hits kb-articles
+                                                        AND kbuat-search_articles agrees
+     "how does LongHorizon-Harness launch a run"     -> repo-graphs + graphify-query on the merged graph
+     "recall the ornith lane decision"               -> memory-recall returns the overseer-ingested fact
+ - Memory: a new chat appears in hivemind_sessions.session_memories with source=openwebui within one
+   minute. CHECK THE EMBEDDING BY RECALLING UNIQUE TEXT, NOT BY STATUS CODE.
+ - Gate auth: harness_resolve_gate with a NON-overseer key returns 403; with the overseer key it
+   succeeds AND writes an audit event.
+ - Lease: a second holder is REFUSED while a lease is live.
+ - SELF-REPORT RE-TEST (the headline success signal): ask the lh-orchestrator model the SAME "what
+   can you infer about my environment" question. It must give CORRECT host roles, mention the
+   harness, the queue, kbuat, graphify and lhharness, and contain NO invented expansions
+   ("PetaIT", "Corsair laptop", "gaming rigs").
+ - Shadow Automation: 24 hours of tick reports matching Claude's loop decisions BEFORE cutover.
+
+================================================================================
+HARD RULES
+================================================================================
+ - NEVER hardcode a secret. Env var NAMES only, in every file, doc and commit message.
+ - NEVER recreate the Hydra orchestrator - it shares a netns with the tunnel.
+ - NEVER the bare gateway /health - use /health/liveliness.
+ - litellm-config.yaml edits force-recreate the CT202 prod router: quiet window, zero active runs.
+ - Never git add -A; commit by explicit path; check git diff --stat first.
+ - Do NOT merge. Commit on spec/fleet-chat-orchestrator and STOP.
+ - Do NOT stop cron f91de072. That is Paxton's call at cutover.
+
+DONE MEANS: the spec folder exists with a canonical .memlog.md, 8 capabilities logged, the four
+companions written, two self-validation verdicts logged, and stories.yaml carrying ONE story per
+phase IN ORDER 0-6 - committed on spec/fleet-chat-orchestrator, not merged. No prod change made by
+this run.
+
+
+================================================================================
+ADDED 2026-09-14 (Paxton, plan review) - PER-USER GATEWAY KEY, PERSISTED, WITH A DEFAULT
+================================================================================
+Decision: gate resolution from Fleet Chat only once EACH USER carries their own gateway key (one LiteLLM virtual
+key per user, minted by task 177 in groups harness-chat / harness-operator). Fleet Chat must: (1) let a user enter
+their gateway key ONCE and PERSIST it server-side against their login (Open WebUI per-user settings / user valves;
+never in the shared mcpo.config.json); (2) DEFAULT to the harness-chat key when a user has none, so status and
+enqueue work out of the box; (3) an explicit accept/use step so the same key is what the harness tools receive for
+that user on every request; (4) show gate tools only when the user's key is in harness-operator. Verify by read-back
+with two users across a UI restart (gateway spend logs show two key ids). Golden scenario is in task 113.

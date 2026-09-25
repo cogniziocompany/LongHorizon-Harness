@@ -1,0 +1,8 @@
+{
+ "name": "02-guest-e2e-readiness",
+ "task_file": "C:/tmp/guest-e2e-readiness-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 6,
+ "trio": "qwen",
+ "run_id": "20260907T085942Z_15fa88b8"
+}

@@ -1,0 +1,9 @@
+{
+  "name": "05h2b-billing-release-gate-setting",
+  "task_file": "C:/tmp/billing-release-gate-task.txt",
+  "workspace": "/home/harness/work/mcp-cognizioware",
+  "max_rounds": 6,
+  "trio": "kimi",
+  "run_id": "20260908T072129Z_da4baee7",
+  "note": "|| *** CAUSE IDENTIFIED — 2026-09-16 08:56 PT, SCHEDULED TICK #283. Still a stranding (work did not land), but NOT the task-136 fallback cohort. Read from run 20260908T072129Z_da4baee7's failure_reason, not inferred: Ollama 400 litellm.BadRequestError (Ollama_chatException) from the agent provider at startup; ran 8 rounds against a max of 6. This entry is one of the FOUR outliers in the 18-entry undispositioned set; the other 14 share the single missing-`:synthetic-anthropic`-fallback cause and are BLOCKED on task 136. NEXT STEP for this one: the fallback fix will NOT revive it — diagnose its own cause before requeuing."
+}

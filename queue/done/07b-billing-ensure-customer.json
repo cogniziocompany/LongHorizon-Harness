@@ -1,0 +1,8 @@
+{
+ "name": "07b-billing-ensure-customer",
+ "task_file": "C:/tmp/billing-ensure-customer-task.txt",
+ "workspace": "/home/harness/work/mcp-cognizioware",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "run_id": "20260908T010249Z_4f5bb97c"
+}

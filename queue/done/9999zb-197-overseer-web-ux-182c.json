@@ -1,0 +1,16 @@
+{
+  "name": "9999zb-197-overseer-web-ux-182c",
+  "task_file": "C:/tmp/overseer-web-ux-182c-task.txt",
+  "task_source": "task_file",
+  "workspace": "ptait09-easybutt0n-ai",
+  "max_rounds": 5,
+  "trio": "kimi",
+  "note": "Queued 2026-09-17 10:17 PT by SCHEDULED TICK #450 as the CUT remainder of task 182. Run 20260917T135926Z_c8e4a4c5 delivered 182a+182b and exhausted its 8/8 budget with 182c/182d untouched; its final gate (approval adece7697c2e) asked for task 119's eleven-state list, which it could not read from PTAIT09 for lack of runner credentials. RESOLVED STOP, not more rounds - the same cut that took task 180 from 90 min / 0 commits to a PR in ONE round. THE ELEVEN-STATE ANSWER IS EMBEDDED IN THE TASK FILE so it can never be asked again, and the CHECK constraint already in schema.sql was verified by the overseer to match it EXACTLY - AC6 is satisfied, change nothing about it. VERIFIED ON CT110 THIS TICK, not taken on report: commits d15a5d5+e2d4375 (182a) and 3f5be96 (182b) exist and both branches are on origin; PR #54 (182a -> easybutt0n-runner-v2) and PR #55 (182b -> 182a) are OPEN, so task 182 is at state PR. Stack is 182b -> 182a -> easybutt0n-runner-v2 -> main: mergeable there is scoped to those bases and does NOT mean it can reach main. SCOPE IS 182c ONLY (the migration script); 182d (tick + artifact route) is queued separately AFTER this lands. Branch off feat/overseer-schema-api-182a. Appended at the END of the band - no reordering. [tick #579 2026-09-18 02:17 PT] Run 20260918T070953Z_fe6f72a6 gate fcc8cffd7a98 (end_of_round 5/5, outcome progress) resolved STOP; read back cancelled, alive=false. State PR: ptait09-easybutt0n-ai #56 head 9a59540, base feat/overseer-schema-api-182a, OPEN, MERGEABLE, unreviewed. Real migration run NOT done: /api/overseer/* routes 404 on fleet until task 175's deploy lane ships 182a. No rows in fleet.*, no .migrated renames.",
+  "run_id": "20260918T070953Z_fe6f72a6",
+  "roles_bound": {
+    "manager": "kimi-k3:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-18T07:09:53.646601+00:00"
+}

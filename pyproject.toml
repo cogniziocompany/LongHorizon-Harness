@@ -34,6 +34,7 @@ Issues = "https://github.com/AMAP-ML/LongHorizon-Harness/issues"
 
 [project.scripts]
 lh-harness = "lh_harness.cli:main"
+lh-validate-queue = "lh_harness.validate_queue:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lh_harness"]

@@ -1,0 +1,16 @@
+{
+ "name": "003-125a-spendlog-export-core",
+ "task_file": "C:/tmp/125a-spendlog-export-core-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "note": "*** REQUEUED 2026-09-11 05:57 PT after the overseer answered and STOPPED run 20260911T115158Z_c0e9bf4e at its credential gate. DO NOT RE-ASK THESE - they are answered: (1) NO credentials will be provisioned to a harness run, ever - standing rule, not a gap. (2) CT202 sshd does not accept the harness key and will not be changed for this task. (3) terranas01 is Paxton-managed AND its SSH host key has CHANGED (raised in OPEN-ASKS), so the destination is untrusted and unreachable - \"verify at the destination before deleting\" cannot be satisfied by anyone right now. *** SCOPE FOR THE NEXT RUN: write and PROVE THE SCRIPT ONLY. Connection details from env var NAMES; idempotent; enforce cutoff -> export -> transfer -> VERIFY AT DESTINATION -> only then delete, refusing to delete if verification fails. Prove it with a dry-run against a fixture, NEVER against prod. The overseer executes the privileged cycle. *** TASK-TEXT CORRECTIONS, MEASURED: the Postgres role is litellm_user and the database is litellm_mcp_tools. The role llmproxy and database litellm named in the task text DO NOT EXIST (psql: \"role llmproxy does not exist\"). Read POSTGRES_USER/POSTGRES_DB from the container. *** CURRENT STATE: LiteLLM_SpendLogs 337,114 rows / 26 GB / n_dead_tup 0; CT202 root 62% used, 32 G free. Nothing exported, nothing deleted - correct. No disk urgency. *** || *** REQUEUED 2026-09-11 01:20 PT by the overseer. Its previous run FAILED on a SYNTHETIC 429/402 (provider rate limit + insufficient credit), NOT on task content - do not cut scope in response. The launcher files entries into done/ on LAUNCH, not on SUCCESS, so it was stranded and would never have retried. *** || *** SLICE OF TASK 125, sliced 2026-09-10 22:35 PT. Its run bb12da51 ran FIVE HOURS without finishing - round 6 of 10 with all three roles on ornith-1.5:pool (the LOCAL single-slot lane, because synthetic was DOWN) at roughly 50 min/round. Unsliced task 69 failed three times at 3600s; sliced, 69a finished in 8 minutes. Same medicine. The parent run was stopped as superseded. *** 125a = THE DATA PATH ONLY: one bounded chunk (row-count or single-day), by hand. Cutoff -> export -> transfer -> *** VERIFY AT THE DESTINATION by checksum AND row count *** -> only then delete by the SAME predicate. NO scheduler, NO audit surface - those are 125b and 125c. Targets verified: CT202 is on ptait01 (pct config 202 -> ip=192.168.21.161/24; its name 'cognizioware-ops-it-services-uat-copy' is MISLEADING). terranas01 = 192.168.21.128, SSH port 9222 as prax211 (NOT root, NOT :22), and it has NO SFTP subsystem so scp FAILS - stream over ssh. NEVER VACUUM FULL. A successful transfer exit code is NOT proof the bytes are readable at the far end.",
+ "task_source": "task_file",
+ "roles_bound": {
+  "manager": "ornith-1.5:pool",
+  "executor": "ornith-1.5:pool",
+  "auditor": "ornith-1.5:pool"
+ },
+ "run_id": "20260911T201034Z_5bda1709",
+ "launched_at": "2026-09-11T20:10:33.992614+00:00"
+}

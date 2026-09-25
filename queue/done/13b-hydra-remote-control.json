@@ -1,0 +1,8 @@
+{
+ "name": "13b-hydra-remote-control",
+ "task_file": "C:/tmp/hydra-remote-control-task.txt",
+ "workspace": "/home/harness/work/cognizioware-hydra-rsi",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "run_id": "20260908T100707Z_8267c54d"
+}

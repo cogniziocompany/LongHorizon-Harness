@@ -1,0 +1,45 @@
+TASK 221 - [queue].database_url is dropped by the config loader, so the Postgres cutover crashes the service at startup
+
+REPRODUCED 2026-09-22 20:55 PT on origin/main (2679f63) in a clean worktree, not inferred:
+
+  config.toml:
+      [queue]
+      backend = "postgres"
+      database_url = "postgresql://lh_harness@192.168.21.154:5432/lh_harness"
+
+  >>> proj = load_run_defaults(path)          # ACCEPTS the file (database_url is in the
+  ...                                          # allowed key set, config.py:262-269)
+  >>> 'database_url' in proj['queue']
+  False                                        # _flatten_queue_table's return dict
+                                               # (config.py, "return {trios, capacity,
+                                               # backend, observe, occupancy_ignore_dirty}")
+                                               # DOES NOT carry it
+  >>> _select_queue_store(runs_root, proj)
+  ValueError: queue_backend=postgres requires queue.database_url
+
+`webapi/server.py` re-raises ValueError out of `create_app` (`except ValueError: raise`), so the
+harness web service FAILS TO START. The operator's config is valid, the failure is silent until
+boot, and the box goes offline.
+
+This is the last mechanical blocker for cutover task 168. It is NOT a duplicate of task 219: #39
+wired `_select_queue_store` into `create_app` correctly; the DSN never reaches it. Note that
+`tests/webapi/test_queue_store_selection.py::test_real_config_flattener_drops_database_url`
+currently ASSERTS the drop - the test encodes the bug. Its own source comment (config.py:258-261)
+calls threading the DSN through "the documented cutover step", i.e. known and deferred.
+
+DELIVERABLES (branch + PR to main, never merge yourself, no @claude review):
+ 1. Carry `database_url` through `_flatten_queue_table` so `_select_queue_store` receives it.
+    Keep the validation already there (unknown [queue] keys still raise; a bad backend name still
+    raises). Never log or echo the DSN, and never a password - the password comes only from
+    `LH_HARNESS_DB_PASSWORD` (name only; `pg_queue._resolve_connection_url`).
+ 2. Replace `test_real_config_flattener_drops_database_url` with its inverse: the flattener CARRIES
+    the DSN, and `_select_queue_store` on that loaded config returns a `PgQueueStore` (mock the
+    connection - do not require a live database in the test).
+ 3. Add a startup test: `create_app` with `[queue] backend="postgres"` + a valid `database_url`
+    builds the app and selects PgQueueStore; with `backend="postgres"` and NO `database_url` it
+    still raises loudly at startup (that half is correct behaviour and must not regress).
+ 4. `docs/queue.md`: the exact config block an operator writes for the cutover, with the env NAME
+    for the password and a pointer to migrations 001/002.
+
+CONSTRAINTS: env NAMES only, never a value; never `git add -A`, commit by explicit path; PR only,
+do NOT merge; do not touch the deployed CT110 tree or its config.toml.

@@ -1,0 +1,8 @@
+{
+ "name": "05h7-fleet-report-deploy",
+ "task_file": "C:/tmp/fleet-report-deploy-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "run_id": "20260908T060622Z_844e8f00"
+}

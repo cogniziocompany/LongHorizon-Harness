@@ -33,6 +33,7 @@ _ENV_URL = "LH_HARNESS_FLEET_URL"
 _ENV_NODE = "LH_HARNESS_FLEET_NODE"
 _ENV_KEY = "LH_HARNESS_FLEET_KEY"
 _ENV_LABELS = "LH_HARNESS_FLEET_LABELS"
+_ENV_ALL = (_ENV_URL, _ENV_NODE, _ENV_KEY, _ENV_LABELS)
 
 _BATCH_INTERVAL_SECONDS = 2.0
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
@@ -41,6 +42,11 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF_SECONDS = (0.0, 1.0, 2.0)
 _WARN_ONCE_INTERVAL_SECONDS = 300.0
 _MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
+# Heartbeat bounding: the heartbeat sends only non-terminal runs (the ones a
+# remote operator can act on) plus aggregate counts for the rest.  The active
+# list itself is hard-capped so a node with a very large live backlog stays
+# well under any plausible proxy body limit for the heartbeat route.
+_MAX_ACTIVE_RUNS_PER_HEARTBEAT = 200
 _MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 _TRAJECTORY_ROLES = (
     "manager",
@@ -113,7 +119,30 @@ class FleetReporter:
         version: str = "unknown",
         capacity: int = 0,
     ) -> None:
-        self._url = (fleet_url or os.environ.get(_ENV_URL) or "").rstrip("/")
+        env_values = {
+            _ENV_URL: fleet_url or os.environ.get(_ENV_URL),
+            _ENV_NODE: node or os.environ.get(_ENV_NODE),
+            _ENV_KEY: key or os.environ.get(_ENV_KEY),
+            _ENV_LABELS: labels if labels else _parse_labels(os.environ.get(_ENV_LABELS, "")),
+        }
+        # An absent URL disables the reporter entirely; anything short of all
+        # four variables is a misconfiguration that must be LOUD so an
+        # unregistered node can never masquerade as an idle one.  Names only,
+        # never values.
+        self._missing_env = [name for name in _ENV_ALL if not env_values.get(name)]
+        self._configured = not self._missing_env
+        if self._missing_env:
+            logger.warning(
+                "fleet reporter configuration incomplete; missing environment "
+                "variables: %s (this node will NOT register with any fleet; "
+                "set them in the service EnvironmentFile and restart the service)",
+                ", ".join(self._missing_env),
+            )
+        self._url = (env_values[_ENV_URL] or "").rstrip("/")
+        self._ever_succeeded = False
+        self._last_attempt_ok: bool | None = None
+        self._last_attempt_error: str | None = None
+        self._attempt_lock = threading.Lock()
         if not self._url:
             self._enabled = False
             self._node = ""
@@ -122,7 +151,11 @@ class FleetReporter:
             self._thread: threading.Thread | None = None
             self._queue: queue.Queue[_PendingItem | None] | None = None
             self._stop_event: threading.Event | None = None
-            self._heartbeat_callback: Callable[[], tuple[list[dict[str, Any]], int, int, int]] | None = None
+            self._heartbeat_callback: Callable[
+                [],
+                tuple[list[dict[str, Any]], int, int, int]
+                | tuple[list[dict[str, Any]], int, int, int, float | None, dict[str, Any] | None],
+            ] | None = None
             return
 
         self._enabled = True
@@ -138,7 +171,11 @@ class FleetReporter:
         self._stop_event = threading.Event()
         self._last_warned: float = 0.0
         self._warned_lock = threading.Lock()
-        self._heartbeat_callback: Callable[[], tuple[list[dict[str, Any]], int, int, int]] | None = None
+        self._heartbeat_callback: Callable[
+            [],
+            tuple[list[dict[str, Any]], int, int, int]
+            | tuple[list[dict[str, Any]], int, int, int, float | None, dict[str, Any] | None],
+        ] | None = None
         self._heartbeat_interval = _HEARTBEAT_INTERVAL_SECONDS
         self._last_heartbeat = 0.0
         self._thread = threading.Thread(target=self._worker, name="fleet-reporter", daemon=True)
@@ -156,6 +193,38 @@ class FleetReporter:
     def labels(self) -> dict[str, str]:
         return dict(self._labels)
 
+    @property
+    def configured(self) -> bool:
+        """True only when all four LH_HARNESS_FLEET_* variables were present and
+        non-empty at construction.  False means this node cannot be registered."""
+        return self._configured
+
+    @property
+    def missing_env(self) -> tuple[str, ...]:
+        """Names of the LH_HARNESS_FLEET_* variables missing at construction."""
+        return tuple(self._missing_env)
+
+    def registration_state(self) -> dict[str, Any]:
+        """Snapshot of registration history for /api/meta exposure.
+
+        ``ever_succeeded`` flips True on the first successful POST and stays
+        True; ``last_ok``/``last_error`` describe the most recent attempt
+        (None before the first attempt completes).
+        """
+        with self._attempt_lock:
+            return {
+                "ever_succeeded": self._ever_succeeded,
+                "last_ok": self._last_attempt_ok,
+                "last_error": self._last_attempt_error,
+            }
+
+    def _record_registration_attempt(self, *, success: bool, error: str | None) -> None:
+        with self._attempt_lock:
+            self._last_attempt_ok = success
+            self._last_attempt_error = error
+            if success:
+                self._ever_succeeded = True
+
     def queue_event(self, envelope: EventEnvelope) -> None:
         """Enqueue one public event.  Never blocks the caller."""
         if not self._enabled or self._queue is None:
@@ -168,10 +237,59 @@ class FleetReporter:
         active: int,
         cap: int,
         queue_len: int = 0,
+        launcher_tick_at: float | None = None,
+        lease_holder: dict[str, Any] | None = None,
     ) -> None:
-        """Enqueue a periodic heartbeat describing this node."""
+        """Enqueue a periodic heartbeat describing this node.
+
+        The heartbeat carries only the node's *non-terminal* runs in
+        ``runs[]`` — the ones a remote operator can act on — plus aggregate
+        counts for the whole store (``runsTotal``, ``runsByStatus``) and a
+        ``runsTruncated`` flag when the active list itself is capped.  A
+        long-lived node accumulates hundreds of completed runs whose per-run
+        summaries dominate the payload (measured ~10 KB per run; a 532-run
+        store produced a 5.47 MB body that the fleet plane rejected with
+        HTTP 413), so the full run list must never be sent.
+        """
         if not self._enabled:
             return
+        # Imported lazily: supervisor/__init__ eagerly pulls in control_bus,
+        # which imports this module, so a module-level import would create a
+        # circular import for anything loading fleet.reporter first.
+        from lh_harness.supervisor.lifecycle import (
+            TERMINAL_STATUSES,
+            canonical_lifecycle_status,
+        )
+        # Aggregate over the whole run list first: every run is counted by
+        # status, but only non-terminal runs are serialized into ``runs[]``.
+        # Unknown/blank statuses canonicalize to "idle" (non-terminal), so a
+        # malformed record is reported, never silently dropped.
+        runs_total = len(runs)
+        runs_by_status: dict[str, int] = {}
+        active_runs: list[dict[str, Any]] = []
+        for run in runs:
+            status = canonical_lifecycle_status(run.get("status"))
+            runs_by_status[status] = runs_by_status.get(status, 0) + 1
+            if status not in TERMINAL_STATUSES:
+                active_runs.append(run)
+        # Hard cap on the active list itself (most recent first by the
+        # summary's ``updated_at``; the raw registry ``mtime`` is the
+        # fallback).  Live runs are bounded in practice by the node's
+        # capacity; the cap keeps a pathological store or a misbehaving
+        # heartbeat callback from re-inflating the payload.
+        runs_truncated = len(active_runs) > _MAX_ACTIVE_RUNS_PER_HEARTBEAT
+        if runs_truncated:
+            active_before_cap = len(active_runs)
+            active_runs = sorted(
+                active_runs,
+                key=lambda r: r.get("updated_at", r.get("mtime", 0)),
+                reverse=True,
+            )[:_MAX_ACTIVE_RUNS_PER_HEARTBEAT]
+            logger.info(
+                "fleet reporter heartbeat: capping active runs from "
+                f"{active_before_cap} to {_MAX_ACTIVE_RUNS_PER_HEARTBEAT} most recent; "
+                "aggregate counts still cover every run"
+            )
         body = {
             "node": {
                 "name": self._node,
@@ -193,10 +311,21 @@ class FleetReporter:
                     "youtrackIssueId": run.get("youtrack_issue_id"),
                     "summary": {k: v for k, v in run.items() if k not in {"id", "status"}},
                 }
-                for run in runs
+                for run in active_runs
             ],
             "capacity": {"active": active, "cap": cap},
             "queueLen": queue_len,
+            # Launcher liveness (task 173, scope 6): the lease's last refresh
+            # and its holder.  Both are None when no lease exists, which is the
+            # fleet window's "no launcher" signal -- so the block is always
+            # present and never omitted.
+            "liveness": {
+                "launcher_tick_at": launcher_tick_at,
+                "lease_holder": lease_holder,
+            },
+            "runsTotal": runs_total,
+            "runsByStatus": dict(sorted(runs_by_status.items())),
+            "runsTruncated": runs_truncated,
         }
         self._post("/harness/heartbeat", body, gzip_body=True)
 
@@ -225,12 +354,19 @@ class FleetReporter:
 
     def register_heartbeat(
         self,
-        callback: Callable[[], tuple[list[dict[str, Any]], int, int, int]],
+        callback: Callable[
+            [],
+            tuple[list[dict[str, Any]], int, int, int]
+            | tuple[list[dict[str, Any]], int, int, int, float | None, dict[str, Any] | None],
+        ],
     ) -> None:
         """Register a callback that produces heartbeat data every 30 s.
 
-        The callback must return ``(runs, active, cap, queue_len)``.  It is
-        invoked on the reporter daemon thread; keep it fast and exception-free.
+        The callback must return ``(runs, active, cap, queue_len)`` or, when
+        the node exposes a launcher lease, the extended
+        ``(runs, active, cap, queue_len, launcher_tick_at, lease_holder)``.  It
+        is invoked on the reporter daemon thread; keep it fast and
+        exception-free.
         """
         if not self._enabled:
             return
@@ -296,8 +432,17 @@ class FleetReporter:
                     and now - self._last_heartbeat >= self._heartbeat_interval
                 ):
                     try:
-                        runs, active, cap, queue_len = self._heartbeat_callback()
-                        self.queue_heartbeat(runs, active, cap, queue_len)
+                        result = self._heartbeat_callback()
+                        if len(result) == 6:
+                            runs, active, cap, queue_len, launcher_tick_at, lease_holder = result
+                            self.queue_heartbeat(
+                                runs, active, cap, queue_len,
+                                launcher_tick_at=launcher_tick_at,
+                                lease_holder=lease_holder,
+                            )
+                        else:
+                            runs, active, cap, queue_len = result
+                            self.queue_heartbeat(runs, active, cap, queue_len)
                     except Exception:
                         logger.exception("fleet reporter heartbeat callback failed")
                     self._last_heartbeat = now
@@ -338,21 +483,31 @@ class FleetReporter:
         url = f"{self._url}{endpoint}"
         body = json.dumps(payload, ensure_ascii=False, default=_json_default).encode("utf-8")
         original_size = len(body)
+        # Sign the JSON bytes, never the compressed wire bytes: fleet-admin's
+        # express.json ``verify`` hands the HMAC the INFLATED body, so a
+        # signature over the gzip stream can never match (9,098 consecutive
+        # ``harness_bad_sig`` rejections for ct110 before this was measured,
+        # 2026-09-22; proven by a probe that signed plaintext and got 200).
+        sign_bytes = body
         if gzip_body:
             body = __import__("gzip").compress(body)
         attempt = 0
         last_error: Exception | None = None
         while attempt < _MAX_RETRIES:
-            req = self._build_request(url, body, gzip_body=gzip_body, original_size=original_size)
+            req = self._build_request(
+                url, body, sign_bytes=sign_bytes, gzip_body=gzip_body, original_size=original_size
+            )
             try:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     resp.read()
+                self._record_registration_attempt(success=True, error=None)
                 return
             except urllib.error.HTTPError as exc:
                 last_error = exc
                 # 4xx client errors are not retried; payload is malformed or auth failed.
                 if 400 <= exc.code < 500:
                     self._warn_once(f"fleet reporter rejected {endpoint}: HTTP {exc.code}")
+                    self._record_registration_attempt(success=False, error=f"HTTP {exc.code}")
                     return
             except Exception as exc:
                 last_error = exc
@@ -362,18 +517,20 @@ class FleetReporter:
         self._warn_once(
             f"fleet reporter could not POST {endpoint} after {attempt} attempts: {last_error}"
         )
+        self._record_registration_attempt(success=False, error=str(last_error))
 
     def _build_request(
         self,
         url: str,
         body: bytes,
         *,
+        sign_bytes: bytes | None = None,
         gzip_body: bool,
         original_size: int,
     ) -> urllib.request.Request:
         signature = hmac.new(
             self._key.encode("utf-8"),
-            body,
+            body if sign_bytes is None else sign_bytes,
             hashlib.sha256,
         ).hexdigest()
         headers = {

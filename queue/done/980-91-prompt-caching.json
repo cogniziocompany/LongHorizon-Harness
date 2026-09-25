@@ -1,0 +1,16 @@
+{
+  "name": "980-91-prompt-caching",
+  "task_file": "C:/tmp/prompt-caching-investigation-task.txt",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "LOW PRIORITY - deliberately near the end. The redis cache is on with ZERO hits across 2,107 Synthetic requests (exact-match response caching cannot hit multi-turn agent traffic). The 'fixed prefix' rescope is RETRACTED and disproved: manager floor is 2,994 tokens, so no 33k constant exists; the stable prefix is ~3k/call, not ~33k. Task 94 (history caps) is the bigger lever. Uses sonar-pro for the research Paxton asked for. | TICK #409 2026-09-17 05:09 PT: run 20260917T095331Z_f0425923 reached its end-of-round gate at round 6/8 with all four done-means met; resolved 'stop' (approval 218f7a2369e6, read back resolved/cancelled). STATE = PR. PR #161 cogniziocompany/cognizioware-mcp-tools, branch task-91-litellm-cache-investigation, head 07cb201, 12 files/+5025, docs-only under 'design docs/', OPEN + MERGEABLE, reviewDecision EMPTY (unreviewed - report, do NOT invoke @claude). Verdict: redis cache is exact-match, 0.23% hit rate on synthetic traffic; keep as deployed; real cost lever is TASK-94 history caps. Merging it needs no quiet window (touches no litellm-config.yaml).",
+  "task_source": "task_file",
+  "run_id": "20260917T095331Z_f0425923",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "syn:large:vision:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-17T09:53:31.613596+00:00"
+}

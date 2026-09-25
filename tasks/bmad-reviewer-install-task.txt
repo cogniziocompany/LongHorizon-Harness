@@ -1,0 +1,118 @@
+TASK 149 - Install the claude-code.yml reviewer in BMAD_Cognizioware, so PR #1 can reach REVIEWED.
+
+*** OVERSEER-EXECUTED. NOT FOR A HARNESS RUN. IN queue/blocked/ DELIBERATELY. ***
+CORRECTED 2026-09-15 by scheduled tick #183. The original premise - *"MEASURED 2026-09-10 20:25 PT,
+from run b9cfaaa8's own gate: CT110 has NO `gh` and NO GitHub token of any kind"* - is **FALSE since
+2026-09-14 16:21 PT**: CT110 runs now hold a scoped GH_TOKEN and push + open their own PRs.
+**THE BLOCK STILL HOLDS, FOR A DIFFERENT AND NARROWER REASON:** this task installs
+`.github/workflows/claude-code.yml`, and the scoped token **refuses workflow-file pushes by
+permission** (verified from CT110). A run also still cannot merge or read a CI run. So it remains
+OVERSEER-EXECUTED - but because of the workflow-path permission, not a missing credential.
+
+Source: Paxton, 2026-09-10, plan from session [503a68] (503a6879-fd92-4101-9032-713855af8088),
+plan mode, read-only. That session is NOT the overseer.
+
+================================================================================
+WHY THIS EXISTS
+================================================================================
+Task 111 was driven BRANCHED -> PUSHED -> PR and **STOPPED AT PR**. `BMAD_Cognizioware` PR #1
+(`docs/bmad-flow-specs`, three FLOW spec commits, 3 files +973/-0) cannot reach REVIEWED because the
+repo has **no `.github/workflows` at all** - so nothing reviews it. STEP 3 is explicit that an
+unreviewed merge is a state the pipeline is not supposed to have.
+
+VERIFIED BY THE OVERSEER 20:30 PT (do not re-derive):
+    BMAD_Cognizioware .github/workflows  -> HTTP 404, no workflows whatsoever
+    default branch = main, private = true, **main is NOT branch-protected**
+    PR #1 state = OPEN, reviewDecision = empty, head = docs/bmad-flow-specs
+    org secret CLAUDE_CODE_OAUTH_TOKEN: visibility = ALL, updated 2026-09-10T02:04:01Z
+      -> the repo ALREADY inherits it. NO SECRET WORK IS NEEDED.
+
+================================================================================
+*** THE CONSTRAINT THAT DECIDES THE WHOLE DESIGN ***
+================================================================================
+`issue_comment` and `pull_request_review_comment` workflows **execute from the DEFAULT BRANCH.**
+Adding the file to PR #1's branch would NOT make PR #1 reviewable. **It must land on `main`.**
+That is why this cannot go through the reviewer it installs - the reviewer does not exist yet. This
+is a bootstrap, and the bootstrap merge is Paxton's call (see STEP 3).
+
+================================================================================
+THE FILE - SPECIFIED BY HASH, NOT BY DESCRIPTION
+================================================================================
+Copy **BYTE-FOR-BYTE** from `cognizioware-mcp-tools/.github/workflows/claude-code.yml`.
+    canonical blob = 71abcfef5cbc   size = 2,491 bytes
+    LongHorizon-Harness carries the IDENTICAL blob - two repos agreeing is what makes it canonical.
+*** DO NOT COPY mcp-cognizioware's variant: blob da743ed07eea, 1,521 bytes. It is the OLDER one. ***
+The canonical file's three material differences, all deliberate and commented in the file itself:
+  * `fetch-depth: 0` - a depth-1 clone contains ONLY the PR head commit, so a review cannot diff.
+  * job-level `timeout-minutes: 20` - without it a hung job blocks every later @claude mention.
+  * NO `timeout_minutes` action input - `claude-code-action@v1` does not accept it and emits
+    "Unexpected input(s) 'timeout_minutes'". It never applied.
+Verify the copy by hash after writing it. A hand-retyped or reformatted file is not this file.
+
+================================================================================
+STEPS
+================================================================================
+STEP 1 - BRANCH AND COMMIT
+  From `main`, create `ci/claude-code-review`. Add ONLY
+  `.github/workflows/claude-code.yml`, byte-identical to the canonical blob.
+  Commit by EXPLICIT PATH. **Never `git add -A`.** Check `git diff --stat` first: it must show
+  exactly 1 file, +N/-0, nothing else. End the commit message with the required trailer:
+      Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+STEP 2 - OPEN PR #2 FOR THE AUDIT TRAIL, THEN STOP
+  Open it against `main`. Do NOT chain create+merge. Body should state plainly: this is a
+  bootstrap, it is a verbatim copy of an already-reviewed fleet file (name the blob hash), and it
+  cannot be reviewed by the workflow it installs.
+
+STEP 3 - *** THE MERGE AND THE REVIEW TRIGGER ARE BOTH PAXTON'S. DO NOT DO EITHER. ***
+  (a) **The merge.** A human merge of a one-file verbatim copy. The overseer does NOT self-merge an
+      unreviewed PR - that is the same refusal that stopped task 111 at PR, and it would be
+      inconsistent to waive it here just because the PR is convenient.
+  (b) **The `@claude` comment on PR #1.** *** THE OVERSEER MUST NEVER POST ONE. *** Since
+      mcp-tools PR #131 that reviewer runs on **PAXTON'S PERSONAL SUBSCRIPTION QUOTA**; task 117
+      bans invocations outright, and on 2026-09-10 19:50 PT the overseer fired five anyway and had
+      to cancel four live runs. The `if:` gate requires `author_association` OWNER/MEMBER/
+      COLLABORATOR, so **Paxton posts it from his own account, knowing it spends his quota.**
+      Report that PR #1 is ready for that comment; do not post it and do not ask a run to.
+
+STEP 4 - HAND BACK
+  Once the reviewer is live and Paxton has triggered it, task 111 advances PR -> REVIEWED, and then
+  MERGED per STEP 3. Record the review verdict in the ledger row. **PR #1 also carries two dangling
+  references** (`_bmad-output/planning-artifacts/publisher-cognizio-cgz.md`, cited 14 times, and
+  `design/ux/modernist-v2/Env-to-Session-Spec.md:78`, never tracked) - the reviewer should be asked
+  about those, and they are a decision for the repo owner, not something to fix silently.
+
+================================================================================
+HARD RULES
+================================================================================
+ - *** DO NOT delete, unset, or re-scope the org secret CLAUDE_CODE_OAUTH_TOKEN to test anything.
+   It is shared by SIX repos and `visibility: all` was set at 2026-09-10T02:04:01Z. Breaking it to
+   test a guard would take the reviewer down FLEET-WIDE. *** It already reaches this repo; there is
+   nothing to change.
+ - Do NOT add any workflow other than `claude-code.yml`. One file, one PR.
+ - Do NOT enable branch protection on `main` as part of this - out of scope, and it would change how
+   every other task merges here.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat`.
+ - NEVER post an `@claude` comment (see STEP 3b).
+ - Do NOT merge PR #2 yourself.
+
+================================================================================
+DEDUP - THREE NEIGHBOURS, AND THE BOUNDARIES ARE NARROW
+================================================================================
+  TASK 130 `993-130-reviewer-qa` (active) - THE PROVING GROUND for the reviewer rollout. It adds the
+      reviewer to `cognizioware-qa` AND designs the **false-green guard** the other repos inherit.
+      Its note already records "THREE repos lack the reviewer".
+      **130 OWNS THE PATTERN AND THE GUARD. THIS TASK OWNS ONE FILE IN ONE REPO.** If you find
+      yourself designing a guard or touching another repo, you are in 130's scope - stop.
+  HYDRA PR #26 `ci: add the PR reviewer to hydra` - already OPEN, mergeable, all checks green. It is
+      the same bootstrap for hydra. **Do not open a second one.** It is itself unreviewed behind the
+      gap it fixes, and merging it is a separate call for Paxton.
+  TASK 140 `998-140-fleet-chat-orchestrator` and `hydra-reviewer-flow-bmad` (blocked) both use the
+      BMAD_Cognizioware workspace for DIFFERENT work. Do not touch `_bmad/`, `_bmad-output/` or any
+      spec content here. This task adds one CI file and nothing else.
+
+DONE MEANS: `.github/workflows/claude-code.yml` exists on `main` in BMAD_Cognizioware and is
+byte-identical to blob 71abcfef5cbc (verified by hash, not by eye); `gh workflow list -R
+cogniziocompany/BMAD_Cognizioware` shows "Claude Code PR Review"; PR #2 was opened and merged by
+Paxton, not by the overseer; and PR #1 is reported to Paxton as ready for him to trigger the review
+from his own account. **No `@claude` comment was posted by the overseer.**

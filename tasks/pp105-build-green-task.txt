@@ -1,0 +1,37 @@
+TASK 192 - Get PR #105 to a mergeable, green state. TWO STEPS, COMMIT AFTER EACH.
+
+REPO / WORKSPACE: cognizioware-powerplatform, the -evalfix tree
+(/home/harness/work/cognizioware-powerplatform-evalfix).
+BRANCH: task-101/build-dispatch, already checked out, HEAD = 9dfda4c. Do NOT branch fresh.
+Do NOT open a new PR - PR #105 already exists and you are updating it.
+
+WHY THIS IS NARROW
+Task 159 spent six rounds on this and produced zero commits; the overseer recovered its work by
+hand and pushed it as 9dfda4c (4 files, +273/-161: the test-mock typing and the WorkspaceLayout
+implicit-any params). That work is ON THE REMOTE. Your job is only the two things still missing.
+This task is a SCOPE CUT of 159, not a retry of it. If you find yourself analysing for a whole
+round without committing, you are repeating 159's failure.
+
+STEP 1 - CLEAR THE BASE CONFLICT (do this first, it is mechanical)
+PR #105's base is `develop` and GitHub reports mergeable=CONFLICTING (measured 2026-09-17 03:40 PT).
+  git fetch origin develop
+  git merge origin/develop        # merge, do NOT rebase - the branch is pushed and shared
+Resolve the conflicts, commit, push. Then read the PR back and confirm mergeable is no longer
+CONFLICTING - `gh pr view 105 --repo cogniziocompany/cognizioware-powerplatform --json mergeable`.
+A 0 exit code from git is not proof; read the PR.
+
+STEP 2 - MAKE THE FRONTEND BUILD PASS
+  cd packages/frontend && npm run build        # this is `tsc -b` + vite, the check that is red
+Fix whatever tsc still reports. Rules carried over from 159, they still apply:
+  - Do NOT cast to `any` to make it compile. Type the `vi.importActual` result and the mocks.
+  - Stage BY PATH. NEVER `git add -A` / `git add .` - packages/frontend/dist/ and
+    packages/frontend/node_modules/ are build artefacts and must not enter a commit.
+Commit and push each time you get the error count down. A partial improvement on the remote beats
+a perfect fix that dies on disk when this run ends.
+
+DONE MEANS
+PR #105 reads mergeable != CONFLICTING and its "Build frontend (tsc -b + vite)" check is green,
+both read back from the GitHub API. Then comment on the PR with what you changed and STOP.
+Do NOT merge - merging is the overseer's. Do NOT post an `@claude` comment anywhere, ever.
+If you cannot get the build green, push what you have and comment naming the exact remaining
+tsc errors, then STOP. Reporting a precise blocker is a successful outcome; looping is not.

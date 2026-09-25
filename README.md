@@ -518,6 +518,8 @@ For example `20250907T120000Z_abcd1234.round_001.cli_executor`. The same value i
 
 Deploy note for node operators: place the gateway key in `/home/harness/.lh-harness-secrets.env` on the node host (CT110/WSL), not in project files. After the harness node reads it, `GET /api/meta` will report `mcp_gateway_configured: true` and the available profiles. If you proxy through LiteLLM, add `X-LH-Session` to a server's `extra_headers` so the gateway forwards it to the upstream.
 
+Changes to `/home/harness/.lh-harness-secrets.env` (including the `LH_HARNESS_FLEET_*` variables) only take effect after a service restart — systemd reads `EnvironmentFile` once at process start.
+
 ### Dashboard commands
 
 ```bash

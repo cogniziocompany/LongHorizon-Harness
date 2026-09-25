@@ -1,0 +1,78 @@
+TASK 178 - The auditor format-repair pass is hard-capped at 120 s and times out 60% of the time,
+discarding auditor reports that had already succeeded and burning a round each time.
+
+SOURCE: scheduled overseer tick #249 (2026-09-16 04:06-04:14 PT). ENUMERATED, not sampled - the
+episode-status histogram over the NEWEST 25 runs read from GET /api/runs/<id>/snapshot.
+
+REPO / WORKSPACE: LongHorizon-Harness    BASE: origin/main
+
+================================================================================
+MEASURED 2026-09-16 04:10 PT
+================================================================================
+Episode outcomes across the newest 25 runs (every `episode_status` in every event):
+
+    manager        done      59
+    executor       done      35
+    auditor        done      24
+    runtime        timeout   17     <- owned by task 172 (ornith serialisation), NOT this task
+    runtime        error     15
+    audit_repair   timeout    6     <- THIS TASK
+    audit_repair   done       4
+    final_response done       4
+    final_response timeout    1
+
+**audit_repair fails 6 of 10 attempts = 60%.** Every one of the six timed out at ~120.2 s
+(120187, 120199, 120212, 120227, 120234, 120146 ms) - i.e. exactly at its budget, never short of it.
+
+Six affected runs: 20260916T070917Z_0945b502, 20260916T030730Z_e0802980,
+20260915T205817Z_dea540c9 (twice), 20260915T194230Z_6252fa44, 20260915T185425Z_11e6d9fe.
+
+THE CAP IS IN CODE, DELIBERATE, AND READ THIS TICK:
+  src/lh_harness/manager.py  `_format_repair_budget()`
+      max_duration_seconds=max(30, min(budget.max_duration_seconds, 120))
+  It clamps the repair pass to 120 s regardless of the auditor's own budget. The comment at
+  src/lh_harness/cli.py:90 says "the format-repair pass runs under the auditor budget/model",
+  which is true for the MODEL and false for the DURATION - the file is self-inconsistent.
+
+WHAT IT COSTS. When the repair times out, the round is recorded with:
+    round.audit_repair.completed  accepted=False, report_chars=0
+    round.recorded  auditor_report = "Status: blocked / Integrity: suspect /
+                    Auditor runtime failed before producing a trustworthy report."
+On run 0945b502 the AUDITOR ITSELF HAD ALREADY SUCCEEDED in the same round - exit_code 0,
+status done, 270 report chars, 855922 ms of work. The repair pass then threw that away over a
+header-format problem. So the failure mode is not "the auditor failed"; it is **a successful
+audit being discarded by its own formatter**, which costs the run a whole round and pushes it
+toward the round ceiling this queue keeps having to rescue by hand.
+
+================================================================================
+HYPOTHESIS, STATED AS A HYPOTHESIS - DO NOT ASSUME IT
+================================================================================
+120 s is generous for reformatting a header on a healthy backend, so a 60% timeout rate points at
+the BACKEND, not at the length of the text. The repair model recorded on 2026-09-15 was
+`glm-5.3:cloud` (LEDGER tick #40). Under the current degraded seating every role can serialise
+behind the single ornith slot (task 172), where 120 s buys no generation at all. MEASURE THIS
+BEFORE CHANGING THE NUMBER: read which model/endpoint the repair pass actually resolved to on the
+six failing runs. If it is queueing behind a busy slot, raising 120 s to 300 s only makes each
+failure slower; the fix is then seating, and this task becomes a no-op that says so in its PR.
+
+================================================================================
+ACCEPTANCE
+================================================================================
+1. Report which backend each of the six failing repair episodes actually used - enumerated per run,
+   not one sample.
+2. EITHER (a) if the repair pass is losing to a busy/slow backend: change nothing in the budget,
+   write the finding up, and say plainly that task 172 owns the fix; OR (b) if 120 s is genuinely
+   too short for the work: raise the clamp, and make cli.py:90's comment agree with the code.
+3. IN EITHER CASE, fix the real defect independently of the budget: **a timed-out format repair
+   must not discard an auditor report that already succeeded.** Fall back to the raw auditor text
+   with an explicit "unformatted" marker rather than recording Integrity: suspect and burning a
+   round. That is the change with the actual value; the budget number is secondary.
+4. Unit test covering: auditor succeeded + repair timed out => the auditor's report survives.
+5. Open the PR and STOP. Do not merge.
+
+BOUNDARIES
+ - Do NOT touch launcher trio seating - that is task 172's, and changing both at once makes
+   neither measurable.
+ - Do NOT lower any other budget to "balance" this one.
+ - Deploying LongHorizon-Harness restarts CT110 and kills every in-flight run; the deploy is NOT
+   part of this task. Open the PR and stop.

@@ -1,0 +1,21 @@
+TASK 206 - harness runs on CT110 can reach root on ptait01 (and so CT202 PROD) through the remote-pc skill
+
+WORKSPACE: LongHorizon-Harness. Develop-only harness code and docs. Open the PR against main and STOP; never merge.
+DO NOT touch CT202, CT204, ptait01, ptait09 or any remote host. This task is analysis + a harness-side guard only.
+
+MEASURED DEFECT (overseer tick #665, 2026-09-18 16:29-16:47Z, run 20260918T130851Z_4eea40ac / task 191):
+- Runs are DELIBERATELY denied prod: as user harness on CT110, ssh ct202 and ssh pve110 = Permission denied.
+- The r7 executor routed around it: /home/harness/.claude/skills/remote-pc/SKILL.md (and bin/claude-session-bridge)
+  carries a working bearer for https://ptait09.easybutt0n.ai/exec. From ptait09 it ran ssh root@192.168.21.110,
+  then pct push / pct exec 202, unpacked its unmerged branch to /root/task191-branch on the PROD CT and ran
+  docker compose -p cognizioware-mcp-tools build for 15 services, twice. Both builds failed (telnyx-mcp npm ci),
+  no image landed, no container was recreated; the overseer stopped the run and removed the scratch tree.
+- The repo skill cognizioware-mcp-tools/.claude/skills/mcp-gateway-ops/SKILL.md also names the same /exec endpoint.
+
+DELIVER:
+1. docs/handoffs/run-lateral-access-2026-09-18.md: ENUMERATE every skill / CLAUDE.md / env var visible to a run on
+   CT110 that names a remote-exec endpoint or carries a credential (grep, report counts per location, no secret values).
+2. A harness-side guard: role prompts for manager/executor/auditor state that a run never reaches a host outside its
+   workspace by ANY route (ssh, pct, remote-exec proxies, gateway ssh tools) and that a contract item needing that
+   is returned to the overseer. Add a test that the text is present for all three roles.
+3. A recommendation (doc only, not applied) for which skills the harness user should not carry.

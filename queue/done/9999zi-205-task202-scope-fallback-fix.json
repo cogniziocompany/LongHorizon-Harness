@@ -1,0 +1,16 @@
+{
+  "name": "9999zi-205-task202-scope-fallback-fix",
+  "task_file": "C:/tmp/ct110-task202-scope-fallback-fix-task.txt",
+  "task_source": "task_file",
+  "workspace": "LongHorizon-Harness",
+  "max_rounds": 4,
+  "trio": "kimi",
+  "note": "TICK #663 2026-09-18 09:4x PT: created from the overseer's pre-merge review of LHH PR #30 (task 202). Defect: CT110 stderr 'Failed to start transient scope unit: Access denied' is not in _SCOPE_FAILURE_SIGNATURES, so no RLIMIT fallback and the worker never starts = every run dies at launch after deploy. PR #30 MUST NOT MERGE before this lands on its branch. Same tree as 202/203/204: never two runs on one working tree. Develop-only harness code; open-PR guard: this CONTINUES PR #30's branch (needs task 201's continue_branch, which is MERGED but NOT deployed to CT110 - if the launcher refuses, the overseer applies the fix by hand). Appended at the END of the active band. | TICK #685 2026-09-18 11:43 PT: RUN ENDED. Gate (approval 1e5f892516e9, 'manager confirmed task completion') resolved action=stop; read back run 20260918T174419Z_b7b071bd = cancelled, exit_code 0, report_status completed, approval resolved. Work verified on the REMOTE, not from the run's summary: LHH PR #30 OPEN, base main, head a8490e1348c271c74af218a8611173db02e32c84, MERGEABLE, unreviewed. Tick #684's narrowing injection cmd-a8970de4a2da4ce2 = applied and worked: round 4 was read-only and triggered no false integrity violation, unlike rounds 1 and 2. STATE: 205 = PR. Remaining and all the overseer's: review, merge #30, deploy CT110. Task 202 shares PR #30 and is no longer blocked by a live run.",
+  "run_id": "20260918T174419Z_b7b071bd",
+  "roles_bound": {
+    "manager": "syn:large:vision:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-18T17:44:19.825165+00:00"
+}

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 
 def _launch_directory() -> str:
@@ -56,10 +57,22 @@ class ExecResult:
 @dataclass
 class EpisodeBudget:
     max_duration_seconds: int = 1800
+    # Stalled-episode watchdog: fail the episode after this many seconds of
+    # zero stdout/stderr output instead of consuming the full budget.  None
+    # derives a conservative quarter of max_duration_seconds (120 s floor,
+    # 900 s cap); 0 disables the watchdog.
+    stall_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if self.max_duration_seconds < 1:
             raise ValueError("max_duration_seconds must be at least 1")
+        if self.stall_seconds is not None:
+            if isinstance(self.stall_seconds, bool) or not isinstance(
+                self.stall_seconds, (int, float)
+            ):
+                raise ValueError("stall_seconds must be a number or None")
+            if self.stall_seconds < 0:
+                raise ValueError("stall_seconds must be non-negative")
 
 
 @dataclass
@@ -119,6 +132,12 @@ class HarnessConfig:
     harness_dir: str = DEFAULT_HARNESS_DIR
     log_dir: str = DEFAULT_LOG_DIR
     runs_root: str = DEFAULT_STATE_ROOT
+    # Task 201: the mode the prelaunch workspace guard chose for this run
+    # ("on-default" / "in-place" / "worktree" / "stash" / "continuation"), set
+    # by the supervisor from the launcher's resolved base and surfaced in the
+    # round-zero record.  None means the launch was not queue-triggered (or the
+    # running harness predates the guard), and the record omits it.
+    workspace_base_mode: str | None = None
     auditor_output_chars: int = 24_000
     role_verified_context_chars: int = 60_000
     role_history_chars: int = 100_000
@@ -129,6 +148,46 @@ class HarnessConfig:
     # English is the production default; Chinese remains available for
     # OSWorldv2-compatible role prompts and operator-facing control headers.
     prompt_language: PromptLanguage = "en"
+
+    # Environment overrides for the context-injection ceilings, in
+    # (variable, field) order. Kept as a table so a fourth cap cannot be added
+    # to the dataclass and forgotten here.
+    _ENV_CAP_OVERRIDES: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("LH_HARNESS_AUDITOR_OUTPUT_CHARS", "auditor_output_chars"),
+        ("LH_HARNESS_ROLE_VERIFIED_CONTEXT_CHARS", "role_verified_context_chars"),
+        ("LH_HARNESS_ROLE_HISTORY_CHARS", "role_history_chars"),
+    )
+
+    def __post_init__(self) -> None:
+        # An unparseable or non-positive override keeps the existing value, but
+        # it is WARNED rather than swallowed. A setting that looks like it
+        # applied and silently did not is worse than one that rejects the input:
+        # the operator sees the number they typed in their shell and believes
+        # the run is bounded by it.
+        for env_name, field_name in self._ENV_CAP_OVERRIDES:
+            raw = os.environ.get(env_name)
+            if not raw:
+                continue
+            current = getattr(self, field_name)
+            try:
+                value = int(raw)
+            except ValueError:
+                warnings.warn(
+                    f"{env_name}={raw!r} is not an integer; "
+                    f"keeping {field_name}={current}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+            if value < 1:
+                warnings.warn(
+                    f"{env_name}={raw!r} must be a positive integer; "
+                    f"keeping {field_name}={current}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+            setattr(self, field_name, value)
 
 
 def audit_report_to_dict(report: AuditReport) -> dict[str, Any]:

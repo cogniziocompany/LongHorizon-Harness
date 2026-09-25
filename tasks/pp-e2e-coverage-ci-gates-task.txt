@@ -1,0 +1,243 @@
+TASK 109 - build the coverage that would have caught all of it, and make CI actually gate.
+
+*** GATED BEHIND TASK 107. DO NOT START UNTIL 107'S FIX IS MERGED TO develop. ***
+Reason, from the handoff: while `envId` is undefined the unmanaged-solutions list is ALWAYS empty, so
+the brownfield specs have nothing to select. Building them first produces tests that cannot pass.
+**If 107 is not merged when you start, STOP and report that rather than working around it.**
+
+REPO: cogniziocompany/cognizioware-powerplatform. Use a free powerplatform workspace.
+**BASE IS `origin/develop`, NOT main.**
+
+Source: `C:\Users\PaxtonTait\.claude\plans\publisher-cognizio-cgz-eager-gadget.md` (Items 6 and 7),
+read in full by the overseer. Task 107 owns the blocking defects; task 108 owns the admin probes.
+
+================================================================================
+WHY THIS EXISTS - four user-facing defects shipped to prod together
+================================================================================
+
+Nothing gates on any of it:
+  - trms-qa-eval.yml:5-6 is explicitly "informational only until consecutive green runs prove stable"
+  - eval-gate.yml:190-194 says browser QA is informational, and :205-214 runs
+    `_workspace-chat-check.mjs` as `continue-on-error: true` **uploading NO artifacts at all**, so the
+    screenshots are discarded
+The auditor's phrase for it: *"documentation that runs on a cron."*
+
+**"Informational until stable" with no written promotion bar is how this state persisted indefinitely.**
+Fixing that is as much the deliverable as the specs.
+
+================================================================================
+PART A - the coverage matrix. FOUR specs.
+================================================================================
+
+The Solution step has two MODES - greenfield (new name) and brownfield (extend an existing unmanaged
+solution, restricted to Cognizio-published, CGZ-E202 at SolutionStep.tsx:90/:231) - and two ENTRY
+POINTS: create (`/environments/:envId/sessions/new`) and resume (`/sessions/:id/setup`).
+
+**Every reported defect lives in a cell nobody tests.** Today `e2e/playwright/env-to-session.spec.js`
+only starts from create. **Nothing navigates directly to `/sessions/:id/setup` or
+`/sessions/:id/workspace` - the resume-by-URL path, where every defect lives, is untested.**
+
+                    create (/environments/:envId/sessions/new)   RESUME (/sessions/:id/setup)
+    greenfield      partially covered today                      NEW - the task-107 regression test
+    brownfield      NEW                                          NEW
+
+Each spec: sign in -> reach the Solution step -> assert the mode badge (`New - Greenfield` /
+`Existing - Brownfield`) -> advance through Requirements and Review -> land on the workspace ->
+**assert a REAL session title, not "Untitled Session"** -> assert the pipeline either starts cleanly
+or is correctly BLOCKED. Screenshot every step.
+
+**BROWNFIELD FIXTURE STRATEGY - do NOT hand-seed a solution.** Run the greenfield spec first, then
+point the brownfield spec at the solution it just created; the product already works this way
+(build-extract.service.ts:80, :450 set `nextSessionMode: 'brownfield'`). That makes brownfield a
+chained second spec AND doubles as a test of that hand-off.
+
+**ALSO ADD an environment-Refresh spec**: Refresh -> button disables IMMEDIATELY -> progress ->
+completes -> row shows a timestamp. Refresh has **no coverage anywhere in either repo**, which is why
+that defect reached prod.
+
+--------------------------------------------------------------------------------
+BUILD IT IN THIS REPO'S `e2e/`, NOT IN THE QA REPO. This was checked.
+--------------------------------------------------------------------------------
+
+`cognizioware-qa` has **no screenshot capability at all**: its only Playwright config sets
+`screenshot: 'off'` (oidc-acceptance/playwright.config.ts:22), and its single "screenshot" reference
+is a byte-length check on a Hydra framebuffer. No baselines, no diffing, no image storage. Putting
+these there means net-new infrastructure (a new acceptance package, `_out` convention, artifact wiring
+in two workflows, a new qa-gate.yml target, a gate-report.mjs handler) **for no benefit.**
+
+COPY THE PATTERN AT `e2e/golden-path/run.mjs` EXACTLY - it already drives sign-in -> session ->
+workspace -> Start Design:
+  - plain `.mjs` ESM, `import { chromium } from '@playwright/test'`, config via env vars with a header
+    comment listing every var and the run command
+  - output dir resolved relative to the SCRIPT, not cwd (:27-28)
+  - step ledger (:31-34): `step(name)` / `done(entry,'pass'|'fail'|'skip',evidence)`, evidence capped
+    at 500 chars, `console.log('[STATUS] n. name - evidence')`
+  - screenshots named `NN-kebab-label.png`, always `.catch(() => {})` so a failed capture never aborts
+    the run (:47)
+  - **NETWORK LEDGER** - record `METHOD path => status` for `/api/*`, last 40 in the report.
+    **This is what would have caught the blocking defect instantly: ZERO requests on a Next click.**
+    Do not omit it.
+  - try/catch/finally with the report written in `finally`, ALWAYS - report.json + report.md
+  - auth via the persistent MFA'd profile `e2e/.visual-profile`, or `e2e/lib/ai-dev01-auth.js`.
+    **Do NOT use the `qaBearerToken` bypass - these must exercise real auth.**
+  - viewport 1600x950, `fullPage: true`. Don't mix sizes; it makes captures non-comparable.
+  - a `requiredShots` coverage array as the screenshot assertion. **There is no baseline-diff pattern
+    in this codebase and this task does not introduce one.**
+  - honour e2e/golden-path/README.md:19-21: *"treat known gaps as failures, not passes. Do not 'fix'
+    it by loosening the assertions."*
+
+Selectors: getByRole -> getByPlaceholder -> getByTestId -> CSS. The wizard already has
+`solution-name-input`, `solution-option-<uniqueName>`, `solution-next`; the environments list has
+`env-list-error`. Add testids where missing, following the existing `kebab-domain-element` convention.
+
+**LANDMINE - do not copy this pattern:** `e2e/playwright/trms-qa-v2-grade.mjs:15` hardcodes a
+`cognizioware-qa\evals\...` path that DOES NOT EXIST; its readFile swallows the error and silently
+scores 50 instead of 100 - a permanent invisible -5 on every graded run.
+
+================================================================================
+PART B - CI gates
+================================================================================
+
+> The full `.github/workflows` inventory was CANCELLED in the source handoff. **Verify before relying
+> on any specific claim below.**
+
+1. Inventory `.github/workflows/*.yml` on origin/develop - triggers, jobs, which are REQUIRED checks.
+   Establish whether unit tests, `tsc` and lint gate PRs at all. Report what you find.
+2. Add the new specs to CI on `[self-hosted, lan-deploy]`, `shell: pwsh`, `working-directory: e2e`,
+   with `actions/upload-artifact@v4` (`if: ${{ !cancelled() }}`, `if-no-files-found: ignore`).
+   **UPLOADING ARTIFACTS IS NOT OPTIONAL - a screenshot suite whose output is discarded proves
+   nothing**, which is precisely today's failure.
+3. Run informational for an AGREED number of consecutive green runs, then promote to a REQUIRED check.
+   **WRITE DOWN THE PROMOTION CRITERION.** The existing suites have been "informational until stable"
+   indefinitely with no defined bar. A number in a file is the deliverable here.
+4. CROSS-REPO: promote.yml:49-50 dispatches cognizioware-qa qa-gate.yml and polls a commit status at
+   :126/:313/:506. Per cognizioware-qa/README.md:228-233 the `QA_GATE_DISPATCH_TOKEN` **lacks the
+   `repo:status` scope**, so those polls time out - **the dual-eval gate is not actually functioning.**
+   Diagnose and report; the token change itself is Paxton's (do not attempt to mint or edit secrets).
+   (Note cognizioware-qa/README.md:176 documents the org as `cognizioware/` - the correct org is
+   `cogniziocompany/`.)
+5. Backfill the two cheap unit tests that would have caught the prod defects: a `SessionWizard`
+   route-param test, and a probe test asserting the requested PATH and HEADERS.
+
+Respect the QA repo's stated vantage rule (cognizioware-qa/README.md:165-170): *"Test a thing from the
+side its users are on."* These test the app as a signed-in user, so they run on the LAB RUNNER against
+the dev lane (http://192.168.21.163:3000) - **not on ubuntu-latest.**
+
+================================================================================
+THE TWO RULES THAT MAKE A RUN REVIEWABLE - added by Paxton 2026-09-09 20:55 PT
+================================================================================
+
+The harness shape and the `requiredShots` assertion are necessary but NOT sufficient. Without these
+two, a golden run produces artefacts nobody can act on:
+
+1. **COMMIT THE CAPTURES.** See the corrected hard rule below. `*.webm` is ignored; the numbered PNGs
+   and `report.md` are tracked on purpose. A run you cannot diff against the previous run proves
+   nothing beyond "it did not crash".
+
+2. **MAINTAIN THE RUN-HISTORY TABLE.** The golden-path README carries a table of runs - `run2 4/6`
+   through `run9 6/6`. **That table IS the approval step**: a human reads the numbered PNGs and
+   `report.md`, then appends a row. **Each new spec needs its own table, and updating it is PART OF
+   RUNNING the spec, not an afterthought.** A spec that runs and leaves the table untouched has not
+   been reviewed, only executed.
+
+================================================================================
+WHERE THESE RUN - `promote.yml` ONLY. NOT ci.yml, NOT every PR, NOT a cron.
+================================================================================
+
+**This supersedes anything above that implies wiring them into general CI.** Scope them to
+`promote.yml` (dev -> uat -> prod) and nowhere else.
+
+WHY, and it is the whole reason the existing suites are decorative: these drive a **real MSAL login
+against a live lane** and take minutes. On every push they become noise, noise gets muted, and a muted
+suite is documentation that runs on a cron. **The promotion gate is where "does the session flow
+actually work" is the question actually being asked** - so that is the only place they belong.
+
+================================================================================
+OPEN DECISION - DO NOT ASSUME EITHER WAY. THIS IS PAXTON'S.
+================================================================================
+
+**The golden runs CREATE sessions.** Running them against PROD during promotion would therefore
+**write into the production tenant.**
+
+There is already a convention for exactly this: `eval-gate.yml` sets `SKIP_CREATE` for prod. So the
+precedent exists - but which way to take it is a decision, not a detail:
+
+  (a) run READ-ONLY against prod (honour `SKIP_CREATE`, assert on existing state only), or
+  (b) gate **dev and uat only**, and let that evidence carry the prod step.
+
+**Do NOT pick one silently.** Implement whichever Paxton chooses; if he has not answered by the time
+you reach it, build for dev/uat, leave the prod step unwired, and say plainly that it is waiting on
+this decision. **Under no circumstances create sessions in the production tenant to satisfy a gate.**
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **DO NOT START until task 107 is merged to develop. Verify it, then proceed or stop and say so.**
+ - Base off origin/develop. Do NOT merge to main.
+ - Build in THIS repo's `e2e/`. Do not add screenshot infrastructure to cognizioware-qa.
+ - Do not edit secrets or token scopes. Report item 4; do not act on it.
+ - Do NOT touch prod.env. Never print, echo or commit a credential value.
+ - Do not run the new specs against PRODUCTION. Dev lane only.
+ - Never `git add -A` - `_out` directories live in that tree. Commit by explicit path and check
+   `git diff --stat`.
+ - **COMMIT THE PNGs AND THE REPORTS. DO NOT GITIGNORE THEM.** An earlier draft of this task said
+   the opposite and it was WRONG - corrected 2026-09-09 20:55 PT. Verified on develop:
+   `e2e/golden-path/.gitignore` contains exactly one line, `_out/**/*.webm`. Only the video is
+   ignored; **the captures and `report.md` are deliberately TRACKED.** This is the opposite of the
+   trms-qa evals, where `_out/` is ignored wholesale. **Without the captures in git you cannot diff
+   one run against the next, which is the entire review mechanism.** Follow golden-path, not trms-qa.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+Four specs plus the Refresh spec, built to the golden-path pattern **including the network ledger**,
+runnable against the dev lane, with PNGs and report.md produced; a CI job that runs them on the lab
+runner and **uploads the artifacts**; a WRITTEN promotion criterion for making them required; a
+workflow inventory stating what actually gates PRs today; a diagnosis of the QA_GATE_DISPATCH_TOKEN
+scope gap; and the two backfilled unit tests.
+
+**Inspect the PNGs and report.md by hand the first time - that is the review step in this pattern.**
+If a spec cannot pass because the product is genuinely broken, that is a PASSING outcome for this task:
+report it as a found defect. Do not loosen an assertion to make a suite green.
+
+================================================================================
+*** YOUR OPEN QUESTION IS ANSWERED - PAXTON, 2026-09-10 23:20 PT. ***
+================================================================================
+Line 110 of this task asks for the one thing that was never written down:
+    "Run informational for an AGREED number of consecutive green runs, then promote to a REQUIRED
+     check. WRITE DOWN THE PROMOTION CRITERION."
+
+**PAXTON'S ANSWER: "change these so the e2e doesn't allow auto pass."**
+
+That is the criterion, and it is a decision, not a target to work toward. **Promote them to gates.**
+The three `continue-on-error: true` steps at `eval-gate.yml:239, 255, 262` - and the
+"informational only until consecutive green runs prove stable" framing in `trms-qa-eval.yml:5-6` -
+**must stop being able to pass while failing.** A step that cannot fail is not a gate, and the
+"informational until stable" wording with no bar is precisely how this state persisted indefinitely,
+as this task already argues.
+
+*** WHY IT IS NOW URGENT RATHER THAN TIDY-UP: TASK 156 DEPENDS ON IT. ***
+Paxton has decided powerplatform will **auto-push through the pipeline to prod** (task 156,
+`1012-156-pp-auto-promote`). In an automatic chain **these gates are the entire safety mechanism** -
+nothing else stands between a merge and prod.
+Measured 23:10 PT, so you know what you are starting from: the session-flow specs are EXCLUDED by
+`playwright.config.js:6` `testMatch`, `env-to-session.spec.js` additionally does
+`test.skip(!DEV_LANE, ...)`, and the three eval-gate steps are `continue-on-error`. `promote.yml`
+computes a real verdict (`$final -gt $threshold`, strictly greater) - **but it is being fed by suites
+that largely do not run and cannot fail.**
+
+BOUNDARY, so this does not collide: **task 153 owns making the SPECS EXECUTE** (tagging, `testMatch`,
+`e2e:prod-ready`, the `DEV_LANE` skip). **You own making CI GATE** - flipping the `continue-on-error`
+flags, the required-check wiring, and the written criterion above. **Task 156 owns only the chain**
+and must not touch either.
+Two facts to carry into the gate design: `weight_secondary` is currently unusable because
+`QA_GATE_DISPATCH_TOKEN` lacks `repo:status` scope (the poll can never succeed), and `SKIP_CREATE=1`
+on the prod tier means the prod gate does not exercise session creation.
