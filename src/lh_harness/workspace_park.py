@@ -118,28 +118,26 @@ def _head_contained_in_origin_branch(repo: Path, branch: str) -> bool:
     """Fetch ``origin/<branch>`` and verify HEAD is contained in the fetched ref.
 
     The containment check is performed against the freshly fetched remote ref,
-    never a stale local tracking ref.
+    never a stale local tracking ref, and it is exact: ``merge-base
+    --is-ancestor`` against the full remote ref name.  A substring scan of
+    ``branch -r --contains`` output would let ``origin/main-v2`` vouch for a
+    check of ``origin/main`` (or ``origin/maintenance`` for ``origin/main``),
+    so a loose name match must never satisfy the check.
     """
 
-    # Fetch just the branch we need; --prune keeps local remote refs tidy but is
-    # not required for the check.
     _git(repo, "fetch", "origin", f"refs/heads/{branch}:refs/remotes/origin/{branch}")
-    # ``git branch -r --contains HEAD`` lists every remote branch that contains
-    # HEAD.  We look for refs/remotes/origin/<branch>.
-    contains = _git_output(repo, "branch", "-r", "--contains", "HEAD")
-    if contains:
-        needle = f"origin/{branch}"
-        for line in contains.splitlines():
-            if needle in line.strip():
-                return True
-    # Fallback / verification: count commits in HEAD but not in the fetched ref.
-    count = _git_output(
+    # Exact containment: exit 0 only when HEAD is a real ancestor of the
+    # freshly fetched tip.  Naming the full remote ref (not the abbreviated
+    # ``origin/<branch>`` display form) keeps the comparison unambiguous.
+    proc = _git(
         repo,
-        "rev-list",
-        "--count",
-        f"refs/remotes/origin/{branch}..HEAD",
+        "merge-base",
+        "--is-ancestor",
+        "HEAD",
+        f"refs/remotes/origin/{branch}",
+        check=False,
     )
-    return count == "0"
+    return proc.returncode == 0
 
 
 def _run_branch_from_owner(owner: dict[str, Any]) -> str | None:
