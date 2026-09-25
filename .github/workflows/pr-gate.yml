@@ -1,0 +1,9 @@
+name: PR Gate
+on: pull_request
+jobs:
+  gate:
+    uses: cogniziocompany/cognizioware-mcp-tools/.github/workflows/pr-gate.yml@main
+    with:
+      build_cmd: 'pip install -e .'
+      test_cmd: 'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src pytest -p no:cacheprovider'
+    permissions: {contents: read, pull-requests: write, issues: write}
