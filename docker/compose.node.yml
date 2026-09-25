@@ -41,6 +41,11 @@ services:
       LH_HARNESS_FLEET_NODE: ${LH_HARNESS_FLEET_NODE:-}
       LH_HARNESS_FLEET_KEY: ${LH_HARNESS_FLEET_KEY:-}
       LH_HARNESS_FLEET_LABELS: ${LH_HARNESS_FLEET_LABELS:-}
+      # Seq logging: Python logging records are shipped to the dev Seq server.
+      # Ingest requires no auth; SEQ_API_KEY is optional (sent only if set).
+      SEQ_URL: ${SEQ_URL:-https://seq.easybutt0n.ai}
+      SEQ_API_KEY: ${SEQ_API_KEY:-}
+      SEQ_MIN_LEVEL: ${SEQ_MIN_LEVEL:-INFO}
     volumes:
       - lh-harness-work:/home/harness/work
       - lh-harness-runs:/home/harness/runs
