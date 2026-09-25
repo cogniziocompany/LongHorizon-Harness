@@ -36,4 +36,7 @@ The PC-based launcher and tick chain (PTAIT09 scheduled task `LH-Overseer-Sweep`
 returns 401; `C:\tmp\queue` is a read-only archive. The scripts here are the historical
 record of that apparatus, kept for post-mortem and audit value — not a runnable system.
 The overseer tick itself moving to a CT-hosted home is the NEXT task, filed after this
-migration PR lands.
+migration PR lands. It has since landed as TASK 236: the CT-side sweep lives in
+`packaging/lh-overseer-sweep.{service,timer}` + `scripts/overseer_ct110/` (READ-ONLY
+default), driven by the adapter doc `docs/OVERSEER-TICK-CT110.md` — see those files;
+this archive remains the historical record.

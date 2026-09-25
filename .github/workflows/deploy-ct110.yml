@@ -317,3 +317,86 @@ jobs:
             echo "- dry_run: ${{ inputs.dry_run }}"
             echo "- deploy step: $DEPLOY_OUTCOME / rollback step: $ROLLBACK_OUTCOME"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # TASK 236: ship the overseer-sweep systemd units to CT110 as part of the
+  # SAME pipeline (no parallel ad-hoc deploy path).  The stage transfers the
+  # two unit files + ct110_units.sh through the same bytes-verified hops and
+  # runs ct110_deploy.sh mode "units" inside CT110.  The stage installs the
+  # units and NEVER enables or starts them (and never touches
+  # LH_OVERSEER_TICK_MODE): enabling the timer and flipping the tick to act
+  # mode are documented operator steps (docs/OVERSEER-TICK-CT110.md section
+  # 5) that require the 24h read-only comparison first.  A dry_run deploy
+  # skips this stage like every other host-touching step.
+  overseer-units:
+    name: Ship overseer-sweep systemd units (install only, never enabled)
+    needs: [preflight, deploy]
+    if: ${{ !inputs.dry_run && needs.deploy.result == 'success' }}
+    runs-on: [self-hosted, lan-deploy]
+    environment: ct110-prod
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+
+      - name: Stage unit files
+        run: |
+          set -euo pipefail
+          mkdir -p stage/units
+          cp packaging/lh-overseer-sweep.service stage/units/
+          cp packaging/lh-overseer-sweep.timer  stage/units/
+          # The tick entrypoint + telemetry module install under
+          # /home/harness/.overseer-sweep/bin/ (self-contained; see
+          # ct110_units.sh), so they travel with the units.
+          cp scripts/overseer_ct110/tick.sh        stage/units/
+          cp scripts/overseer_ct110/tick_notify.py stage/units/
+          # run_on_ct110.sh stages ct110_units.sh (its sibling) itself; this
+          # job only stages the unit payloads above.
+          test -f scripts/deploy/ct110/ct110_units.sh
+          test -f scripts/deploy/ct110/ct110_deploy.sh
+          ls -l stage/units
+
+      - name: Install units inside CT110 (install-only; nothing enabled)
+        run: |
+          scripts/deploy/ct110/run_on_ct110.sh units
+
+      - name: Verify the units are installed but NOT enabled
+        run: |
+          set -euo pipefail
+          for unit in lh-overseer-sweep.service lh-overseer-sweep.timer; do
+            installed="$(scripts/deploy/ct110/run_on_ct110.sh exec test -f /etc/systemd/system/$unit && echo yes || echo no)"
+            echo "$unit installed: $installed"
+            if [ "$installed" != "yes" ]; then
+              echo "::error::$unit is not installed on CT110 after the units stage"
+              exit 1
+            fi
+          done
+          installed_tick="$(scripts/deploy/ct110/run_on_ct110.sh exec test -x /home/harness/.overseer-sweep/bin/tick.sh && echo yes || echo no)"
+          echo "tick entrypoint installed: $installed_tick"
+          if [ "$installed_tick" != "yes" ]; then
+            echo "::error::tick entrypoint is not installed at /home/harness/.overseer-sweep/bin/tick.sh"
+            exit 1
+          fi
+          # Enablement must remain untouched by the pipeline: an enabled
+          # timer that appeared as a deploy side effect would start ticking
+          # without the operator's 24h read-only comparison.
+          for unit in lh-overseer-sweep.timer; do
+            state="$(scripts/deploy/ct110/run_on_ct110.sh exec systemctl is-enabled $unit || true)"
+            echo "$unit is-enabled: ${state:-not-enabled}"
+            if [ "$state" = "enabled" ]; then
+              echo "::error::$unit is ENABLED after the units stage — the pipeline must never enable it (operator step only)"
+              exit 1
+            fi
+          done
+          echo "CT110_UNITS_SHIP_OK (installed, not enabled)"
+
+      - name: Overseer units record
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## CT110 overseer-sweep units — $(date -u +%FT%TZ)"
+            echo
+            echo "- resolved sha: \`${{ needs.preflight.outputs.sha }}\`"
+            echo "- units staged and shipped through the 224 bytes-verified hops"
+            echo "- install-only: timer NOT enabled, tick mode NOT touched (operator rollout step)"
+          } >> "$GITHUB_STEP_SUMMARY"
