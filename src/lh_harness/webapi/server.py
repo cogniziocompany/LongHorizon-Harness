@@ -29,6 +29,7 @@ from ..dashboard.state import DashboardState
 from ..launcher import Launcher
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
+from ..overseer_state import resolve_overseer_root
 from . import mcp_jsonrpc as mcp_protocol
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
@@ -942,6 +943,11 @@ def create_app(
     if supervisor is not None and queue_store is not None:
         launcher = Launcher(supervisor, queue_store, queue_config=queue_config)
 
+    # Task 235: the overseer-state tools read the migrated apparatus archive
+    # (tasks/, queue/done, queue/blocked, docs/) from this checkout. Resolve
+    # the root once; None just means those tools report themselves unavailable.
+    overseer_root = resolve_overseer_root()
+
     snapshot_cache = _SnapshotCache(ttl_seconds=2.0)
 
     def _cached_snapshot_for(state: DashboardState, run_id: str) -> dict[str, Any]:
@@ -1234,6 +1240,7 @@ def create_app(
             supervisor=supervisor,
             auth_token=token,
             request_token=normalize_request_token(request.headers.get("authorization")),
+            overseer_root=str(overseer_root) if overseer_root is not None else None,
         )
 
     @app.post("/api/mcp/fleet/{tool_name}")
