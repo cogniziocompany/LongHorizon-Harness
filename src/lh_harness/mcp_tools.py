@@ -33,7 +33,8 @@ from .caller_auth import (
     strip_caller_arguments,
     tool_allowed,
 )
-from .config import _MCP_TOOL_NAMES as _KNOWN_TOOLS
+from .config import _MCP_DISPATCH_TOOL_NAMES as _KNOWN_TOOLS
+from .config import _MCP_TOOL_NAMES as _SCOPING_ELIGIBLE_TOOLS
 from .contention import detect_contention, groups_to_json
 from .workspace_identity import resolve_many
 
@@ -73,7 +74,8 @@ Accepted fields (all persisted on the queue entry):
   launched at most once; the key frees up once the entry reaches a
   terminal state (done/failed).
 - requested_by (string, required): fleet client identity, e.g. 'openwebui'
-  or 'hydra'.
+  or 'hydra'. With per-caller scoping (task 174) the server stamps it from
+  the verified caller identity; a client-supplied value is overridden.
 - base_check (string, optional): base commit/branch check guard.
 
 Unknown fields are rejected with an error naming them; they are never
@@ -218,8 +220,22 @@ def _optional_integer_param(description: str) -> dict[str, Any]:
     return {"type": "integer", "description": description}
 
 
-def tools_manifest() -> list[dict[str, Any]]:
-    """Return the list of fleet MCP tools exposed by this service."""
+def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
+    """Return the list of fleet MCP tools exposed by this service.
+
+    ``caller_scoped`` (task 174) only shapes the ``requested_by`` hint: with
+    per-caller scoping the server stamps it from the verified caller, so the
+    schema advertises it as deprecated/ignored.  Without scoping the task-233
+    store contract applies and the client value is required.
+    """
+    requested_by_hint = (
+        _string_param(
+            "Deprecated: stamped server-side from your verified caller identity.",
+            required=False,
+        )
+        if caller_scoped
+        else _string_param("Fleet client identity, e.g. 'openwebui' or 'hydra'.", required=True)
+    )
     return [
         _tool_spec(
             "harness_enqueue_task",
@@ -247,10 +263,11 @@ def tools_manifest() -> list[dict[str, Any]]:
                     "Idempotent-enqueue key: same non-terminal key resolves to one queue entry, launched at most once.",
                 ),
                 "base_check": _string_param("Optional base commit/branch check guard.", required=False),
-                "requested_by": _string_param(
-                    "Deprecated: stamped server-side from your verified caller identity.",
-                    required=False,
-                ),
+                # With scoping ON the stamp wins (task 174); the field stays in
+                # the schema because the store's own contract (task 233)
+                # requires it -- the value a client passes is overridden, never
+                # trusted.
+                "requested_by": requested_by_hint,
             },
         ),
         _tool_spec(
@@ -389,8 +406,47 @@ def dispatch(
 
     # A name that is not a tool at all stays 404 regardless of identity: the
     # allowlist decides refusal for tools that exist, and an unknown name has
-    # nothing to authorize.
+    # nothing to authorize.  The known-tool set is the full dispatch surface
+    # (task 174 + the task-235 overseer-state tools).
     if tool_name not in _KNOWN_TOOLS:
+        return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
+
+    # Task 235: the read-only overseer-state tools are called from the
+    # authenticated overseer session, which carries no caller identity block.
+    # They are not scoping-eligible (config keeps them out of ``tools``
+    # validation) so they dispatch before the identity check.  Everything in
+    # the scoping-eligible task-174 set still requires a verified caller.
+    if tool_name not in _SCOPING_ELIGIBLE_TOOLS:
+        overseer_tools = {
+            "get_queue_entry": _overseer_get_queue_entry,
+            "list_queue": _overseer_list_queue,
+            "get_task_history": _overseer_get_task_history,
+            "read_ledger": _overseer_read_ledger,
+            "list_open_asks": _overseer_list_open_asks,
+            "get_handoff": _overseer_get_handoff,
+        }
+        handler = overseer_tools.get(tool_name)
+        if handler is not None:
+            return handler(arguments, overseer_root=overseer_root)
+        # Unreachable while _KNOWN_TOOLS == _SCOPING_ELIGIBLE_TOOLS | the
+        # overseer set above (both live in config.py, validated together).
+        return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
+
+    # Scoping OFF (caller_configs is None -- no [callers] table anywhere):
+    # keep the pre-174 dispatch contract (bearer-only, client-supplied
+    # requested_by).  An injected empty table still enforces, matching the
+    # REST routes' injected-table semantics.
+    if caller_configs is None:
+        if tool_name == "harness_enqueue_task":
+            return _enqueue(arguments, queue_store=queue_store, caller=None)
+        if tool_name == "harness_list_queue":
+            return _list_queue(arguments, queue_store=queue_store)
+        if tool_name == "harness_run_status":
+            return _run_status(arguments, registry=registry, supervisor=supervisor)
+        if tool_name == "harness_resolve_gate":
+            return _resolve_gate(arguments, registry=registry, supervisor=supervisor)
+        if tool_name == "harness_list_contentions":
+            return _list_contentions(runs_root=_runs_root(registry, supervisor))
         return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
 
     specs = caller_configs_or_defaults(caller_configs)
@@ -413,8 +469,14 @@ def dispatch(
         }
 
     if tool_name == "harness_enqueue_task":
+        # Scoping OFF (no [callers] table configured) reaches here with
+        # caller=None: no identity enforcement, no ceilings -- the pre-174
+        # dispatch contract.
         return _enqueue(
-            arguments, queue_store=queue_store, caller=caller, spec=specs.get(caller)
+            arguments,
+            queue_store=queue_store,
+            caller=caller,
+            spec=specs.get(caller) if caller is not None else None,
         )
     if tool_name == "harness_list_queue":
         return _list_queue(arguments, queue_store=queue_store)
@@ -424,21 +486,7 @@ def dispatch(
         return _resolve_gate(arguments, registry=registry, supervisor=supervisor)
     if tool_name == "harness_list_contentions":
         return _list_contentions(runs_root=_runs_root(registry, supervisor))
-    # Task 235: read-only overseer-state tools over the migrated apparatus
-    # archive. They take no store, registry or supervisor - only the archive
-    # root resolved by the WebAPI.
-    overseer_tools = {
-        "get_queue_entry": _overseer_get_queue_entry,
-        "list_queue": _overseer_list_queue,
-        "get_task_history": _overseer_get_task_history,
-        "read_ledger": _overseer_read_ledger,
-        "list_open_asks": _overseer_list_open_asks,
-        "get_handoff": _overseer_get_handoff,
-    }
-    handler = overseer_tools.get(tool_name)
-    if handler is not None:
-        return handler(arguments, overseer_root=overseer_root)
-    # Unreachable: every allowlisted tool is dispatched above (the config
+    # Unreachable: every scoping-eligible tool is dispatched above (the config
     # loader validates ``tools`` against this same surface).
     return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
 
@@ -511,7 +559,7 @@ def _enqueue(
     arguments: dict[str, Any],
     *,
     queue_store: Any,
-    caller: str,
+    caller: str | None = None,
     spec: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if queue_store is None:
@@ -533,13 +581,15 @@ def _enqueue(
     # but before any store validation of the payload: a caller at its hourly
     # cap gets 429 with a retry hint, and a max_rounds over the caller's clamp
     # gets 422 with the refusal spelled out -- never a silently truncated
-    # entry.
-    rate = enqueue_rate_violation(spec, queue_store, caller)
-    if rate is not None:
-        return {"ok": False, "error": rate["error"], "code": 429, "retry_after": rate["retry_after"]}
-    clamp_reason = rounds_clamp_violation(spec, arguments.get("max_rounds"))
-    if clamp_reason is not None:
-        return {"ok": False, "error": clamp_reason, "code": 422}
+    # entry.  ``caller`` is None only when scoping is OFF (no [callers]
+    # table); the ceilings are then unconfigured and skipped.
+    if caller is not None:
+        rate = enqueue_rate_violation(spec, queue_store, caller)
+        if rate is not None:
+            return {"ok": False, "error": rate["error"], "code": 429, "retry_after": rate["retry_after"]}
+        clamp_reason = rounds_clamp_violation(spec, arguments.get("max_rounds"))
+        if clamp_reason is not None:
+            return {"ok": False, "error": clamp_reason, "code": 422}
     body = {
         "name": _bounded(arguments.get("name"), field="name", max_chars=256, required=True),
         "task": _bounded(arguments.get("task"), field="task", max_chars=100_000, required=True),
@@ -560,8 +610,16 @@ def _enqueue(
         # (task 174 scope item 3). Main (task 233) additionally requires a
         # requested_by field and a dedup_key on the body; the stamp wins for
         # requested_by and dedup_key passes through to the store's own
-        # validation.
-        "requested_by": caller,
+        # validation.  When scoping is OFF (no [callers] table) the caller
+        # argument is None and the client value is required instead.
+        "requested_by": caller
+        if caller is not None
+        else _bounded(
+            arguments.get("requested_by"),
+            field="requested_by",
+            max_chars=256,
+            required=True,
+        ),
         "dedup_key": _bounded(arguments.get("dedup_key"), field="dedup_key", max_chars=256),
     }
     try:

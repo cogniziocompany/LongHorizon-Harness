@@ -65,6 +65,23 @@ _MCP_TOOL_NAMES = frozenset(
         "harness_list_contentions",
     }
 )
+# Task 235: read-only overseer-state tools over the migrated apparatus archive.
+# They are known to the dispatcher but deliberately NOT scoping-eligible: the
+# overseer calls them from an authenticated loopback session that carries no
+# caller identity, so requiring a ``tools`` grant would 401 them.  ``tools``
+# allowlists keep validating against _MCP_TOOL_NAMES only (merged with 174).
+_OVERSEER_TOOL_NAMES = frozenset(
+    {
+        "get_queue_entry",
+        "list_queue",
+        "get_task_history",
+        "read_ledger",
+        "list_open_asks",
+        "get_handoff",
+    }
+)
+# The full dispatcher surface: unknown-tool 404 decisions use this set.
+_MCP_DISPATCH_TOOL_NAMES = _MCP_TOOL_NAMES | _OVERSEER_TOOL_NAMES
 _CALLER_KEYS = {
     "secret_env",
     "tools",
@@ -339,6 +356,25 @@ def load_run_defaults(path: str | Path = PROJECT_CONFIG_PATH) -> dict[str, Any]:
         result["queue"] = _flatten_queue_table(queue)
     result["callers"] = _flatten_callers_table(payload.get("callers", {}), source)
     return result
+
+
+def config_defines_callers(path: str | Path) -> bool:
+    """True only when the config file explicitly carries a [callers] table.
+
+    Used by the WebAPI to decide whether per-caller scoping (task 174) is
+    active: scoping is OFF unless the deployment declares [callers], which
+    keeps the pre-174 bearer-only behavior for unconfigured deployments
+    (merged decision -- see the server comment and PR).
+    """
+    source = Path(path)
+    if not source.is_file():
+        return False
+    try:
+        with source.open("rb") as handle:
+            payload = tomllib.load(handle)
+    except Exception:
+        return False
+    return isinstance(payload.get("callers"), dict)
 
 
 def load_caller_configs(path: str | Path = PROJECT_CONFIG_PATH) -> dict[str, dict[str, Any]]:

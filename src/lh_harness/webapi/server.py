@@ -235,17 +235,28 @@ def _path_requires_bearer(path: str) -> bool:
 
 def _load_caller_specs(
     runs_root: str | Path | None,
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, dict[str, Any]] | None:
     """Load the [callers] table for per-caller scoping (task 174).
 
     Prefers the project config next to the runs root, falls back to the CWD
-    config, and finally to the pure migration-doc defaults when no config file
-    exists.  Any malformed config degrades to the defaults rather than taking
-    the whole API down; an audit-visible misconfiguration is the launcher's
-    concern, not the API's availability.
+    config.  Returns ``None`` when NO config file in the chain defines a
+    ``[callers]`` table: scoping then stays OFF and the API keeps the
+    bearer-only behavior every pre-task-174 deployment and client relies on
+    (merged decision -- see PR #36 comment).  A config that DOES define
+    ``[callers]`` gets the full task-174 model: defaults merged under the
+    configured overrides, and a malformed ``[callers]`` section degrades to
+    the enforced migration-doc defaults rather than taking the API down
+    (fail-closed on misconfiguration, matching task 174's own degradation
+    rule) -- an audit-visible misconfiguration is the launcher's concern,
+    not the API's availability.
     """
     try:
-        from ..config import PROJECT_CONFIG_PATH, load_caller_configs, load_run_defaults
+        from ..config import (
+            PROJECT_CONFIG_PATH,
+            config_defines_callers,
+            load_caller_configs,
+            load_run_defaults,
+        )
     except ImportError:  # pragma: no cover - config always present in-tree
         return caller_configs_or_defaults(None)
     config_path: Path | None = None
@@ -255,10 +266,14 @@ def _load_caller_specs(
         except Exception:
             config_path = None
     try:
-        if config_path is not None and Path(config_path).is_file():
+        if config_path is not None and config_defines_callers(config_path):
             return caller_configs_or_defaults(load_run_defaults(config_path)["callers"])
-        return caller_configs_or_defaults(load_caller_configs(PROJECT_CONFIG_PATH))
+        if config_defines_callers(PROJECT_CONFIG_PATH):
+            return caller_configs_or_defaults(load_caller_configs(PROJECT_CONFIG_PATH))
+        return None
     except Exception:
+        # A file that declares [callers] but fails validation is an operator
+        # mistake that must fail closed (enforced defaults), not open.
         return caller_configs_or_defaults(None)
 
 
@@ -952,16 +967,26 @@ def create_app(
     origins = {str(item).rstrip("/") for item in (allowed_origins or ()) if str(item).strip()}
     # Per-caller scoping (task 174): the caller table comes from [callers] in
     # the project config next to the runs root (falling back to the CWD
-    # config), merged over the migration-doc defaults.  Tests (and embedded
-    # service processes) may inject ``caller_configs`` directly, which skips
-    # the CWD config lookup entirely and keeps the app hermetic.
+    # config), merged over the migration-doc defaults.  ``None`` means no
+    # [callers] table anywhere in the chain: scoping stays OFF and the app
+    # keeps the bearer-only behavior (merged decision -- see PR #36 comment).
+    # Tests (and embedded service processes) may inject ``caller_configs``
+    # directly, which skips the config lookup entirely and keeps the app
+    # hermetic.
     if caller_configs is None:
         caller_specs = _load_caller_specs(runs_root)
     else:
         caller_specs = caller_configs_or_defaults(caller_configs)
 
-    def _scoped_caller(request: Request, tool: str, run_id: str | None = None) -> str:
+    def _tools_manifest_for_scoping() -> list[dict[str, Any]]:
+        """Manifest for this app: scoped hint when scoping is ON (task 174)."""
+        return tools_manifest(caller_scoped=caller_specs is not None)
+
+    def _scoped_caller(request: Request, tool: str, run_id: str | None = None) -> str | None:
         """Resolve and authorize the REST caller for scoped routes (task 174).
+
+        Returns ``None`` when scoping is OFF (no [callers] table configured)
+        so the route keeps the bearer-only behavior of the pre-task-174 API.
 
         Raises 401 for an unverifiable identity (anon) and 403 when the
         verified caller's allowlist does not name ``tool``.  Refused
@@ -970,6 +995,8 @@ def create_app(
         a bearer with no caller headers trying to resolve a gate is exactly
         the leak this scoping exists to catch (migration doc 3.4).
         """
+        if caller_specs is None:
+            return None
         caller = resolve_rest_caller(request.headers, caller_specs)
         if caller == ANON_CALLER:
             if tool == RESOLVE_TOOL:
@@ -989,8 +1016,13 @@ def create_app(
             )
         return caller
 
-    def _run_control_caller(request: Request) -> str:
-        """401/403 gate for the overseer-only REST run-control routes."""
+    def _run_control_caller(request: Request) -> str | None:
+        """401/403 gate for the overseer-only REST run-control routes.
+
+        Returns ``None`` when scoping is OFF (no [callers] table configured).
+        """
+        if caller_specs is None:
+            return None
         caller = resolve_rest_caller(request.headers, caller_specs)
         if caller == ANON_CALLER:
             raise HTTPException(status_code=401, detail="invalid or missing caller identity")
@@ -1221,35 +1253,45 @@ def create_app(
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
         caller = _scoped_caller(request, "harness_enqueue_task")
-        spec = caller_specs.get(caller)
-        # Budget ceilings (task 174, section 3.5) run before payload validation:
-        # the hourly ceiling answers 429 with a Retry-After hint, the rounds
-        # clamp answers 422 and the request is refused -- never truncated.
-        rate = enqueue_rate_violation(spec, queue_store, caller)
-        if rate is not None:
-            raise HTTPException(
-                status_code=429,
-                detail=rate["error"],
-                headers={"Retry-After": str(rate["retry_after"])},
-            )
-        clamp_reason = rounds_clamp_violation(spec, body.get("max_rounds"))
-        if clamp_reason is not None:
-            raise HTTPException(status_code=422, detail=clamp_reason)
-        # requested_by is stamped from the VERIFIED caller identity; a client
-        # value is overridden so the ownership proof cannot be forged
-        # (task 174 scope item 3).
-        stamped = dict(body)
-        stamped["requested_by"] = caller
+        if caller is not None:
+            spec = caller_specs.get(caller)
+            # Budget ceilings (task 174, section 3.5) run before payload validation:
+            # the hourly ceiling answers 429 with a Retry-After hint, the rounds
+            # clamp answers 422 and the request is refused -- never truncated.
+            rate = enqueue_rate_violation(spec, queue_store, caller)
+            if rate is not None:
+                raise HTTPException(
+                    status_code=429,
+                    detail=rate["error"],
+                    headers={"Retry-After": str(rate["retry_after"])},
+                )
+            clamp_reason = rounds_clamp_violation(spec, body.get("max_rounds"))
+            if clamp_reason is not None:
+                raise HTTPException(status_code=422, detail=clamp_reason)
+            # requested_by is stamped from the VERIFIED caller identity; a client
+            # value is overridden so the ownership proof cannot be forged
+            # (task 174 scope item 3).
+            stamped = dict(body)
+            stamped["requested_by"] = caller
+            try:
+                entry = queue_store.create(stamped)
+            except UnknownQueueFieldError as exc:
+                # Task 233: a body with keys outside the accepted set is a client
+                # error (400) that names every offending field -- never a silent
+                # drop and never a generic 422.
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {"ok": True, "queue_id": entry.queue_id, "requested_by": caller}
+        # Scoping OFF (no [callers] configured): the store's own contract
+        # (task 233) validates the client-supplied requested_by.
         try:
-            entry = queue_store.create(stamped)
+            entry = queue_store.create(body)
         except UnknownQueueFieldError as exc:
-            # Task 233: a body with keys outside the accepted set is a client
-            # error (400) that names every offending field -- never a silent
-            # drop and never a generic 422.
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {"ok": True, "queue_id": entry.queue_id, "requested_by": caller}
+        return {"ok": True, "queue_id": entry.queue_id}
 
     @app.post("/api/queue/drain")
     def set_queue_drain(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
@@ -1332,12 +1374,16 @@ def create_app(
             raise HTTPException(status_code=404, detail="queue entry not found")
         if entry.status != "pending":
             raise HTTPException(status_code=409, detail=f"cannot delete entry with status {entry.status}")
-        spec = caller_specs.get(caller)
-        if not may_delete_entry(caller, spec, entry):
-            raise HTTPException(
-                status_code=403,
-                detail=f"caller '{caller}' may not delete entry '{queue_id}' created by '{entry.requested_by}'",
-            )
+        if caller is not None:
+            # Task 174: chat-agent may only delete entries it created; the
+            # overseer/operator manage the whole queue.  Scoping OFF keeps the
+            # pre-174 delete rule (pending-only, bearer-gated).
+            spec = caller_specs.get(caller)
+            if not may_delete_entry(caller, spec, entry):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"caller '{caller}' may not delete entry '{queue_id}' created by '{entry.requested_by}'",
+                )
         removed = queue_store.delete(queue_id)
         if removed is None:
             raise HTTPException(status_code=404, detail="queue entry not found")
@@ -1345,7 +1391,16 @@ def create_app(
 
     @app.get("/api/mcp/fleet/tools")
     def mcp_fleet_tools() -> dict[str, Any]:
-        return {"ok": True, "gateway_alias": "lhharness", "tools": tools_manifest()}
+        # With scoping ON the manifest must not advertise caller fields the
+        # dispatcher strips before a tool ever sees them (task 174 merged with
+        # task 233's additionalProperties=false: advertised-but-rejected
+        # fields break schema-conformant clients).  Scoping OFF keeps the
+        # plain manifest.  One source of truth for both transports (the /mcp
+        # tools/list uses the same helper), and the scoping-OFF branch must
+        # request the plain manifest explicitly -- the bare default of
+        # tools_manifest() is the scoped hint.
+        manifest = _tools_manifest_for_scoping()
+        return {"ok": True, "gateway_alias": "lhharness", "tools": manifest}
 
     def _invoke_fleet_tool(tool_name: str, arguments: dict[str, Any], request: Request) -> dict[str, Any]:
         """Run one fleet MCP tool.
@@ -1364,7 +1419,8 @@ def create_app(
             request_token=normalize_request_token(request.headers.get("authorization")),
             # Task 174: per-caller scoping rides the same single dispatch path;
             # the verified-caller stamp and the [callers] table apply to both
-            # transports.
+            # transports.  ``None`` (no [callers] configured) dispatches
+            # without identity enforcement, matching the REST routes.
             caller_configs=caller_specs,
             overseer_root=str(overseer_root) if overseer_root is not None else None,
         )
@@ -1412,7 +1468,7 @@ def create_app(
 
         status, payload = mcp_protocol.handle_message(
             message,
-            list_tools=tools_manifest,
+            list_tools=_tools_manifest_for_scoping,
             call_tool=call_tool,
         )
         if payload is None:
