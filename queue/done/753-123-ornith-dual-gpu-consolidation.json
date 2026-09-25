@@ -1,0 +1,8 @@
+{
+  "name": "753-123-ornith-dual-gpu-consolidation",
+  "task_file": "C:/tmp/ornith-dual-gpu-consolidation-task.txt",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "COMPLETE AND VERIFIED BY THE OVERSEER 2026-09-10 10:58 PT - do not relaunch. The repo-side mirror this entry asked for IS PR #136 (merged 1527d73, lane 34507640480 all six jobs green). Live evidence: /model/info shows qwen3.8 and qwen3.8-nothink each with TWO deployments on :11441 and :11438, ollama_chat/ornith-1.5:9b-256k, max_input_tokens 262144, supports_vision and supports_function_calling both true; qwen3.8--128k and qwen3.8--256k have ZERO deployments (purged). Proven by TRAFFIC not by a 200: 8 nonce-d cache-bypassed requests split exactly 4/4 across the two daemons, counted from their own GIN log timestamps. Both daemons carry the ornith-1.5:9b-256k tag, both have it resident at 11.3 GB VRAM, and both list an identical 30 tags (the shared ollama source drive Paxton required). Task 124 (YAML->DB migration) remains queued and still owns the \"no more recreates\" half of the combined plan. || ORIGINAL: REPO-SIDE MIRROR ONLY - the overseer makes the live router change directly; this task must NOT call /model/* or /config/* on the live router. Paxton 2026-09-10 06:30 PT: 'If ornith 128k model is doing so well we'll have the current qwen3.8 all version point to it' + 'simplify the local hardware, create that as queue task and implement asap since the model passed experimental testing'. Live state m"
+}

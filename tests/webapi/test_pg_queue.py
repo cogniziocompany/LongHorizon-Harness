@@ -440,9 +440,8 @@ def test_pg_create_without_driver_raises(tmp_path: Path) -> None:
     """Constructing PgQueueStore with a bad URL fails at connect, not import."""
     if PgQueueStore is None:
         pytest.skip("psycopg not installed; PgQueueStore import fell back to None")
-    store = PgQueueStore("postgresql://user:pass@127.0.0.1:1/missing?connect_timeout=1")
     with pytest.raises(Exception):
-        store.counts()
+        PgQueueStore("postgresql://user:pass@127.0.0.1:1/missing?connect_timeout=1")
 
 
 def test_pg_empty_store_counts(tmp_path: Path) -> None:
@@ -609,6 +608,49 @@ def test_pg_store_requeue_preserves_fields(tmp_path: Path) -> None:
     assert successor.retry_of == original.queue_id
     assert successor.attempt == 2
     assert successor.failure_cause == "executor timeout"
+
+
+def test_pg_store_requeue_preserves_continuation_fields(tmp_path: Path) -> None:
+    """PG requeue surface: a retried continuation stays a continuation (task 233)."""
+    store = _require_backend(tmp_path)
+    original = store.create(
+        {
+            "name": "cont retry",
+            "task": "t",
+            "workspace": "/tmp/workspace",
+            "trio": "kimi",
+            "branch": "feat/cont",
+            "requested_by": "ci",
+        }
+    )
+    store.mark_failed(original.queue_id, "boom")
+    successor = store.requeue(original.queue_id, "boom")
+    assert successor is not None
+    assert successor.branch == "feat/cont"
+    # Read back from the row, not the in-memory return value.
+    read = store.get(successor.queue_id)
+    assert read is not None
+    assert read.branch == "feat/cont"
+    assert read.continue_branch is False
+
+
+def test_pg_store_persists_continue_branch_flag(tmp_path: Path) -> None:
+    """PG create/get surface: continue_branch=True round-trips the row."""
+    store = _require_backend(tmp_path)
+    entry = store.create(
+        {
+            "name": "cont flag",
+            "task": "t",
+            "workspace": "/tmp/workspace",
+            "trio": "kimi",
+            "continue_branch": True,
+            "requested_by": "ci",
+        }
+    )
+    read = store.get(entry.queue_id)
+    assert read is not None
+    assert read.continue_branch is True
+    assert read.branch == ""
 
 
 def test_pg_store_requeue_creates_queue_events_row(tmp_path: Path) -> None:

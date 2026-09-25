@@ -1,0 +1,135 @@
+TASK 167 - AUTHOR AND PUBLISH THE lh-orchestrator SKILL in the gateway skills catalog.
+The overseer's operating doctrine moves OUT of a file on one Windows PC and INTO the gateway.
+
+SOURCE: audit session [fe2679] 2026-09-11 section H, which calls this "the hard requirement that got
+lost". Verified by the overseer 2026-09-11: NOTHING owns it.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+
+================================================================================
+WHY THIS EXISTS
+================================================================================
+The stated target state - the overseer reads its orchestrator skill from LiteLLM and orchestrates
+through the CT110 API instead of running a queue from C:\tmp - is asserted in TWO artifacts (Ship
+Plane line 15, and the task-49 dynamic-model-routing doc) but NO TASK OWNS IT.
+
+MEASURED 2026-09-11, do not go hunting:
+  - GET /claude-code/marketplace.json on the gateway returns  "plugins": []
+  - cogniziocompany/cognizioware-skills is README-ONLY
+  - gateway-skills-mcp/skills/ holds FOUR skills: audio-qa, gateway-skill-authoring,
+    litellm-gateway-quickstart, remote-pc. PR #146 adds a 5th (claude-bridge).
+  - The only "orchestrator" text anywhere in the catalog is the Hydra paragraph inside remote-pc.
+  - C:/tmp/queue/LOOP-PROMPT.md (19.6 KB) still hard-codes C:/tmp/queue as the queue.
+So the skill does not exist. This task creates it.
+
+*** THIS TASK IS THE SKILL ONLY. IT DOES NOT CUT THE QUEUE OVER. *** The cutover is task 168, which
+is gated on other work. The skill can and should ship FIRST, because it is additive and blocks
+nothing.
+
+================================================================================
+HOW SKILLS WORK HERE - VERIFIED, DO NOT REDESIGN IT
+================================================================================
+  - infrastructure/docker/gateway-skills-mcp/ is a PROMPTS-ONLY MCP server.
+  - It BAKES skills/<folder>/SKILL.md into the image and rescans on every prompts/list.
+  - The FOLDER NAME becomes the id: clients see skills-skill-<folder>, plus skills-index.
+  - Access wiring ALREADY EXISTS - mcp_aliases.skills, access_groups ["repo-tools","dev-tools"].
+    You need NO new server, NO new access group, NO key or team change.
+  - Follow the frontmatter contract in the EXISTING skills/gateway-skill-authoring/SKILL.md.
+    The cleanest single-file precedent is commit cc3eee7 (audio-qa).
+  - *** THE EMPTY tools/list HANDLER IN src/index.ts MUST STAY. *** If that call throws -32601,
+    LiteLLM DROPS THE WHOLE SERVER from the aggregate, prompts included, and the entire skills
+    catalog silently vanishes for every client. Do not touch it.
+  - *** A FOLDED YAML SCALAR (> or |) IN description: DOES NOT PARSE *** - the server's
+    parseFrontmatter reads plain/continuation form only. A folded description yields an EMPTY
+    description and a silently useless catalog entry. Use plain form.
+
+================================================================================
+DELIVERABLE - skills/lh-orchestrator/SKILL.md
+================================================================================
+Content, moved out of LOOP-PROMPT.md so the doctrine has ONE home:
+ 1. THE ELEVEN-STATE MACHINE and the rule that a row advances ONLY on recorded evidence:
+    QUEUED -> RUNNING -> GATED -> BRANCHED -> PR -> REVIEWED -> MERGED -> LANE -> LIVE -> VERIFIED.
+ 2. RULE 1, VERIFY BY READING BACK - with the named traps, because each one cost a day:
+    a 200 from a write API is not proof (POST /config/update returned 200 and discarded the key
+    TWICE); editing a file is not proof (five config sections are Postgres-shadowed and the DB row
+    WINS over the YAML); a 200 on /v1/chat/completions proves nothing about /v1/messages; a GREEN
+    JOB CAN CONTAIN A HARD-FAILING TEST; one sample does not characterise a population; YOUR OWN
+    TOOLING CAN FAKE A FAILURE (gh api --jq .content emits base64 WITH newlines and base64 -d
+    silently produced nothing); NEVER READ A STALE LOG - check the mtime first; PROBE FROM THE HOST
+    THAT ACTUALLY FAILS.
+    Add the two traps the audit named: GATE DETECTION MUST READ GET /api/runs, never a scratch file
+    or a directory listing (three stale-glob false alarms in one day); and LAUNCH IS NOT DONE (an
+    entry filed to done/ at launch has stranded 16 tasks, the failures invisible for up to 8 hours).
+ 3. THE CT110 QUEUE API CONTRACT: POST/GET/DELETE /api/queue, the priority endpoint, integer
+    priority, the blocked status, the pending/launched/done/failed distinction, and that
+    GET /api/runs TAKES NO PARAMETERS and returns every run unsorted - filter by id prefix.
+    *** AND FILTER ON THE FULL ID. *** The overseer truncated a run id by ONE character on
+    2026-09-11 and got "run not found" from the snapshot endpoint, which reads exactly like a
+    deleted run. Quote ids whole.
+ 4. MODEL-PER-ROLE SELECTION recorded on the entry with its reason (task 49).
+ 5. THE DRAIN-WINDOW RULE: a zero-run window means running + waiting_approval == 0, COUNTED from
+    the API. Merges touching infrastructure/litellm-config.yaml force-recreate the CT202 prod
+    router, so they need such a window; the deploy job hashes the DEPLOYED file, so even a
+    comment-only edit triggers it.
+ 6. THE LANE MAP - where "live" actually is per repo - including the measured correction that
+    powerplatform prod is served by the corsairai300 HOST stack (NOT CT105, a stale decoy) and runs
+    develop-derived images, so shipping means landing on DEVELOP, not merging to main.
+ 7. THE LEDGER ROW FORMAT, and that evidence goes IN the row.
+ 8. THE ROLE RULES: Synthetic for manager and auditor; the /v1/messages 404 is solved by the
+    provider prefix (openai/ -> 404, custom_openai/ -> 200); never fall back onto the local span,
+    which serves about ONE executor.
+
+HARD RULES
+================================================================================
+ - Do NOT edit infrastructure/litellm-config.yaml or docker-compose.yml. The access wiring already
+   exists; if you find yourself editing either file you have left the plan. This also means the PR
+   needs NO zero-run window.
+ - Do NOT weaken or remove the empty tools/list handler.
+ - No secrets: env var NAMES only. No host names with credentials. No tokens.
+ - NEVER git add -A; commit by explicit path; git diff --stat before every commit.
+ - Do NOT post an @claude comment (task 117).
+ - Do NOT edit C:/tmp/queue/LOOP-PROMPT.md - that is the overseer's file and Paxton's call; this
+   task WRITES THE SKILL, and the overseer switches over afterwards.
+ - Open the PR and STOP. Do not merge, do not deploy to CT202.
+
+TESTS
+================================================================================
+Extend e2e/suites/25-gateway-skills-mcp.test.js: skills-skill-lh-orchestrator is present on BOTH the
+per-server path AND the aggregate /mcp/; its body contains the eleven state names and the phrase
+"read back"; the existing secret regex passes on it; and the folder count assertion is updated to
+the MEASURED total (count the folders, do not hard-code a number - PR #146 is adding one).
+
+VERIFICATION
+================================================================================
+ 1. LOCAL: docker build the gateway-skills-mcp image and run prompts/list, then prompts/get for
+    skills-skill-lh-orchestrator - READ THE BODY BACK and confirm the description is NOT empty
+    (that is the folded-scalar trap).
+ 2. UAT (CT204) first: suite 25 green with the new assertions.
+ 3. Only then does the overseer merge; on PROD confirm prompts/get through the aggregate /mcp/ AND
+    that skills-index lists it.
+ 4. Confirm a repo-tools key and a dev-tools key BOTH see it, and a key with neither does not -
+    READ THE PROMPT LIST BACK, do not infer it from the access-group config.
+
+DONE MEANS: prompts/get skills-skill-lh-orchestrator returns the full doctrine body through the
+gateway aggregate, with a non-empty description, on a key in each of the two groups; suite 25 proves
+it; and litellm-config.yaml is untouched.
+
+
+================================================================================
+AMENDMENT 2026-09-14 (session [fe2679]; Paxton's use case) - THE SKILL IS ALSO AN OPERATOR PLAYBOOK
+================================================================================
+Paxton: "log into a chat session, ask it to look at the lh-harness skill, get the status of everything being
+processed, resolve a gate". Add a section mapping INTENT -> GATEWAY TOOL NAME, using the names as the aggregate
+exposes them:
+  status of everything     -> hydrafleet-list_fleet_runs (all nodes, non-terminal) + lhharness-harness_list_queue
+  why is this run stuck    -> hydrafleet-get_run_snapshot (approvals live in the snapshot approvals[] - there is NO
+                              /approvals route; it 404s and looks like "nothing pending") + get_run_activity
+  queue this               -> lhharness-harness_enqueue_task with dedup_key + requested_by (after task 168 this is
+                              the real path; until then the PC launcher does not read CT110's queue - SAY SO)
+  approve / reject a gate  -> hydrafleet-resolve_run_gate WITH A RATIONALE (Hydra logs it). NEVER the raw
+                              lhharness-harness_resolve_gate from chat: it records no caller.
+  capacity                 -> hydrafleet-get_fleet_capacity; briefing -> Hydra prompt overseer-briefing
+Rules the playbook states: read back, never infer (RULE 1); GET /api/runs is unsorted and complete - filter
+non-terminal; the eleven states; the caller table from task 174; "enter your gateway key once in Fleet Chat; gate
+tools appear only when your key is in the harness-operator group" (tasks 140 + 177). Cite the shadow flag
+`[queue] observe` (task 173) by name once it exists.

@@ -1,0 +1,10 @@
+TASK 217 - Fleet heartbeat rejected with HTTP 413 (LongHorizon-Harness, fleet reporter)
+
+Measured 2026-09-22 00:36 PT on CT110 after the deploy of main 8b349bc: GET /api/meta reports fleet_configured=true, fleet_ever_succeeded=false, fleet_last_ok=false, fleet_last_error="HTTP 413"; the journal shows "fleet reporter rejected /harness/heartbeat: HTTP 413" right after startup, and https://fleet.easybutt0n.ai/api/fleet/nodes returns []. The box holds 529 runs. Hypothesis to PROVE, not assume: the heartbeat body carries the whole run list and exceeds the fleet plane's request-size limit.
+
+Deliverables (same repo, branch + PR to main, never merge yourself, no @claude review):
+1. Reproduce: log the heartbeat payload size (bytes) and the 413 body; find the fleet plane's limit (cognizioware-hydra fleet API, or the Caddy/proxy in front of it) and cite the exact setting.
+2. Fix on the reporter side: bound the payload (e.g. only active/non-terminal runs plus counts, or a capped page), keeping the fleet plane's contract; do NOT raise the server limit as the only fix.
+3. Tests for the bound; a note in docs on the payload shape.
+4. Read-back plan for the overseer: after deploy, /api/meta fleet_ever_succeeded must read true and /api/fleet/nodes must list ct110.
+Constraints: never print secrets (env NAMES only); never git add -A; do not touch the deployed CT110 tree; PR only.

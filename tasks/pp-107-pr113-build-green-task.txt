@@ -1,0 +1,39 @@
+TASK 107b — MAKE POWERPLATFORM PR #113 BUILD GREEN. THIS IS THE WHOLE TASK.
+
+This is the narrow remainder of task 107. Everything else in task 107 is ALREADY MERGED into
+`develop` and VERIFIED against the GitHub API on 2026-09-16 19:10 PT — do not redo any of it:
+  - Item A (wizard "Next -> Requirements" no-op): 69ae4f3, merged as 3f11dae (PR #108).
+  - Item C (durable/atomic environment refresh lock, TTL, 409 conflict code, regression test): 7215ba7 — ANCESTOR OF develop.
+  - Item B3 (pipeline-start guard): aad454a — ANCESTOR OF develop.
+  - Item B (Start repointed to /sessions/:id/flow): commits a0c2907 + e3f9422, OPEN as PR #113.
+
+THE ONE THING LEFT: PR #113 (`fix/setup-wizard-prod` -> `develop`) is MERGEABLE and its `test` job is
+SUCCESS, but its `build` job FAILS on `tsc -b` at head e3f9422 (CI run 35169323834). Six errors, all in
+packages/frontend:
+
+  src/flow/FlowVisualizer.tsx(387,19)  TS2322  a `failureReason` prop is passed to OutputPanel but is not in OutputPanelProps
+  src/flow/FlowVisualizer.tsx(387,52)  TS2339  Property 'failureReason' does not exist on type 'AgentStep'
+  src/flow/__tests__/AgentNode.failureReason.test.tsx(48,12)  TS18047  'node' is possibly null
+  src/flow/__tests__/AgentNode.failureReason.test.tsx(49,12)  TS18047  'node' is possibly null
+  src/flow/__tests__/AgentNode.failureReason.test.tsx(58,12)  TS2531  Object is possibly null
+  src/flow/__tests__/AgentNode.failureReason.test.tsx(67,12)  TS2531  Object is possibly null
+
+DO: check out `fix/setup-wizard-prod`, make the types honest (either add `failureReason` to the
+AgentStep type and OutputPanelProps where the data genuinely flows, or stop passing it — decide by
+reading how the backend `agent:failed` message reaches the component; e3f9422's commit message says
+pipeline.ts:187 sends `error: errorMsg`), add the null guards the test needs, then run the frontend
+build AND the frontend tests locally until BOTH are green. Commit ONLY the files you changed for this,
+push to the SAME branch, and STOP. The PR already exists — do not open a second one, do not force-push,
+do not merge. Merging is the overseer's alone.
+
+HARD CONSTRAINTS, carried from task 107 and still binding:
+  - The workspace tree was left DIRTY by the previous run with OUT-OF-SCOPE edits: ws-handler.ts,
+    GuardedLayout.tsx, ProcessStrip.tsx, layoutStripContext.ts, tokens.ts, Footer.tsx (+ its test),
+    zz_probe_nav.test.tsx, ws-handler.test.ts, plus deleted dist assets. NONE of these may be committed.
+    `git add` only the specific files for the six errors above; never `git add -A`.
+  - There are ~33 untracked `pprepro_*.mjs` probe scripts in the tree containing a PLAINTEXT BEARER
+    TOKEN. NEVER commit them, never print their contents.
+  - Do NOT run SQL against production. Do NOT touch prod.env.
+  - Do NOT post an `@claude` comment anywhere, ever.
+  - Base is `develop` (branch-per-env: develop -> dev only), NOT main.
+This is a small typing fix. If you find yourself redesigning the flow visualizer, you have left the task.

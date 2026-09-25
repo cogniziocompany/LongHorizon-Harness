@@ -1,0 +1,96 @@
+TASK 74 - subscriptions.CurrentPeriodEndUtc is never populated (Stripe moved the field)
+
+CONTEXT (all of this was READ from the live prod system on 2026-09-10, do not re-derive it)
+
+While diagnosing the Stripe webhook 500 warning, three prod subscriptions were found with
+CurrentPeriodEndUtc = NULL even immediately after a customer.subscription.updated event was
+processed successfully (Status='processed', Error=NULL).
+
+Root cause, confirmed against the live event payload for evt_1UCe91CXyLTnTERyEYsxYn2U:
+
+  - The event's api_version is "2025-09-30.clover".
+  - On that version Stripe does NOT send current_period_end at the subscription level.
+    Top-level `current_period_end` is absent (null).
+  - The value lives on each subscription item instead:
+    items.data[].current_period_end  ->  1791285712  (2026-10-06T11:21:52 UTC), present and correct.
+
+So UpsertSubscription reads Subscription.CurrentPeriodEnd, gets the default/null, and the column is
+never populated. Renewal and expiry tracking silently has no date to work from.
+
+SCOPE - do exactly this and nothing more
+
+1. In the billing service, fix the mapping so CurrentPeriodEndUtc is populated from the subscription
+   ITEM period when the subscription-level field is absent. Prefer the subscription-level value when
+   it IS present, so older API versions keep working. If items disagree, use the earliest item's
+   current_period_end (that is when the customer next needs to pay) and do not throw.
+2. Do the same for any trial/period field with the same problem, but ONLY if you confirm it by reading
+   the model - do not guess which fields moved. If nothing else moved, say so and change nothing else.
+3. Add a unit test with a subscription payload shaped like the clover version (period on the item, absent
+   at the top level) asserting CurrentPeriodEndUtc is set. Add a second asserting the legacy shape still
+   maps. The existing tests are in
+   src/McpCognizioware.BillingService.tests/McpCognizioware.BillingService.tests/Controllers/.
+4. Do NOT write a data backfill for existing rows in this task, and do NOT touch signature handling
+   (that is PR #95, already open). Report the backfill as a follow-up if you think it is needed.
+
+CONSTRAINTS
+
+- Branch off develop. PR to develop. Do not merge.
+- This repo has CRLF line endings. Do not reformat files; check `git diff --stat` before opening the PR
+  and make sure it lists only the files you meant to touch. Never `git add -A`.
+- You will NOT be given any credentials. Do not ask for the Stripe secret key, the webhook secret, or
+  SSH passwords. Everything you need about the live payload is written above.
+- Do not call the Stripe API. Work from the payload shape described here and from the Stripe.NET model.
+
+DONE MEANS
+
+`dotnet test` passes on the billing service test project, the PR is open against develop, and the PR body
+states which field(s) you remapped and which you deliberately left alone.
+
+## CORRECTED 2026-09-09 14:20 PT - MY ORIGINAL ROOT CAUSE WAS WRONG. THE FIX ALREADY EXISTS IN THIS REPO.
+
+Run `20260909T181322Z_a69d1503` did not complete (no PR, code did not compile, no green test run) - but it
+found the real defect, and the overseer verified every part of it in the source before rewriting this.
+
+**WHAT MY BRIEF GOT WRONG:** it said `UpsertSubscription` reads `Subscription.CurrentPeriodEnd` and gets a
+null. **That property does not exist.** In the pinned **Stripe.net 49.1.0** (confirmed:
+`McpCognizioware.BillingService.csproj:28`), `Stripe.Subscription` exposes neither `CurrentPeriodEnd` nor
+`CurrentPeriodStart` - **both live on `Stripe.SubscriptionItem`**. So there is no bad read to fix.
+
+**THE ACTUAL DEFECT, and it is simpler:** `UpsertSubscription` in
+`src/McpCognizioware.BillingService/Controllers/StripeWebhookController.cs` (~lines 149-194) **never
+assigns `CurrentPeriodEndUtc` at all.** Verified by grep: the identifier does not appear in that file.
+The entity column exists and is writable - `Models/OnboardingModels.cs:72`,
+`public DateTime? CurrentPeriodEndUtc { get; set; }`. Nothing populates it, so renewal and expiry
+tracking have no date. The effect is as described; the cause is an omission, not a mis-read.
+
+**THE REFERENCE IMPLEMENTATION IS ALREADY IN THIS REPO - COPY IT, DO NOT INVENT ONE.**
+
+    GuestWebhookController.cs:244
+        // Stripe.Subscription in Stripe.net 49.1.0 does not expose CurrentPeriodEnd directly;
+    GuestWebhookControllerTests.cs:164
+        var item = new SubscriptionItem { CurrentPeriodEnd = trialEnd };
+
+**`GuestWebhookController` already handles this correctly via `SubscriptionItem`, and its tests already
+construct the item that way.** `StripeWebhookController` never received the same treatment. **Follow the
+sibling controller's pattern exactly** - matching two controllers beats inventing a third approach, and
+the test shape is already proven.
+
+**Scope item 2 is ANSWERED - do not re-investigate.** Only the two period fields moved to the item.
+`CurrentPeriodStart` is also item-only but the mapping never reads it, so there is nothing to remap.
+`TrialStart`, `TrialEnd`, `CanceledAt`, `CancelAt`, `EndedAt`, `StartDate` and `CancelAtPeriodEnd` are
+unaffected.
+
+**THE WORKSPACE WAS LEFT DIRTY - clean it before you start.** The previous run worked on `develop`
+directly rather than cutting a branch, and left behind:
+
+    M  src/McpCognizioware.BillingService/Services/ProvisioningClients.cs
+    ?? TASK_74_DIAGNOSTIC_REPORT.md
+    ?? src/McpCognizioware.BillingService.tests/.../TestResults/
+    ?? src/McpCognizioware.BillingService/Controllers/GuestSubscriptionController.cs.bak
+
+**Cut a fresh branch off `develop` and do NOT commit any of those** - especially not the `.bak` file or
+`TestResults/`. Inspect `ProvisioningClients.cs` before discarding it in case it holds real work; if it
+does, say so rather than silently dropping it.
+
+**Remember the standing rule for this repo: SKIP `dotnet ef migrations add`** - the EF model differ
+crashes on this repo's `jsonb` columns. No migration is needed here anyway; the column already exists.

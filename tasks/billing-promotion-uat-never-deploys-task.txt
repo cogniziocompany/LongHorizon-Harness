@@ -1,0 +1,86 @@
+BUILD + TEST (CI; mcp-cognizioware): the billing promotion reports success while deploying NOTHING to UAT, and the UAT quality gate then passes by testing whatever old build is still running. Found live 2026-09-09. Work ONLY in /home/harness/work/mcp-cognizioware-b on branch fix/promotion-uat-never-deploys (run `git fetch origin && git checkout -B fix/promotion-uat-never-deploys origin/develop` first); plain git; commit by EXPLICIT PATH; no push; NO live deploys and NO workflow dispatches from the run; env NAMES only.
+
+## WHAT WAS OBSERVED - ALL OF IT READ OFF THE LIVE SYSTEM, NOT INFERRED
+Promotion `34306378271` promoted `20f07d10` and reported: `Require billing-dev QA gate` success, `Fast-forward release` success, **`Poll billing-uat QA gate` success**. It looks like a clean promotion. It is not.
+ - The `release` branch IS at `20f07d10` - the fast-forward genuinely worked.
+ - **UAT (`http://192.168.21.153:20253/api/health`) reports `version: sha-b9b06b7`** - NOT the promoted sha.
+ - The newest CI run on the `release` branch is `b9b06b7d`, dated **2026-09-06** - three days before this promotion. It is the build UAT is still running.
+ - So the UAT quality gate passed by testing a three-day-old build while reporting success for a promotion of a different commit.
+For contrast, dev deployed correctly and runs `sha-20f07d1`; prod runs `sha-9d0a6ca`, matching the `prod` branch at `9d0a6cab`.
+
+## THE MECHANISM - ESTABLISHED, DO NOT RE-DERIVE IT
+`ci.yml` declares `on: push: branches: [main, develop, release]` and maps `release -> uat lane (CT100 :20253)`. So a push to `release` is SUPPOSED to deploy UAT.
+The `release-ff` job in `promote-billing.yml` checks out with a bare `actions/checkout@v4` and runs `git push origin release`, so the push is authenticated with the **default `GITHUB_TOKEN`**. GitHub deliberately does not trigger workflows for pushes made with `GITHUB_TOKEN` - it is the documented guard against recursive workflow runs. The branch moves; nothing builds; UAT is never redeployed.
+This is not a one-off. Every promotion through this workflow has had the same shape, which is why UAT has been sitting on a 2026-09-06 build.
+
+## FIX - THERE IS ALREADY A WORKING REFERENCE IN THIS ESTATE; COPY IT
+Do NOT invent a design. `cognizioware-powerplatform/.github/workflows/promote.yml` solves exactly this problem and is VERIFIED working: checked 2026-09-09, pp prod reports `version: sha-26d90ca` and the `main` branch is at `26d90caa` - they agree. That promotion does not move a branch and hope a push trigger fires; each stage **deploys directly** (checkout, then a rollout step with `GHCR_PULL_TOKEN`) and dispatches its QA gate with a dedicated `QA_GATE_DISPATCH_TOKEN` secret rather than the default token. Read it first and follow its shape.
+So the fix is: make the promotion OWN the UAT deployment instead of delegating it to a push trigger that cannot fire. If you conclude a different approach is better - pushing with a credential that does trigger workflows, or dispatching the deploy explicitly - say plainly why the powerplatform pattern does not fit here, because copying a proven pattern beats inventing a third one.
+Whichever you choose, the promotion must not be able to report success unless UAT is actually running the promoted sha.
+
+## THE ASSERTION THAT WOULD HAVE CAUGHT THIS - THIS IS THE HEART OF THE TASK
+Before the UAT gate is dispatched, and again before the promotion is allowed to conclude, **read `/api/health` on the UAT lane and fail unless `version` matches the promoted sha**. A gate that tests whatever happens to be running is not a gate. Apply the same assertion to the dev stage and to the prod stage.
+NOTE the related defect in the same family, already observed: the dev rollout's own check printed `=== [dev] OK - health reports sha-20f07d1` and passed by comparing ONLY the version string, never the health `status` - it green-lit a service reporting itself unhealthy. Harness task 65 covers the status half. Coordinate: if 65 has landed, extend what it added rather than writing a second check; if it has not, leave a clearly-marked seam and say so. DO NOT duplicate it.
+
+## TESTS
+Assert, without deploying anything: the promotion workflow contains a post-deploy version assertion for every stage it promotes; the assertion fails when the reported version differs from the promoted sha. Follow whatever CI-guard pattern this repo already uses - `tests/ci/` in the powerplatform repo carries an equivalent, and the guard added there for `PROD_PROMOTED_SHA` (pp #98) is a good shape to copy. Report counts, baseline first.
+
+## HARD RULES
+Do NOT run a promotion or a deploy from this task - the overseer runs it once the fix is merged. Do NOT put a token literal anywhere; env NAMES only, and if the fix needs a new secret, name it and say who must create it. Do not weaken the dev gate. Explicit-path commits; no push.
+Completion = commits, diff stat, test counts, which approach you chose and why (and, if not the powerplatform pattern, why that pattern does not fit), the exact assertion text, and a plain statement of what UAT and prod are running versus what their branches say right now. Auditor: read-only - verify no token literal, that the promotion can no longer report success without UAT running the promoted sha, that no deploy or dispatch is executed by the task itself, and that task 65's status check was extended rather than duplicated.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.
+
+## ADDITIONAL SLICE - THE PR GATE IN THIS REPO HAS BEEN RED FOR TWO MONTHS AND NOBODY NOTICED
+Same repo, same family of defect: CI that reports something other than the truth. Folded in here rather than raised as its own task.
+The `Cognizioware01 Pull Request Checks` workflow has a step `Test build scripts syntax` that runs:
+    pwsh -Command "Get-Command -Syntax .\build-and-export-images.ps1" || echo "PowerShell syntax check failed"
+    bash -n build-and-export-images.sh && echo "Bash syntax is valid"
+**Neither file exists anywhere in the repository.** The bash line therefore exits 127 and fails the job. Verified 2026-09-09: the `validate` check is `failure` on EVERY run of that workflow going back to **2026-07-10** - six for six across two months, on unrelated branches (`feat/admin-token-e2e-surface`, `feat/admin-config-dbprovider`, `feat/admin-config-rbac`, `feat/usage-events-langfuse-ingest`, `security/swashbuckle-dompurify`, and today's `feat/e2e-model-registry-api`).
+So every pull request in this repo carries a red check that means nothing, which is worse than having no check: it trains reviewers to merge past red.
+FIX: either delete the step, or point it at scripts that actually exist - decide which and say why. If those scripts were removed deliberately, the step should go with them. Do NOT simply add `|| true`: a check that cannot fail is the same problem wearing a different colour.
+Report which PRs were affected and what the `validate` job asserts after your change.
+
+================================================================================
+DELTA FROM THE OVERSEER, 2026-09-10 07:20 PT - THIS NARROWS THE TASK. READ IT BEFORE STARTING.
+
+Part of this task has already been done and is open as **PR #98** against develop
+(`fix/promote-billing-uat-deploy`). Do NOT redo it and do NOT open a competing PR.
+
+WHAT #98 ALREADY DOES:
+  - Adds a `uat-deploy` job to promote-billing.yml between `release-ff` and `wait-uat`.
+  - It runs on [self-hosted, lan-deploy] and calls scripts/deploy/rollout.sh with lane `uat`,
+    exactly as the `production` job already did - i.e. it adopts the powerplatform pattern this
+    task told you to copy: the promotion OWNS the deployment instead of relying on a push trigger.
+  - `wait-uat` now `needs: uat-deploy`, so the gate cannot be polled before the build it judges
+    is deployed.
+So the mechanism half of this task is settled. The root cause in the brief above was confirmed
+exactly as written: the GITHUB_TOKEN push does not trigger workflows.
+
+ALSO NOTE, because it changes what is left: `rollout.sh` ALREADY asserts that the health payload's
+`version` equals the tag it just deployed, and fails the lane if it does not. That assertion runs
+for whichever lane rollout.sh is given. With #98 merged, uat gets that assertion for the first
+time, because uat now actually runs rollout.
+
+WHAT IS LEFT, AND IT IS STILL THE HEART OF THIS TASK:
+ 1. The version assertion currently lives only inside rollout.sh, so it only covers a stage that
+    calls rollout. Make the PROMOTION itself unable to report success unless each stage it claims
+    to have promoted is actually running the promoted sha - including a check before the QA gate
+    is dispatched, and again before the promotion concludes. A stage that is skipped, or that
+    deploys by some other path, must not slip through.
+ 2. Apply it to the dev stage too. `dev-check` only reads a commit status; it never confirms dev
+    is running the sha being promoted.
+ 3. The health `status` half - rollout.sh compares ONLY the version string and will pass a service
+    reporting itself unhealthy. Task 65 covers this. Coordinate as the brief above says: extend
+    what 65 added if it has landed, otherwise leave a clearly-marked seam. DO NOT duplicate it.
+ 4. The CI-guard tests, as described above. Report counts, baseline first.
+
+Two more facts measured on 2026-09-10, use them rather than re-deriving:
+  - `LAN_DEPLOY_ENABLED` is `1`. That is NOT the cause and was ruled out.
+  - The dev lane deploys correctly because merges to `develop` are pushed with a real user
+    credential, not GITHUB_TOKEN. So the trigger suppression is specific to the branches the
+    promotion pushes itself (`release`, `prod`).
+
+Everything else in the brief above still stands, including every hard rule: no push, no deploys,
+no workflow dispatches from the run, env NAMES only.
+================================================================================

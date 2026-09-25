@@ -41,16 +41,31 @@ from ..caller_auth import (
     tool_allowed,
 )
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
+from ..overseer_state import resolve_overseer_root
+from . import mcp_jsonrpc as mcp_protocol
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
 from ..supervisor.control_bus import CommandConflict, RevisionConflict
 from ..fleet import get_reporter
-from ..queue import QueueStore, default_queue_config, queue_config_from_config
+from ..queue import (
+    PgQueueStore,
+    QueueStore,
+    UnknownQueueFieldError,
+    default_queue_config,
+    queue_config_from_config,
+    read_lease,
+    _select_queue_store,
+)
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
+
+import logging
+
 from .events import EventTailer
+
+logger = logging.getLogger(__name__)
 
 # The standalone workbench has no project ``config.toml`` of its own (one
 # server can host runs across many workspaces), so the New Task form's
@@ -206,6 +221,16 @@ def _bearer_matches(value: str | None, token: str | None) -> bool:
         return False
     supplied = value.removeprefix("Bearer ").strip()
     return bool(supplied) and hmac.compare_digest(supplied, token)
+
+
+# Paths guarded by the same bearer boundary as /api.  The MCP streamable-HTTP
+# endpoint lives at /mcp (outside the /api/ prefix), so it is listed here to
+# share the authentication logic rather than duplicating it.
+_BEARER_GUARDED_PREFIXES = ("/api/", "/mcp", "/mcp/")
+
+
+def _path_requires_bearer(path: str) -> bool:
+    return any(path == prefix or path.startswith(prefix) for prefix in _BEARER_GUARDED_PREFIXES)
 
 
 def _load_caller_specs(
@@ -673,7 +698,7 @@ def _snapshot_for(registry: StateRegistry, state: DashboardState, run_id: str) -
 def _maybe_start_fleet_reporter(
     registry: StateRegistry,
     supervisor: RunSupervisor | None,
-    queue_store: QueueStore | None = None,
+    queue_store: QueueStore | PgQueueStore | None = None,
 ) -> None:
     """Start the fleet reporter when LH_HARNESS_FLEET_URL is configured.
 
@@ -697,10 +722,16 @@ def _maybe_start_fleet_reporter(
     # Capacity is best-effort: count the workers this supervisor already owns.
     active_cap = 0 if supervisor is None else max(1, len(supervisor._processes))
 
-    def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int]:
+    def _heartbeat() -> tuple[list[dict[str, Any]], int, int, int, float | None, dict[str, Any] | None]:
         runs: list[dict[str, Any]] = []
         active = 0
         queue_len = 0
+        # Orchestrator liveness (task 173, scope 6 / migration doc §4.3): the
+        # launcher lease is refreshed on every pass, so its ts is the
+        # launcher's last tick and its pid/host identify the holder.  Absent
+        # lease -> None, the fleet window reads that as "no launcher".
+        launcher_tick_at: float | None = None
+        lease_holder: dict[str, Any] | None = None
         try:
             for item in registry.run_items():
                 run_id = str(item.get("id") or "")
@@ -718,9 +749,17 @@ def _maybe_start_fleet_reporter(
             if queue_store is not None:
                 counts = queue_store.counts()
                 queue_len = counts.get("pending", 0) + counts.get("launched", 0)
+            runs_root = getattr(queue_store, "runs_root", None)
+            if runs_root is not None:
+                lease = read_lease(runs_root)
+                if lease is not None:
+                    ts = lease.get("ts")
+                    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                        launcher_tick_at = float(ts)
+                    lease_holder = {"pid": lease.get("pid"), "host": lease.get("host")}
         except Exception:
             logger.exception("fleet heartbeat callback failed")
-        return runs, active, active_cap, queue_len
+        return runs, active, active_cap, queue_len, launcher_tick_at, lease_holder
 
     reporter = get_reporter(version=version, capacity=active_cap)
     if reporter is not None and reporter.enabled:
@@ -891,7 +930,12 @@ def create_app(
     bind_host: str = "127.0.0.1",
     caller_configs: dict[str, dict[str, Any]] | None = None,
 ) -> FastAPI:
-    """Create an API app over a live shared state or a historical runs root."""
+    """Create an API app over a live shared state or a historical runs root.
+
+    ``supervisor`` accepts the real :class:`RunSupervisor` or any stand-in
+    exposing the same surface (tests pass an in-memory fake so the launcher
+    the app builds can be driven without spawning workers).
+    """
 
     dashboard_state = state or DashboardState(
         log_dir,
@@ -957,9 +1001,11 @@ def create_app(
             )
         return caller
 
-    queue_store: QueueStore | None = None
+    # Bound before the try/except so the Launcher path below always has the
+    # default config even when a non-ValueError config error skips the stores.
+    queue_config = default_queue_config()
+    queue_store: QueueStore | PgQueueStore | None = None
     if runs_root is not None:
-        queue_config = default_queue_config()
         try:
             from ..config import PROJECT_CONFIG_PATH, load_run_defaults
 
@@ -967,14 +1013,33 @@ def create_app(
             # current working directory so existing deployments keep working.
             config_path = _runs_root_config_path(runs_root) or PROJECT_CONFIG_PATH
             project = load_run_defaults(config_path)
+            # An unknown backend name raises out of _select_queue_store so a
+            # misconfigured deployment fails at startup instead of silently
+            # running on the file store.
+            selected = _select_queue_store(runs_root, project)
             if isinstance(project.get("queue"), dict):
                 queue_config = queue_config_from_config(project)
+            if isinstance(selected, QueueStore):
+                # The selector builds the file store bare; rebuild it with the
+                # queue_config derived above so the file-store path stays
+                # byte-for-byte the construction it replaces.
+                selected = QueueStore(runs_root, queue_config)
+        except ValueError:
+            raise
         except Exception:
             pass  # Keep default queue_config
-        queue_store = QueueStore(runs_root, queue_config)
+        else:
+            queue_store = selected
+        if queue_store is None:
+            queue_store = QueueStore(runs_root, queue_config)
     launcher: Launcher | None = None
     if supervisor is not None and queue_store is not None:
         launcher = Launcher(supervisor, queue_store, queue_config=queue_config)
+
+    # Task 235: the overseer-state tools read the migrated apparatus archive
+    # (tasks/, queue/done, queue/blocked, docs/) from this checkout. Resolve
+    # the root once; None just means those tools report themselves unavailable.
+    overseer_root = resolve_overseer_root()
 
     snapshot_cache = _SnapshotCache(ttl_seconds=2.0)
 
@@ -1021,7 +1086,7 @@ def create_app(
         ):
             return JSONResponse({"detail": "host is not allowed"}, status_code=403)
         authenticated = _bearer_matches(request.headers.get("authorization"), token)
-        if token and request.url.path.startswith("/api/") and not authenticated:
+        if token and _path_requires_bearer(request.url.path) and not authenticated:
             return JSONResponse(
                 {"detail": "invalid or missing bearer token"},
                 status_code=401,
@@ -1070,12 +1135,37 @@ def create_app(
         )
         reporter = get_reporter()
         fleet_state = reporter.registration_state() if reporter is not None else {}
+        # Drain state (task 242): surfaced here so the fleet window, Hydra and
+        # deploy tooling see a maintenance window in the same handshake they
+        # already poll.  A store without drain support reports not-drained —
+        # the flag is an explicit operator action, so absence must fail open.
+        drain: dict[str, Any] = {"enabled": False, "reason": None, "since": None}
+        get_drain = getattr(queue_store, "get_drain", None) if queue_store is not None else None
+        if get_drain is not None:
+            try:
+                drain = get_drain()
+            except Exception:
+                pass
+        # Launcher stall detector (task 230): read the launcher's own state,
+        # never a re-created one, so the flag reflects live passes.  Fail-open:
+        # a launcher that cannot report its stall state degrades to "not
+        # stalled" rather than aborting the metadata handshake.
+        launcher_stalled = False
+        launcher_stall_cycles = None
+        if launcher is not None:
+            try:
+                launcher_stalled = bool(launcher.stall_fired)
+                launcher_stall_cycles = launcher.stall_cycles or None
+            except Exception:
+                pass
         return build_meta(
             endpoint=endpoint,
             fleet_configured=bool(reporter is not None and reporter.configured),
             fleet_ever_succeeded=bool(fleet_state.get("ever_succeeded", False)),
             fleet_last_ok=fleet_state.get("last_ok"),
             fleet_last_error=fleet_state.get("last_error"),
+            launcher_stalled=launcher_stalled,
+            launcher_stall_cycles=launcher_stall_cycles,
             capabilities={
                 "approvals": live_control,
                 "injections": live_control,
@@ -1086,6 +1176,7 @@ def create_app(
                 "abort": supervisor is not None,
                 "fleet_mcp_tools": queue_store is not None,
             },
+            drain=drain,
             mcp_gateway_alias="lhharness",
             agents=catalogue["agents"],
             models=catalogue["models"],
@@ -1151,9 +1242,53 @@ def create_app(
         stamped["requested_by"] = caller
         try:
             entry = queue_store.create(stamped)
+        except UnknownQueueFieldError as exc:
+            # Task 233: a body with keys outside the accepted set is a client
+            # error (400) that names every offending field -- never a silent
+            # drop and never a generic 422.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"ok": True, "queue_id": entry.queue_id, "requested_by": caller}
+
+    @app.post("/api/queue/drain")
+    def set_queue_drain(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        """Set/clear the queue drain flag (task 242).
+
+        ``{"enabled": true, "reason": "deploy 228"}`` stops NEW queue launches
+        (live runs are untouched) and ``{"enabled": false}`` resumes.  The
+        flag persists across service restarts — a deploy must come back up
+        still drained until it is verified and an operator clears it.  The
+        current state is always visible in GET /api/meta under ``drain``.
+
+        This inherits the single bearer-token boundary that guards every
+        /api/ route (no separate role-token layer exists in this codebase).
+        """
+
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        set_drain = getattr(queue_store, "set_drain", None)
+        if set_drain is None:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "queue drain is not available for the "
+                    f"{type(queue_store).__name__} queue store"
+                ),
+            )
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            raise HTTPException(status_code=422, detail="enabled must be a boolean")
+        reason = body.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise HTTPException(status_code=422, detail="reason must be a string")
+        if enabled and not (reason or "").strip():
+            raise HTTPException(status_code=422, detail="reason is required when enabling drain")
+        try:
+            state = set_drain(enabled, reason if isinstance(reason, str) else None)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"could not persist drain state: {exc}") from exc
+        return {"ok": True, "drain": state}
 
     @app.get("/api/queue")
     def list_queue(
@@ -1212,22 +1347,35 @@ def create_app(
     def mcp_fleet_tools() -> dict[str, Any]:
         return {"ok": True, "gateway_alias": "lhharness", "tools": tools_manifest()}
 
+    def _invoke_fleet_tool(tool_name: str, arguments: dict[str, Any], request: Request) -> dict[str, Any]:
+        """Run one fleet MCP tool.
+
+        Single dispatch path shared by the REST bridge (``POST
+        /api/mcp/fleet/{tool_name}``) and the MCP streamable-HTTP endpoint
+        (``POST /mcp`` tools/call), so both transports behave identically.
+        """
+        return _dispatch_mcp_tool(
+            tool_name,
+            arguments,
+            queue_store=queue_store,
+            registry=registry,
+            supervisor=supervisor,
+            auth_token=token,
+            request_token=normalize_request_token(request.headers.get("authorization")),
+            # Task 174: per-caller scoping rides the same single dispatch path;
+            # the verified-caller stamp and the [callers] table apply to both
+            # transports.
+            caller_configs=caller_specs,
+            overseer_root=str(overseer_root) if overseer_root is not None else None,
+        )
+
     @app.post("/api/mcp/fleet/{tool_name}")
     def mcp_fleet_invoke(
         tool_name: str,
         request: Request,
         body: dict[str, Any] = Body(default_factory=dict),
     ) -> dict[str, Any]:
-        result = _dispatch_mcp_tool(
-            tool_name,
-            body.get("arguments", {}),
-            queue_store=queue_store,
-            registry=registry,
-            supervisor=supervisor,
-            auth_token=token,
-            request_token=normalize_request_token(request.headers.get("authorization")),
-            caller_configs=caller_specs,
-        )
+        result = _invoke_fleet_tool(tool_name, body.get("arguments", {}), request)
         status = result.get("code", 200)
         if status == 401:
             return JSONResponse(result, status_code=401, headers={"WWW-Authenticate": "Bearer"})
@@ -1245,6 +1393,31 @@ def create_app(
         if status >= 400:
             return JSONResponse(result, status_code=status)
         return result
+
+    @app.post("/mcp")
+    @app.post("/mcp/")
+    async def mcp_streamable_http(request: Request) -> Response:
+        """MCP streamable-HTTP (JSON-RPC 2.0) endpoint over the fleet tools.
+
+        Shares ``tools_manifest()`` and the fleet dispatch path with the REST
+        bridge above; see ``webapi.mcp_jsonrpc`` for the protocol layer.
+        """
+        raw = await request.body()
+        message = mcp_protocol.parse_message(raw)
+        if mcp_protocol.is_error_envelope(message):
+            return JSONResponse(message, status_code=400)
+
+        def call_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            return _invoke_fleet_tool(tool_name, arguments, request)
+
+        status, payload = mcp_protocol.handle_message(
+            message,
+            list_tools=tools_manifest,
+            call_tool=call_tool,
+        )
+        if payload is None:
+            return Response(status_code=status)
+        return JSONResponse(payload, status_code=status)
 
     @app.post("/api/queue/{queue_id}/priority")
     def update_queue_priority(queue_id: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
@@ -1277,6 +1450,52 @@ def create_app(
         except Exception:
             pass
         return effective
+
+    @app.get("/api/queue/shadow")
+    def queue_shadow_events(since: str | None = None) -> dict[str, Any]:
+        """Shadow (observe-mode) decisions over a fleet window (task 173).
+
+        One record per would-launch / would-skip decision, read from the
+        durable shadow log (``runs_root/queue/shadow.jsonl`` plus its daily
+        rotations).  ``since`` accepts epoch seconds or an ISO-8601 timestamp
+        and filters on the record ``ts``.
+
+        Only the file-backed store carries the shadow log.  A store without
+        ``read_shadow_records`` (``PgQueueStore`` under ``[queue] backend =
+        "postgres"``) gets an explicit 501 naming the store — never an
+        AttributeError/500 (task 220).
+        """
+
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        since_ts: float | None = None
+        if since is not None and since.strip():
+            raw = since.strip()
+            try:
+                since_ts = float(raw)
+            except ValueError:
+                try:
+                    from datetime import datetime, timezone
+
+                    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    since_ts = parsed.timestamp()
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="since must be epoch seconds or an ISO-8601 timestamp",
+                    ) from exc
+        if not hasattr(queue_store, "read_shadow_records"):
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "shadow records are not available for the "
+                    f"{type(queue_store).__name__} queue store"
+                ),
+            )
+        records = queue_store.read_shadow_records(since=since_ts)
+        return {"ok": True, "count": len(records), "events": records}
 
     @app.get("/api/fleet/contentions")
     def fleet_contentions() -> dict[str, Any]:

@@ -1,0 +1,15 @@
+{
+  "name": "20c-litellm-retire-qwen35",
+  "task_file": "C:/tmp/litellm-config-purge-task.txt",
+  "workspace": "/home/harness/work/cognizioware-mcp-tools",
+  "max_rounds": 4,
+  "trio": "kimi",
+  "run_id": "20260909T073210Z_09fa9ed6",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "glm-5.2:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-09T07:32:10.305924+00:00",
+  "note": " || STATE = PR, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in the same triage. The run ended without a disposition, but its branch feat/litellm-retire-qwen35 is on origin at 6a6216c with cognizioware-mcp-tools PR #120 STILL OPEN. It needs review and a merge decision, NOT a relaunch. || BLOCKED BY ITS OWN PRECONDITION - disposition 2026-09-20 20:24 PT [5321285c]: mcp-tools PR #120 carries [DO NOT MERGE] in its own title because retiring the qwen3.5 local tags is a deploy-ORDERING blocker, and it is CONFLICTING/DIRTY besides. This is a decision with a precondition, not a merge: the ordering must be settled first, then a rebase, then a merge window."
+}

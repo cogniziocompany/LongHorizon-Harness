@@ -1,0 +1,7 @@
+TASK 183 - Merge powerplatform PR #111 (dedicated CI test job) in a window, and hand the one real test failure to task 154.
+OVERSEER-EXECUTED. PR #111 https://github.com/cogniziocompany/cognizioware-powerplatform/pull/111 base develop (never main).
+Before merge: read `gh pr checks 111` - `build` green; `test` RED because SessionList.environments-back-button.test.tsx
+fails on develop (navigate never called; #107 landed the test without the fix). That failure is task 154's item 3
+(back button -> /environments). Merge order: 154's fix first if it is close; otherwise merge #111 red-by-design and
+say so in the ledger - the badge must tell the truth. After merge: the next PR on develop shows the `test` job.
+Then task 185 generalises this as pr-gate for every repo.

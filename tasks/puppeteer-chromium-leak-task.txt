@@ -1,0 +1,157 @@
+ITEM 1 IS ALREADY SATISFIED - 2026-09-15 19:19 PT (SCHEDULED TICK #188). DO NOT RE-DERIVE, DO NOT RE-FETCH
+supergateway, DO NOT RE-MEASURE ANYTHING. Three executor rounds in a row (run 3994e8ed) each spent the FULL 3600 s
+episode budget re-deriving this same result and were killed before they could commit, so the answer is written out
+here once and for all. Round 3 completed the source-citation path (path b) before it was killed. ITS RESULT:
+
+  * Image ships supergateway 3.4.3, which contains BOTH stdioToStatelessStreamableHttp.js and
+    stdioToStatefulStreamableHttp.js.
+  * The compose command is `--stdio mcp-server-puppeteer --outputTransport streamableHttp` with NO --stateful flag,
+    so it routes to stdioToStatelessStreamableHttp.
+  * In that handler: L71  `const child = spawn(stdioCmd, { shell: true });`  -> ONE CHILD PER REQUEST.
+    L158-161 `transport.onclose = () => { child.kill(); }` and L162-165 `transport.onerror = (err) => { child.kill(); }`
+    are the ONLY reapers. There is no other reaper and no timeout.
+  * The healthcheck `timeout 5 bash -c '</dev/tcp/localhost/3106'` opens a BARE TCP SOCKET and never sends a valid
+    HTTP request, so neither onclose nor onerror fires cleanly and the spawned child is never killed.
+  * That accounts exactly for the measured slope: 3 x (11 threads + 1) = 36 pids per 30 s healthcheck cycle.
+
+=> The trigger is PROVEN, not merely correlated. Item 1 of the tick #151 CUT SCOPE is DONE. Item 5's "source citation"
+   half is DONE. Do not open the npm registry again.
+
+DO THE REMAINING WORK FIRST, BEFORE ANY EXPLORATORY READING - you have a HARD 3600 s episode cap and three previous
+rounds died inside it having written nothing:
+  STEP A. Branch off `main` FIRST. The CT110 workspace tree is DIRTY and shared: read 2026-09-15 19:15 PT it carried
+          STAGED e2e/package.json, e2e/suites/46-compose-every-service-mem-limit.test.js and
+          infrastructure/docker-compose.yml(+15), plus UNSTAGED infrastructure/docker/fleet-admin/{schema.sql,
+          src/server.js, src/test/helpers.js, web/src/App.tsx, web/src/lib/api.ts, web/src/lib/socket.ts,
+          web/src/pages/OverviewPage.tsx, web/src/types/index.ts}. NONE OF THAT IS TASK 121'S WORK.
+          NEVER `git add -A` or `git add -u`. Add ONLY the puppeteer-mcp paths, by explicit path.
+  STEP B. Make the SMALLEST fix the citation above supports (item 2 below): a healthcheck that cannot spawn a child,
+          and/or stateful mode reusing one stdio child. `init: true` only as a reaper ON TOP, never as the whole fix.
+  STEP C. `git diff --cached --stat`, confirm ONLY your paths are in it, commit, PUSH and OPEN THE PR yourself, STOP.
+          No merge. mem_limit STAYS 2g. Never touch litellm-config.yaml. Do not mask or remove the healthcheck.
+================================================================================
+
+MEASURED 2026-09-15 13:18 PT (SCHEDULED TICK #151 [66296/17388], read-only from ptait07 `pct exec 204`) - THIS SUPERSEDES THE JUNE FRAMING'S MECHANISM. (1) Full sampler curve 19:40:04Z-20:00:36Z (37 samples): puppeteer-mcp pids 623 -> 2099 at a constant +36 per ~34 s, including AFTER memory saturated at 1.95-1.99 GiB from 19:47:31Z; playwright-* flat 7 pids / ~82 MiB. The restart came at 20:04:37Z (RestartCount 67 -> 68), ~33.5 min after the 19:31:04Z start - NOT 17 min. (2) After the restart the slope is the same: 839 pids / 1.446 GiB at 20:16:37Z, 12 min in. (3) PROCESS TREE: chromium = 0. node = 76, 11 threads each. PID 1 = supergateway (node) has 72 `sh` children, each running one `node` (mcp-server-puppeteer). They spawn in groups of THREE every ~30 s: sh children by age in seconds = 3@14, 3@42, 3@71-72, 3@104, 3@132-133, 3@164, 3@194 ... 2@491. The healthcheck is `timeout 5 bash -c '</dev/tcp/localhost/3106'` at a 30 s interval, and its log reads 20:15:44 / 20:16:14 / 20:16:44 / 20:17:14 / 20:17:44 rc=0. 3 x (11 + 1) = 36 pids per 30 s cycle = the exact measured slope. CONCLUSION: this is an IDLE leak. The leaked unit is a supergateway-spawned stdio child `mcp-server-puppeteer`, not chromium. The trigger CORRELATES with the 30 s healthcheck cadence; that is a correlation, not yet a proven cause. Traffic from the router is negligible (28 puppeteer tool-lists in 24 h). Image: node:20-bookworm-slim, CMD supergateway --stdio mcp-server-puppeteer --outputTransport streamableHttp --port 3106, Init=nil, mem 2147483648.
+
+CUT SCOPE (tick #151) - THE MEASUREMENT IS DONE. DO NOT RE-MEASURE, and do not probe for pct, ssh or any route to CT204/ptait07/ptait01 - there is none from CT110.
+  1. Reproduce LOCALLY in your workspace if docker is available: build infrastructure/docker/puppeteer-mcp, run it, open a bare TCP connection to :3106 every few seconds (the same shape as the healthcheck), and count `sh`/`node` children of PID 1 before and after. This proves or refutes the trigger. If docker is unavailable, read the pinned supergateway source for streamableHttp stateless mode (does it spawn a child per connection/request, and is the child ever killed?) and cite the lines.
+  2. Make the SMALLEST fix the evidence supports. Candidates: pin/configure supergateway so it reuses one stdio child (stateful mode with a session timeout, if the version supports it) or kills the child when the request ends; and/or a healthcheck that cannot spawn a child. Add `init: true` only as a reaper on top of that, never as the whole fix: these children are live, not zombies, so init alone will not stop the leak.
+  3. mem_limit STAYS 2g. Never touch litellm-config.yaml. Do not mask the healthcheck (removing it or setting restart:no is forbidden).
+  4. Commit by explicit path, check `git diff --stat`, then PUSH AND OPEN THE PR YOURSELF (GH_TOKEN is in your environment since 2026-09-14 16:21 PT) and STOP. No merge. This REPLACES the older 'do not push / do not open the PR' rule below.
+  5. DONE MEANS: local child count flat across >= 20 simulated healthchecks with the fix and growing without it (or the source citation), plus the PR URL. Verification on CT204 is the overseer's job after the UAT lane deploys it (pids flat for 10 min).
+================================================================================
+
+CORRECTION 2026-09-15 10:23 PT (scheduled tick [a4a5f4], read back on both hosts): CT204 NO LONGER LIVES ON ptait01. It was migrated to ptait07 (192.168.21.138): pct status 204 = running, onboot 1, hostname cognizioware-ops-it-services-uat, ip 192.168.21.162; puppeteer-mcp 'Up 6 minutes (healthy)' (still cycling) beside four playwright-* up 35 h. The ptait01 CT204 is a STOPPED STALE COPY with the SAME MAC BC:24:11:25:3D:A3 and IP - NEVER START IT (duplicate IP/MAC). Measure via ptait07 `pct exec 204 -- ...`, read-only; never sample CT202 prod. Injected to run 20260915T165146Z_e05cda0b as the answer to gate df87dac33f80.
+
+TASK 121 - fix the ROOT CAUSE of the puppeteer-mcp chromium leak so the container stops cycling.
+LOW PRIORITY AND ALREADY CONTAINED. Read the framing below before you touch anything: the current
+OOM kills are a DESIGNED containment working correctly, NOT an outage. Do not "fix" the containment.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+  image source: infrastructure/docker/puppeteer-mcp/Dockerfile  (this dir holds ONLY a Dockerfile)
+  compose service: infrastructure/docker-compose.yml:890-915  (service `puppeteer-mcp`)
+
+================================================================================
+THE FRAMING - do not skip this, the obvious "fix" is wrong
+================================================================================
+
+The 2 GiB cap is DELIBERATE. docker-compose.yml:897-903 says so verbatim:
+
+    # Cap headless Chromium leak: unclosed browser sessions orphan chromium
+    # procs that accumulate unbounded (2026-06-25: hit ~10GiB / 467 procs and
+    # OOM-killed litellm, 502'ing the gateway). 2g hard limit makes a future
+    # leak kill THIS container, not the whole CT.
+    mem_limit: 2g
+
+So on 2026-06-25 this leak reached ~10 GiB / 467 chromium procs and took out LiteLLM, 502-ing the
+gateway. The cap was added so the leak kills only this container. **It is working.** Measured on
+CT204 (which lives on ptait01, 192.168.21.110) at 2026-09-10 03:40 PT:
+
+    8 cgroup OOM kills tonight, victim=node every time, ZERO global host kills from this container
+    cadence 02:49:26 -> 03:06:26 -> 03:23:26 -> 03:40:26 = **17 minutes to the second**
+    restart policy unless-stopped; container reads "Up About a minute (healthy)" after each
+    RestartCount = 227
+    the four playwright-* siblings: RestartCount = 0 each, on the IDENTICAL 2 GiB mem_limit
+
+** RAISING OR REMOVING mem_limit IS FORBIDDEN. ** That re-opens the 2026-06-25 failure mode where
+the leak escapes the container and kills LiteLLM. If you conclude the cap needs to change, STOP and
+report instead. The cap is the safety net, not the bug.
+
+DO NOT change the healthcheck to mask the restarts. DO NOT set restart:no to "stop the loop".
+
+================================================================================
+THE ACTUAL DEFECT
+================================================================================
+
+Five containers, identical 2 GiB limit, identical restart policy, same box, same workload class.
+**One has 227 restarts and four have zero.** The limit is therefore NOT the differentiator and is
+not misconfigured - the puppeteer image leaks and the playwright images do not. The 17-minute
+periodicity means a steady, near-constant leak rate, not sporadic pressure.
+
+Root cause as documented in June: unclosed browser sessions orphan chromium processes. The service is
+`@modelcontextprotocol/server-puppeteer` (stdio) bridged to HTTP by `supergateway`. The likely shape,
+TO BE CONFIRMED NOT ASSUMED: each MCP session launches a browser, and a client that disconnects
+without a clean shutdown leaves browser.close() uncalled, so the chromium tree survives the session.
+The supergateway stdio-to-HTTP bridge is the prime suspect for swallowing the disconnect that the
+stdio server would otherwise see as EOF.
+
+MEASURE IT FIRST. Before proposing any change, get evidence:
+  - watch the process tree inside the container over one full 17-minute cycle and record what
+    accumulates: `pct exec 204 -- docker exec cognizioware-mcp-tools-puppeteer-mcp ps -ef` sampled
+    repeatedly; count chromium procs and total RSS per sample. Report the growth curve.
+  - identify WHAT drives the cycle. Is anything actually calling it? If the leak advances with NO
+    client traffic, the driver is internal (the 30s healthcheck opening a TCP socket to :3106 is a
+    candidate - about 34 healthchecks fit in 17 minutes) and that is a very different fix from a
+    per-request leak. **Distinguish these two before writing code.** An idle-leak and a
+    per-request-leak have opposite fixes and guessing wrong wastes the whole task.
+  - compare against a playwright sibling under the same idle conditions. It has 0 restarts; knowing
+    what it does differently IS the fix direction.
+
+================================================================================
+LIKELY FIX SHAPES - pick from evidence, do not implement all of them
+================================================================================
+
+  (a) a session reaper: kill orphaned chromium procs whose parent session is gone.
+  (b) launch flags that make chromium cheaper/self-limiting, and/or a single shared browser instance
+      reused across sessions rather than one per session.
+  (c) `init: true` / a proper PID-1 reaper in the container so orphans are reaped rather than
+      accumulating - the Dockerfile is one file, check whether anything reaps at all.
+  (d) an explicit idle timeout that closes browsers after N seconds unused.
+(c) is the cheapest and most likely correct if the accumulation is orphaned procs with no reaper.
+Prefer the smallest change that the measurement supports.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - CT204 is the UAT box and it SERVES THE QA LANES. The four playwright-qa* siblings are live test
+   infrastructure - do not restart or disturb them.
+ - **Must NOT touch infrastructure/litellm-config.yaml.** Any edit to that file force-recreates the
+   CT202 PRODUCTION router (the deploy job hashes the deployed file, so even a comment-only change
+   triggers it).
+ - No bare `docker compose up` for mcp-tools - always `--env-file mcp-tools.env`.
+ - **NEVER `docker compose down -v`** (it would destroy the ollama model blobs).
+ - Never `git add -A`; commit by explicit path; check `git diff --stat` before committing (this
+   estate has had a PR balloon to hundreds of CRLF phantom files).
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+ - No host-level changes on ptait01. Container-level work inside CT204 only.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+The growth curve measured over at least one full 17-minute cycle with counts, the idle-vs-per-request
+question ANSWERED with evidence, the difference from the playwright siblings identified, the smallest
+supported fix committed on a branch, and mem_limit STILL 2g. If the measurement shows the leak is not
+what June assumed, say so plainly and report rather than forcing a fix - a correct diagnosis is a
+better outcome here than a speculative patch, because the containment means nothing is burning.
+
+================================================================================
+BLOCKED 2026-09-15 12:29 PT (scheduled tick #147): a harness run CANNOT reach CT204 - CT110 has no pct route and SSH to the PVE host is denied.
+Two executor hours were lost looking for one. The next run must be GIVEN the measured growth curve (the overseer measures it from ptait07 read-only)
+and must not probe for pct/ssh access at all.

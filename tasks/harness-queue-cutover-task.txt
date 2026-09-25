@@ -1,0 +1,131 @@
+TASK 168 - CUT THE QUEUE OVER FROM C:\tmp ONTO THE CT110 HARNESS API, AND RETIRE THE PC LAUNCHER.
+
+SOURCE: audit session [fe2679] 2026-09-11 section A. Verified by the overseer 2026-09-11: this step
+is UNOWNED. It is explicitly out of task 134's run scope by design, and it is not in 150, 155 or 104.
+
+REPO / WORKSPACE: LongHorizon-Harness   (but most of the work is OVERSEER-EXECUTED, see below)
+
+================================================================================
+*** THIS TASK IS BLOCKED AND MUST NOT LAUNCH UNTIL ALL THREE ARE TRUE. ***
+================================================================================
+ 1. Task 134 (PgQueueStore behind the existing QueueStore, `blocked` added to _VALID_STATUS) HAS
+    LANDED. 134 is itself a repeat casualty: its runs died at round 0 on a provider 429 and its
+    entry was re-requeued by hand TWICE (the second time by the overseer on 2026-09-11, as the 15th
+    done-at-launch stranding).
+ 2. The lh_harness DATABASE AND ROLE EXIST ON CT103. This is 134's stated prerequisite and it is
+    PAXTON'S to provision - a harness run is never given credentials.
+ 3. A COUNTED ZERO-RUN WINDOW: running + waiting_approval == 0, read from GET /api/runs, not
+    inferred. The cutover stops the launcher, so it must not orphan a live run.
+
+================================================================================
+WHY THIS EXISTS - EVERY PC-LAUNCHER DEFECT IS ALREADY SOLVED ON CT110
+================================================================================
+C:/tmp/launch_queue.py is a polling script on ONE Windows workstation. The CT110 service already
+deploys 22 queue/run endpoints and NOTHING WRITES TO THEM. Measured defect-for-defect:
+
+  PC launcher defect                                  CT110 already has
+  --------------------------------------------------  ---------------------------------------
+  lexicographic glob sort inverts the priority bands  integer priority + a priority endpoint
+  dies on ONE malformed JSON (no try/except)          POST /api/queue validates, returns 400
+  trio "default" bypasses the safety block            _validate_trio rejects it
+  blocked_until is PROSE that nothing reads           a real blocked status + transitions (134)
+  default max_rounds 8 vs the packaged 25             one default in the API config
+  *** files the entry to done/ AT LAUNCH ***          launched vs done are DISTINCT statuses
+  the all-Synthetic fallback is overwritten by the    "the queue chooses a model per role and
+    rotation loop                                       RECORDS WHY" (task 49)
+
+That done-at-launch line is the whole argument: it has stranded SIXTEEN tasks, most recently 134
+and 140 on 2026-09-11, with failures invisible for up to EIGHT HOURS. It is not fixable in the PC
+script's model, because filing-on-launch is how that script tracks work.
+
+*** THEREFORE: DO NOT FIX ANY OF THESE IN launch_queue.py, AND DO NOT ZERO-PAD-RENAME THE QUEUE
+FILES. That code is being RETIRED. Carry priority across as an INTEGER instead. ***
+
+================================================================================
+STEPS - EACH GATED ON READING BACK THE PREVIOUS ONE
+================================================================================
+ 1. IMPORT. POST every ACTIVE and BLOCKED entry to /api/queue, preserving the CURRENT FILE ORDER as
+    integer priorities and the blocked status as a status, carrying each note across as the entry
+    rationale.
+    *** DO NOT IMPORT done/. *** done/ is an UPPER BOUND, not a record of completion - it contains
+    running, failed and unfixed tasks because of the defect above. Before trusting any done/ row,
+    reconcile it against GET /api/runs: an entry whose run_id resolves to a failed or stopped run,
+    and which is not in active or blocked, IS A STRANDING - requeue it with the cause written into
+    the note, and COUNT them in the report.
+ 2. STOP THE OLD WORLD. Set the DRAIN flag, confirm ACTIVE=0 from the API, stop the PC launcher
+    process (count it with PowerShell filtering on the COMMAND LINE - a bare ps | grep python
+    counts unrelated processes and has produced false alarms), then ROTATE THE CT110 BEARER THE
+    SCRIPT EMBEDS and confirm the old token is REJECTED WITH 401.
+ 3. ARCHIVE. Move launch_queue.py and its watcher scripts into the repo so the behaviour contract
+    survives them (this is task 104's scope - coordinate, do not duplicate). C:\tmp\queue becomes a
+    READ-ONLY ARCHIVE.
+ 4. SWITCH THE OVERSEER. Its queue reads and writes go through the API; the Ship Plane's "live
+    counts: GET /api/queue" box becomes TRUE instead of aspirational.
+ 5. EXPOSE THE ENTRY POINTS ALREADY SPECIFIED: the lhharness gateway alias on LiteLLM and the
+    chat.easybutt0n.ai tool, with the queue token ON THE ALIAS, NOT ON THIS PC.
+
+================================================================================
+THE ONE THING THAT MUST BE TRUE AFTERWARDS, AND A TEST THAT PROVES IT
+================================================================================
+Add an e2e case in LongHorizon-Harness: enqueue -> launch -> force a 429 on round 1 using the
+synthetic-provider fake (task 47's provider) -> ASSERT the entry ends `failed` WITH THE CAUSE
+RECORDED, is re-eligible after the ramp, and that NO ENTRY IS EVER `done` WHILE ITS RUN IS
+NON-TERMINAL. Add a second case for the stale-glob shape: a gate list must come from the API, never
+from a directory listing.
+Also add the STRANDING SWEEP as a recurring check: for each done entry with a run_id, read the run's
+status; any failed/stopped run whose entry is not active or blocked is a stranding, counted and
+requeued automatically. Today they are found by accident.
+
+HARD RULES
+================================================================================
+ - ONE orchestrator. The PC script once ran THREE COPIES AT ONCE racing the same directory, because
+   a pkill from Git Bash does not kill Windows processes and each "restart" stacked another. After
+   cutover, concurrent orchestrators must be impossible or harmless BY ENFORCEMENT (a lease, a lock,
+   an idempotent enqueue key), not by convention.
+ - DO NOT REORDER THE QUEUE on your own judgement. File order becomes priority order, verbatim.
+   Only Paxton changes priority.
+ - Do NOT weaken the auditor lock, the MCP profiles, the per-run budgets, or the
+   one-run-per-working-tree rule.
+ - The CT110 deploy RESTARTS THE SERVICE AND KILLS EVERY IN-FLIGHT RUN; the deploy script aborts
+   unless zero runs are active. Never pip into /home/harness/venv - it is root-owned; deploy as root
+   from /home/harness/release-src.
+ - No credentials in files, docs or notes - env var NAMES only. Never print a token.
+ - NEVER git add -A; commit by explicit path.
+ - Do NOT post an @claude comment (task 117).
+
+VERIFICATION
+================================================================================
+ 1. GET /api/queue returns every imported entry with priorities in the ORIGINAL FILE ORDER and the
+    blocked ones blocked - compare the LISTS against the directory listing, count for count.
+ 2. ACTIVE=0 was read from /api/runs at cutover; the PC launcher process is ABSENT (PowerShell
+    command-line filter); the old bearer returns 401.
+ 3. Every done entry's run_id resolves to a TERMINAL /api/runs status - zero strandings remain, and
+    the count of strandings found during import is reported.
+ 4. The 429 e2e case leaves the entry failed with its cause, never done.
+ 5. A queue entry created through the chat tool appears in GET /api/queue and launches.
+
+DONE MEANS: the queue lives on CT110, the PC launcher is stopped and archived with its token
+rotated, no entry can be done while its run is live, the stranding sweep runs automatically, and the
+overseer reads its queue from the API.
+
+
+================================================================================
+AMENDMENT 2026-09-14 (session [fe2679]; Paxton's decisions) - THE SHADOW PHASE, PER TASK 55'S SPEC
+================================================================================
+Task 55's spec (orchestrator-migration-task.txt L21; docs/handoffs/orchestrator-migration-2026-09-08.md section 5
+Step 2 and section 6) REQUIRES a period where both orchestrators run and the CT110 launcher is observed but not
+authoritative, promoted only on named evidence. This task's L83/L100 read as a single switch; they are not
+replaced, they are PRECEDED by:
+ 0. Task 173 deployed with `[queue] observe = true` (CT110 restart, zero-active window). The PC launcher stays
+    authoritative. Task 172 (retry/requeue) landed first.
+ 1. Shadow window: NO FIXED LENGTH (Paxton 2026-09-14, overriding "7 days"). Promote when ALL SIX hold, read from
+    scripts/compare_shadow.py and the fleet window: (1) decision agreement with zero unexplained divergence;
+    (2) zero phantom launches; (3) zero missed launches; (4) liveness green across ONE CT110 reboot and ONE network
+    blip, both exercised DELIBERATELY by the overseer in a window, not waited for; (5) zero double-launch (lease +
+    dedup_key held); (6) time-to-launch <= the PC baseline recorded in Step 0.
+ 2. Then the existing L83/L100 sequence: ACTIVE=0 read from /api/runs, DRAIN set, import active/blocked entries
+    with int priorities (dedup_key = PC entry id), flip observe off and stop the PC launcher IN THE SAME WINDOW,
+    rotate the CT110 bearer, archive launch_queue.py per task 104, point LOOP-PROMPT at GET /api/queue.
+ 3. Rollback at any point = observe back on + PC launcher restarted (one flag, one process).
+Also: Step A of the 09-14 handoff (task 55's three secondary commits) is DONE - 0de7b2d dedup_key, 3efb79b real
+queue_len, ca4670c docs/queue.md are all on origin/main. Callers must send dedup_key as a BODY field.

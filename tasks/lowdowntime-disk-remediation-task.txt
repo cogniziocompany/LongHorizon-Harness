@@ -1,0 +1,172 @@
+TASK 141 - Fix everything with low downtime: ptait07 OS disk, CT100 thin volume, CT202 SpendLogs
+reclaim. FOUR TRACKS, A -> C -> D -> B.
+
+REPO / WORKSPACE: cognizioware-mcp-tools  (the runbook and scripts land here; see the SCOPE SPLIT)
+Source: Paxton 2026-09-10, session [092659] (09265918-624d-476c-95fb-25e9575c50f4).
+
+================================================================================
+*** SCOPE SPLIT - READ THIS FIRST. MOST OF THIS TASK IS NOT YOURS TO EXECUTE. ***
+================================================================================
+A harness run is NEVER given credentials, and this plan is almost entirely HOST-LEVEL mutation on
+production Proxmox hosts. The standing rule is absolute:
+
+    NO host-level change on any PVE host without Paxton's EXPLICIT GO naming the change, the
+    rollback, and a quiet window.
+
+So: **YOU PREPARE AND PROVE. THE OVERSEER AND PAXTON EXECUTE.** Deliver, in this repo:
+  * one idempotent, re-runnable script per track, each of which REFUSES to act unless its
+    preconditions are verified in the same invocation;
+  * a runbook naming, per step: the exact command, the expected before/after reading, the rollback,
+    and whether it needs Paxton's explicit go;
+  * for every destructive step, the VERIFICATION THAT MUST PASS FIRST, written so a failed check
+    makes the destructive step impossible rather than merely discouraged.
+
+DO NOT ssh into a PVE host and mutate it. DO NOT delete archives. DO NOT create or remove LVs. DO
+NOT run pg_repack. DO NOT restart docker, containerd or any container. Committing the tooling IS the
+deliverable.
+
+================================================================================
+MEASURED STATE - do not re-derive, but DO re-verify before any destructive step
+================================================================================
+ptait07 (192.168.21.138), read 2026-09-11 00:23 UTC:
+
+    /dev/mapper/pve-root   94G   66G   24G   74%   /
+    /var/lib/vz/dump       18G total:
+        vzdump-lxc-201-2026_06_26-16_35_10.tar.zst    3,904,268,284 bytes
+        vzdump-lxc-204-2026_09_10-13_04_24.tar.zst   14,688,865,867 bytes
+    /root/vzdump.sha256    present, 438 bytes, mtime 17:17
+    rsync process          NOT RUNNING
+
+    lvs:
+        data           pve  twi-aotz--  794.30g   Data% 14.14   Meta% 0.70   <- ~682G IDLE
+        root           pve  -wi-ao----   96.00g
+        vm-100-disk-0  pve  Vwi-aotz--   40.00g   Data% 99.87   <- the trim problem, track C
+        vm-101-disk-0  pve  Vwi-aotz--   10.00g   Data% 73.75
+        vm-201-disk-0  pve  Vwi-aotz--   24.00g   Data% 23.13
+        vm-204-disk-0  pve  Vwi-aotz--   80.00g   Data% 55.93
+
+*** THE SOURCE PLAN SAYS THE CT204 ARCHIVE "IS STILL COPYING". IT IS NOT - there is no rsync
+process. Either it completed or it died. THAT IS UNRESOLVED and it is the precondition for the
+only destructive step in track A. Establish which by checking the DESTINATION, never the source. ***
+
+*** ALSO NOTE: the source plan says "CT disks total 234G". lvs shows FOUR vm disks totalling 154G
+(40+10+24+80). Reconcile that before relying on the pool budget arithmetic in track B - either a
+disk is missing from the plan or from lvs, and an overcommitted thin pool is not a small mistake. ***
+
+================================================================================
+TRACK A - ptait07 vzdump archives. Frees ~18G, 74% -> ~55%. ZERO DOWNTIME.
+================================================================================
+ 1. Confirm the rsync is finished, NOT by looking at ptait07 but by listing
+    /Volume2/usbdrive/ptait07-vzdump/ on terranas01 and comparing BYTE SIZES against the two sizes
+    above. A partial file has a plausible-looking name.
+ 2. Run `sha256sum -c vzdump.sha256` ON TERRANAS01, against the copies that landed there.
+    *** ONLY IF EVERY LINE READS OK may the originals be deleted. *** A successful rsync exit code
+    is NOT proof the bytes are readable at the far end - that lesson is already paid for.
+ 3. Then, and only then, `rm /var/lib/vz/dump/vzdump-lxc-*` on ptait07.
+ 4. Add terranas01 as a Proxmox backup storage (content=backup) so future vzdumps never land on
+    root again. CHECK FIRST whether NFS is actually exported; terranas01 sshd is on port 9222 and it
+    has NO SFTP subsystem, so do not assume a standard service layout. If NFS is not exported, leave
+    /var/lib/vz/dump as-is and SAY SO rather than improvising a mount.
+
+ Note: terranas01 is Paxton's to manage. Write into the destination path only; do not reconfigure it.
+
+================================================================================
+TRACK C - CT100 thin volume. ZERO DOWNTIME. Do this early, it is free.
+================================================================================
+vm-100-disk-0 reads 99.87% at the THIN POOL level but CT100 internally is ~8.5G/40G (23%). The
+difference is deleted blocks that were never returned to the pool.
+
+ 1. `pct fstrim 100`, then the same for every other CT on the host as routine cleanup.
+ 2. Make it durable: either enable discard on the CT disks, or add a weekly `pct fstrim` cron on the
+    host. State which you chose and why.
+ 3. Verify by re-reading `lvs` Data% for each volume, before and after.
+
+================================================================================
+TRACK D - CT202 pg_repack. Reclaims the 26G SpendLogs table. ROUTER STAYS UP.
+================================================================================
+*** THIS IS THE ONE-TIME RECLAIM. TASK 003-125 OWNS THE RECURRING 2-HOURLY EXPORT AND EXPLICITLY
+DEFERS THIS STEP TO A SEPARATE ATTENDED WINDOW. Do not re-implement 125, and do not let 125's
+schedule call pg_repack - VACUUM FULL and pg_repack are both banned from the recurring path. ***
+
+ALREADY DONE TODAY, do not repeat:
+  * `docker builder prune -f` on CT202 freed 10.43 GB and took the disk 72% -> 59%. The source
+    plan lists this as a pre-check; IT IS SATISFIED. Re-measure, do not re-run blindly.
+  * The whole pre-cutoff backlog - 219,367 rows, ~5.5 GB - was already exported to terranas01,
+    verified by checksum at the destination, and deleted from the table. CONFIRMED: the file did
+    NOT shrink. total_relation stayed 26 GB and toast 25 GB, because a DELETE returns nothing to
+    the filesystem. THAT DEAD SPACE IS EXACTLY WHAT THIS TRACK RECLAIMS.
+  * Autovacuum was verified keeping up: n_dead_tup went 122,525 -> 0 unprompted.
+
+ PRE-CHECKS, all of which must hold in the same invocation:
+  * ZERO active harness runs, and no gate or promotion mid-flight.
+  * Free space >= the live table size. Last read: 34G free, table 26G. That is TIGHT - state the
+    margin you measured and refuse if it is insufficient.
+ EXECUTION:
+  * pg_repack needs a client matching PG 16. Check whether the alpine repo has it; if not, run the
+    client from a sidecar postgres:16 debian image carrying postgresql-16-repack rather than
+    installing build tooling into the live database container.
+  * `CREATE EXTENSION pg_repack;` then
+    `pg_repack -t '"LiteLLM_SpendLogs"' --no-kill-backend --wait-timeout=60`
+    (the table name is quoted and CASE-SENSITIVE).
+  * RUN IT IN THE BACKGROUND WITH A LOG AND POLL IT. The ssh MCP has a 180 s hard cap and
+    `pkill -f` self-kills the call.
+ VERIFY: table size and `df` before and after; `/health/liveliness` returns 200 - NEVER the bare
+ gateway /health, which fans a completion out to every configured model including paid and GPU ones;
+ and confirm NEW SpendLogs rows are still landing after the swap.
+ ROLLBACK: an interrupted run leaves `repack.*` objects behind - clean with
+ `DROP EXTENSION pg_repack CASCADE`. The original table is untouched until the final swap.
+
+================================================================================
+TRACK B - move Docker onto the idle thin pool. ~5 MIN OF ptait07 OLLAMA DOWNTIME.
+================================================================================
+*** THIS IS A HOST-LEVEL CHANGE ON A PVE HOST AND NEEDS PAXTON'S EXPLICIT GO, NAMING THE CHANGE,
+THE ROLLBACK AND THE QUIET WINDOW. DO NOT RUN IT. Deliver the script and the runbook. ***
+
+ 1. Online, zero downtime: `lvcreate -V 200G -T pve/data -n hostdocker`, mkfs.ext4, mount at
+    /srv/hostdocker via an fstab entry BY UUID with `nofail`.
+ 2. Pre-sync while the service is still running: `rsync -aHAX /var/lib/docker/ /srv/hostdocker/docker/`
+    and the same for containerd.
+ 3. THE SHORT CUTOVER: stop docker + containerd, final delta `rsync -aHAX --delete` (seconds),
+    rename the originals to `*.old`, bind-mount the new dirs via fstab, start containerd then docker.
+    The only host container is `cognizioware-ollama-gpu3` (ollama 0.34.0, CPU, :11436) - that is
+    what is down, for the delta sync plus restart.
+ 4. VERIFY before deleting anything: cognizioware-ollama-gpu3 is up, `ollama list` is UNCHANGED, and
+    :11436 answers a SINGLE TINY /api/tags. Only then remove `*.old`.
+ 5. ROLLBACK: stop docker, remove the bind mounts, rename `*.old` back, start docker,
+    `lvremove pve/hostdocker`.
+
+ POOL BUDGET: re-derive it from `lvs` yourself. Do not inherit the plan's 234G figure - see the
+ reconciliation note above. An overcommitted thin pool that fills is a far worse outage than the one
+ being fixed.
+
+================================================================================
+ORDER, AND WHY
+================================================================================
+    A (now, gated on the checksum)  ->  C (now, free)  ->  D (next zero-active-run moment)
+    ->  B (a quiet 5-minute slot, and only with Paxton's explicit go)
+
+A and C are safe and reversible. D needs a quiet moment but keeps the router up. B is last because it
+is the only one with downtime and the only host-level structural change.
+
+================================================================================
+EXPLICITLY OUT OF SCOPE
+================================================================================
+ - ZFS snapshots on ptait01 still pin pool space. Destroying them is a ptait01 HOST change and is
+   NOT part of this task.
+ - Shrinking the thin pool to grow root. LVM cannot shrink a thin pool; doing it would mean
+   destroying and restoring all CTs. REJECTED for downtime - do not revisit it.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Never `docker compose down -v`. For mcp-tools, compose ALWAYS takes `--env-file mcp-tools.env`;
+   a bare `docker compose up` is forbidden.
+ - Never the bare gateway `/health`. Use `/health/liveliness`.
+ - Do NOT edit `infrastructure/litellm-config.yaml` - any edit force-recreates the CT202 prod router.
+ - No secrets in scripts, docs, logs or commit messages - env var NAMES only.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat` first.
+ - Do NOT merge. Open the PR and STOP.
+
+DONE MEANS: four idempotent scripts plus one runbook, each destructive step gated on a verification
+that must pass in the same invocation, every rollback written down, and a clear statement of which
+steps need Paxton's explicit go. Nothing on any host mutated by this run.

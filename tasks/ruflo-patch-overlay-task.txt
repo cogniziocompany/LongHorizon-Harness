@@ -1,0 +1,290 @@
+TASK 165 - Make the Ruflo eval-gate fixes SURVIVE A REINSTALL. Patch overlay + drift check.
+
+SOURCE: planning session [5b1a13] (5b1a13da-4239-42ec-8cba-a20c6daa53dd), interactive VSCode plan
+mode, cwd C:\Users\PaxtonTait\source\cognizioware-mcp-tools. Handed to the overseer by Paxton
+2026-09-11 and queued as given.
+
+*** THIS TEXT REPLACES THE OVERSEER'S EARLIER DRAFT, WHICH CONTAINED A PRODUCTION HAZARD AND THREE
+WRONG PREMISES. The superseded draft is at ruflo-patch-overlay-task.txt.bak-superseded-*. Read the
+CORRECTIONS section before anything else. ***
+
+REPO / WORKSPACE: cognizioware-mcp-tools   (plus a second PR in cognizioware-powerplatform)
+
+================================================================================
+WHY THIS EXISTS
+================================================================================
+The powerplatform eval-gate step "Ruflo live verification" (e2e/evals/ruflo-live-verify.mjs, invoked
+at .github/workflows/eval-gate.yml:155-157, BLOCKING and UNCONDITIONAL) was RED all day 2026-09-11
+and now passes 11/11. It passes ONLY because of four changes applied live by hand on CT101, three of
+which live in files NO REPO TRACKS. A reinstall or container rebuild reverts them and the gate goes
+red with no code change anywhere - an unattributable failure.
+
+This task makes those fixes reproducible: version- and hash-pinned patch files, an idempotent apply
+script, wire-in so an install cannot win, and a drift check that turns a future revert into a NAMED
+error.
+
+RUFLO IS NOT BEING DEPRECATED. It stays running and stays registered as an MCP server in LiteLLM.
+An earlier thread explored deprecation and Paxton CANCELLED it; the inventory is kept in Appendix B
+only so the sweep is not repeated.
+
+*** THIS RUN MUTATES NO HOST. Deliver files, tests and PRs, then STOP. ***
+
+================================================================================
+MEASURED GROUND TRUTH - read live from CT101 read-only, and re-confirmed by the overseer
+================================================================================
+Installed versions - READ, NOT GUESSED:
+  ruflo                    /usr/lib/node_modules/ruflo                                 3.5.2
+  @claude-flow/cli         /usr/lib/node_modules/ruflo/node_modules/@claude-flow/cli    3.5.2
+  @claude-flow/mcp         /usr/lib/node_modules/ruflo/node_modules/@claude-flow/mcp    3.0.0-alpha.8
+  sql.js                   /usr/lib/node_modules/ruflo/node_modules/sql.js             1.14.0
+  @claude-flow/cli overlay /opt/ruflo/v3/@claude-flow/cli          NO package.json - UNVERSIONED
+
+All four changes verified present; all four backups verified present. Both systemd units exist on
+the box (/etc/systemd/system/ruflo-{mcp,daemon}.service, dated Mar 1) and NEITHER has an
+ExecStartPre=.
+
+THE FOUR CHANGES, so nobody re-derives them:
+  CHANGE 0 (config, already durable - DO NOT TOUCH):
+    CT202 /opt/cognizioware-mcp-tools/mcp-tools.env:49
+      RUFLO_MCP_URL=http://192.168.21.155:3000/mcp   (was .218, a dead host)
+  CHANGE A (registration validation; 4 hunks across 3 files, all the SAME transform
+            `value: { description:` -> `value: { type: ['string', 'object'], description:`):
+    /opt/ruflo/v3/@claude-flow/cli/dist/src/mcp-tools/config-tools.js     @145
+    /opt/ruflo/v3/@claude-flow/cli/dist/src/mcp-tools/hive-mind-tools.js  @407 and @755
+    /opt/ruflo/v3/@claude-flow/cli/dist/src/mcp-tools/memory-tools.js     @140
+    Backups: *.bak-untyped-20260911-202147
+  CHANGE C (call-time validator could not read a type ARRAY):
+    /usr/lib/node_modules/ruflo/node_modules/@claude-flow/mcp/dist/schema-validator.js @153,
+    ONE line inserted immediately after `function validateType(data, expectedType) {`:
+        if (Array.isArray(expectedType)) return expectedType.some((t) => validateType(data, t));
+    Backup: *.bak-typearray-20260911-202636
+  CHANGE D (sql.js unresolvable, so memory_store had no backend):
+    /opt/ruflo/node_modules/sql.js -> symlink to /usr/lib/node_modules/ruflo/node_modules/sql.js
+
+PRE-PATCH SHA-256 PIN ANCHORS (from the .bak files):
+  1e8129d8db61ae0be24cd9e09c9c0bd74dfe7fe15481f197e9531e424fd25732  config-tools.js
+  9041d0a5744b495f6a8dcc989c65142218ab9a9486a83066ed18713df53c017d  hive-mind-tools.js
+  c5ca56c308719fdccff0b993ed14bb61d9ff1eeda37d253e1435ce00ac50e1eb  memory-tools.js
+  f9dbb26546669f89c2828ea033dd2dab5049d127194e842b14e3fb2a9fd64c7e  schema-validator.js
+
+*** INERT - DO NOT PACKAGE, DO NOT "FIX", DO NOT DELETE: ***
+  /opt/ruflo/v3/@claude-flow/mcp/dist/schema-validator.js (change B) and the agentdb
+  dist/controllers symlink are copies the running server NEVER LOADS, proven off the code path.
+  Packaging them would imply they matter. The FIRST attempt at change C went into the wrong copy and
+  appeared to do nothing - that is why this warning exists.
+
+================================================================================
+*** BLOCKER: "verify on ruflo-uat, not CT101 prod" IS NOT CURRENTLY POSSIBLE. ***
+    RE-CONFIRMED BY THE OVERSEER 2026-09-11 BEFORE QUEUEING. READ THIS OR YOU WILL BREAK PROD.
+================================================================================
+There is NO ruflo-uat environment. Measured on ptait07 (192.168.21.138):
+  - `pct list` shows EXACTLY ONE ruflo container: CT101, named `ruflo`. There is no uat CT.
+  - On CT101, /opt/ruflo-uat DOES NOT EXIST (only /opt/ruflo and /opt/ruflo-update), and
+    ruflo-uat.service is not installed. Only ruflo-daemon.service, ruflo-daemon.service.d and
+    ruflo-mcp.service are present.
+  - infrastructure/ruflo-uat/deploy-ruflo-uat.ps1 has `[int]$ContainerId = 101` - THE PROD
+    CONTAINER - and installs at L36 with `npm install -g ./<tarball>`.
+  - `npm prefix -g` on CT101 is `/usr`, so `npm install -g` writes /usr/lib/node_modules/ruflo -
+    EXACTLY where CHANGE C lives. `/usr/bin/ruflo` resolves to
+    /usr/lib/node_modules/ruflo/bin/ruflo.js, i.e. what prod actually runs.
+
+*** THEREFORE: RUNNING THE OLD VERIFICATION STEP 1 WOULD REVERT CHANGE C ON PRODUCTION AND TURN THE
+BLOCKING EVAL GATE RED. NEVER RUN `npm install -g` INSIDE CT101. This holds no matter who runs it. ***
+This does NOT block authoring the deliverables - see the two-tier verification below.
+
+ALSO FOUND ON CT101: a systemd drop-in /etc/systemd/system/ruflo-daemon.service.d/apikey.conf
+holding the API key. When the units move into this repo, that drop-in STAYS ON THE BOX and MUST NOT
+BE COMMITTED.
+
+================================================================================
+CORRECTIONS TO THE EARLIER PREMISE - THESE CHANGE THE DESIGN
+================================================================================
+The superseded draft said all three code changes live in node_modules and that `npm install -g`
+silently reverts all three. Measured on the box, that is WRONG, and building to it would produce a
+patch set that fails its own verification:
+
+ 1. CHANGE A IS NOT IN node_modules. It lives at /opt/ruflo/v3/@claude-flow/cli/dist/..., a
+    standalone tree containing only dist/ with NO package.json. `npm install -g ruflo` does not
+    touch it. A is lost on CONTAINER REBUILD, not on reinstall.
+ 2. CHANGE A THEREFORE CANNOT BE VERSION-PINNED - there is no version to read, and pinning it to
+    ruflo@3.5.2 would be exactly the guess the task forbids. RESOLUTION: pin patch A by SHA-256 of
+    the pre-patch file (hashes above). That is STRICTLY STRONGER than a version pin - it detects any
+    content drift, not just a version bump.
+ 3. CHANGE D SURVIVES `npm install -g` TOO. The symlink points into the global tree; a reinstall
+    replaces the target directory but the path stays valid. D breaks on CONTAINER REBUILD only.
+
+ONLY CHANGE C IS GENUINELY REINSTALL-FRAGILE. So the old step 1 ("a fresh install should revert
+everything") would have reverted only C and silently MISSED A and D. The corrected procedure induces
+each failure by the mechanism that actually causes it.
+
+================================================================================
+DELIVERABLES
+================================================================================
+ 1. infrastructure/ruflo/patches/
+      001-claude-flow-cli-typed-value.patch  - change A, pinned by SHA-256, WITH a comment stating
+        why no version pin exists.
+      002-claude-flow-mcp-typearray.patch    - change C, pinned to @claude-flow/mcp@3.0.0-alpha.8
+        AND SHA-256.
+      README.md - what each patch fixes, why, the inert-copy warning VERBATIM, upstream issue links.
+
+ 2. infrastructure/ruflo/apply-ruflo-patches.sh - follow this repo's canonical idempotent-apply
+    style, infrastructure/pihole/apply-allowlist.sh: `set -euo pipefail`, the SCRIPT_DIR idiom,
+    info/good/warn/die helpers, a header comment documenting purpose and exit codes, a
+    verify-before-write gate that REFUSES when the environment does not match assumptions, and
+    DRY-RUN BY DEFAULT (--dry-run / --apply). Ship a sibling apply-ruflo-patches.test.sh - the
+    convention here (poll-qa-gate.test.sh, litellm-config-drift.test.sh).
+    Per patch: assert the pin (version where one exists, SHA-256 always) and exit NON-ZERO naming
+    the package and BOTH values on mismatch; grep the marker and SKIP if present; back up before
+    writing; print one PASS/SKIP/FAIL line per patch plus a summary. A second consecutive run MUST
+    be a pure no-op.
+    *** THE MARKER GREP MUST RUN BEFORE THE SHA CHECK. *** A patched file will never match the
+    pre-patch hash, so hash-first makes the idempotent path fail.
+
+ 3. CHANGE D: symlink -> NODE_PATH. Add
+    `Environment=NODE_PATH=/usr/lib/node_modules/ruflo/node_modules` to both units. Supporting
+    evidence: mcp-start.mjs already reads RUFLO_GLOBAL_NODE_MODULES defaulting to that same path, so
+    the resolution root is an established concept here. KEEP THE SYMLINK until equivalence is proven
+    - memory_store must still report backend=sql.js - and only then remove it.
+
+ 4. WIRE-IN so a reinstall cannot win:
+      - a step after `npm install -g` in infrastructure/ruflo-uat/deploy-ruflo-uat.ps1. The natural
+        seam is BETWEEN L36 (install) and L37 (unit install + restart): nothing occupies it, and
+        /usr/lib/node_modules/ruflo/... only exists after L36 and is rebuilt on every rerun.
+      - ExecStartPre= in both units. *** These units are NOT in this repo *** - they live in the
+        POWERPLATFORM repo at deployments/ruflo/ruflo-mcp.service and ruflo-daemon.service, and on
+        the box. So "move into this repo" is a CROSS-REPO MOVE: add to infrastructure/ruflo/ here,
+        and DELETE from powerplatform's deployments/ruflo/ in that repo's PR, so one source of truth
+        remains. The on-box apikey.conf drop-in stays on the box, uncommitted.
+
+ 5. DRIFT CHECK (powerplatform repo - the second PR). Extend e2e/evals/ruflo-live-verify.mjs with a
+    PRE-FLIGHT block before the existing 11 checks: assert each marker line exists; on absence exit
+    non-zero with the LITERAL string `ruflo patches missing` naming the file.
+    *** Do not weaken or reorder the existing 11 checks - they are the proof this task protects. ***
+    MECHANISM (resolved): the script today makes only HTTPS JSON-RPC calls to the LiteLLM gateway
+    (x-mcp-servers: ruflo) and never touches CT101, so marker assertion needs a HOST READ. Reuse the
+    pattern the same job already establishes - eval-gate.yml passes EVAL_SSH_CONFIG:
+    deployments/ssh/config to the run.mjs and rsi-eval-fix.mjs steps on the same self-hosted
+    lan-deploy runner. Add that env to the Ruflo live verification step and grep the markers over
+    SSH.
+    DEGRADE DELIBERATELY: if SSH is unavailable, print a clear "drift check skipped (no SSH)" and
+    STILL run the 11 checks. A missing drift check must never fail a gate that would otherwise be
+    green.
+
+ 6. PIN THE RUFLO INSTALL VERSION - and note the caveat that reshapes this: deploy-ruflo-uat.ps1
+    does NOT install from a registry. L13-21 run `npm pack` against a SEPARATE LOCAL CHECKOUT
+    (C:\Users\PaxtonTait\source\ruflo, param $RufloRepoPath) and L36 installs that tarball. So the
+    installed version is "whatever was checked out on the deploying machine" and NOTHING IN GIT
+    RECORDS IT. `npm install -g ruflo@3.5.2` is therefore NOT the pin.
+    INSTEAD: add infrastructure/ruflo/manifest.json recording the expected version (3.5.2) and the
+    patch pin hashes, and have deploy-ruflo-uat.ps1 assert the packed tarball's version against it
+    between L19 and L36, FAILING FAST on drift. This follows the repo's established "pin a
+    live-measured fact in git and assert it from e2e" pattern - see e2e/baseline.json (which already
+    pins ruflo at 243 tools) and e2e/suites/22-aggregate-baseline.test.js.
+
+ 7. UPSTREAM ISSUES - three, against ruflo / claude-flow: untyped `value` properties; validateType
+    not handling a type array; sql.js unresolvable from /opt/ruflo. Link them in the patches README.
+    The apply script no-ops as each lands upstream.
+
+================================================================================
+FILES TOUCHED
+================================================================================
+cognizioware-mcp-tools (NEW BRANCH OFF main - the repo is currently on docs/ornith-256k-verified):
+  NEW:  infrastructure/ruflo/patches/001-...patch, 002-...patch, patches/README.md
+        infrastructure/ruflo/apply-ruflo-patches.sh + apply-ruflo-patches.test.sh
+        infrastructure/ruflo/fixtures/            (pre-patch copies of the 4 files)
+        infrastructure/ruflo/manifest.json        (version + hash pins)
+        infrastructure/ruflo/ruflo-mcp.service, ruflo-daemon.service   (cross-repo move)
+        infrastructure/ruflo/README.md
+  EDIT: infrastructure/ruflo-uat/deploy-ruflo-uat.ps1  (pin assert before L36, apply step after)
+
+cognizioware-powerplatform (SEPARATE PR):
+  EDIT:   e2e/evals/ruflo-live-verify.mjs           (drift pre-flight)
+          .github/workflows/eval-gate.yml           (add EVAL_SSH_CONFIG to the ruflo step)
+  DELETE: deployments/ruflo/ruflo-mcp.service, deployments/ruflo/ruflo-daemon.service (moved)
+  ALSO FIX the stale header comment at ruflo-live-verify.mjs:10, which points at
+  e2e/playwright/_ruflo-live-verify.mjs; the file lives in e2e/evals/.
+
+OFF-LIMITS: infrastructure/litellm-config.yaml (force-recreates the CT202 prod router, and is
+currently DIRTY in the working tree) and docker-compose.yml.
+
+*** DO NOT STAGE infrastructure/mcp-tools.env. *** It is gitignored but PRESENT in the working tree
+with a LIVE BEARER TOKEN on line 50. Committing by explicit path - never `git add -A` - is what
+keeps it out. This is the concrete reason for that rule here.
+
+REPO CONVENTIONS (CLAUDE.md): Conventional Commits with a scope (`fix(ruflo): ...`); branch `fix/...`
+off main; new e2e suites as e2e/suites/NN-name.test.js using the soft-fail pattern for unreachable
+services (e2e/suites/16-ruflo-mcp.test.js:33-40); run `graphify update .` after.
+CLAUDE.md:278-291's live-env durability rule - live-only fixes silently regress, so mirror them into
+git - is PRECISELY the doctrine this task implements.
+
+================================================================================
+VERIFICATION - TWO TIERS, corrected for the measured failure modes
+================================================================================
+DECISION (Paxton, source session): build the pipeline assets; DO NOT BLOCK on the environment.
+Everything provable without a host is proven in CI; only the final on-box confirmation waits.
+
+TIER 1 - fixture-based, NO HOST, runs in CI. *** THIS IS WHAT GATES THE PR. ***
+infrastructure/ruflo/fixtures/ holds committed pre-patch copies of the four target files,
+byte-identical to the .bak files (hashes above). apply-ruflo-patches.test.sh copies them into a temp
+tree, points the apply script at it via the root override, and asserts:
+  1. Apply to fixtures -> every patch PASS, files now contain the markers.
+  2. Apply AGAIN -> every patch SKIP, ZERO files rewritten (compare mtimes AND hashes).
+  3. Tamper a fixture's pin hash -> script REFUSES with the named message naming both values,
+     changes nothing, exits non-zero.
+  4. Remove a marker from one fixture -> drift check reports `ruflo patches missing` naming that file.
+
+TIER 2 - on-box confirmation. OVERSEER, IN A QUIET WINDOW. *** NOT THIS RUN. ***
+Preferred target is a DISPOSABLE `pct clone 101 <newid>` on ptait07 so a real `npm install -g` can be
+exercised without touching prod. If the clone is unavailable, the .bak files on CT101 are the
+rollback. Each step induces the failure by its REAL mechanism:
+  1. CHANGE C (the only reinstall-fragile one): fresh `npm install -g` of the pinned 3.5.2 tarball
+     -> confirm C reverts -> drift check fails with `ruflo patches missing` naming
+     schema-validator.js.
+  2. CHANGES A and D (rebuild-fragile, NOT reverted by npm): restore the .bak for A / remove the
+     symlink for D -> confirm the drift check names each file. The old step 1 would have missed both.
+  3. Run apply-ruflo-patches.sh -> ruflo-live-verify.mjs back to 11 pass / 0 fail.
+  4. Run it AGAIN -> every patch SKIP, no file rewritten (compare mtimes).
+  5. Pin a deliberately WRONG version/hash -> script refuses with the named message, changes nothing.
+  6. DELIVERABLE 3 EQUIVALENCE GATE: with the symlink removed and only NODE_PATH set, memory_store
+     must STILL report backend=sql.js. Only on success remove the symlink for real.
+NOTE /opt/ruflo-update exists on CT101 and is UNEXPLAINED - check whether it is a staging dir for an
+in-flight upgrade BEFORE cloning, so verification is not done against a half-migrated tree.
+
+DONE MEANS (THIS RUN): patches, apply script, fixtures, units, manifest, wire-in and drift check
+committed; apply-ruflo-patches.test.sh passes all four Tier-1 assertions; TWO PRs open (mcp-tools +
+powerplatform); three upstream issues filed and linked. Tier 2 is handed to the overseer with the
+blocker written up.
+
+================================================================================
+HARD RULES
+================================================================================
+ - NO HOST MUTATION THIS RUN - no ssh writes, no systemctl, no npm install. The read-only version
+   reads are already done and are recorded above, so you need no host access at all.
+ - NEVER `npm install -g` inside CT101. It reverts CHANGE C on PRODUCTION and reddens a blocking
+   gate.
+ - NEVER git add -A; commit by explicit path; `git diff --stat` before each commit.
+ - Do NOT edit infrastructure/litellm-config.yaml or docker-compose.yml.
+ - Do NOT post an @claude comment - it bills Paxton's personal subscription (task 117).
+ - Env var NAMES only, no secrets. Do not commit mcp-tools.env or the apikey.conf drop-in.
+ - Open the PRs and STOP - no merge, no deploy.
+
+================================================================================
+APPENDIX A - ADJACENT DRIFT, FLAGGED NOT FIXED (now queued separately as task 171)
+================================================================================
+RUFLO_MCP_URL has THREE different values across live config, repo config and deploy tooling:
+  192.168.21.155  live on CT202 per CHANGE 0 - ZERO occurrences anywhere in this repo
+  192.168.21.218  infrastructure/.env.example:66, mcp-tools.env:49, litellm-config.yaml:592
+  192.168.21.118  infrastructure/ruflo-uat/README.md, e2e/lib/api-client.js:37, e2e/.env.example:13-14
+So the LIVE value is recorded in NO repo file, and the deploy tooling plus the e2e default still
+assume the .118 host that caused the 2026-07-14/15 nightly-RED incident.
+register-mcp-tools-stack.py:85-87 has a dead-IP guard, which mitigates but does not resolve it.
+Fixing it touches litellm-config.yaml, which THIS task forbids - hence flag-only here.
+
+================================================================================
+APPENDIX B - RUFLO DEPRECATION INVENTORY (CANCELLED; retained so the sweep is not repeated)
+================================================================================
+SUPERSEDED - ruflo STAYS. No app/product source references ruflo at all; every reference is in
+e2e/evals/ (2 scripts), deployments/ruflo/, .github/workflows/eval-gate.yml (the gate step +
+RSI_RUFLO: '1'), and docs/handoffs. Env vars: RSI_RUFLO, RUFLO_MCP_URL, RUFLO_MCP_TOKEN,
+RUFLO_MAX_SESSIONS, RUFLO_SESSION_TIMEOUT_MS, RUFLO_REPO_ROOT, RUFLO_GLOBAL_NODE_MODULES, RUFLO_HOST,
+RUFLO_CTID. No npm dependency on ruflo in any package.json.

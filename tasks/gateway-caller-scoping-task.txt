@@ -1,0 +1,48 @@
+TASK 177 - Gateway: two key groups for the harness (chat-agent vs operator), per-user keys for Fleet Chat,
+and stop executor keys from holding hydrafleet.
+
+SOURCE: Paxton 2026-09-14 (interview, audit [fe2679] section M2b): gate resolution from Fleet Chat only once EACH
+USER carries their own gateway key; mechanism = one LiteLLM virtual key per Fleet Chat user in two access groups.
+Migration doc section 3.4: the chat agent's "never call" list is enforceable only at the gateway today.
+Ordered after every powerplatform task.
+
+REPO / WORKSPACE: cognizioware-mcp-tools    BASE: origin/main
+
+================================================================================
+MEASURED 2026-09-14
+================================================================================
+ - lhharness alias serves the four harness tools (harness_enqueue_task, harness_list_queue, harness_run_status,
+   harness_resolve_gate) to access group fleet-runners.
+ - docs/fixtures/intended-key-matrix.yaml L19 puts hydra AND hydrafleet in the EXECUTOR base access-group set:
+   an executor role's key can call resolve_run_gate, stop_run, restart_harness_node today.
+ - Fleet Chat reaches lhharness through openwebui/mcpo.config.json with ONE key for all users (task 13a).
+ - Nothing at the harness scopes callers (task 174 adds that); the gateway is the only enforcement point now.
+
+================================================================================
+SCOPE
+================================================================================
+ 1. Access groups (litellm-config.yaml mcp_servers/access_groups - NOTE: any edit to litellm-config.yaml
+    force-recreates the CT202 prod router; if the groups are DB-owned, use /key and /team APIs instead and say
+    which in the PR):
+      harness-chat     : lhharness tools harness_enqueue_task, harness_list_queue, harness_run_status ONLY
+      harness-operator : all four lhharness tools + hydrafleet
+      executor keys    : REMOVE hydra and hydrafleet from the EXECUTOR base set (intended-key-matrix.yaml L19)
+    LiteLLM tool-level allow/deny per access group: if the router version cannot filter individual tools inside
+    one MCP server, split the harness MCP registration into two server entries (lhharness-read + lhharness-gate)
+    and assign per group. Say which mechanism was used and read the tool list back per key.
+ 2. Per-user Fleet Chat keys: a script infrastructure/scripts/mint-fleet-chat-user-key.sh <user> <group> using
+    the litellm-admin path (/key/generate with team + access group + a per-user tag), output the key ONCE to the
+    operator, never to a file in the repo. Default group harness-chat; operators get harness-operator.
+ 3. Drift matrix + suites: intended-key-matrix.yaml updated; suite 20/29 assert that a harness-chat key gets 403
+    on harness_resolve_gate and does not see hydrafleet, an operator key does, an executor key no longer sees
+    hydra/hydrafleet.
+ 4. Hand-off to task 140 (Fleet Chat): the UI must let each user enter their key once, persist it server-side
+    against their login, default to the harness-chat key when none is set, and pass the user's key to the tool
+    server per request. That is 140's work; this task provides the keys and documents the contract in
+    docs/fleet-chat-keys.md.
+
+HARD RULES: key VALUES never in files, tests, logs or the PR. If the yaml must change, it lands ONLY in a
+zero-active window (overseer). Push + PR yourself; DO NOT MERGE.
+
+DONE MEANS: PR open; three keys (chat, operator, executor) each read back through /mcp/tools show exactly the
+intended tool sets; suites green; docs/fleet-chat-keys.md written.

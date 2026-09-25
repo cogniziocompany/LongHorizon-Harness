@@ -1,0 +1,79 @@
+TASK 104 - MIGRATE THE OVERSEER'S C:\tmp WORKING SET INTO A GIT REPO.
+
+*** THIS BRIEF WAS REWRITTEN 2026-09-11 BY THE OVERSEER. THE ORIGINAL WAS LOST. ***
+The queue entry blocked/745-104-tmp-to-repo-migration.json pointed at
+C:/tmp/tmp-to-repo-migration-task.txt, which DID NOT EXIST - the only missing task_file of 38,
+found by audit session [fe2679] section B1. Do not treat this file as the original wording; it is
+reconstructed from the entry's note, the audit, and the surrounding tasks. If you find the original
+in a transcript or a .bak, PREFER IT and say so.
+
+REPO / WORKSPACE: LongHorizon-Harness
+
+================================================================================
+WHY THIS EXISTS
+================================================================================
+The overseer's entire operating apparatus lives in C:\tmp on ONE Windows workstation, untracked and
+unbacked-up: the queue directory (active, blocked, done), LEDGER.md, OPEN-ASKS.md, LOOP-PROMPT.md,
+launch_queue.py and about a dozen watcher scripts, every *-task.txt brief, and the Ship Plane HTML.
+There is no history, no review, and no recovery. This task has already been demonstrated by two
+separate incidents: a task brief vanished with no way to recover it (this very file), and the ledger
+was nearly clobbered by two sessions writing it at once.
+
+================================================================================
+SCOPE - AND ITS HARD BOUNDARY
+================================================================================
+IN SCOPE: bring the FILES under version control, with history, review and a documented layout.
+  - the scripts (launch_queue.py and the watchers) into a tools/ or ops/ path;
+  - the task briefs into a tracked directory;
+  - the doctrine files (LOOP-PROMPT.md and the ledger format) into docs/;
+  - a README stating which files are authoritative and which are generated.
+
+*** OUT OF SCOPE: CUTTING THE QUEUE OVER TO THE CT110 API. That is TASK 168, it is blocked on task
+134 and a CT103 database, and it RETIRES launch_queue.py outright. ***
+Read that sentence twice, because it decides how much effort this task deserves: you are archiving
+a script that is being deleted. Therefore:
+  - DO NOT refactor launch_queue.py. Do not fix its lexicographic sort, its missing try/except, or
+    its file-on-launch behaviour. Task 168 replaces all of it, and task 146 owns its one live bug.
+  - DO NOT zero-pad-rename the queue files.
+  - Track the script AS-IS so its behaviour contract survives its deletion. That is the whole point.
+
+SEQUENCING: task 150 records that THREE tasks now edit launch_queue.py and that this must be
+sequenced. If this task lands FIRST, later edits get history - which is the argument for doing it
+early. But if a later task is mid-flight on that script, coordinate rather than racing it.
+
+================================================================================
+HARD RULES
+================================================================================
+ - *** SECRETS. C:\tmp IS FULL OF THEM. *** Before ANY commit, scan every file for tokens, bearer
+   values, keys and passwords: the launcher EMBEDS a CT110 bearer token, and the watcher scripts and
+   task notes carry endpoints and auth headers. Commit env var NAMES only; replace every value with
+   a placeholder and document where the real one lives. A single committed token makes this task a
+   net loss. If you find one, report the PATH and the FACT, never the value, and do NOT rotate it
+   (rotation is out of scope by standing decision).
+ - NEVER git add -A. This is the single highest-risk task in the queue for that rule, because the
+   source directory is a pile of untracked files including secrets and 150+ done entries. Commit by
+   EXPLICIT PATH, and run git diff --stat before every commit.
+ - Windows CRLF: clone with autocrlf=false and check git ls-files --eol before pushing. LOOP-PROMPT
+   is LF-only today and must stay LF.
+ - Do NOT commit the done/ history as truth: it is an UPPER BOUND, not a record of completion
+   (entries are filed there AT LAUNCH, which has stranded 16 tasks). If you include it, label it.
+ - Do NOT edit the live files in place while the launcher is running against them. Copy, then commit
+   the copy. Never edit a running script.
+ - Do NOT post an @claude comment (task 117).
+ - Open the PR and STOP.
+
+================================================================================
+VERIFICATION
+================================================================================
+ 1. git log shows the files with history, committed by explicit path.
+ 2. A secret scan over the committed tree returns ZERO values - prove it with the scan output, and
+    confirm the launcher's bearer is a placeholder, not the live token.
+ 3. git ls-files --eol shows LF for the doctrine files (do not trust a grep for carriage returns -
+    it is unreliable in Git Bash; use git ls-files --eol or a Python byte count).
+ 4. The README names, for each tracked file, whether it is authoritative or generated, and which
+    task retires it.
+ 5. The live overseer loop still works: the launcher is still running against its own paths and its
+    log is still being WRITTEN (check the mtime, not merely that the file exists).
+
+DONE MEANS: the overseer's scripts, briefs and doctrine are in git with history and a README, no
+secret values are committed, line endings are preserved, and nothing about the running loop broke.

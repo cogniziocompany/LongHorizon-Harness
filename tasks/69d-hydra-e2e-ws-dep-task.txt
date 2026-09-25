@@ -1,0 +1,40 @@
+TASK 69d - hydra-e2e: the checkpoint suite's fake agent cannot resolve `ws`
+
+MEASURED THIS TICK (2026-09-17 13:30 PT, scheduled tick #479). DO NOT RE-DERIVE:
+- QA CI run 35270141949 on cognizioware-qa master @083e7b4b (the merge of PR #29, task 69b)
+  job `hydra-e2e` FAILED. It is the 10th straight master red since 2026-09-16 18:08.
+- 69b's fix DID work and must not be reverted: the path error is GONE. The suite now resolves
+  /home/runner/qa/_work/cognizioware-qa/cognizioware-qa/cognizioware-hydra/design/fake-agent.js
+  - a correct LINUX path from the cross-repo checkout, where it used to be `C:\hydra-ci` concatenated
+  onto a Linux path. The private-repo checkout and HYDRA_REPO_READ_TOKEN both work.
+- The failure moved one layer DOWN, to a dependency:
+  Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'ws' imported from <...>/cognizioware-hydra/design/fake-agent.js
+- cognizioware-hydra has NO package.json AT ALL (GitHub contents API returns 404 for /package.json;
+  the reader was verified by that 404 body arriving intact). `design/` has no package.json either.
+  So `ws` is imported bare and is declared nowhere - it used to resolve from a global install on the
+  old Windows runner box and did not survive the migration to the Linux runner ct210-qa.
+- Suite result unchanged at score=76.92 passed=10 failed=3 total=13 - the SAME numbers recorded
+  before 69b merged. The 3 failing checkpoints are the ones that need the fake agent.
+
+DO:
+Make `ws` resolvable for design/fake-agent.js when the suite runs in QA CI, on the QA side.
+Prefer the smallest change that keeps ownership in cognizioware-qa: declare the dependency in the
+QA runner package that spawns the fake agent (packages/runner) and/or install it into the checked-out
+hydra directory in the `hydra-e2e` job before `npm run hydra`, so node's resolution from
+cognizioware-hydra/design/ finds it. Pin a version rather than floating.
+Read what 69b did in .github/workflows (QA CI, job hydra-e2e) and extend THAT job - do not add a
+second mechanism beside it.
+
+HARD RULES:
+- DO NOT lower the 76.92 threshold. DO NOT delete or skip a checkpoint. The 3 failures must be fixed
+  by making the agent run, not by making the suite ask for less.
+- DO NOT re-touch HYDRA_REPO_DIR or FACTORY_REPO_DIR. FACTORY_REPO_DIR belongs to task 69c, which is
+  assigned to a HUMAN EXPERT and held in blocked/ - do not touch it.
+- Keep the episode SMALL. Open the named files and nothing else. Task 69 burned three runs to zero
+  commits by grepping the whole tree; if you find yourself searching broadly, stop and report.
+- No secrets in the repo or in output; env var NAMES only, never invent a secret name.
+- No live Hydra calls, no QA backend calls, no deploys.
+- Plain git. Commit by EXPLICIT PATH, never `git add -A`. Check `git diff --stat` first.
+- Push the branch and open the PR YOURSELF (CT110 runs carry GH_TOKEN with push + PR rights), then
+  STOP. Do NOT merge - merging is the overseer's.
+- Do NOT post an @claude comment to request a review. It bills Paxton's personal subscription.

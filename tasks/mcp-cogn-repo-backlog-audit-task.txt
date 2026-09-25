@@ -1,0 +1,300 @@
+*** CORRECTION 2026-09-15 05:53 PT (scheduled tick #94): (a) = PR #106 and (b) CI repair = PR #107 (task/102-ci-repair-finding-3, opened by the overseer because the run token cannot push workflow files) are BOTH DONE - do not redo either, do not edit .github/workflows/*. Start at (c): cherry-pick 4a9824f0 only onto a fresh branch from origin/main, push, open ONE PR, deliver the tables in its body, STOP. ***
+*** CORRECTION 2026-09-15 01:47 PT (scheduled tick #50): task 78 is FINISHED - PR #103 task/78-branch-divergence-audit -> develop MERGED 2026-09-10T00:16:47Z. A workspace checked out on that branch is a leftover, not ownership; never commit to it. Cut branches from origin/main (Phase A, CI hygiene) or origin/develop (Phase B). Do NOT close/re-open PRs, delete remote branches or push archive tags - deliver those lists as tables in the PR body; the overseer applies dispositions. Push, open the PR, STOP. ***
+
+TASK 102 - mcp-cognizioware repo backlog audit and cleanup. *** VERY LOW PRIORITY ***
+
+REPO: cogniziocompany/mcp-cognizioware (private, default branch `main`). Workspace on CT110:
+/home/harness/work/mcp-cognizioware-b (NOT the -b tree if task 78 still holds it - see the
+boundary section; use whichever mcp-cognizioware workspace is free).
+
+Paxton, 2026-09-09: "If you haven't already added this as a task in the queue do it it's a very
+low priority of course."
+
+Source: plan `we-want-to-get-smooth-puzzle.md` (301 lines), session
+`a2ab0b02-2817-40a8-b444-2e7df32f4d2c` (Claude Opus 5, PTAIT09), audit 2026-09-09.
+The overseer READ THE PLAN OFF DISK: C:\Users\PaxtonTait\.claude\plans\we-want-to-get-smooth-puzzle.md
+Audit baseline: `origin/main` @ `72c75e70` (PR #101, 2026-09-09T15:07:51Z).
+Lane baseline: `develop` = `release` = `prod` @ `728a1408`.
+
+**RE-RUN `gh pr list` AND `gh run list` BEFORE STARTING - this snapshot goes stale fast.**
+
+================================================================================
+STOP GATE - CONCURRENCY. ANOTHER AGENT IS LIVE IN THIS REPO RIGHT NOW.
+================================================================================
+
+The plan's own header carries this warning: *"Another agent is actively iterating on the
+promote-billing deploy pipeline right now (PRs #74-#101 landed in the last 3 days; most recent
+merge 2026-09-09 15:07Z)."*
+
+**DO NOT TOUCH ANY OF THE DEPLOY PIPELINE.** Off-limits: `.github/workflows/ci.yml`,
+`.github/workflows/promote-billing.yml`, `scripts/deploy/*`, `deployments/instances.json`,
+`deployments/tier/*`, `deployments/ssh/config`, `docs/deploy/billing-lanes.md`; the branches
+`develop` / `release` / `prod`; the `production` GitHub environment; secret
+`QA_GATE_DISPATCH_TOKEN`; var `LAN_DEPLOY_ENABLED`; runner label `lan-deploy`.
+
+Also live in this repo as of this writing: **the overseer merged PR #102** (task 74,
+`CurrentPeriodEndUtc`) to `develop` at 22:54:36Z. Do not revert or re-litigate it.
+
+================================================================================
+RULE 2 BOUNDARY - FINDING 0 IS ALREADY SOMEONE ELSE'S TASK. DO NOT DUPLICATE IT.
+================================================================================
+
+**TASK 78 IS RUNNING RIGHT NOW** (run `20260909T205306Z_4d7ca291`, workspace
+`mcp-cognizioware-b`) and its title is: *"mcp-cognizioware: main and develop have diverged, and
+work on main never reaches any environment."*
+
+**That IS Finding 0.** This task must NOT write the fork handoff doc, must NOT open a
+`main -> develop` PR, and must NOT attempt reconciliation. Finding 0 is reproduced below **only
+as context you need to understand why a fix on `main` never reaches production** - which changes
+where Phase B has to land. If task 78 has already produced the handoff doc, reference it; if it
+has not, hand your evidence to task 78 rather than writing a second document.
+
+FINDING 0 AS CONTEXT ONLY:
+
+    origin/main    72c75e70   19 commits main-only  ·  67 commits behind the lanes
+    origin/develop ┐
+    origin/release ├─ 728a1408   all three identical
+    origin/prod    ┘
+
+The promotion path is `develop -> release -> prod`. **`main` is not in it.** Consequences the
+plan evidenced:
+
+  - `Swashbuckle.AspNetCore` is `10.2.3` on `main` but `6.5.0` on develop, release and prod, so
+    PR #54's dependency bump never reached a deployed lane. **Paxton has explicitly downgraded
+    this (dev lab, testing) - note it as version drift for task 78 and do NOT escalate it as a
+    vulnerability.**
+  - `.github/workflows/ci.yml` is absent from `main`; its `push: [main, ...]` trigger is inert.
+  - `scripts/deploy/rollout.sh`, `deployments/instances.json`, `deployments/tier/*` are NOT on
+    `main`. `promote-billing.yml` works only because the deploy jobs check out `release`/`prod`.
+    **Any "tidy the lanes toward main" change kills both deploy jobs instantly.**
+  - Stranded on `main`: #57 (CI repair), #55 (Tailscale DB-egress docs), #60 (Xrm.Mcp token
+    cache), the AADSTS90009 MSAL scope fix, and every promote-billing fix (#77-#80, #99-#101).
+
+**The practical consequence for THIS task: a change landed on `main` alone NEVER reaches
+production.** That is why Phase B below targets `develop`, not `main`.
+
+================================================================================
+FINDING 1 - SECRETS COMMITTED ON `main`
+================================================================================
+
+`.gitignore` was tightened in July, but **ignore rules never untrack an already-tracked file.**
+So live values sit on `main` today.
+
+*** PAXTON DOWNGRADED THIS 2026-09-09 - READ BEFORE TREATING IT AS AN INCIDENT. ***
+*"No ignore this as issue this all dev lab. TESTING ... i will worry about this later. you purge
+it."*
+
+**This is NOT a security incident and must not be written up as one.** This is a dev lab and the
+values are test credentials. So:
+
+  - **DO the purge** - untrack the files and put placeholders in. That is routine repo hygiene and
+    it is the work item.
+  - **DO NOT** raise it as a breach, do NOT write "assume compromised", do NOT open an incident,
+    and do NOT escalate. Paxton will handle whatever he wants to handle later.
+  - **ROTATION AND HISTORY REWRITE REMAIN OUT OF SCOPE** - the plan says so itself and it matches
+    the standing dropped-rotation decision. Do not re-raise rotation.
+
+Kinds of value tracked on `main`: Anthropic, OpenRouter, Gemini and Stripe test keys, Postgres
+passwords, a YouTrack token, a Seq API key, a Twilio auth token, and a control-API bearer at
+`CLAUDE.md:97`. **Even for test values, never reproduce a VALUE in a commit, PR body, doc or
+report - name the FILE and the KIND only.** That is a habit worth keeping regardless of stakes.
+
+TRACKED `.env` FILES CARRYING LIVE VALUES:
+  prod.env, uat.env, cloudflare/dev.env, cloudflare/uat.env, seq/nas.env,
+  Archive/.env.aidev01, Archive/.env.aidev02,
+  deployments/cognizioware-litellm/litellm.env, deployments/cognizioware-litellm-v2/litellm-v2.env,
+  deployments/cognizioware04-phx/prod-stack.env,
+  deployments/cognizioware-ptait01/ptait01-inference.env,
+  deployments/cognizioware-ptait06/ptait06-inference.env,
+  deployments/cognizioware03-corsairai300/corsairai300-inference.env,
+  deployments/n8n-mcp-uat/n8n-mcp-cloud.env, deployments/n8n-mcp-uat/n8n-mcp-easybutt0n.env
+TRACKED SOURCE CONFIG:
+  src/McpCognizioware.BillingService/appsettings.UAT.json, appsettings.Development.old.json,
+  appsettings.Twilio.example.json
+DOCS: README.md (1854 lines, multiple live values), CLAUDE.md:97 (control-API bearer).
+  *Correction the plan makes about itself: an earlier pass reported CLAUDE.md clean. It is not.*
+
+--- PHASE A - safe, `main`-only, zero deploy impact. DO THIS FIRST. ---
+  - `CLAUDE.md`: redact the bearer at line 97 -> `Bearer: <see 1Password / ops vault>`.
+  - `README.md`: replace every live value with a placeholder. **Do NOT restructure it** - the
+    1854-line problem is issue #52 territory and explicitly out of scope.
+
+--- PHASE B - touches DEPLOYED artifacts. Gated. Needs pipeline-agent coordination. ---
+  *** VERIFY BEFORE EDITING `appsettings.UAT.json`: it SHIPS INSIDE THE CONTAINER. Confirm the
+  runtime actually sources these values from environment variables or the DB-first config
+  provider added in PRs #58/#59 - NOT from the file - before replacing them with placeholders.
+  IF THE FILE IS AUTHORITATIVE AT RUNTIME, PLACEHOLDERS BREAK UAT. ***
+  *** VERIFY BEFORE UNTRACKING each `.env`: `git grep` its path across workflows, compose files
+  and `scripts/deploy/` on ALL FOUR of main/develop/release/prod. Untrack ONLY files nothing
+  references. Use `git rm --cached` (keeps the working copy) and commit a `*.env.example`
+  alongside each. ***
+  *** TARGETING: these live in `src/` and `deployments/`, so a fix on `main` alone never reaches
+  production. LAND PHASE B AGAINST `develop` - and only after the pipeline agent's in-flight
+  promotion settles. ***
+
+================================================================================
+FINDING 2 - `main`'s CLAUDE.md ACTIVELY MISINSTRUCTS AGENTS
+================================================================================
+
+`main`'s `CLAUDE.md` (107 lines) contradicts the project's own hard rules, so agents and humans
+reading it are being told the wrong thing. Correct it in the same PR as Phase A. The plan also
+records host-identity drift found while correcting its own header - carry that correction.
+
+================================================================================
+FINDING 3 - DEAD AND BROKEN CI
+================================================================================
+
+Delete the broken step in `pr-checks.yml`, add an **advisory** gitleaks scan (reports findings
+WITHOUT failing the job), and retire dead workflows. One PR to `main`; confirm CI goes green.
+
+**OVERSEER ADDITION - do this while you are in these workflows.** A black-hat pass on
+2026-09-09 found `pr-failure-investigator.yml` runs on `workflow_run` - a privileged trigger that
+executes in the base repo's context with full secrets - carrying `pull-requests: write` and with
+**NO `author_association` gate**, unlike the three Goose/Claude workflows which all have one.
+Risk today is low (private repo, so a PR needs someone who already has access) and **no MCP server
+is wired into any PR-triggered workflow**, but **add the `author_association` gate** while you are
+here. It is cheap and it closes the gap before anyone adds a credential. See task 87.
+
+================================================================================
+FINDING 4 - OPEN PR DISPOSITION (all 5 close)
+================================================================================
+
+**RE-VERIFY EACH VERDICT against current `origin/main` before closing. If a verdict no longer
+holds, LEAVE THE PR OPEN and say so.** Close each with a one-line reason linking the superseding
+PR/commit. **Do NOT delete the branches for #31-#34 and #61 until the PRs are closed** (closing
+auto-orphans them; delete after).
+
+  #61  model retirement (Jul 14, draft, CONFLICTING, 837 files / +23.5k)
+       CLOSE, BUT EXTRACT THE RESIDUAL VALUE. The 5 retiring models (deepseek-v3.2:cloud,
+       devstral-2:123b-cloud, gemini-3-flash-preview:cloud, glm-5:cloud, qwen3-coder-next:cloud)
+       ARE STILL PRESENT in deployments/cognizioware-litellm/litellm-config.yaml and
+       -v2/litellm-config-v2.yaml on `main`. The branch is unusable; the real change is a small
+       2-file edit. *** FIRST VERIFY WHICH COPY IS SOURCE OF TRUTH - the infra notes point at the
+       cognizioware-workstation repo, and the PR's own body says live CT202 /v1/models already
+       returns zero retiring strings, i.e. THIS IS REPO DRIFT, NOT A LIVE OUTAGE. ***
+  #33  epic-4 monitoring + RBAC (Feb 26, CONFLICTING, 48 commits / 160 files)
+       CLOSE as superseded. RBAC shipped via #58 (merged Jul 11). The Prometheus/Grafana stack was
+       never adopted - live observability is Seq + Langfuse.
+  #34  RBAC tests (Feb 26, draft)
+       CLOSE - PREMISE IS FALSE. It adds `BillingRecord.CustomerEmail` to fix a "build failure";
+       that column has existed since migration `20251210102916_AddCustomerEmailToBillingRecords`
+       (Dec 2025) - BEFORE the PR was opened.
+  #32  RBAC verification (Feb 26, draft, CONFLICTING)
+       CLOSE - same false premise. Its own body admits "the specified RBAC files were not found in
+       this repository."
+  #31  GitHub MCP config (Feb 25, draft, CONFLICTING, 23 commits)
+       CLOSE as superseded by the tools-gateway architecture.
+
+================================================================================
+FINDING 5 - BRANCH CLEANUP (51 -> 14)
+================================================================================
+
+**ARCHIVE FIRST, THEN DELETE.** For anything with unique commits, push
+`archive/<name>-2026-09-09` tags so history survives deletion. Confirm every tag resolves before
+deleting the branch it came from. **NEVER use `delete_repo` (task 87).** Deleting a branch is not
+deleting a repo - keep them distinct.
+
+================================================================================
+FINDING 6 - THE LOCAL WORKING TREE IS A HAZARD - *** NOT YOURS TO FIX ***
+================================================================================
+
+The plan describes `docs/youtrack-gap-analysis` on **PTAIT09, Paxton's own workstation** - 253
+commits behind `main`, 25 modified tracked files (incl. `Program.cs` and 12 controllers), ~40
+untracked artifacts, and **377 tracked `node_modules/` files** (5,874 tracked files vs `main`'s
+780).
+
+**A harness run on CT110 cannot and must not touch Paxton's laptop working tree. REPORT ONLY.**
+
+What you CAN do from CT110: cherry-pick the gap-analysis doc commit `4a9824f0` onto a fresh branch
+off `main` and PR it, so the real work is preserved. **Do NOT commit the current working-tree
+state** - those 25 modifications are 253 commits stale and would REVERT MERGED WORK. The archive
+tag and the local cleanup are Paxton's.
+
+================================================================================
+EXECUTION ORDER
+================================================================================
+
+ 0. Read-only check for a stale `lan-deploy` runner on PTAIT09 (`Get-Service actions.runner.*`).
+    If one is registered and running it can contend with `ct210-billing` for deploy jobs.
+    **REPORT BEFORE CHANGING ANYTHING** - and note a harness run may not be able to see PTAIT09
+    at all; say so rather than guessing.
+ 1. **Finding 0 -> HAND TO TASK 78. Do not write a second handoff doc.** (See the boundary above.)
+ 2. Finding 2 + Finding 1 Phase A - CLAUDE.md correctness + doc secret redaction. ONE PR to `main`.
+ 3. Finding 3 - delete the broken pr-checks step, add advisory gitleaks, retire dead workflows,
+    add the missing `author_association` gate. ONE PR to `main`; confirm CI green.
+ 4. Finding 4 - close the 5 PRs with reasons, after re-verifying each.
+ 5. Finding 5 - push archive tags, THEN delete branches (PR-closed ones last).
+ 6. Finding 6 - land the gap-analysis doc from `4a9824f0`; the rest is Paxton's.
+ 7. Finding 1 Phase B - ONLY after verification and pipeline-agent coordination.
+ 8. Open a tracking item for credential rotation. **This task rotates nothing.**
+
+================================================================================
+VERIFICATION
+================================================================================
+
+ - Branches: `gh api repos/cogniziocompany/mcp-cognizioware/branches --paginate -q '.[].name' |
+   wc -l` -> expect 14. Confirm EVERY archive tag resolves: `git rev-parse archive/<n>-2026-09-09`.
+ - PRs: `gh pr list --state open` -> empty.
+ - CI: open a trivial PR touching `src/**`; confirm "Cognizioware01 Pull Request Checks" goes
+   **green** (it currently FAILS) and that `pr-failure-investigator.yml` does NOT fire.
+ - gitleaks: confirm it runs and reports findings WITHOUT failing the job while advisory.
+ - Docs, after Phase A - a pattern search on origin/main for the credential shapes in README.md
+   and CLAUDE.md returns **no hits**. (Search by shape; do not paste any value into the report.)
+ - *** DEPLOY PIPELINE UNTOUCHED - THE CRITICAL REGRESSION CHECK ***
+     `git diff origin/main~N origin/main -- .github/workflows/promote-billing.yml` -> EMPTY for
+       this workstream's commits.
+     `develop`/`release`/`prod` tips unchanged by THIS work - re-check
+       `git rev-parse origin/develop origin/release origin/prod` (the pipeline agent may have
+       advanced them; the point is that YOU did not).
+     Lanes healthy: `curl -s http://192.168.21.153:20252/api/health/ready`, `:20253/...`, and
+       `https://billing.easybutt0n.ai/api/health/ready`.
+     `gh run list --workflow=promote-billing.yml --limit 5` -> no new failures attributable here.
+ - Phase B gate BEFORE any edit: confirm the billing service reads UAT config from env/DB rather
+   than `appsettings.UAT.json`, and that no workflow, compose file or deploy script references a
+   `.env` slated for untracking - on ALL FOUR of main/develop/release/prod.
+
+================================================================================
+EXPLICITLY OUT OF SCOPE
+================================================================================
+
+ - **GitHub Issues** - left untouched per Paxton's direction. No closing, no migration to
+   YouTrack, no relabelling. (The audit validated 10 still-valid / 4 partial / 0 fixed; that
+   record lives in the plan file only.)
+ - **Reconciling the main <-> lane fork** - task 78's, not this one's.
+ - **Rotating any credential**, and **rewriting git history** to purge secrets.
+ - **Restructuring README.md** beyond redacting secrets.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - VERY LOW PRIORITY. If anything else in the queue needs the workspace, yield.
+ - **Never two runs on one working tree** - task 78 may hold an mcp-cognizioware workspace.
+ - Do NOT touch the deploy pipeline files/branches listed in the STOP GATE.
+ - **Never reproduce a credential value.** File and kind only.
+ - Archive before delete; verify the tag resolves first. NEVER `delete_repo`.
+ - **SKIP `dotnet ef migrations add` in this repo - migrations are HAND-WRITTEN.**
+ - Commit by EXPLICIT PATH; never `git add -A` (this tree has 377 tracked node_modules files -
+   `git add -A` here would be catastrophic); check `git diff --stat` before every PR.
+ - PRs as directed above. **DO NOT MERGE.**
+
+================================================================================
+DONE MEANS
+================================================================================
+
+Phase A + Finding 2 landed as one PR to `main` with no credential value anywhere in the diff
+(purge done, no incident language anywhere in the PR);
+Finding 3's CI repair plus advisory gitleaks plus the `author_association` gate as a second PR
+with CI proven green; the five PRs re-verified and closed with reasons (or left open with the
+reason the verdict failed); branches archived as tags THEN deleted, every tag confirmed to
+resolve, count down to ~14; the gap-analysis doc preserved from `4a9824f0`; Finding 0 handed to
+task 78 rather than duplicated (Swashbuckle noted as version drift, NOT escalated - Paxton
+downgraded it); Finding 6 and the PTAIT09 runner check reported, not acted
+on; a credential-rotation tracking item opened; and the deploy-pipeline regression check showing
+this work moved none of `develop`/`release`/`prod` and left `promote-billing.yml` untouched.
+
+
+CORRECTION 2026-09-15 06:44 PT (scheduled tick #102 [32e596]): mcp-cognizioware PR #108 (branch task/102-ci-repair-finding-3-disposition, head bc2dcbb) was built on fd92e93 (task/78 tip), not origin/main - 68 develop-history commits, CONFLICTING, and missing the Finding 6 cherry-pick of 4a9824f0. The deliverable for item (c) is: that SAME branch rebuilt from origin/main = cherry-pick 4a9824f0 + the one disposition .md, force-with-lease pushed so #108 updates in place, PR body corrected (#106 and #107 are OPEN, not landed). No new PR. Then STOP.
+
+
+*** 2026-09-15 07:25 PT TICK #107: run 4723229e stopped at round 3 - item (c) is DONE (PR #108 rebuilt on main, 2 commits/2 files, body corrected). Nothing left for a run; the overseer applies the Finding 4/5 tables after review. Do not relaunch. ***

@@ -1,0 +1,57 @@
+TASK 69a - READ-ONLY. Name the three failing hydra-e2e checkpoints and prove they are the ones that
+dereference HYDRA_REPO_DIR. NO CODE CHANGE. This is slice 1 of 3.
+
+REPO / WORKSPACE: cognizioware-qa
+
+================================================================================
+WHY THIS IS ITS OWN SLICE - read this, it is the reason the task was cut up
+================================================================================
+Task 69 has been attempted THREE times and produced ZERO commits every time. Measured on the third
+attempt (run 20260910T230152Z_70f383f9) at 2026-09-10 23:45-23:56 UTC:
+
+    executor_raw_trajectory.jsonl reached 13,357,549 bytes
+    per-request latency on the local model: 3m44s, 3m30s, 3m9s - CLIMBING with context size
+    the executor sat blocked on ONE in-flight request for ~10 minutes
+    round 1 completed its executor AND auditor and still left zero commits
+
+The failure mode is NOT a hard bug and NOT an unreachable backend: the context grows, prefill time
+grows with it, and the episode runs out its 3600 s budget before finishing. **Smaller context is the
+fix.** So: keep this episode SMALL. Do not read the repository broadly. Open the named files and
+nothing else. If you find yourself grepping the whole tree, stop and report what you have.
+
+================================================================================
+WHAT TO DO - all of it read-only
+================================================================================
+ 1. Open `src/flows/hydra-checkpoint-suite.ts` and list the checkpoint names.
+ 2. Identify WHICH THREE fail, and confirm they are the ones that dereference `HYDRA_REPO_DIR`.
+    The suite reports: score=76.92 passed=10 failed=3 total=13 durationMs=54464.
+ 3. *** IF THE THREE FAILING CHECKPOINTS ARE NOT THE ONES THAT USE HYDRA_REPO_DIR, SAY SO PLAINLY
+    AND STOP. *** The whole diagnosis behind slices 69b and 69c would then be wrong and must not be
+    built on. That outcome is a SUCCESS for this slice, not a failure.
+ 4. Report how far back the failure goes - check earlier runs of the workflow and give the earliest
+    red you can evidence. QA CI has carried a permanent red while its other three jobs passed; put
+    the cost of that blind spot on the record.
+
+================================================================================
+ALREADY MEASURED - DO NOT RE-DERIVE, DO NOT RE-PROVE
+================================================================================
+    QA CI run 34294460756 (2026-09-09T00:18Z): build OK, oidc-shield OK, oidc-acceptance OK,
+                                               hydra-e2e FAILURE
+    runner ct210-qa   status=online   os=LINUX   labels=self-hosted,X64,qa-host,Linux
+    repo variables:   HYDRA_REPO_DIR = C:\hydra-ci      FACTORY_REPO_DIR = C:\factory-ci
+    On CT210, searched /home/runner and /opt to depth 3: NO hydra dir, NO factory dir,
+      and `find / -name fake-agent.js -path "*design*"` returned NOTHING.
+    The exact error is a Windows path concatenated onto a Linux one:
+      Cannot find module '/home/runner/qa/_work/cognizioware-qa/cognizioware-qa/packages/runner/C:\hydra-ci/design/fake-agent.js'
+
+================================================================================
+HARD RULES
+================================================================================
+ - READ-ONLY. No code change, no commit, no push, no PR. Reporting IS the deliverable.
+ - No live Hydra calls, no QA backend calls, no deploys.
+ - Do NOT lower the 76.92 threshold and do NOT delete a checkpoint. Not your slice anyway.
+ - No secrets in output - env var NAMES only.
+ - Keep the episode small. Named files only.
+
+DONE MEANS: the three checkpoint names, the evidence that each one dereferences HYDRA_REPO_DIR (or a
+plain statement that they do not, and stop), and how far back the red goes. Nothing written.

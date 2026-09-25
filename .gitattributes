@@ -1,0 +1,7 @@
+# LF endings end-to-end for anything the CT110 deploy ships to a bash
+# interpreter (2026-09-18 lesson: a CRLF pipe killed deploy-harness-v2.sh
+# with `$'do\r'`).  The runner-side transfer also sha256-verifies both hops,
+# but correct line endings in the CHECKOUT are the first line of defence.
+scripts/deploy/**/*.sh text eol=lf
+scripts/deploy/**/*.py text eol=lf
+.github/workflows/*.yml text eol=lf

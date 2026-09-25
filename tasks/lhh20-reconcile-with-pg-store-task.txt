@@ -1,0 +1,35 @@
+TASK 208 - RECONCILE LHH PR #20 (retry/requeue, task 172) WITH PR #19 (PgQueueStore, task 134)
+
+REPO: cogniziocompany/LongHorizon-Harness. WORK ON THE EXISTING #20 BRANCH feat/task-172-retry-requeue.
+continue_branch: this is a CONTINUATION task - it must keep pushing to PR #20. Never open a second PR.
+Merge main INTO the branch. NEVER rebase a pushed branch. NEVER merge the PR - that is the overseer's.
+
+MEASURED 2026-09-21 by the interactive session in a throwaway worktree (not inferred):
+ - #19 is MERGEABLE/CLEAN against main. Merged locally, it adds ZERO test regressions: the 53 failures seen
+   on Windows are IDENTICAL on plain main (all `OSError: secure control-bus directory creation is
+   unavailable`, control_bus.py:130 - POSIX-only, pre-existing). 24 of #19's 27 tests SKIP without a live
+   Postgres, so "its tests pass" is weak evidence until a DB exists.
+ - #20 vs main TODAY: conflicts in docs/queue.md only (2 hunks).
+ - #20 vs (main + #19): conflicts in FOUR files - docs/queue.md (2), src/lh_harness/config.py (1),
+   src/lh_harness/queue.py (1), src/lh_harness/webapi/server.py (2). So do this AFTER #19 merges, once.
+
+THE TWO THINGS THAT ARE NOT MECHANICAL
+ 1. queue.py: #20 introduces `_VALID_TRANSITIONS` for FOUR statuses; #19 adds a FIFTH, `blocked`
+    (non-terminal, dedup key stays in use). Keep BOTH: `_VALID_STATUS` and `_NON_TERMINAL_STATUS` take #19's
+    five/three-member sets, and the transition table gains blocked: pending->blocked, blocked->pending,
+    blocked->launched (as #19's own comment describes: record_unblock / mark_launched). Without this, #20's
+    `_is_valid_transition` (queue.py:439) rejects every blocked entry.
+ 2. THE REAL GAP: #20 adds `requeue` to the FILE QueueStore only. PgQueueStore implements
+    counts/create/delete/get/list/mark_done/mark_failed/mark_launched/record_skip/set_priority/update and has
+    NO `requeue`. After the cutover (task 168) flips queue_backend to postgres, retry/requeue - the change
+    that ends the done-at-launch stranding class - would not exist on the store in use. Implement `requeue`
+    on PgQueueStore with the same semantics (new successor entry, failed->pending only via successor, a
+    queue_events row), and extend tests/webapi/test_pg_queue.py to cover it. Also check whether
+    record_block/record_unblock, which migration 002's comments name, exist on either store.
+
+ACCEPTANCE
+ - PR #20 reports mergeable=MERGEABLE against main (with #19 in it).
+ - The queue/launcher/guard test selection shows NO NEW failures versus main on Linux (run it on CT110's
+   checkout or CI, not Windows - the control-bus tests cannot pass on Windows).
+ - A test proves: a failed entry requeues on BOTH stores; a blocked entry can unblock and launch.
+Push and STOP.

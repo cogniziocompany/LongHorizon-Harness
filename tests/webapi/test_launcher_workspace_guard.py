@@ -93,13 +93,23 @@ class FakeSupervisor:
         return result
 
 
-def _launcher(tmp_path: Path, probe_open_pr=None) -> tuple[Launcher, QueueStore, FakeSupervisor]:
+def _launcher(
+    tmp_path: Path,
+    probe_open_pr=None,
+    *,
+    occupancy_ignore_dirty: bool = False,
+) -> tuple[Launcher, QueueStore, FakeSupervisor]:
     root = tmp_path / "runs"
     root.mkdir(parents=True)
     supervisor = FakeSupervisor(root)
     store = QueueStore(root)
     config = default_queue_config()
     config["capacity"]["kimi_max"] = 1
+    # Task 173 scope 4: a dirty tree is an OCCUPIED workspace in the default
+    # configuration, so guard tests whose fixtures carry foreign uncommitted
+    # work opt the environment out of the occupancy probes to reach the guard
+    # layer under test (that override is the documented overseer switch).
+    config["occupancy_ignore_dirty"] = occupancy_ignore_dirty
     launcher = Launcher(supervisor, store, queue_config=config, probe_open_pr=probe_open_pr)
     return launcher, store, supervisor
 
@@ -156,7 +166,11 @@ def test_dirty_non_default_branch_preserves_foreign_work(tmp_path: Path) -> None
     # An ahead-of-remote commit on top of the pushed branch.
     _git(repo, "commit", "-q", "-m", "local-only commit ahead of remote")
     ahead_sha = _git(repo, "rev-parse", "HEAD")
-    launcher, store, supervisor = _launcher(tmp_path, probe_open_pr=NO_PR)
+    # The tree here is deliberately dirty (that is the scenario), so this test
+    # uses the occupancy override to reach the guard layer (task 173 scope 4).
+    launcher, store, supervisor = _launcher(
+        tmp_path, probe_open_pr=NO_PR, occupancy_ignore_dirty=True
+    )
     entry = _entry(store, repo)
 
     asyncio.run(launcher.tick())
@@ -529,3 +543,65 @@ def test_guard_unit_continuation_named_branch_mismatch_is_retryable(tmp_path: Pa
     assert "feat/harness-fleet-report" in message
     assert "feat/other-task" in message
     assert "checked-out branch 'feat/other-task'" in message
+
+def test_refused_head_entry_does_not_block_other_workspace(tmp_path: Path) -> None:
+    """Task 230: a refused head entry must not consume the pass's batch capacity.
+
+    Measured 2026-09-24 (~04:25Z, cutover 168): one workspace parked on a
+    branch carrying another task's OPEN PR was refused every cycle, but the
+    refusal CONSUMED the cycle's launch slot, so ~4.5h of cycles skipped every
+    other eligible entry with "launch batch already consumed capacity"
+    (2899 queue.skipped, 0 launches in service_events.jsonl).  The fix: only a
+    SUCCESSFUL launch consumes capacity; a refused/skipped head entry falls
+    through to the next eligible entry in the same cycle.
+
+    The refusal itself is unchanged: the head entry stays pending, the reason
+    names the branch and the PR, and nothing is launched into its workspace.
+    """
+
+    refused_repo = _make_repo(tmp_path, name="ws-refused")
+    _feature_branch(refused_repo)  # carries another task's OPEN PR
+    eligible_repo = _make_repo(tmp_path, name="ws-eligible", default_branch="main")
+
+    launcher, store, supervisor = _launcher(
+        tmp_path,
+        probe_open_pr=lambda repo, branch: "#48 'other task PR' https://gh.example/pr/48",
+    )
+    # Both entries are in the same trio with capacity for exactly ONE launch
+    # this pass; the refused head entry is created first (higher priority), so
+    # pre-fix it consumed the batch slot even though it never launched.
+    head = _entry(store, refused_repo)
+    second = _entry(store, eligible_repo)
+    assert head.priority >= second.priority
+
+    asyncio.run(launcher.tick())
+
+    # The eligible entry in the other workspace launched in the SAME cycle.
+    second_updated = store.get(second.queue_id)
+    assert second_updated is not None and second_updated.status == "launched", (
+        "the eligible entry must launch in the same cycle despite the refused head"
+    )
+    assert len(supervisor.created) == 1
+    assert Path(supervisor.created[0]["workspace"]).resolve() == eligible_repo.resolve()
+
+    # The refusal itself keeps working exactly as before: retryable, loud,
+    # naming the branch and the PR, and the workspace is untouched.
+    head_updated = store.get(head.queue_id)
+    assert head_updated is not None and head_updated.status == "pending"
+    reason = head_updated.skip_reasons[-1]
+    assert "feat/other-task" in reason
+    assert "#48" in reason and "https://gh.example/pr/48" in reason
+    assert "refusing to launch" in reason
+    assert head_updated.reason is None
+    assert _git(refused_repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/other-task"
+
+    # The refused entry produced a queue.skipped service event, and no
+    # "launch batch already consumed capacity" skip exists anywhere.
+    service_log = tmp_path / "runs" / "queue" / "service_events.jsonl"
+    assert service_log.is_file()
+    lines = service_log.read_text(encoding="utf-8").splitlines()
+    assert any(
+        "queue.skipped" in line and "workspace base refused" in line
+        for line in lines
+    )
+    assert not any("launch batch already consumed capacity" in line for line in lines)

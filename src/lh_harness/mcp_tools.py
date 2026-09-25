@@ -9,8 +9,10 @@ routes, and returns plain JSON results that an HTTP MCP wrapper can forward.
 
 No native MCP server SDK is required.  The tools are advertised in
 ``GET /api/mcp/fleet/tools`` and invoked through ``POST
-/api/mcp/fleet/{tool_name}``; a separate LiteLLM-compatible MCP bridge (not in
-this repo) maps the gateway alias ``lhharness`` to those endpoints.
+/api/mcp/fleet/{tool_name}``.  The WebAPI also serves them as a real MCP
+server over streamable HTTP at ``POST /mcp`` (``webapi/mcp_jsonrpc.py``), so
+LiteLLM can register the gateway alias ``lhharness`` directly; both transports
+share this module's manifest and dispatcher.
 """
 
 from __future__ import annotations
@@ -42,6 +44,40 @@ _ENQUEUE_DESCRIPTION = """Enqueue a long-horizon run in the harness service.
 Use this tool to ask the service to start a task. The service stores the task in
 the durable queue, evaluates capacity from [queue.capacity], and launches it
 through the same code path as POST /api/runs.
+
+Accepted fields (all persisted on the queue entry):
+- name (string, required): short human-readable task name.
+- task (string, required): scoped task text. Provide repo, branch,
+  deliverables, and hard rules.
+- workspace (string, required): workspace directory path for the run.
+- trio (string, optional): resource trio, 'kimi' for development work or
+  'qwen' for QA only. No default trio is applied at enqueue time. When
+  omitted, the entry persists with trio unset and never launches until a
+  trio is set: remaining capacity is derived only from the configured
+  trios (launcher.py _remaining_capacity), so each launcher pass records
+  an ' at capacity' skip for the entry (launcher.py _check_eligibility)
+  and it stays pending, unlaunched, consuming no capacity; _launch and
+  _shadow_launch_decision guard the same condition with an 'unknown trio'
+  skip. Supply 'kimi' or 'qwen' whenever the task should actually launch.
+- max_rounds (integer, optional): maximum harness rounds (default 25).
+- priority (integer, optional): higher number = earlier launch within the
+  same trio (default 0).
+- continue_branch (boolean, optional): continuation opt-in. When true the
+  launcher uses whatever branch the workspace currently has checked out
+  as-is (no relocation, no stash, no open-PR refusal). Mutually exclusive
+  with branch.
+- branch (string, optional): continuation opt-in naming a specific branch
+  to use as-is. Mutually exclusive with continue_branch.
+- dedup_key (string, optional): idempotent-enqueue key. Two enqueues with
+  the same non-terminal key resolve to one queue entry, so the work is
+  launched at most once; the key frees up once the entry reaches a
+  terminal state (done/failed).
+- requested_by (string, required): fleet client identity, e.g. 'openwebui'
+  or 'hydra'.
+- base_check (string, optional): base commit/branch check guard.
+
+Unknown fields are rejected with an error naming them; they are never
+dropped silently.
 
 Rules:
 - task text must be scoped: repository, branch, deliverables, and hard rules.
@@ -81,6 +117,61 @@ raise a warning naming the peers; confirm the sibling tree is not mid-PR on the
 same branch.
 """
 
+# Task 235: read-only overseer-state tools over the migrated apparatus archive
+# (README-OVERSEER-APPARATUS.md). They answer "what is the overseer working on,
+# what did it decide, what is waiting on Paxton" without any fleet-host
+# filesystem read.
+
+_GET_QUEUE_ENTRY_DESCRIPTION = """Return the full task text and notes for one overseer queue record.
+
+Reads the migrated overseer apparatus (task 104b): the queue entry snapshot
+filed at launch (queue/done or queue/blocked) plus the task brief it points
+at (tasks/<name>-task.txt in this repository). Pass the record_name, the
+entry name, or its run_id. The note field carries the overseer's triage and
+block/skip reasons verbatim. Read-only; never touches a fleet host.
+"""
+
+_LIST_QUEUE_DESCRIPTION_OVERSEER = """List the overseer's migrated queue archive with skip reasons.
+
+Returns done and blocked queue records (the pre-cutover overseer queue)
+newest launch first, each carrying its verbatim note - the note is where
+skip and block reasons live. Filter with status (done/blocked/all), a query
+substring, and a limit. Read-only over the in-repo apparatus archive.
+"""
+
+_GET_TASK_HISTORY_DESCRIPTION = """Return every archived run for a task number or name.
+
+Searches the migrated overseer queue archive (queue/done + queue/blocked) by
+task number, name fragment, or run_id, newest first. Each run carries its
+name, workspace, trio, launch time, and a note excerpt; use get_queue_entry
+for the full task text and note. This is how a chat client finds out whether
+task N ever ran and what happened, without reading a fleet filesystem.
+"""
+
+_READ_LEDGER_DESCRIPTION = """Read recent rows from the overseer deployment ledger.
+
+Returns sections from docs/LEDGER.md (one section per overseer tick, newest
+last in the file; this tool returns the newest N by default). Filter with a
+query substring. The ledger is the written record of what the scheduled
+overseer observed and decided, tick by tick, up to the cutover.
+"""
+
+_LIST_OPEN_ASKS_DESCRIPTION = """List rows from the overseer open-asks register.
+
+Returns the table from queue/OPEN-ASKS.md as it stood at export time, one row
+per thing the overseer was genuinely waiting on Paxton to decide. By default
+only rows that are still open are returned; pass include_closed=true to see
+the answered/closed rows too.
+"""
+
+_GET_HANDOFF_DESCRIPTION = """Return an operator handoff written during the overseer era.
+
+Reads docs/handoffs/HANDOFF-*.md from the migrated apparatus archive. With no
+argument the most recent handoff is returned; pass a filename (or unique
+substring) to pick one. Each handoff is a point-in-time statement of fact,
+not a live status - newer handoffs supersede older ones on the same topic.
+"""
+
 
 def _is_ascii_only(value: str) -> bool:
     """Return True if every character in value is ASCII."""
@@ -98,6 +189,10 @@ def _tool_spec(name: str, description: str, parameters: dict[str, Any]) -> dict[
         "input_schema": {
             "type": "object",
             "properties": parameters,
+            # Reject unknown properties instead of dropping them silently
+            # (task 233): a chat client misspelling a field must get an error
+            # naming it, not a task filed without that field.
+            "additionalProperties": False,
         },
     }
 
@@ -114,6 +209,15 @@ def _integer_param(description: str, default: int) -> dict[str, Any]:
     return {"type": "integer", "description": description, "default": default}
 
 
+def _boolean_param(description: str, default: bool) -> dict[str, Any]:
+    return {"type": "boolean", "description": description, "default": default}
+
+
+def _optional_integer_param(description: str) -> dict[str, Any]:
+    """Integer parameter the caller may omit entirely (no filled-in default)."""
+    return {"type": "integer", "description": description}
+
+
 def tools_manifest() -> list[dict[str, Any]]:
     """Return the list of fleet MCP tools exposed by this service."""
     return [
@@ -124,9 +228,24 @@ def tools_manifest() -> list[dict[str, Any]]:
                 "name": _string_param("Short human-readable task name.", required=True),
                 "task": _string_param("Scoped task text. Provide repo, branch, deliverables, and hard rules.", required=True),
                 "workspace": _string_param("Workspace directory path for the run.", required=True),
-                "trio": _string_param("Resource trio: 'kimi' for dev, 'qwen' for QA only.", required=True),
-                "max_rounds": _integer_param("Maximum harness rounds.", default=25),
-                "priority": _integer_param("Higher number = earlier launch within the same trio.", default=0),
+                "trio": _string_param(
+                    "Resource trio: 'kimi' for dev, 'qwen' for QA only. "
+                    "Optional: omit to store the entry with trio unset; the "
+                    "launcher then skips it as 'unknown trio' until a trio "
+                    "is set. No default trio is applied at enqueue time.",
+                ),
+                "max_rounds": _optional_integer_param("Maximum harness rounds."),
+                "priority": _optional_integer_param("Higher number = earlier launch within the same trio."),
+                "continue_branch": _boolean_param(
+                    "Continuation opt-in: use whatever branch the workspace has checked out as-is. Mutually exclusive with branch.",
+                    default=False,
+                ),
+                "branch": _string_param(
+                    "Continuation opt-in naming the branch to use as-is. Mutually exclusive with continue_branch.",
+                ),
+                "dedup_key": _string_param(
+                    "Idempotent-enqueue key: same non-terminal key resolves to one queue entry, launched at most once.",
+                ),
                 "base_check": _string_param("Optional base commit/branch check guard.", required=False),
                 "requested_by": _string_param(
                     "Deprecated: stamped server-side from your verified caller identity.",
@@ -164,6 +283,73 @@ def tools_manifest() -> list[dict[str, Any]]:
             _LIST_CONTENTIONS_DESCRIPTION,
             {},
         ),
+        _tool_spec(
+            "get_queue_entry",
+            _GET_QUEUE_ENTRY_DESCRIPTION,
+            {
+                "name": _string_param(
+                    "Record name: the record_name file stem, the entry name, or the run_id.",
+                    required=True,
+                ),
+            },
+        ),
+        _tool_spec(
+            "list_queue",
+            _LIST_QUEUE_DESCRIPTION_OVERSEER,
+            {
+                "status": _string_param(
+                    "Filter by archived status: done, blocked, or all (default all).",
+                    required=False,
+                ),
+                "query": _string_param(
+                    "Optional substring match on record name, entry name, run_id, or task_file.",
+                    required=False,
+                ),
+                "limit": _integer_param("Maximum entries to return (1-500).", 100),
+            },
+        ),
+        _tool_spec(
+            "get_task_history",
+            _GET_TASK_HISTORY_DESCRIPTION,
+            {
+                "task": _string_param(
+                    "Task number, name fragment, or run_id to search for.", required=True
+                ),
+                "limit": _integer_param("Maximum runs to return (1-500).", 100),
+            },
+        ),
+        _tool_spec(
+            "read_ledger",
+            _READ_LEDGER_DESCRIPTION,
+            {
+                "limit": _integer_param(
+                    "Maximum ledger rows to return (1-500). Default 20.", 20
+                ),
+                "query": _string_param(
+                    "Optional substring filter on heading or body.", required=False
+                ),
+            },
+        ),
+        _tool_spec(
+            "list_open_asks",
+            _LIST_OPEN_ASKS_DESCRIPTION,
+            {
+                "include_closed": _boolean_param(
+                    "Include closed/answered rows too.", default=False
+                ),
+                "limit": _integer_param("Maximum rows to return (1-500).", 100),
+            },
+        ),
+        _tool_spec(
+            "get_handoff",
+            _GET_HANDOFF_DESCRIPTION,
+            {
+                "name": _string_param(
+                    "Handoff filename or unique substring. Omit for the most recent.",
+                    required=False,
+                ),
+            },
+        ),
     ]
 
 
@@ -177,6 +363,7 @@ def dispatch(
     auth_token: str | None,
     request_token: str | None,
     caller_configs: dict[str, dict[str, Any]] | None = None,
+    overseer_root: str | None = None,
 ) -> dict[str, Any]:
     """Run one MCP tool call and return a JSON-RPC style result.
 
@@ -191,6 +378,10 @@ def dispatch(
     reserved ``"anon"`` caller -- 401 on every tool; a verified caller outside
     its allowlist gets 403, and a refused gate resolution also emits an audit
     event with ``{caller, tool, run_id, decision}``.
+
+    ``overseer_root`` (task 235) is the resolved apparatus archive root; the
+    WebAPI resolves it once at app creation and passes it here so the
+    overseer-state tools share the deployment's archive path.
     """
     # Auth parity with the REST boundary.
     if auth_token is not None and auth_token != (request_token or ""):
@@ -233,9 +424,59 @@ def dispatch(
         return _resolve_gate(arguments, registry=registry, supervisor=supervisor)
     if tool_name == "harness_list_contentions":
         return _list_contentions(runs_root=_runs_root(registry, supervisor))
+    # Task 235: read-only overseer-state tools over the migrated apparatus
+    # archive. They take no store, registry or supervisor - only the archive
+    # root resolved by the WebAPI.
+    overseer_tools = {
+        "get_queue_entry": _overseer_get_queue_entry,
+        "list_queue": _overseer_list_queue,
+        "get_task_history": _overseer_get_task_history,
+        "read_ledger": _overseer_read_ledger,
+        "list_open_asks": _overseer_list_open_asks,
+        "get_handoff": _overseer_get_handoff,
+    }
+    handler = overseer_tools.get(tool_name)
+    if handler is not None:
+        return handler(arguments, overseer_root=overseer_root)
     # Unreachable: every allowlisted tool is dispatched above (the config
     # loader validates ``tools`` against this same surface).
     return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
+
+
+def _overseer_get_queue_entry(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import get_queue_entry
+
+    return get_queue_entry(arguments, overseer_root=overseer_root)
+
+
+def _overseer_list_queue(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import list_queue as handler
+
+    return handler(arguments, overseer_root=overseer_root)
+
+
+def _overseer_get_task_history(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import get_task_history
+
+    return get_task_history(arguments, overseer_root=overseer_root)
+
+
+def _overseer_read_ledger(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import read_ledger
+
+    return read_ledger(arguments, overseer_root=overseer_root)
+
+
+def _overseer_list_open_asks(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import list_open_asks
+
+    return list_open_asks(arguments, overseer_root=overseer_root)
+
+
+def _overseer_get_handoff(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import get_handoff
+
+    return get_handoff(arguments, overseer_root=overseer_root)
 
 
 def _runs_root(registry: Any, supervisor: Any) -> str | None:
@@ -275,10 +516,24 @@ def _enqueue(
 ) -> dict[str, Any]:
     if queue_store is None:
         return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
-    # Budget ceilings (task 174, section 3.5) run before any validation of the
-    # payload: a caller at its hourly cap gets 429 with a retry hint, and a
-    # max_rounds over the caller's clamp gets 422 with the refusal spelled out
-    # -- never a silently truncated entry.
+    # Task 233: reject unknown argument keys by name instead of dropping them.
+    # The schema already advertises additionalProperties=false; the dispatch
+    # layer enforces it too so non-schema-conformant transports behave the
+    # same way.
+    from .queue import KNOWN_REQUEST_KEYS
+
+    unknown = sorted(set(arguments) - KNOWN_REQUEST_KEYS)
+    if unknown:
+        return {
+            "ok": False,
+            "error": "unknown field(s): " + ", ".join(unknown),
+            "code": 400,
+        }
+    # Budget ceilings (task 174, section 3.5) run after the unknown-key check
+    # but before any store validation of the payload: a caller at its hourly
+    # cap gets 429 with a retry hint, and a max_rounds over the caller's clamp
+    # gets 422 with the refusal spelled out -- never a silently truncated
+    # entry.
     rate = enqueue_rate_violation(spec, queue_store, caller)
     if rate is not None:
         return {"ok": False, "error": rate["error"], "code": 429, "retry_after": rate["retry_after"]}
@@ -289,15 +544,25 @@ def _enqueue(
         "name": _bounded(arguments.get("name"), field="name", max_chars=256, required=True),
         "task": _bounded(arguments.get("task"), field="task", max_chars=100_000, required=True),
         "workspace": _bounded(arguments.get("workspace"), field="workspace", max_chars=4096, required=True),
-        "trio": _bounded(arguments.get("trio"), field="trio", max_chars=64, required=True),
-        "max_rounds": arguments.get("max_rounds", 25),
-        "priority": arguments.get("priority", 0),
+        # trio is optional (task 233): omitting it stores the entry with trio
+        # unset; no default is invented at enqueue time.
+        "trio": _bounded(arguments.get("trio"), field="trio", max_chars=64),
+        # max_rounds/priority stay unset when omitted so the store's own
+        # validation defaults apply (no duplicated defaults here).
+        "max_rounds": arguments.get("max_rounds"),
+        "priority": arguments.get("priority"),
+        "branch": _bounded(arguments.get("branch"), field="branch", max_chars=256),
+        "continue_branch": arguments.get("continue_branch"),
         "base_check": _bounded(arguments.get("base_check"), field="base_check", max_chars=4096),
         # requested_by comes from the VERIFIED caller identity, not from the
         # client: the stamp is the ownership proof for the DELETE rule and the
         # hourly ceiling, so a client cannot forge it by passing the field
-        # (task 174 scope item 3).
+        # (task 174 scope item 3). Main (task 233) additionally requires a
+        # requested_by field and a dedup_key on the body; the stamp wins for
+        # requested_by and dedup_key passes through to the store's own
+        # validation.
         "requested_by": caller,
+        "dedup_key": _bounded(arguments.get("dedup_key"), field="dedup_key", max_chars=256),
     }
     try:
         entry = queue_store.create(body)

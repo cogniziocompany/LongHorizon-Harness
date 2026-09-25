@@ -1,0 +1,92 @@
+TASK 75 - PLAN (do not execute) how to relieve ptait07's root filesystem
+
+THIS TASK PRODUCES A PLAN DOCUMENT. IT CHANGES NOTHING ON ANY HOST.
+
+Hard boundary, no exceptions: ptait07 is a Proxmox (PVE) host. Host-level changes on a PVE host require
+Paxton's explicit go, naming the change, the rollback and a quiet window. A previous host-level change on a
+sibling host (a swap zvol on ptait01) hung the machine and took DNS down with it. So:
+
+  - Do NOT run lvextend, lvcreate, lvresize, resize2fs, pvresize, mkfs, mount, or fstrim anywhere.
+  - Do NOT run docker prune, docker rmi, docker system prune, or delete any file on any host.
+  - Do NOT stop, restart or migrate any container.
+  - Do NOT edit /etc/fstab or any systemd unit.
+  If you find yourself about to change a host, stop and write the step into the plan instead.
+
+MEASURED STATE (read from the live host on 2026-09-10; treat as given, do not re-derive)
+
+Host ptait07 = 192.168.21.138, hostname cognizioware-ptait07. It hosts CT100 (pp-dev-uat), CT101 (ruflo),
+CT201 (cognizioware-ops-it-services) and CT210 (ci-runners - every GitHub Actions runner in the fleet).
+
+  Filesystem            Size  Used Avail Use% Mounted on
+  /dev/mapper/pve-root   94G   80G  9.8G  90% /
+
+  /var/lib                73G      <- essentially all of the used space
+    /var/lib/containerd   47G
+    /var/lib/docker       23G
+    /var/lib/vz          3.8G
+  /usr                   5.5G
+
+  Host docker: 8 images totalling 49.7GB, 12.15GB reclaimable (24%);
+               build cache 3.047GB, 1.686GB reclaimable; 1 local volume 23.87GB, 0B reclaimable.
+
+  VG `pve`: VSize <930.51g, VFree 16.00g
+  LVs: data 794.30g thin pool, Data% 8.48   <- roughly 727G unused
+       root 96.00g
+       swap 8.00g
+       vm-100-disk-0 40.00g (Data% 99.87)
+       vm-101-disk-0 10.00g (Data% 73.75)
+       vm-201-disk-0 24.00g (Data% 23.13)
+       vm-210-disk-0 80.00g (Data% 18.14)
+
+Two facts that shape the answer:
+  1. There IS plenty of space on this server - it is in the `data` thin pool (~727G unused), not on root.
+     The problem is where the space is, not whether it exists.
+  2. CT210 lives in the `data` thin pool, NOT on root. So the CI runners are NOT at risk from root filling.
+     This is important: it means this is a planned-maintenance item, not an incident. Do not write the plan
+     as if CI were about to fail.
+
+Also worth explaining in the plan: vm-100-disk-0 shows Data% 99.87 while the container's own filesystem
+reports only 27% used (40G, 10G used). That is thin-provisioning accounting - freed blocks are not returned
+to the pool without discard/fstrim. Say plainly whether that matters here and why.
+
+WHAT TO PRODUCE
+
+A single markdown document, `docs/runbooks/ptait07-root-capacity-plan.md` (create the directory if the repo
+does not have one; if the repo already has a runbook or ops-docs convention, FOLLOW IT instead and say so).
+
+The document must contain:
+
+1. Current state - the numbers above, presented so an operator can see the shape of the problem in ten seconds.
+2. Why root is full: which consumers, in size order, and what each one is for.
+3. At least three options, each with: what it does, exact commands, how long it takes, whether the host or any
+   container must be stopped, what breaks if it goes wrong, and the ROLLBACK. Consider at minimum:
+     a. Reclaim host docker space (~14GB reclaimable). Cheapest and reversible in the sense that images re-pull.
+        Be precise about the difference between pruning dangling images and `-a`, and say which is safe here.
+     b. Extend pve-root using the 16G VFree. Note honestly that an ext4/xfs grow is ONE-WAY - you cannot
+        cleanly shrink it back - and say what that means for the rollback column.
+     c. Move the large consumer off root: put /var/lib/containerd (47G) on a new LV carved from the `data`
+        pool. This is the option that actually uses the space the server has. Cover the migration order
+        (stop consumers, copy with attributes preserved, swap the mount, verify, keep the old copy until
+        proven), the fstab entry, and how to back out.
+   If you think of a better option, include it.
+4. A RECOMMENDATION - pick one, and justify it against the others. Do not present a menu with no opinion.
+5. The exact quiet-window and rollback wording Paxton needs, written so he can approve it by saying "go":
+   what changes, when, how long, what is at risk, how it is undone.
+6. A short "how we detect this earlier" section: what a check should measure and where it should surface.
+   The ops surface is ops.easybutt0n.ai and its infrastructure results render on /overview. DO NOT design a
+   new page, a new route or a new dashboard - check whether a disk/health check already exists there and
+   extend it. Say which existing check you would extend.
+
+CONSTRAINTS
+
+- Branch off main, PR to main, do not merge.
+- Documentation only. No code that executes against a host. No scripts that change anything.
+- Do NOT ask for credentials, SSH passwords or API keys, and do not attempt to SSH to ptait07. Everything you
+  need is above. If you believe a number is missing, write down which number and why it matters, and proceed
+  with the plan flagged as needing that measurement.
+- No secrets, IPs are fine, but no credentials in the document.
+
+DONE MEANS
+
+The PR is open against main with the single document, it contains a clear recommendation with a rollback for
+every option, and it names the existing ops check it would extend rather than proposing a new surface.

@@ -1,0 +1,143 @@
+TASK 79 - Pi-hole analytics allowlist: make it a versioned, testable artifact (REPO WORK ONLY)
+
+Paxton's request, 2026-09-09, from a plan authored 2026-09-08 (session 04fa96ce, plan file
+`C:\Users\PaxtonTait\.claude\plans\come-up-woth-a-dreamy-creek.md`). **You cannot read that plan file - it is
+on the overseer PC.** Everything you need is below.
+
+## THE SPLIT - READ THIS FIRST
+
+The original plan has the executor apply the change to CT105 directly. **THIS TASK DOES NOT DO THAT.**
+CT105 is production DNS for every device on the LAN, there is no UAT lane for it, and a harness run must not
+make live DNS changes. So:
+
+  - **YOU** produce the versioned artifact, the apply script, the tests and the docs. You change NOTHING live.
+  - **THE OVERSEER** runs the apply against CT105 afterwards and records the verification transcript.
+
+Do not ssh anywhere. Do not run `pct exec`. Do not touch CT105, CT106, ptait01 or corsairai300.
+
+## WHY THIS EXISTS
+
+Both LAN Pi-holes sinkhole Google's measurement domains to `0.0.0.0`. Two consequences:
+ 1. Paxton cannot reach the Google Analytics / Ads consoles from the LAN. A "Google locked me out" symptom is
+    very likely OUR OWN DNS - `analytics.google.com` resolving to `0.0.0.0` looks identical to an account
+    problem in a browser. **This must be retested after the unblock before anyone concludes the account or
+    the legacy property G-Z57H5MVW21 is gone.**
+ 2. The allowlist is hand-maintained and lives ONLY inside the LXCs. A rebuilt or restored Pi-hole silently
+    loses it. That durability problem is the real deliverable - the unblock is the easy half.
+
+## TWO HARD CORRECTIONS TO ANY "OBVIOUS" APPROACH
+
+ - **WRITE THE PRIMARY, VERIFY THE REPLICA.** CT106 is a READ-ONLY MIRROR
+   (`infrastructure/pihole-secondary/README.md:18`). Nebula Sync runs on corsairai300 with `FULL_SYNC=true`,
+   `RUN_GRAVITY=true`, `CRON=*/15 * * * *`. Anything written straight to CT106 is reverted on the next tick.
+   The script must target the PRIMARY only.
+ - **NEVER RESTART FTL.** An FTL restart is a LAN-WIDE DNS OUTAGE. A domainlist change needs a *lists*
+   reload, not a daemon restart. The script must not restart FTL under any flag.
+
+## THE DOMAIN SET - use exactly this, do not widen it
+
+Exact-allow (`domainlist.type = 0`):
+
+    www.googletagmanager.com
+    googletagmanager.com
+    tagmanager.google.com
+    analytics.google.com
+    www.google-analytics.com
+    google-analytics.com
+    ssl.google-analytics.com
+    ads.google.com
+    adservice.google.com
+    www.googleadservices.com
+    googleadservices.com
+    stats.g.doubleclick.net
+    googleads.g.doubleclick.net
+
+Regex-allow (`domainlist.type = 2`):
+
+    ^region[0-9]+\.google-analytics\.com$
+    ^region[0-9]+\.analytics\.google\.com$
+
+**DELIBERATELY NOT ALLOWED:** `pagead2.googlesyndication.com`, `*.doubleclick.net` generally,
+`adservice.google.<cctld>` variants. The doubleclick ZONE stays blocked - only those two host-level
+endpoints are excepted. If a conversion tag still fails later, the fix is to add the specific host it
+queries, NEVER to widen the zone.
+
+## WHAT TO BUILD
+
+1. `infrastructure/pihole/allowlist.d/analytics.txt` (new) - the source of truth. Plain text, one entry per
+   line, `#` comments, blank lines ignored, with clearly marked `# type: exact` and `# type: regex`
+   sections so the script and the test read the same list. The new `infrastructure/pihole/` directory
+   deliberately mirrors the existing `infrastructure/pihole-secondary/` subject-dir pattern.
+
+2. `infrastructure/pihole/apply-allowlist.sh` (new). Follow the house conventions exactly - read
+   `infrastructure/scripts/litellm-team-audit.sh` and `infrastructure/scripts/safe-recreate.sh` first:
+   - `#!/usr/bin/env bash`, a header comment block with `Problem:` / `What this script does:` / `Usage:` /
+     `Environment:` / `Returns:`, then `set -euo pipefail`.
+   - Log prefixes `[*]` info, `[+]` good, `[!]` warn/error. Meaningful exit codes.
+   - **`--dry-run` IS THE DEFAULT; `--apply` is required to write.** Same shape as
+     `create-ct-corsairai300.sh --apply`.
+   - `pihole` is NOT on `$PATH` inside CT105 - drive the DB directly via
+     `pihole-FTL sqlite3 /etc/pihole/gravity.db`.
+   - **IDEMPOTENT**: insert only where the row does not already exist, keyed on (domain, type). Re-running
+     must be a no-op, and it must NEVER delete a pre-existing hand-added entry.
+   - Print a before/after diff of the managed rows.
+   - **VERIFY THE TYPE CODES BEFORE TRUSTING THEM.** Expected Pi-hole v6: 0 exact-allow, 1 exact-deny,
+     2 regex-allow, 3 regex-deny. The script must confirm against the known-good hand-maintained allowlist
+     (cognizio.company, easybutt0n.ai, the Microsoft telemetry entries) before inserting.
+     **Getting this backwards inserts BLOCKS, not allows.**
+   - **SQLite: single quotes only.** Double quotes parse as identifiers.
+   - Reload lists WITHOUT restarting FTL.
+
+3. `infrastructure/pihole/README.md` (new) - what it is, why it is in git, the primary-writes/replica-syncs
+   rule pointing at `../pihole-secondary/README.md`, how to run it, how to roll back.
+
+4. `e2e/suites/38-lan-dns-redundancy.test.js` (MODIFY - **do not add a new suite**). Suite 38 already pins
+   both resolvers via `dns.Resolver().setServers([...])` against 192.168.21.3 / .4 and already has the
+   softSkip + `RUN_LIVE_REGRESSION` pattern. Extend it:
+   - Parse `allowlist.d/analytics.txt` (exact entries only) so test and applied state share ONE list.
+   - For each exact domain, resolve on BOTH resolvers; assert the answer is not `0.0.0.0` and not empty.
+   - A parity test: primary and secondary must agree per domain. **This is what proves Nebula Sync actually
+     propagated, and it is the check that would catch a hand-edit on CT106.**
+   - Keep the soft-fail semantics (off-LAN -> skip; hard fail under `RUN_LIVE_REGRESSION=1`). Prefer the
+     registry-recording softSkip used in `e2e/suites/26-fleet-dns-tls.test.js:69`
+     (`require('../lib/skip-registry')`) so skips land in `e2e/.skips.json`.
+
+5. `e2e/suites/26-fleet-dns-tls.test.js` - **CHECK, do not casually edit.** Its `26A` group asserts
+   `doubleclick.net` is sinkholed. The two host-level DoubleClick allows should NOT trip it, because that
+   test queries the APEX and the apex stays blocked. Verify by reading the assertion. **If it would trip,
+   narrow the allowlist rather than weakening suite 26's ad-block assertion** - and say so in the report.
+
+6. `e2e/package.json` - add `"test:lan-dns": "npx jest --testPathPattern=38-lan-dns-redundancy --forceExit"`.
+   Suite 38 currently has no alias.
+
+7. `e2e/README.md` - add/refresh the suite-38 row in the `| # | Suite | Tests | Coverage |` table.
+
+8. `CLAUDE.md` - add to the Pi-hole maintenance section: where the allowlist now lives, that it is applied by
+   `apply-allowlist.sh` on the PRIMARY only, that it propagates via Nebula Sync, that suite 38 covers it, and
+   the GA/Ads scope decision including what was deliberately left blocked. **ONLY ADD** - do not delete or
+   reword existing content (Paxton's standing preference).
+
+9. `design docs/handoff-docs/pihole-analytics-allowlist-handoff.md` (new) - match the template of
+   `design docs/handoff-docs/ops-control-center-handoff.md`: title, metadata table, `## TL;DR - what
+   shipped`, `## What is in the repo`, `## Operator steps`, `## Verification transcript`, `## Rollback`,
+   `## Open items`. **Leave the verification transcript section with a clearly marked placeholder** - the
+   overseer fills it with real `dig` output after applying, along with the observed type codes, whether
+   Nebula Sync was running, the propagation delay, and the Google-account retest result.
+
+## HARD RULES
+
+ - Branch `feat/pihole-analytics-allowlist` off **main**. PR to main. DO NOT MERGE.
+ - **NO live changes**: no ssh, no `pct exec`, no DNS writes, no deploy, no workflow dispatch.
+ - `infrastructure/litellm-config.yaml` MUST NOT be touched - it force-recreates the production router.
+ - Commit by explicit path; never `git add -A`. This repo has CRLF endings - do not reformat, and check
+   `git diff --stat` before opening the PR.
+ - Env NAMES only, never values. The Pi-hole admin password exists; do not put it, or any credential, in any
+   file, doc or commit message.
+
+## DONE MEANS
+
+A PR against main with: the allowlist artifact, an idempotent `--dry-run`-by-default apply script that never
+restarts FTL and verifies the type codes before inserting, suite 38 extended with both the resolution and the
+primary/secondary parity assertions, the suite-26 check result stated, the package.json alias, the README and
+CLAUDE.md additions, and the handoff doc with the verification section left for the overseer. Report test
+counts, baseline first, and state plainly whether suite 26 would trip.

@@ -1,0 +1,15 @@
+{
+  "name": "44-fleet-window-ux-gate",
+  "task_file": "C:/tmp/fleet-window-ux-gate-task.txt",
+  "workspace": "cognizioware-qa",
+  "max_rounds": 5,
+  "trio": "kimi",
+  "run_id": "20260909T105730Z_3f8c8123",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "syn:large:vision:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-09T10:57:30.823571+00:00",
+  "note": " || STATE = MERGED, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in a triage of every undispositioned failed/cancelled entry. The run ended without a disposition note, but its work SHIPPED: branch feat/fleet-window-ux-gate -> cognizioware-qa PR #26 is MERGED at 4915fcb. This was a RECORDS gap, not a work gap: nothing needs relaunching. LIVE/VERIFIED still require the usual lane and read-back evidence."
+}

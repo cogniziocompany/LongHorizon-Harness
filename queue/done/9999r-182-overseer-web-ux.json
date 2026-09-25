@@ -1,0 +1,16 @@
+{
+ "name": "9999r-182-overseer-web-ux",
+ "task_file": "C:/tmp/overseer-web-ux-task.txt",
+ "task_source": "task_file",
+ "workspace": "ptait09-easybutt0n-ai",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "note": "Queued 2026-09-16 by session [fe2679] on Paxton's instruction: the overseer's comms (HANDOFF-*.md, OPEN-ASKS, LEDGER, queue state, artifacts) move to a DB-backed web UX at fleet.easybutt0n.ai/overseer on fleet-admin (Express+React, Postgres schema fleet). Builds ON task 92 (hydra PR #25 session-bridge docs/template), 134 (queue via harness API only), 119 (folded in), 145 (linked), 148 (pattern). Idempotent keys = repo|branch|overseer session|run ids (= the Langfuse tags). Shared artifact space = /home/harness/handoffs/<key> on CT110 via one new harness route, not a cross-CT mount. SLICES 182a schema+API, 182b UI, 182c migration, 182d tick+artifacts pre-authorised. Appended after pp and fleet-plane tasks. || TICK #450 (2026-09-17 10:17 PT): run c8e4a4c5 hit its 8/8 ceiling and gated (approval adece7697c2e) asking for task 119's eleven-state list - it could not read LOOP-PROMPT.md from PTAIT09. RESOLVED STOP with the canonical list supplied; run read back cancelled/alive False. STATE = PR, verified on CT110 rather than from the run's report: d15a5d5+e2d4375 (182a) and 3f5be96 (182b) exist, both branches on origin, PR #54 (182a -> easybutt0n-runner-v2) and PR #55 (182b -> 182a) OPEN, both reviewDecision EMPTY. The embedded schema.sql CHECK constraint already matches the canonical eleven states + four off-path states exactly, so AC6 was satisfied as written. NOT MERGEABLE TO MAIN despite MERGEABLE on both: the stack is 182b -> 182a -> easybutt0n-runner-v2 -> main and easybutt0n-runner-v2 is itself PR #35. Remainder (182c) re-queued as task 197 '9999zb-197-overseer-web-ux-182c' with the eleven-state answer embedded; 182d follows after 197 lands.",
+ "run_id": "20260917T135926Z_c8e4a4c5",
+ "roles_bound": {
+  "manager": "nemotron-3-super:synthetic-anthropic",
+  "executor": "syn:large:vision:synthetic-anthropic",
+  "auditor": "kimi-k3:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-17T13:59:26.634038+00:00"
+}

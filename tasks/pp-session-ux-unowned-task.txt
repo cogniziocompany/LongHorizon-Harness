@@ -1,0 +1,114 @@
+TASK 154 - The four powerplatform session-UX findings that NO existing task owns.
+
+REPO: `cogniziocompany/cognizioware-powerplatform`. **Base on `origin/develop`, NOT main** - pp prod
+runs develop-derived images and main is separately held.
+Source: `docs/handoff/PLAN-powerplatform-session-ux-fixes.md`, **ON ORIGIN as `8210a96`** - the tip of
+branch `ci/env-promotion`. VERIFIED by the overseer 2026-09-10 21:25 PT.
+*** IT IS NOT ON `develop`, WHICH IS YOUR BASE. *** `ci/env-promotion` is 2 ahead / 1 behind
+`origin/develop`, and the doc exists only on that branch. **Read it from `origin/ci/env-promotion`**
+(e.g. `git show origin/ci/env-promotion:docs/handoff/PLAN-powerplatform-session-ux-fixes.md`). Do NOT
+conclude the source is missing because it is absent from your base branch.
+
+================================================================================
+*** THIS TASK EXISTS ONLY FOR WHAT THE OTHER FOUR TASKS DO NOT COVER. READ THE DEDUP FIRST. ***
+================================================================================
+The source plan has eight findings. Four are already owned:
+
+  Screenshot 2, the wizard "Next - Requirements" no-op -> **TASK 107**. Do not touch
+      `SessionWizard.tsx` or `SolutionStep.tsx` gating. VERIFIED still live on origin/develop:
+      `SessionWizard.tsx:44` reads `sessionId`, `:117` guards on `envId`.
+  Screenshot 3, discover/refresh/Open-button states -> already CONFIRMED CORRECT in code; the only
+      action was e2e tagging -> **TASK 153**.
+  Screenshot 5, e2e `@production-ready` tagging and making the specs execute -> **TASK 153**.
+  The Publisher card copy -> **TASK 108**. Item 3 (admin probes) already shipped as PR #106.
+  The 2x2 greenfield/brownfield x create/resume matrix -> **`pp-e2e-coverage-ci-gates`**, gated on 107.
+
+**If you find yourself editing the wizard, the probes, or building the coverage matrix, STOP - you
+are in another task's scope.**
+
+*** ONE FILE IS SHARED WITH TASK 153 AND THE BOUNDARY IS NARROW: `nav-archive.spec.js`. ***
+**153 OWNS MAKING IT EXECUTE** - tagging it `@production-ready`, adding it to `testMatch` in
+`e2e/playwright.config.js`, and the `e2e:prod-ready` script. **Do NOT do any of that here.**
+THIS task adds exactly ONE test case to that spec: the back-button assertion for item 3.
+If 153 has not landed yet, the spec still does not run - add the case anyway and say plainly in the
+PR that it is **not yet executing, pending 153**. Do NOT add it to `testMatch` yourself to make it
+run; that is 153's change and doing it in both places produces a merge conflict in the same file.
+
+================================================================================
+THE FOUR ITEMS THAT ARE YOURS
+================================================================================
+
+1. LEGACY SESSIONS RENDER AS BROKEN INSTEAD OF AS LEGACY.
+   `/sessions/:id/flow` is the **legacy** pipeline UI (`packages/frontend/src/flow/FlowVisualizer.tsx`).
+   Uploads were never on that page - `features/session/setup/SpecUploader.tsx` is used only by the new
+   wizard (`sessions/wizard/SpecsStep.tsx`) and the legacy create form (`SessionList.tsx:249-259`).
+   Sessions showing "Untitled Session", `Step 0 / 6`, no workspace and no solution were created
+   through `POST /api/sessions` (`SessionList.tsx:239`), NOT through the wizard. They have no
+   `setup_state`, so the flow page has nothing to attach to and the first agent fails immediately.
+   **FIX:** in `FlowVisualizer.tsx` and `SessionDetail.tsx`, when a session has no
+   `solution_unique_name` / `setup_step`, render an explicit **"This session predates the setup
+   wizard"** card with a **Migrate to setup** button opening `/sessions/:id/setup` (the wizard already
+   supports resume). **HIDE the Start Pipeline button in that state** - offering it is what produces
+   the immediate agent failure.
+   *** DO NOT write a migration or SQL to archive legacy sessions. The plan floats it as optional;
+   deleting or archiving production rows is Paxton's call, not this task's. Propose it, do not do it. ***
+   **CAVEAT, and it matters:** task 107's `persistStep` fix may change how many sessions land in this
+   state. It does NOT remove the state - sessions created through the legacy form still exist - so
+   this fix stands on its own. Say so in the PR rather than letting a reviewer assume 107 supersedes it.
+
+2. THE PROCESS STRIP IS NOT NAVIGABLE, AND LIES ON THE ALL-ENVIRONMENTS PAGE.
+   The stepper is derived from the route in `ui/GuardedLayout.tsx:19-30`: `/sessions` and
+   `/environments/:id/sessions` are hard-mapped to step 3; step 4 (Design) is `/sessions/:id/flow`;
+   step 6 is `/sessions/:id/workspace`. **There is no step-5 route**, and steps are not clickable.
+   **FIX:** make `ProcessStrip` steps navigable when a target exists - step 1 -> `/environments`,
+   step 3 -> the current environment's sessions, steps 4/6 -> the selected session's flow/workspace
+   (pass `sessionId` through `layoutStripContext`). Render unreachable steps as **disabled with a
+   tooltip** ("Open a session to continue") rather than as dead text.
+   Also **stop rendering "You are here - Session setup" on the All-environments page**: with no
+   `envId` there is nothing to advance to, so show step 1/2 context instead.
+   **Do NOT invent a step-5 route to fill the gap.** If step 5 has no page, the strip should say so.
+
+3. THE "<- Environments" BACK BUTTON IS BROKEN. One line.
+   `SessionList.tsx:323` navigates to `` `/environments/${envId}` `` - **no such route exists**
+   (`App.tsx:26-42`), so the router renders nothing and the user is stranded.
+   **FIX:** navigate to `/environments`. Add a unit test under `sessions/__tests__/` and cover it in
+   `nav-archive.spec.js`.
+
+4. NO FOOTER: no build version, no environment label.
+   There is no footer anywhere. Layout chrome lives in `ui/Shell.tsx` and `ui/GuardedLayout.tsx` (the
+   strip sits above the outlet). **FIX:** put the footer in `GuardedLayout.tsx` BELOW the outlet so it
+   renders once for every guarded page. Include the build version and the environment label.
+   **Source the version from the same place `/api/health` reports it** - a footer that shows a
+   different version from the health endpoint is worse than no footer. Note that
+   `/api/runtime-config` currently has **no `appEnv` field on prod**, which is exactly how the
+   deployment gap was detected; if you need `appEnv` for the label, say plainly that it must be added
+   rather than inferring the environment client-side.
+
+================================================================================
+VERIFICATION
+================================================================================
+ 1. Item 1: load a legacy session (one with `Step 0 / 6` and no solution). The legacy card renders,
+    Start Pipeline is ABSENT, and Migrate to setup opens the wizard on that session id.
+ 2. Item 2: from the All-environments page the strip shows step 1/2 context, not "Session setup".
+    With a session selected, steps 4 and 6 navigate; unreachable steps are disabled and show the
+    tooltip. No step-5 route was invented.
+ 3. Item 3: the back button lands on `/environments`; unit test + `nav-archive.spec.js` cover it.
+ 4. Item 4: the footer renders on every guarded page exactly once, and its version string MATCHES
+    `/api/health`. Check both light and dark.
+ 5. Frontend tests: `npm run test -w packages/frontend` (Vitest + happy-dom) stays green.
+ 6. Verify against **dev/uat** (192.168.21.163 :3000 / :3001), not prod.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Base on `origin/develop`. Merging to main deploys PROD - do not merge there.
+ - Do NOT create or delete data in the production tenant; no archive migration.
+ - Never `git add -A`; commit by explicit path; `git diff --stat` first.
+ - Do NOT merge, and do NOT post an `@claude` comment - it bills Paxton's personal subscription.
+ - Note: the app repo has a post-commit hook that complains `graphify-out/.hook.log` is missing. It
+   is PRE-EXISTING and harmless - the commit still lands. Do not "fix" it here and do not treat it as
+   a failure.
+
+DONE MEANS: all four items are implemented and PR'd against develop, each verified on dev/uat as
+above, with the PR stating explicitly that item 1 stands independently of task 107 and that no
+step-5 route was invented to fill the stepper gap.

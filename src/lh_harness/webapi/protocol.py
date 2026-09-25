@@ -35,6 +35,9 @@ def build_meta(
     fleet_ever_succeeded: bool = False,
     fleet_last_ok: bool | None = None,
     fleet_last_error: str | None = None,
+    drain: dict[str, Any] | None = None,
+    launcher_stalled: bool = False,
+    launcher_stall_cycles: int | None = None,
 ) -> dict[str, Any]:
     """Return the stable handshake payload used by both clients."""
 
@@ -67,8 +70,23 @@ def build_meta(
     result["fleet_ever_succeeded"] = bool(fleet_ever_succeeded)
     result["fleet_last_ok"] = fleet_last_ok
     result["fleet_last_error"] = fleet_last_error
+    # Launcher stall detector (task 230): the plain-flag surface the workbench
+    # reads to see that the launcher has had N consecutive stalled cycles.
+    # ``launcher_stall_cycles`` is None until at least one stalled cycle was
+    # counted (the counter itself stays at 0 while healthy), so a False flag
+    # is never confused with a counter that simply has not started counting.
+    result["launcher_stalled"] = bool(launcher_stalled)
+    if launcher_stall_cycles is not None:
+        result["launcher_stall_cycles"] = int(launcher_stall_cycles)
     if mcp_gateway_alias is not None:
         result["mcp_gateway_alias"] = mcp_gateway_alias
     if model_discovery is not None:
         result["model_discovery"] = model_discovery
+    # Queue drain state (task 242) in the same plain-flag style as the fleet
+    # fields: always present when the server passes it (``{"enabled": bool,
+    # "reason": str|None, "since": ts|None}``).  Consumers such as the fleet
+    # window and deploy tooling read ``drain.enabled`` to see a maintenance
+    # window without a second call.
+    if drain is not None:
+        result["drain"] = drain
     return result

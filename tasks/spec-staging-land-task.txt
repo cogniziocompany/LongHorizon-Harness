@@ -1,0 +1,183 @@
+TASK 150 - LAND the spec-staging work. It is BUILT and UNLANDED, and it is not in any queue.
+
+*** OVERSEER-EXECUTED. NOT FOR A HARNESS RUN. IN queue/blocked/ DELIBERATELY. ***
+CORRECTED 2026-09-15 by scheduled tick #183: the push/PR half of this reason is RETIRED. CT110 runs
+hold a scoped GH_TOKEN and push + open their own PRs since 2026-09-14 16:21 PT, so
+"CT110 has NO `gh` and NO GitHub token - measured 20:25 PT from run b9cfaaa8's gate" is FALSE now.
+**THE BLOCK STILL HOLDS ON ITS SECOND HALF:** the deploy step RESTARTS the CT110 service, which kills
+every in-flight run, and a run must never deploy the harness it is running inside. So the PR could be
+opened by a run; the DEPLOY stays overseer-executed in a counted zero-active window.
+
+Paxton asked 2026-09-10 20:30 PT whether this work was "tasked or queued". **It was neither.** This
+task exists so it is not lost. **THE WORK IS ALREADY WRITTEN - DO NOT REBUILD IT.**
+
+================================================================================
+WHAT EXISTS RIGHT NOW - measured by the overseer 20:32 PT, do not re-derive
+================================================================================
+    repo    C:\Users\PaxtonTait\source\LongHorizon-Harness
+    branch  feat/spec-staging   (currently checked out)
+    18 commits ahead of main, and **0 remote refs - IT HAS NEVER BEEN PUSHED**
+    PLUS 17 files still UNCOMMITTED on top: +848 / -24
+    untracked: templates/, src/lh_harness/spec_stats.py, tests/test_spec_stats.py,
+               tests/webapi/test_queue_spec.py, docs/handoffs/spec-staging-2026-09-10.md
+    open LHH PRs are #10, #8, #7 - none of them is this
+
+So its state is **BRANCHED at best, and partly not even committed.** Not PUSHED, not PR, not
+REVIEWED, not MERGED, not LIVE.
+
+REPORTED BY THE BUILDING SESSION (verify, do not assume): full pytest in a Linux container -
+**585 passed, 2 failed, 1 skipped**; the two failures (deepseek adapter e2e, launcher key-health
+file-URL) fail identically on a CLEAN tree, so they are pre-existing. **Re-run and confirm that
+"identical on clean tree" claim yourself before merging** - "pre-existing" is exactly the kind of
+assertion that turns out to be caused by the branch.
+Also reported NOT verified by them: the UI against a live backend, because CT110 returns 405 for the
+new routes until this branch is deployed. So the UI is unproven, and the task must say so.
+
+================================================================================
+WHAT IT DELIVERS
+================================================================================
+A BMAD-style spec-staging stage between "queued" and "launched": a spec template
+(`templates/task-spec.md`), per-workspace draft specs, a learned size range
+(`src/lh_harness/spec_stats.py`, median +/- 3 scaled MAD over the last 50 finished specs, established
+at n>=5), new `spec_pending` queue status with mark-ready/preview routes and MCP mirrors, a Web UI
+queue panel with a size cell and an out-of-range notice, and the token fix below.
+
+*** THE MEASUREMENT THAT MOTIVATES IT: manager prompts at 90,000-96,500 tokens, of which the fixed
+instruction text is only ~4.1k. The rest is the raw task_file body plus re-injected history. ***
+
+================================================================================
+*** OVERLAP WITH TASK 94 - READ BEFORE TOUCHING role_prompts.py ***
+================================================================================
+`737-94-history-caps` (queue/done/) ALREADY OWNED the core finding, in its own words:
+    "role_history_chars=100_000, applied TWICE in role_prompts.py (lines 58+60) = 200k chars
+     ~= 50k tokens of history per manager prompt; the function's own default is 36_000."
+94's deliverable was **configurability first, value change as a separate evidenced PR**, and that
+landed as `92806f2` on `perf/role-context-caps`.
+VERIFIED BY THE OVERSEER 20:32 PT:
+    main   role_prompts.py:58,60  -> BOTH still `max_chars=max_history_chars`  (double-spend LIVE)
+    branch role_prompts.py:72,74  -> `auditor_share` / `feedback_share`        (FIXED here)
+**So this branch is the value change task 94 deferred. It is the follow-through, not a duplicate -
+but say so in the PR and reference 94, or a reviewer will read it as unowned scope creep.**
+
+================================================================================
+*** THREE TASKS NOW EDIT C:/tmp/launch_queue.py. THIS MUST BE SEQUENCED. ***
+================================================================================
+    task 147  the `C:/tmp/queue/DRAIN` flag  - ALREADY APPLIED by the overseer 20:30 PT
+    task 148  `push_trios()` fleet push      - to be delivered as a patch, not applied
+    task 150  this: the spec gate (SS3)      - `spec_file` / `spec_status` / SPEC_PENDING
+**Check what is actually in the live file before editing it** - the overseer edited it at 19:12 and
+again at 20:30, and the building session reports it also added a gate helper there. If two edits
+have collided, reconcile against the backups (`launch_queue.py.bak-*`) rather than overwriting.
+LAUNCHER-EDIT DISCIPLINE, every time: back up first; CRLF only (verify CRLF==totalLF, bareLF==0,
+bareCR==0 - appending CRLF onto a line already ending CR produces CR CR LF, a bug made twice today);
+`ast.parse`; exactly ONE launcher process after; log APPENDED not truncated; restart just AFTER a
+poll. **A file edit is inert until the restart** - proven at 19:09 when the process had been running
+15:15 code for four hours. The building session explicitly did NOT restart it.
+
+================================================================================
+TWO DECISIONS THE BUILDING SESSION LEFT OPEN - THEY ARE PAXTON'S, NOT YOURS
+================================================================================
+ SS8  Bridging the live file queue into the QueueStore so the UI shows the real fleet. Three ranked
+      options; their recommendation is **option 1, "Mirror"** (launch_queue.py becomes the writer of
+      record, upserting one entry per file, A stays authoritative). Option 3 (port the probe/
+      rotation/ramp logic into launcher.py) is explicitly HIGH RISK - every rule in that file was
+      paid for by a live incident. **Do not pick option 3 on your own authority.**
+ SS9  The same history-budget fix in three VENDORED eval harnesses (OSWorldv2, WeaveBench, TB).
+      Their recommendation is option 1, fix in place. NOTE their own caveat: whether `0` means
+      "unlimited" or "none" **differs per copy and must be read**, not assumed.
+      SS6 and SS9-option-1 are ONE change applied to four files - treat as one story, not two.
+**Record the decision in the PR body. Do not silently implement one.**
+
+================================================================================
+STEPS
+================================================================================
+ 1. Confirm the two test failures are genuinely pre-existing: stash the branch changes, run the
+    suite on a clean tree, compare. Report both numbers.
+ 2. Commit the 17 modified + 5 untracked paths BY EXPLICIT PATH. **Never `git add -A`** - the tree
+    holds unrelated scratch. `git diff --stat` before committing. Attribution trailer required.
+ 3. Push `feat/spec-staging` and open the PR against `main`. Reference task 94 for the history-budget
+    lineage, and carry the SS8/SS9 options tables with the decision line filled in by Paxton.
+ 4. Get it REVIEWED. LongHorizon-Harness DOES carry `claude-code.yml` (canonical blob 71abcfef5cbc),
+    so the reviewer works here - **but the overseer must NEVER post the `@claude` comment: it bills
+    Paxton's personal subscription (task 117). Paxton triggers it from his own account.**
+ 5. **DEPLOY IS WINDOWED.** The CT110 deploy restarts the service and kills every in-flight run; the
+    deploy script aborts unless zero runs are active. Take it in the SAME drain window as tasks
+    144/147, after the CT202 work, not before.
+ 6. Only after deploy: verify the UI against the live backend - the new routes currently 405. Until
+    then the UI half is UNPROVEN and must be reported that way.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Do NOT rebuild any of this. It is written. Land it.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat` first.
+ - Do NOT post an `@claude` comment. Do NOT merge without a review.
+ - Do NOT deploy CT110 outside the zero-active-run window.
+ - Do NOT pick SS8 option 3, or implement either open decision, without Paxton's word.
+ - Env var NAMES only; no key or token values anywhere.
+
+DONE MEANS: the two failures are proven pre-existing against a clean tree with both numbers recorded;
+the branch is committed by explicit path, pushed and PR'd with task 94 referenced and the SS8/SS9
+decisions stated; the PR is REVIEWED and merged; CT110 is deployed inside a counted zero-active
+window; and the UI is verified against the live backend - or explicitly reported UNPROVEN with the
+405 as the evidence.
+
+================================================================================
+*** REVIEW FINDINGS, ADDED BY THE OVERSEER 2026-09-10 21:45 PT. Source: Paxton, session [4aa9cb],
+from an exploration pass over the working tree. Fix these as part of landing the branch. ***
+================================================================================
+Run `/code-review high` on the working tree first, then address:
+
+ 1. **MISSING SPEC FILE CRASHES ENTRY CREATION.** `queue.py::_validate_spec_file` RAISES when the spec
+    file is absent at entry-creation time. It should store the entry as `spec_pending` and report a
+    validation error. A queue that refuses to accept an entry because its spec is not written yet
+    defeats the point of a staging state.
+ 2. **UNBOUNDED SPEC READS.** Spec text is read with no cap - in a change whose entire purpose is to
+    bound prompt size. Cap it with `task_text_warn_chars` from `types.py`.
+ 3. **TWO FRONTMATTER PARSERS.** One in `launch_queue.py::_task_text` (currently ~L453, verified) and
+    another in `spec_stats.py`. Two parsers for one format drift apart silently. Either have the
+    launcher import/copy the harness parser, or add a test feeding BOTH the same fixtures.
+ 4. **THE AUDITOR'S BUDGET WAS HALVED AS A SIDE EFFECT.** `role_prompts.py` now SHARES
+    `role_history_chars` between auditor reports and harness feedback. That is the intended token fix,
+    but it also halves auditor context. **Either give the auditor its own budget, or name the change
+    explicitly in the PR body.** The auditor's rejection reasons are what the manager must act on - a
+    silent halving of that context is exactly the kind of change a reviewer should be told about.
+ 5. **CONFIRM THE TWO FAILURES ARE PRE-EXISTING ON A CLEAN TREE.** `test_deepseek_adapter...` and
+    `test_launcher_key_health...`. Check on a CLEAN MAIN WORKTREE that they fail there too, and record
+    both numbers. **Do NOT prune WSL worktrees from Windows** - that is a known destructive hazard.
+
+COMMIT DISCIPLINE: commit with `core.autocrlf=false` and check `git diff --stat` for CRLF noise before
+pushing. **Open the PR, then merge as a SEPARATE step after CI - never chain create+merge.**
+
+================================================================================
+*** PAXTON 2026-09-10 22:40 PT: THE SIZE RANGE IS THE SLICING TRIGGER, AND BMAD WRITES THE SLICES. ***
+================================================================================
+Tonight gave this feature its justifying case, so build it to catch exactly this:
+
+    Task 125 ran **FIVE HOURS** and reached round 6 of 10 without finishing - all three roles on
+    `ornith-1.5:pool`, the LOCAL single-slot lane, because Synthetic was down. It had to be stopped
+    and sliced into 125a/125b/125c by hand.
+    Task 69 did the same: **three failures at 3600s**, then sliced - and 69a finished in **8 minutes**.
+
+**Both were discovered AFTER the burn. The whole point of `spec_stats` is to know BEFORE the launch.**
+
+SO, ON TOP OF WHAT THIS TASK ALREADY BUILDS:
+ 1. **`classify()` returning `above` IS THE "THIS NEEDS SLICING" SIGNAL.** Do not leave it as a
+    cosmetic badge. An out-of-range spec should say plainly, in the UI notice and in
+    `stage_specs.py`'s `SPEC_OUT_OF_RANGE` line, that the task is a **slicing candidate** and name the
+    two precedents above. Keep it ADVISORY - **do not block the launch on it.** A hard block on a
+    learned range with n=5 would stall the queue on its own noise.
+ 2. **BMAD_Cognizioware writes the slice specs.** The template this task adds
+    (`templates/task-spec.md`) is BMAD-derived; when a spec measures `above`, the remedy is to run the
+    BMAD spec process to produce N smaller specs, each its own queue entry, rather than hand-editing
+    prose. **Task 111 proved BMAD does NOT currently execute as a generator in that repo** (skill
+    sources absent, manifests point at directories that do not exist) - so this task must NOT assume
+    it runs. Wire the hand-off and say plainly that the generator half is blocked on that finding.
+ 3. **SIZE IS A PROXY, NOT THE CAUSE - say so where an operator will read it.** 125's spec was not
+    unusually long; it was unusually *broad* (DB export + NAS transfer + destination verification +
+    audit surface + scheduling + locking). And it ran slowly because the LOCAL lane is single-slot,
+    which no character count can see. **Record the executing MODEL alongside the size**, or the range
+    will quietly learn two different distributions and explain neither.
+
+*** THE LESSON TO ENCODE, IN ONE LINE: an oversized task moves its failure BETWEEN roles and rounds;
+a failing backend fails the SAME role repeatedly. The size range can only ever flag the first. ***

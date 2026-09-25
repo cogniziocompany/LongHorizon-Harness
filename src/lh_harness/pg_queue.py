@@ -19,10 +19,14 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from .queue import QueueEntry, _NON_TERMINAL_STATUS, _VALID_STATUS, _normalize_request, _is_valid_transition
+if TYPE_CHECKING:
+    # Import cycle: lh_harness.queue selects PgQueueStore lazily (see
+    # _select_queue_store), so this module must not import from .queue at
+    # module level. Runtime uses below import the shared names lazily instead.
+    from .queue import QueueEntry
 
 # Column names mirror QueueEntry.to_dict() field-for-field; see docs/queue.md.
 _COLUMN_QUEUE_ID = "queue_id"
@@ -33,6 +37,8 @@ _COLUMN_MAX_ROUNDS = "max_rounds"
 _COLUMN_TRIO = "trio"
 _COLUMN_PRIORITY = "priority"
 _COLUMN_REQUESTED_BY = "requested_by"
+_COLUMN_BRANCH = "branch"
+_COLUMN_CONTINUE_BRANCH = "continue_branch"
 _COLUMN_BASE_CHECK = "base_check"
 _COLUMN_STATUS = "status"
 _COLUMN_RUN_ID = "run_id"
@@ -43,6 +49,10 @@ _COLUMN_UPDATED_AT = "updated_at"
 _COLUMN_LAUNCHED_AT = "launched_at"
 _COLUMN_LAST_CHECKED_AT = "last_checked_at"
 _COLUMN_DEDUP_KEY = "dedup_key"
+# ``retry_of``/``attempt``/``failure_cause`` stay outside the column set: the
+# requeue feature is out of scope for task 233 and the file store's successor
+# round-trip already matches on the caller-facing fields (branch,
+# continue_branch, priority, dedup_key).
 _QUEUE_COLUMNS = (
     _COLUMN_QUEUE_ID,
     _COLUMN_NAME,
@@ -52,6 +62,8 @@ _QUEUE_COLUMNS = (
     _COLUMN_TRIO,
     _COLUMN_PRIORITY,
     _COLUMN_REQUESTED_BY,
+    _COLUMN_BRANCH,
+    _COLUMN_CONTINUE_BRANCH,
     _COLUMN_BASE_CHECK,
     _COLUMN_STATUS,
     _COLUMN_RUN_ID,
@@ -128,60 +140,61 @@ class PgQueueStore:
     def _migrate(self) -> None:
         """Apply the queue migrations idempotently on first connect.
 
-        Migrations live next to this module under ``..migrations/`` and are
+        Migrations live under the repository ``migrations/`` directory and are
         ordered by filename.  Each file is a schema statement batch that is a
         no-op if the objects already exist.  Runs inside a transaction so a
         partial file never leaves the schema half-applied.
         """
         try:
             with self._txn() as txn:
-                for sql in _read_migrations():
+                for sql in self._read_migrations():
                     txn.execute(sql)
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"migration failed: {exc}") from exc
 
+    @staticmethod
+    def _read_migrations() -> list[str]:
+        """Return the ordered list of migration SQL strings for the queue schema.
 
-def _read_migrations() -> list[str]:
-    """Return the ordered list of migration SQL strings for the queue schema.
+        Migrations live under the repository ``migrations/`` directory (``harness``
+        schema), not next to this module, so the search is anchored to the repo root
+        and falls back to the in-package location for a fresh checkout.  Ordering is
+        by filename so ``001_harness_queue`` runs before ``002_harness_queue_events``.
+        """
+        import importlib.util
 
-    Migrations live under the repository ``migrations/`` directory (``harness``
-    schema), not next to this module, so the search is anchored to the repo root
-    and falls back to the in-package location for a fresh checkout.  Ordering is
-    by filename so ``001_harness_queue`` runs before ``002_harness_queue_events``.
-    """
-    import importlib.util
-    import os
-
-    spec = importlib.util.find_spec("lh_harness.pg_queue")
-    if spec is None or spec.origin is None:
-        raise OperationalError("could not locate lh_harness.pg_queue for migrations")
-    module_dir = os.path.dirname(spec.origin)
-    repo_root = os.path.dirname(os.path.dirname(module_dir))
-    candidates = (
-        os.path.join(repo_root, "migrations"),
-        os.path.join(module_dir, "..", "migrations"),
-    )
-    migrations_dir = next((dir for dir in candidates if os.path.isdir(dir)), None)
-    if migrations_dir is None:
-        raise OperationalError(
-            f"migrations directory not found under the repo root or next to lh_harness.pg_queue"
+        spec = importlib.util.find_spec("lh_harness.pg_queue")
+        if spec is None or spec.origin is None:
+            raise OperationalError("could not locate lh_harness.pg_queue for migrations")
+        module_dir = os.path.dirname(spec.origin)
+        repo_root = os.path.dirname(os.path.dirname(module_dir))
+        candidates = (
+            os.path.join(repo_root, "migrations"),
+            os.path.join(module_dir, "..", "migrations"),
         )
-    entries = sorted(
-        name for name in os.listdir(migrations_dir) if name.endswith(".sql")
-    )
-    sqls: list[str] = []
-    for name in entries:
-        path = os.path.join(migrations_dir, name)
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                sqls.append(fh.read())
-        except OSError as exc:
-            raise OperationalError(f"could not read migration {name}: {exc}") from exc
-    return sqls
+        migrations_dir = next((dir for dir in candidates if os.path.isdir(dir)), None)
+        if migrations_dir is None:
+            raise OperationalError(
+                "migrations directory not found under the repo root or next to lh_harness.pg_queue"
+            )
+        entries = sorted(
+            name for name in os.listdir(migrations_dir) if name.endswith(".sql")
+        )
+        sqls: list[str] = []
+        for name in entries:
+            path = os.path.join(migrations_dir, name)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    sqls.append(fh.read())
+            except OSError as exc:
+                raise OperationalError(f"could not read migration {name}: {exc}") from exc
+        return sqls
 
     def _row_to_entry(self, row: tuple[Any, ...]) -> QueueEntry | None:
         """Build a QueueEntry from a fetched row, rejecting anything malformed."""
+        from .queue import QueueEntry, _VALID_STATUS  # lazy: see TYPE_CHECKING note
+
         values = [self._cast(row[index], column) for index, column in enumerate(_QUEUE_COLUMNS)]
         try:
             entry = QueueEntry.from_dict(dict(zip(_QUEUE_COLUMNS, values)))
@@ -198,6 +211,8 @@ def _read_migrations() -> list[str]:
 
         Idempotent-enqueue semantics mirror the file store exactly.
         """
+        from .queue import _normalize_request  # lazy: see TYPE_CHECKING note
+
         params = _normalize_request(body)
         dedup_key = params.get("dedup_key")
         now = time.time()
@@ -211,6 +226,8 @@ def _read_migrations() -> list[str]:
             params["trio"],
             params["priority"],
             params["requested_by"],
+            params["branch"],
+            params["continue_branch"],
             params["base_check"],
             "pending",
             None,
@@ -229,12 +246,14 @@ def _read_migrations() -> list[str]:
         try:
             with self._txn() as txn:
                 txn.execute(
-                    "INSERT INTO harness.queue (" + ", ".join(_QUEUE_COLUMNS) + ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "INSERT INTO harness.queue (" + ", ".join(_QUEUE_COLUMNS) + ") VALUES (" + ", ".join(["%s"] * len(_QUEUE_COLUMNS)) + ")",
                     values,
                 )
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"could not create queue entry: {exc}") from exc
+        from .queue import QueueEntry  # lazy: see TYPE_CHECKING note
+
         return QueueEntry.from_dict(
             {
                 "queue_id": queue_id,
@@ -252,6 +271,8 @@ def _read_migrations() -> list[str]:
         A non-terminal entry is one whose dedup key stays "in use" -- pending,
         launched, or blocked (see ``_NON_TERMINAL_STATUS`` in queue.py).
         """
+        from .queue import QueueEntry  # lazy: see TYPE_CHECKING note
+
         try:
             with self._txn() as txn:
                 txn.execute(
@@ -262,6 +283,8 @@ def _read_migrations() -> list[str]:
                 rows = txn.fetchall()
         except Exception as exc:
             raise OperationalError(f"could not look up dedup entry: {exc}") from exc
+        from .queue import _NON_TERMINAL_STATUS  # lazy: see TYPE_CHECKING note
+
         for row in rows:
             if row[1] in _NON_TERMINAL_STATUS:
                 return QueueEntry.from_dict(
@@ -335,6 +358,8 @@ def _read_migrations() -> list[str]:
             entry.trio,
             entry.priority,
             entry.requested_by,
+            entry.branch,
+            entry.continue_branch,
             entry.base_check,
             entry.status,
             entry.run_id,
@@ -395,6 +420,8 @@ def _read_migrations() -> list[str]:
         return self.update(entry)
 
     def mark_done(self, queue_id: str, *, reason: str | None = None) -> QueueEntry | None:
+        from .queue import _MAX_QUEUE_REASON_CHARS  # lazy: see TYPE_CHECKING note
+
         entry = self.get(queue_id)
         if entry is None:
             return None
@@ -404,6 +431,8 @@ def _read_migrations() -> list[str]:
         return self.update(entry)
 
     def mark_failed(self, queue_id: str, reason: str) -> QueueEntry | None:
+        from .queue import _MAX_QUEUE_REASON_CHARS  # lazy: see TYPE_CHECKING note
+
         entry = self.get(queue_id)
         if entry is None:
             return None
@@ -412,6 +441,8 @@ def _read_migrations() -> list[str]:
         return self.update(entry)
 
     def record_skip(self, queue_id: str, reason: str) -> QueueEntry | None:
+        from .queue import _MAX_QUEUE_REASON_CHARS  # lazy: see TYPE_CHECKING note
+
         entry = self.get(queue_id)
         if entry is None:
             return None
@@ -433,7 +464,9 @@ def _read_migrations() -> list[str]:
         entry = self.get(queue_id)
         if entry is None:
             return None
-        if not _is_valid_transition(entry.status, "blocked"):
+        from .queue import _valid_transition  # lazy: see TYPE_CHECKING note
+
+        if not _valid_transition(entry.status, "blocked"):
             return None
         entry.status = "blocked"
         return self.update(entry)
@@ -451,7 +484,9 @@ def _read_migrations() -> list[str]:
         entry = self.get(queue_id)
         if entry is None:
             return None
-        if not _is_valid_transition(entry.status, "pending"):
+        from .queue import _valid_transition  # lazy: see TYPE_CHECKING note
+
+        if not _valid_transition(entry.status, "pending"):
             return None
         entry.status = "pending"
         return self.update(entry)
@@ -495,6 +530,8 @@ def _read_migrations() -> list[str]:
             raise ValueError("can only requeue failed entries")
 
         # Create successor entry
+        from .queue import QueueEntry  # lazy: see TYPE_CHECKING note
+
         successor = QueueEntry(
             queue_id=f"q-{uuid.uuid4().hex[:16]}",
             name=entry.name,
@@ -526,6 +563,8 @@ def _read_migrations() -> list[str]:
                     successor.trio,
                     successor.priority,
                     successor.requested_by,
+                    successor.branch,
+                    successor.continue_branch,
                     successor.base_check,
                     successor.status,
                     successor.run_id,
@@ -538,7 +577,7 @@ def _read_migrations() -> list[str]:
                     successor.dedup_key,
                 ]
                 txn.execute(
-                    "INSERT INTO harness.queue (" + ", ".join(_QUEUE_COLUMNS) + ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "INSERT INTO harness.queue (" + ", ".join(_QUEUE_COLUMNS) + ") VALUES (" + ", ".join(["%s"] * len(_QUEUE_COLUMNS)) + ")",
                     values,
                 )
                 # Insert queue_events row for the enqueue event
@@ -562,6 +601,8 @@ def _read_migrations() -> list[str]:
         return successor
 
     def counts(self) -> dict[str, int]:
+        from .queue import _VALID_STATUS  # lazy: see TYPE_CHECKING note
+
         counts: dict[str, int] = {status: 0 for status in _VALID_STATUS}
         for entry in self.list():
             counts[entry.status] = counts.get(entry.status, 0) + 1

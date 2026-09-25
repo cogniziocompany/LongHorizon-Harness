@@ -324,3 +324,39 @@ def test_launcher_no_double_launch_across_ticks(tmp_path: Path) -> None:
     assert second_updated is not None
     assert second_updated.status == "pending"
     assert any("has active run" in reason for reason in second_updated.skip_reasons)
+
+
+def test_launch_role_configs_omit_unset_and_keep_auditor_read_only(tmp_path: Path) -> None:
+    # Cutover 168 (2026-09-23): an unset model/profile was passed as the string
+    # "None" and every worker died on its reservation check; a trio-wide
+    # profile also landed on the auditor, which must stay read-only.
+    _root, store, supervisor = _fixture(tmp_path)
+    config = default_queue_config()
+    config["trios"]["kimi"] = {"agent": "claude_code", "model": "kimi-k3", "mcp_profile": "default"}
+    launcher = Launcher(supervisor, store, queue_config=config)
+    entry = store.create(_base_entry(trio="kimi"))
+
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None and updated.status == "launched"
+    owner = supervisor.created[-1]["owner"]
+    roles = owner["role_configs"]
+    # No mcp_profile in any role spec: the worker cannot round-trip it and
+    # would reject its own reservation (2026-09-23, runs 7164fbff/70ed3e28).
+    assert all(spec == {"agent": "claude_code", "model": "kimi-k3"} for spec in roles.values())
+    assert owner["mcp_profile"] is None
+    assert "None" not in json.dumps(roles)
+
+
+def test_launch_role_configs_without_model_or_profile(tmp_path: Path) -> None:
+    _root, store, supervisor = _fixture(tmp_path)
+    config = default_queue_config()
+    config["trios"]["kimi"] = {"agent": "claude_code", "model": None, "mcp_profile": None}
+    launcher = Launcher(supervisor, store, queue_config=config)
+    store.create(_base_entry(trio="kimi"))
+
+    asyncio.run(launcher.tick())
+
+    roles = supervisor.created[-1]["owner"]["role_configs"]
+    assert all(spec == {"agent": "claude_code"} for spec in roles.values())

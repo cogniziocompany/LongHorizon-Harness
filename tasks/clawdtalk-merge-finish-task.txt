@@ -1,0 +1,10 @@
+TASK 223: finish the task-217 ClawdTalk removal PRs (rebase, fix checks, merge in order)
+
+Context: task 217-clawdtalk (run 5879857b, stopped at its round cap) opened the removal PRs. Its merges were HELD on one question: is +14244217540 a live ClawdTalk caller? RESOLVED 2026-09-23 05:2x PT by the interactive overseer [5321285c], read-only Telnyx API from CT202. The number is active on connection "ai-assistant-d16133ff-..." = Telnyx AI Assistant "West Hive Capital Assistant (DEV)" (gpt-4o). Its 3 webhook tools all point at hive-api.easybutt0n.ai/api/v1/outreach/*, and the config has 0 mentions of clawd. It is NOT a ClawdTalk binding. Do NOT change that number or assistant.
+
+Scope (ONLY these PRs):
+1. cogniziocompany/cognizioware-mcp-tools #184 (+252/-468, 23 files) is CONFLICTING with main. Rebase onto origin/main, resolve conflicts keeping main's newer changes plus the clawdtalk removal. Survivor acceptance: 24 telnyx native tools remain (not 16). Run the telnyx-mcp tests. Push to the same branch. Check git diff --stat and git ls-files --eol (LF only; no CRLF churn).
+2. cogniziocompany/mcp-cognizioware #110 (+2/-6, 3 files): the "validate" check fails (run 35838126594). Find the actual error (the log is mostly CS8618 warnings; look for the real failure, likely the submodule removal or .gitmodules). Fix it on the branch. "Cloudflare Pages" fails on every PR on main too (baseline); ignore it.
+3. cogniziocompany/cognizioware-nebo #3 is MERGEABLE; verify its tests pass locally.
+Do NOT merge anything. Report each PR's final head sha, the diff stat, and the test results in your final message. The overseer merges.
+Never post @claude comments. Never print secret values. Never git add -A.

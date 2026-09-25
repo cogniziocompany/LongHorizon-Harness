@@ -1,0 +1,8 @@
+{
+ "name": "05h4-eval-gate-hybrid-options",
+ "task_file": "C:/tmp/eval-gate-latency-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 5,
+ "trio": "kimi",
+ "run_id": "20260908T053620Z_1e87e05e"
+}
