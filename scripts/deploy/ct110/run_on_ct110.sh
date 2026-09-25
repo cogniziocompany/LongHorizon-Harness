@@ -18,10 +18,12 @@
 # Usage:
 #   run_on_ct110.sh deploy          stage wheel+script, run deploy inside CT110
 #   run_on_ct110.sh rollback        stage script, run rollback inside CT110
+#   run_on_ct110.sh units           stage script+units, install units inside CT110 (TASK 236)
 #   run_on_ct110.sh exec <cmd...>   run an arbitrary command inside CT110
 #
 # Required environment: PVE_HOST, PVE_USER, SSH_KEY_FILE, CT_ID.
 # deploy additionally: EXPECTED_VERSION.  The wheel is picked up from ./stage/.
+# units additionally: the two unit files from packaging/ staged under ./stage/units/.
 set -euo pipefail
 
 MODE="${1:?usage: run_on_ct110.sh deploy|rollback|exec ...}"
@@ -56,7 +58,7 @@ remote_exec() {  # remote_exec <command-string>; rc/stderr discipline lives here
   return "$rc"
 }
 
-run_inner() {  # run_inner deploy|rollback
+run_inner() {  # run_inner deploy|rollback|units
   local mode="$1" full rc
   full="pct exec $CT_ID -- env LH_EXPECTED_VERSION='${EXPECTED_VERSION:-}' bash '$REMOTE_DIR/ct110_deploy.sh' '$mode'"
   set +e
@@ -83,8 +85,8 @@ if [[ "$MODE" == "exec" ]]; then
   exit $?
 fi
 
-[[ "$MODE" == "deploy" || "$MODE" == "rollback" ]] || {
-  echo "usage: run_on_ct110.sh deploy|rollback|exec ..." >&2; exit 1; }
+[[ "$MODE" == "deploy" || "$MODE" == "rollback" || "$MODE" == "units" ]] || {
+  echo "usage: run_on_ct110.sh deploy|rollback|units|exec ..." >&2; exit 1; }
 
 # --- stage payload ----------------------------------------------------------
 payload=("$INNER_LOCAL")
@@ -96,6 +98,21 @@ if [[ "$MODE" == "deploy" ]]; then
   [[ ${#wheels[@]} -eq 1 ]] || {
     echo "expected exactly one wheel under ./stage, found ${#wheels[@]}" >&2; exit 1; }
   payload+=("${wheels[0]}")
+fi
+if [[ "$MODE" == "units" ]]; then
+  shopt -s nullglob
+  units=(
+    stage/units/lh-overseer-sweep.service
+    stage/units/lh-overseer-sweep.timer
+    stage/units/tick.sh
+    stage/units/tick_notify.py
+  )
+  shopt -u nullglob
+  [[ ${#units[@]} -eq 4 ]] || {
+    echo "expected both units + tick.sh + tick_notify.py under ./stage/units, found ${#units[@]}" >&2; exit 1; }
+  [[ -f "$SCRIPT_DIR/ct110_units.sh" ]] || {
+    echo "expected ct110_units.sh next to run_on_ct110.sh" >&2; exit 1; }
+  payload+=("$SCRIPT_DIR/ct110_units.sh" "${units[@]}")
 fi
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"

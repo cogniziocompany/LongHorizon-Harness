@@ -1,0 +1,88 @@
+# lh-overseer-sweep.service — the CT110 overseer sweep tick (TASK 236).
+#
+# In-repo shipped copy of the systemd oneshot unit that replaces the PTAIT09
+# scheduled-task chain (`LH-Overseer-Sweep` -> `overseer_tick_hidden.vbs` ->
+# `overseer_tick.ps1` -> `claude -p` + `C:/tmp/queue/LOOP-PROMPT.md`, every
+# 5 minutes).  Same concept, CT home: this unit is fired by
+# ``lh-overseer-sweep.timer`` (also in packaging/), runs the headless
+# ``claude -p`` tick under the LOOP-PROMPT doctrine
+# (docs/LOOP-PROMPT.md) via the CT110 adapter
+# (docs/OVERSEER-TICK-CT110.md), and reads/writes the CT110 harness API +
+# apparatus archive (the task 235 surface) instead of ``C:/tmp``.
+#
+# Conventions follow packaging/lh-harness.service: User=harness, repo
+# WorkingDirectory, credentials injected through an EnvironmentFile that must
+# stay out of git (env-var NAMES only in the repo; see docs/SECRETS.md).
+#
+# The live units are installed on CT110 by the task 224 deploy pipeline's
+# units stage (scripts/deploy/ct110/ct110_deploy.sh mode ``units``).  The
+# install NEVER enables or starts anything: the timer ships DISABLED and the
+# tick below defaults to read-only, so deploying this file can never start a
+# second acting overseer next to the PTAIT09 sweep.  Enabling the timer and
+# flipping the mode are the operator's documented rollout steps
+# (docs/OVERSEER-TICK-CT110.md, disconnect checklist D3).
+
+[Unit]
+Description=Overseer sweep tick (headless claude -p, LOOP-PROMPT doctrine, CT110)
+Documentation=file:/home/harness/work/LongHorizon-Harness/docs/OVERSEER-TICK-CT110.md
+Documentation=file:/home/harness/work/LongHorizon-Harness/scripts/overseer_ct110/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=harness
+WorkingDirectory=/home/harness/work/LongHorizon-Harness
+
+# Credentials and endpoints, env-var NAMES only (the file itself is
+# operator-written on CT110 and is never committed; the names are registered
+# in docs/SECRETS.md):
+#   ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL /
+#   ANTHROPIC_MODEL            - the harness claude credential NAMES (the
+#                                BASE_URL points at the LiteLLM router)
+#   GH_TOKEN                   - gh CLI credential for PR/merge work
+#   LH_HARNESS_WEB_TOKEN       - bearer for the CT110 harness API
+#   LH_HARNESS_MCP_GATEWAY_URL / LH_HARNESS_MCP_GATEWAY_KEY /
+#   LH_HARNESS_MCP_GATEWAY_HEADERS_JSON - the gateway MCP wiring (the `ssh`
+#                                MCP server is reached through this key by
+#                                its alias name `ssh`; see
+#                                src/lh_harness/mcp_profiles.py)
+#   SEQ_URL / SEQ_API_KEY / SEQ_MIN_LEVEL - per-tick Seq logging (TASK 161
+#                                wire contract, branch feat/seq-logging)
+#   MEMORY_URL / MEMORY_TOKEN or MEMORY_MCP_URL / MEMORY_MCP_KEY (+ optional
+#   MEMORY_MCP_TOOL)           - hivemind ingest of its own ticks (TASK 229
+#                                contract, tasks/overseer-ingest-task.txt)
+#   CT110_WEB_URL / LH_HARNESS_APPARATUS_ROOT - non-secret topology overrides
+EnvironmentFile=/home/harness/.overseer-sweep-secrets.env
+
+# READ-ONLY DEFAULT (TASK 236 hard rule).  The shipped tick observes and
+# reports only: it may READ the fleet state and write ONLY its own ledger row
+# and its own hivemind ingest.  Acting mode (full LOOP-PROMPT authority: gate
+# resolves, requeues, task edits) exists ONLY behind an explicit documented
+# override of this variable, and requires the PTAIT09 task
+# `LH-Overseer-Sweep` to be disabled FIRST — never both acting at once.
+Environment=LH_OVERSEER_TICK_MODE=read-only
+
+# Single-instance lock, layered:
+#   1. systemd itself never runs two instances of the same oneshot unit
+#      concurrently (a start while active is merged into the running one);
+#   2. flock -n additionally refuses to run the tick while the lock is held
+#      and maps "lock held" to exit 0 (-E 0), so an overlapping fire is a
+#      logged SKIP, never a concurrent second tick and never a failed unit.
+# Kernel flock releases on process death, so there is no stale-lock state to
+# age out — the failure mode the archived PTAIT09 age-based lock
+# (tools/overseer_tick.ps1:10-14) had to work around with a 55-minute TTL.
+ExecStart=/usr/bin/flock -n -E 0 /home/harness/.overseer-sweep/tick.lock /home/harness/.overseer-sweep/bin/tick.sh /home/harness/.overseer-sweep/bin/tick_notify.py
+
+# A headless tick can legitimately run for many minutes; the archived PTAIT09
+# guard treated a lock younger than 55 minutes as "previous tick still
+# running".  Same ceiling here: systemd kills a tick that overruns it.
+TimeoutStartSec=55min
+
+# Fail-open telemetry: the tick never tears anything down on failure; the
+# timer simply fires again at the next 5-minute boundary.  A failed tick is
+# visible in the journal and in Seq, not by a red unit row.
+Restart=no
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lh-overseer-sweep

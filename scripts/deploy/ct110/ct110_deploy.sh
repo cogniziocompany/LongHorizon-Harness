@@ -27,6 +27,12 @@
 #               service was already restarted and the window was already
 #               zero-active; blocking recovery behind the hold file that
 #               (rightly) blocked the deploy would strand the host.
+#   units     — TASK 236: install the overseer-sweep systemd units
+#               (lh-overseer-sweep.service + .timer) via ct110_units.sh.
+#               Runs AFTER the wheel deploy (the tick entrypoint lives in the
+#               wheel's repo checkout on the host).  The units stage NEVER
+#               enables or starts the timer — read-only shadowing and the
+#               acting flip are operator steps (docs/OVERSEER-TICK-CT110.md).
 set -euo pipefail
 
 MODE="${1:?usage: ct110_deploy.sh deploy|rollback}"
@@ -180,8 +186,14 @@ case "$MODE" in
     log "CT110_ROLLBACK_INNER_OK restored=$got"
     ;;
 
+  units)
+    log "installing overseer-sweep units (never enabling: operator step)"
+    bash "$DEPLOY_DIR/ct110_units.sh"
+    log "CT110_UNITS_STAGE_OK"
+    ;;
+
   *)
-    echo "usage: ct110_deploy.sh deploy|rollback" >&2
+    echo "usage: ct110_deploy.sh deploy|rollback|units" >&2
     exit 1
     ;;
 esac

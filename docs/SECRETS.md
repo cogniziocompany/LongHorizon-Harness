@@ -37,6 +37,26 @@ not wiring - the scripts do not read it).
 - Stripe-shaped ids (`price_...`, meter ids) and HF model slugs in task briefs: product
   config identifiers, publishable by design.
 
+## Env-var NAMES referenced by the CT110 overseer sweep (TASK 236)
+
+The CT-side tick (`packaging/lh-overseer-sweep.service`,
+`scripts/overseer_ct110/`) reads credentials exclusively through these
+env-var NAMES, supplied at runtime by the operator-written
+`/home/harness/.overseer-sweep-secrets.env` EnvironmentFile on CT110
+(never committed):
+
+| Env NAME | Stands for |
+|---|---|
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` | the headless `claude -p` model credential (same names the harness already uses; BASE_URL points at the LiteLLM router) |
+| `GH_TOKEN` | the `gh` CLI credential for branch/PR work (disconnect plan row 10: CT110 `GH_TOKEN`, fine-grained PAT) |
+| `LH_HARNESS_WEB_TOKEN` | bearer for the CT110 harness API (same name the `lh-harness.service` EnvironmentFile already carries) |
+| `LH_HARNESS_MCP_GATEWAY_URL` / `LH_HARNESS_MCP_GATEWAY_KEY` / `LH_HARNESS_MCP_GATEWAY_HEADERS_JSON` | the LiteLLM gateway MCP wiring (same names as `src/lh_harness/mcp_profiles.py`); the gateway `ssh` MCP server is reached under its alias `ssh` through this key |
+| `SEQ_URL` / `SEQ_API_KEY` / `SEQ_MIN_LEVEL` | Seq ingestion (TASK 161 contract) |
+| `MEMORY_URL` / `MEMORY_TOKEN`, or `MEMORY_MCP_URL` / `MEMORY_MCP_KEY` (+ optional `MEMORY_MCP_TOOL`) | hivemind ingest of the tick's own records (TASK 229 contract) |
+
+None of these values appears in this repo; the names are documentation and
+runtime wiring only, exactly the rule this file was created to record.
+
 ## Verification (2026-09-23)
 
 - Fixed-string search for the live value across all 593 copied files: **0 occurrences**.
