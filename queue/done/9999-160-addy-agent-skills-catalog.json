@@ -1,0 +1,16 @@
+{
+  "name": "9999-160-addy-agent-skills-catalog",
+  "task_file": "C:/tmp/addy-agent-skills-catalog-task.txt",
+  "task_source": "task_file",
+  "trio": "kimi",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 8,
+  "note": "Queued by Paxton 2026-09-11 from planning session [2f6fa0]. Vendor addyosmani/agent-skills @6ca0cd7db39b41b1c37e26d335c507ee92382c6d (MIT, 25 skills) into gateway-skills-mcp as addy-*, plus a sidecar-file server change. VERIFIED BEFORE QUEUEING: no duplicate in the queue; gateway-skills-mcp has 4 skill folders today so /health must report 29; suite 25 exists; litellm-config.yaml L195/L562 carry the alias and server block exactly as the plan states. IMPORTANT: the plan leaves litellm-config.yaml and docker-compose.yml UNCHANGED, so this does NOT force-recreate the CT202 prod router and the PR needs no zero-run window. WORKSPACE NOTE: run 143 (20260911T163800Z_e46b9baf) currently occupies the mcp-tools tree; the launcher allows one run per tree, so this holds until that finishes - expected, not a fault. Slicing into 160a/b/c is pre-authorised in the task file if it loops three rounds. | TICK #437 2026-09-17 08:25 PT: run 20a610bd opened **mcp-tools PR #164** itself at 15:21:59Z (head 03ae506, base main, 48 files, MERGEABLE, checks [], reviewDecision EMPTY). State RUNNING -> PR. Run still alive r4/8. The 5 graphify-out/* files in the diff are NOT hook spill - they are tracked on main and .gitignore L30 says graph.json/GRAPH_REPORT.md/graph.html ARE committed; verified before considering an injection, so none was sent. Unreviewed: report, do not buy a review. | TICK #696 2026-09-18 13:01 PT: LIVE ON CT202 PROD. Deploy 35387203706 success 19:55:15Z (6/6). Read from the live system 3 ways: 25 addy-* skill dirs + 9 _addy-references inside the running gateway-skills-mcp; image built 19:52:17Z AFTER the 19:39:55Z merge of #164; prompts/list returns skill-addy-*. NOTE FOR FUTURE READS: skills are served as MCP PROMPTS, not tools - tools/list correctly returns [] and is NOT a defect.",
+  "run_id": "20260917T143034Z_20a610bd",
+  "roles_bound": {
+    "manager": "syn:large:vision:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-17T14:30:34.274640+00:00"
+}

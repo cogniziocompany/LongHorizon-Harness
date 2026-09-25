@@ -1,0 +1,8 @@
+{
+ "name": "30-pp-eval-flakiness",
+ "task_file": "C:/tmp/pp-eval-flakiness-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "run_id": "20260907T223114Z_3f931e9b"
+}

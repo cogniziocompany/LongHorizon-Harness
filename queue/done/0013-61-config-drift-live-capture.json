@@ -1,0 +1,15 @@
+{
+  "name": "61-config-drift-live-capture",
+  "task_file": "C:/tmp/config-drift-live-capture-task.txt",
+  "workspace": "cognizioware-mcp-tools-b",
+  "max_rounds": 6,
+  "trio": "kimi",
+  "run_id": "20260909T132914Z_3c5f9f01",
+  "roles_bound": {
+    "manager": "glm-5.2:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-09T13:29:14.431464+00:00",
+  "note": "|| *** BLOCKED ON TASK 136 — 2026-09-16 08:55 PT, SCHEDULED TICK #283. NOT a plain stranding; do NOT requeue yet. Cause read from run 20260909T132914Z_3c5f9f01's failure_reason, not inferred: `No fallback model group found for original model_group=nemotron-3-super:synthetic-anthropic` (429 from Synthetic with no fallback to land on). Died at round 1/6. This is ONE cause shared by 14 of the 18 undispositioned strandings — ENUMERATED this tick across all 18 snapshots, not sampled; the other 4 are 2x `403 key not allowed`, 1x Ollama 400, 1x `worker disappeared`. REQUEUEING THIS NOW REPRODUCES THE IDENTICAL DEATH, because the fallback groups are still missing on the live router. UNBLOCK WHEN: task 136 (`002-136-litellm-fallbacks-db-write`, run 20260916T144554Z_96563c4c) lands the `:synthetic-anthropic` fallback groups in the LiteLLM Postgres config AND the row is read back and diffed (the DB row wins over the YAML). Then requeue this entry at its ORIGINAL prefix with identity fields (run_id, roles_bound, launched_at) stripped. Only Paxton reorders."
+}

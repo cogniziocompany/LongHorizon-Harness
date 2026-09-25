@@ -1,0 +1,94 @@
+TASK 182 - The overseer's communication surface becomes a DB-backed web UX at fleet.easybutt0n.ai/overseer
+(handoffs, asks/answers, tasks, ledger, artifacts), replacing C:/tmp files.
+
+SOURCE: Paxton 2026-09-16 (verbatim intent): "We need to move the Overseer Session Comm to a Visual Web UI at
+fleet.easybutt0n.ai ... the handoffs (C:\tmp\HANDOFF-*.md >> OPEN-ASKS) need to be a formal web UX process, like a
+Claude chat style question session but DB persisted ... a web form UI to see the overseer session's tasks, read and
+write, persisted ... idempotent keys: repo, branch, overseer session, lh-harness run id(s) as it ties back to the
+Langfuse functionality ... persisted on the server via DB ... if ad-hoc lh-harness runs are controlled by the overseer
+they share drive space on CT110, so a handoff created from the web UI lands in the shared space (files and artifacts)
+and is picked up on refresh ... all currently saved overseer / queue / process files / artifacts migrated to DB and
+displayed in the new front end, piggybacking on pre-existing infra: fleet.easybutt0n.ai/overseer." Queued by
+session [fe2679]; appended after every powerplatform task and the fleet-plane set.
+
+REPO / WORKSPACE: ptait09-easybutt0n-ai (fleet-admin: Express + React under fleet-admin/web, Postgres schema `fleet`)
+Secondary: LongHorizon-Harness (one API addition), cognizioware-hydra (reuse task 92's session-bridge docs).
+
+================================================================================
+DEPENDENCIES VERIFIED 2026-09-16 - build ON these, do not rebuild them
+================================================================================
+ - fleet-admin is the right host: it already serves fleet.easybutt0n.ai (Express, Caddy on CT202), has a React web/
+   (App.tsx, pages/, components/, lib/socket.ts) and Postgres schema fleet.* (hosts, harness_nodes, harness_runs,
+   harness_events, harness_gates, harness_rounds, harness_artifacts, ...). NOT Blazor - that is ops-control-center
+   (infra health only, RULE 2: one surface per question). Run detail belongs on fleet; the overseer UI is a NEW page
+   set on the same app: /overseer.
+ - Task 92 (cognizioware-hydra PR #25, OPEN): docs/session-bridge/{PER-TICK-PROCEDURE.md, HANDOFF-TEMPLATE.task.txt,
+   CREDENTIAL-SAFETY.md, SURFACE-CHOICE.md} + scripts/overseer-session-ingest.mjs (ingests session transcripts into
+   memory-mcp every 5 min on PTAIT09; regex-only redaction, prompt text capped 600 chars). READ THESE FIRST. The
+   handoff TEMPLATE becomes the web form's schema; the per-tick procedure becomes the tick's DB read; the redaction
+   rules apply to anything the UI stores.
+ - Task 134 (LongHorizon-Harness PR #19, OPEN): PgQueueStore for the harness queue in schema `harness` on CT103. The
+   overseer UI reads the queue THROUGH the harness API (GET /api/queue), never a second copy of the queue table.
+ - Task 119 (ledger-state-alignment, blocked - wrong host): its content (eleven-state table per task) is what the
+   /overseer/tasks page renders; fold 119 into this task's schema and retire 119's file target.
+ - Task 145 (overseer liveness metrics on ops/fleet, PR mcp-tools #148): keep its metrics where they are; link, don't copy.
+ - Task 163 (queue/overseer folder) and the bridge step (LOOP-PROMPT STEP 6, /claude-bridge): the DB becomes the FIRST
+   source the bridge step reads; C:/tmp/HANDOFF-*.md remains a fallback until migration is complete.
+ - Task 148 trios table (PRs ptait09-easybutt0n-ai #50/#51) adds fleet.harness_trio_config + /harness/trios: same
+   push-and-render pattern; follow it for the overseer tables.
+ - Langfuse: runs are tagged lh-run/<run_id>,round_N,<role>,lh-session/<id> (adapters/claude_code.py). Those tags ARE
+   the idempotent keys Paxton names; store them, do not invent new ones.
+
+================================================================================
+SCOPE - slices, in order (each is a PR; slicing pre-authorised: 182a schema+API, 182b UI, 182c migration, 182d tick)
+================================================================================
+182a  SCHEMA + API (fleet-admin/schema.sql + src/server.js, applied by src/migrate.js):
+  fleet.overseer_sessions   (id, name, short_ref, transcript_path, started_at, last_seen_at, host)
+  fleet.handoffs            (id, key UNIQUE, title, body_md, source_session, target, status[open|acknowledged|
+                             queued|superseded|closed], created_by, created_at, acknowledged_at, ack_token,
+                             repo, branch, run_ids text[], langfuse_trace_ids text[], artifact_paths text[])
+  fleet.asks                (id, handoff_id NULL, kind[CREDENTIAL|SPEND|PROD_WINDOW|DECISION], question_md,
+                             recommended_md, default_md, state[open|answered|withdrawn], asked_by, asked_at)
+  fleet.ask_messages        (id, ask_id, author[paxton|overseer|session:<ref>], body_md, created_at)  -- the chat
+  fleet.ledger_rows         (id, ts, session, body_md, task_ids text[], run_ids text[], key UNIQUE)
+  fleet.task_state          (task_id, state ∈ the eleven states + HELD/BLOCKED/FAILED/SUPERSEDED, evidence_md,
+                             verified_at, updated_by, updated_at)   -- task 119's table, made real
+  Idempotency: `key` = sha256(repo|branch|overseer_session|sorted run_ids) for handoffs; ledger rows key on
+  (ts, session, first 120 chars). POST with an existing key returns the existing row (200, not 409) - same
+  semantics as the harness queue's dedup_key.
+  Routes (same auth as the rest: FLEET_ADMIN_KEY writes, FLEET_READ_KEY reads; per-user identity arrives with
+  task 177's per-user keys - store `created_by` from the key's tag): GET/POST /api/overseer/handoffs,
+  POST /api/overseer/handoffs/:id/ack, GET/POST /api/overseer/asks, POST /api/overseer/asks/:id/messages,
+  POST /api/overseer/asks/:id/answer, GET/POST /api/overseer/ledger, GET/PUT /api/overseer/tasks/:id/state.
+  socket.io /fleet events: handoff.created, ask.updated, ledger.appended (follow _emit at server.js ~L312).
+182b  UI (fleet-admin/web, route /overseer, link in the nav): pages Handoffs (list + form from the task-92 template,
+  markdown body, attach artifact paths), Asks (chat-style thread per ask: question, recommended, default, messages,
+  Answer button), Tasks (task_state table with the eleven states, filter by state/repo, edit evidence), Ledger
+  (append-only feed, search). Live via lib/socket.ts. Read-only until the caller's key has write scope.
+182c  MIGRATION (one-shot script scripts/migrate-overseer-files.mjs, idempotent by key, run from PTAIT09):
+  C:/tmp/queue/*.json + blocked/ + done/ -> fleet.task_state (state derived: active=QUEUED, blocked=BLOCKED,
+  done + run_id = RUNNING-or-terminal AS REPORTED BY GET /api/runs, never assumed); C:/tmp/queue/LEDGER.md -> ledger
+  rows split on "### TICK" / "- <date> PT -" markers; OPEN-ASKS.md -> asks (open table rows = open, "Answered" +
+  struck headings = answered, with their answer text as the first message); C:/tmp/HANDOFF-*.md -> handoffs.
+  Redact with task 92's CREDENTIAL-SAFETY rules before insert. Dry-run first, print counts, then insert; read back
+  counts equal file counts.
+182d  TICK + SHARED SPACE: the bridge step (LOOP-PROMPT STEP 6) reads GET /api/overseer/handoffs?status=open FIRST,
+  acknowledges with the ack_token, and only then scans C:/tmp/HANDOFF-*.md (fallback, to be retired when 182c has
+  run twice with zero new files). Artifacts: the UI does not write to CT110's disk directly (fleet-admin is on
+  CT202); a handoff's artifact_paths point at /home/harness/handoffs/<key>/ on CT110, written through ONE new
+  harness API route POST /api/handoffs/:key/artifacts (LongHorizon-Harness, multipart, size-capped, key-scoped) so
+  runs and the overseer share the same directory. That is the "shared drive space" Paxton asked for, without a
+  cross-CT mount. Refresh = socket event + the tick's read; no polling loop in the UI beyond reconnect.
+
+================================================================================
+HARD RULES
+================================================================================
+ - RULE 2: no second copy of the queue; read it via the harness API. No second liveness view (145). No Blazor.
+ - Secrets: redact per task 92's CREDENTIAL-SAFETY before any insert; env NAMES only in code and docs.
+ - Migration is additive: files stay in place, renamed .migrated-<date> only after read-back counts match.
+ - Deploy of fleet-admin is task 175's path; this task ships PRs and stops. Each PR: push + open yourself.
+ - Do not edit LOOP-PROMPT.md from a run; 182d hands the STEP 6 text to the overseer as a proposed patch.
+
+DONE MEANS: fleet.easybutt0n.ai/overseer shows the migrated handoffs, asks (with their answer threads), tasks with
+states, and ledger; a handoff created in the UI is acknowledged by the next tick with its ack_token; the same
+handoff POSTed twice yields one row; an artifact uploaded via the UI is readable from a CT110 run's workspace.

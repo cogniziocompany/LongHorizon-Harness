@@ -1,0 +1,106 @@
+TASK 94 - three hardcoded integers permit 50k tokens of history in a single manager prompt. Nothing has ever overridden them.
+
+REPO: cogniziocompany/LongHorizon-Harness. Workspace on CT110: /home/harness/work/LongHorizon-Harness.
+
+## THE FINDING - verified in the source, not inferred
+
+`src/lh_harness/types.py`:
+
+    line 122:  auditor_output_chars: int = 24_000
+    line 123:  role_verified_context_chars: int = 60_000
+    line 124:  role_history_chars: int = 100_000
+
+`src/lh_harness/role_prompts.py`:
+
+    line 52:  max_history_chars: int = 36_000,                                     <- the function's OWN default
+    line 58:  ... format_auditor_context(rounds, max_chars=max_history_chars, ...)  <- application 1
+    line 60:  harness_feedback = format_harness_feedback_context(rounds, max_chars=max_history_chars)  <- application 2
+
+`src/lh_harness/manager.py:361` passes `max_history_chars=config.role_history_chars` - **100,000** into
+a parameter the author defaulted to **36,000**, and it is consumed **TWICE**: once for auditor reports,
+once for harness feedback.
+
+**100,000 x 2 = 200,000 characters ~= 50,000 tokens of history permitted in ONE manager prompt.**
+
+**There is exactly ONE `HarnessConfig(...)` construction in the entire source tree** -
+`src/lh_harness/cli.py:1644` - and it passes **none** of the three. No env var, no CLI flag, no
+override anywhere in `src/` or `tests/`. **Every run that has ever executed used these defaults.**
+
+That the function's own default is 36k while the config supplies 100k is itself the tell: **100_000
+does not look like a considered choice for this call path.**
+
+## WHY THIS IS THE DOMINANT LEVER
+
+Measured on CT202 for 2026-09-09 (calls >= 1k tokens, so probes excluded):
+
+| model | role | real calls | floor | p50 | p90 | max |
+|---|---|---|---|---|---|---|
+| nemotron-3-super | executor | 5,099 | 3,690 | 58,446 | 133,092 | **222,019** |
+| glm-5.3-flash | | 2,882 | 1,168 | 66,176 | 123,820 | 154,314 |
+| syn:large:vision | auditor | 1,273 | 1,579 | 23,208 | 56,218 | 96,670 |
+| glm-5.2 | manager | 796 | **2,994** | 28,931 | 80,427 | 149,043 |
+
+**The manager's floor is 2,994 tokens.** Its real base is ~3k (harness doctrine ~2k + task text ~1.6k
+median) and it gets **no tools** (0 `tool_use`). **Everything above ~3k is injected history** - and the
+distribution runs to 149k. The spread between floor and max IS the history term.
+
+**A prior claim that there is a "~33k byte-identical fixed prefix" is RETRACTED and disproved:** a floor
+of 2,994 makes a 33k constant impossible; that figure was a MEAN of a right-skewed distribution read as
+if it were a constant. **Do not build on it.** Prefix caching (task 91) is therefore worth much less
+than first thought; **this task is the bigger lever, and it is three integers.**
+
+## SCOPE
+
+1. **Make the three caps configurable** - env var and/or CLI flag, threaded through the single
+   `HarnessConfig(...)` at `cli.py:1644`. **Keep the current values as defaults in this change** so
+   merging it alters no behaviour on its own.
+2. **Then measure what a lower cap actually costs.** Do NOT just lower them and declare victory. The
+   history exists because roles need context; truncating it can make a manager repeat work an auditor
+   already rejected. **Propose a value per cap WITH the evidence**: sample real rounds from the
+   trajectory artifacts (`/api/runs/{id}/rounds/{n}/trajectory/{role}` on CT110) and show what would
+   have been cut at, say, 25k / 50k / the existing 100k, and whether the cut content was load-bearing.
+3. **Check the double application is intended.** `max_history_chars` bounds auditor reports AND harness
+   feedback with the SAME number, so the effective ceiling is 2x the configured value. State whether
+   that is deliberate. If not, a separate cap per section may be the right shape.
+4. **Report the expected saving in tokens/day**, using the measured per-role distributions above rather
+   than an estimate.
+
+## WHY IT MATTERS RIGHT NOW
+
+On 2026-09-09 the harness ran **11,885 Synthetic requests / 643M prompt tokens in 18 hours**, exhausting
+the weekly credit in a single day, with **no manual reset available until ~2026-10-09**. Rate was the
+primary cause (2.8x the 500/hr cap), but **prompt size is the multiplier on top of it**, and these three
+integers set the ceiling on prompt size.
+
+**Also relevant to any context-window planning:** on 09-09, **44.9% of executor calls and 52.0% of
+glm-5.3-flash calls already exceeded 64k tokens**. No role fits a 64k window reliably until these caps
+come down.
+
+## HARD RULES
+
+ - **Do NOT change the default values in the same PR that makes them configurable.** Configurability
+   first, with current values preserved; the value change is a second, evidenced PR. A silent
+   behaviour change buried in a plumbing commit is how a regression ships.
+ - **Truncating history is a correctness risk, not just a cost saving.** If a lower cap would drop an
+   auditor's rejection reason, the manager repeats the mistake. Show the evidence before proposing a
+   number.
+ - This repo is the harness itself - a bad change here breaks every run. Ship tests.
+ - Deploying lh-harness restarts the service on CT110 and **kills every in-flight run**; the deploy
+   script aborts unless zero runs are active. Note that in the PR body.
+ - Env NAMES only, never values.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+ - PR to `main`, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR against main that makes `role_history_chars`, `role_verified_context_chars` and
+`auditor_output_chars` overridable through the single `HarnessConfig` construction **with today's values
+as the defaults**; states whether the double application of `max_history_chars` is intended; proposes a
+value per cap backed by sampled real rounds showing what would be cut and whether it was load-bearing;
+and reports the expected tokens/day saving from the measured distributions.
+
+## CREDIT
+
+The config finding is from session `longhorizon-harness-58`, verified line-by-line in the source by the
+overseer before this task was written - including the double-application detail, which the overseer
+initially could not reproduce and then confirmed in `role_prompts.py` lines 58 and 60.

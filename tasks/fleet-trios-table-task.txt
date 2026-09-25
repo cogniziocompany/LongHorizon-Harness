@@ -1,0 +1,240 @@
+TASK 148 - Fleet Window v1: the harness TRIO TABLE on fleet.easybutt0n.ai.
+
+REPO / WORKSPACE: cognizioware-mcp-tools (fleet-admin lives here as a PINNED COPY - see below).
+Source: Paxton, 2026-09-10, spec from session [949d74] (949d74d1-1c00-5861-b6d0-6a5ff4d47876),
+plan-mode, read-only. That session is NOT the overseer.
+
+Paxton wants the per-run trio configuration (manager / executor / auditor per trio) shown as the
+first version of a table on the fleet wallboard. The overseer's 18:50 analysis
+(LEDGER.md:15637-15648) is built on that table, and today it exists ONLY as hand-edited Python
+tuples on PTAIT09 that no operator surface can see.
+
+DECIDED, do not relitigate:
+  * The LAUNCHER PUSHES its table to fleet. fleet does not pull.
+  * COST COLUMNS ARE OUT OF V1. Per-role token numbers cannot be measured while the whole harness
+    uses ONE LiteLLM key - the 9,756 / 1,210 figures are PER MODEL, not per role. Do not invent them.
+
+================================================================================
+*** HARD DEPENDENCY - READ BEFORE PLANNING. THE PUSH CANNOT LAND YET. ***
+================================================================================
+The spec requires the host to already exist in `fleet.hosts` (foreign key). **IT DOES NOT.**
+Measured by the overseer 2026-09-10 20:20 PT:
+
+    GET https://fleet.easybutt0n.ai/api/fleet/nodes   ->  200  []
+    CT110 /api/meta: fleet_configured=true, fleet_ever_succeeded=FALSE, fleet_last_error=HTTP 413
+
+**fleet.hosts is empty because the harness heartbeat has NEVER succeeded** - every push is rejected
+413. That is TASK 114 (`fleet-heartbeat-413`), and task 77b already records this exact root cause.
+So `POST /harness/trios` will fail its foreign key until 114 lands.
+
+*** 114's LAST RUN FAILED. *** Run `20260911T022549Z_4fd07c9c` launched 19:25 and FAILED. Its queue
+entry is now in `queue/done/` - the launcher files entries on LAUNCH, not on SUCCESS - so it will
+NOT retry on its own. The overseer is handling the requeue; do not queue it yourself and do not
+assume 114 is progressing.
+
+WHAT THIS MEANS FOR YOUR SCOPE:
+  LAND NOW  - the fleet-admin backend endpoint, the schema table, the provider classifier, the
+              TriosPage UI, and ALL the tests. These need no live host; test against the existing
+              node test harness.
+  WAITS     - the live end-to-end verification (steps 3-6 below) and the launcher push itself.
+**If 114 has not landed when you finish, deliver the repo half, open the PR, and report the live
+verification as BLOCKED ON 114 BY NAME.** Do not fake it with a poller, and do not insert a fake
+host row to make an FK pass - that would put fabricated data on an operator surface.
+
+================================================================================
+SOURCE OF TRUTH - VERIFIED BY THE OVERSEER 2026-09-10 20:20, USE THESE, NOT THE SPEC'S LINE NUMBERS
+================================================================================
+`C:/tmp/launch_queue.py` is 56,036 bytes and is HAND-EDITED - there is no template behind it.
+**The spec's line numbers are STALE** (the overseer edited the file at 19:12). Current anchors:
+
+    _TRIOS          line 175      (6 primary trios)
+    _SYN_DOWN       line 188      current mode flag
+    _SEQ            line 198      rotation counter
+    SYN_ONLY        line 214      computed from _TRIOS
+    DEGRADED_TRIOS  line 237      (2 fallback trios)
+    DEGRADED_CAP    line 286
+    BASE            line 6        <- this is the BASE URL, NOT a token (the spec is wrong)
+    H               line 349      <- the auth header dict lives HERE
+    check_pools()   called line 569;  `while True:` line 570;
+    _SYN_DOWN set   line 574;  status print line 578
+
+*** THREE `CAP=` ASSIGNMENTS EXIST: line 25 (`CAP=4`, SUPERSEDED), line 62 (`CAP=6`), line 100
+(`CAP=6`). Python takes the LAST one, so **line 100 is live**. Do not read line 25 and report CAP=4.
+Re-verify all of these before editing - the file changes daily. ***
+
+THE LIVE TABLE (overseer confirmed it matches the spec's table exactly, tuple for tuple):
+  #  manager                              executor                              auditor
+  0  glm-5.2:synthetic-anthropic          ornith-1.5:pool                       kimi-k3:synthetic-anthropic
+  1  glm-5.2:synthetic-anthropic          ornith-1.5:pool                       syn:large:vision:synthetic-anthropic
+  2  glm-5.2:synthetic-anthropic          nemotron-3-super:synthetic-anthropic  syn:large:vision:synthetic-anthropic
+  3  glm-5.2:synthetic-anthropic          nemotron-3-super:synthetic-anthropic  kimi-k3:synthetic-anthropic
+  4  nemotron-3-super:synthetic-anthropic kimi-k3:synthetic-anthropic           syn:large:vision:synthetic-anthropic
+  5  nemotron-3-super:synthetic-anthropic syn:large:vision:synthetic-anthropic  kimi-k3:synthetic-anthropic
+  D0 ornith-1.5:pool                      ornith-1.5:pool                       ornith-1.5:pool
+  D1 ornith-1.5:pool                      ornith-1.5:pool                       glm-5.3:cloud
+
+================================================================================
+1. PUSH PAYLOAD - POST /harness/trios, schema `lh-trios/v1`
+================================================================================
+    { "schema":"lh-trios/v1", "sentAt":"<ISO8601 Z>",
+      "launcher":{"path":"C:/tmp/launch_queue.py","sha256":"<file hash>","cap":6,"degradedCap":2},
+      "mode":"primary"|"degraded",          // degraded when _SYN_DOWN[0]
+      "nextIndex":<_SEQ[0] % len(active pool)>,
+      "synOnly":[2,3,4,5],
+      "pools":{ "primary":[{"idx":0,"manager":"...","executor":"...","auditor":"..."}],
+                "degraded":[{"idx":0,...}] } }
+
+AUTH: the same scheme the lh-harness reporter uses -
+`LongHorizon-Harness/src/lh_harness/fleet/reporter.py:433-445` - HMAC-SHA256 of the RAW body with
+the host's device key, in `X-Fleet-Host` and `X-Fleet-Signature`. No gzip; the body is under 2 KB.
+HOST: use the `LH_HARNESS_FLEET_NODE` / `LH_HARNESS_FLEET_KEY` of the lh-harness node the launcher
+drives (192.168.21.168), so trios appear under the same host as its runs.
+
+================================================================================
+2. FLEET-ADMIN BACKEND
+================================================================================
+*** IT IS A PINNED COPY. Verified: `infrastructure/docker/fleet-admin/SOURCE_REF.md` names
+`ptait09-easybutt0n-ai/fleet-admin`, branch `feat/harness-fleet-report`, commit `804a4f07f779bd7b`.
+MAKE THE CHANGE AT THE SOURCE, THEN RE-PIN THE COPY. *** A change made only in the vendored tree is
+lost on the next re-pin and is a silent regression.
+
+  * `schema.sql` + `src/test/helpers.js`: add
+      fleet.harness_trio_config (
+        host text PRIMARY KEY REFERENCES fleet.hosts ON DELETE CASCADE,
+        body jsonb NOT NULL, launcher_sha256 text,
+        received_at timestamptz NOT NULL DEFAULT now())
+  * `src/server.js`:
+      - `app.post('/harness/trios', harnessJson, requireDevice, ...)` - validate
+        `schema === 'lh-trios/v1'`, three non-empty strings per row, contiguous `idx`. Upsert by
+        host, then `_emit` a `trios` socket event. Follow the `/harness/heartbeat` pattern at ~L276.
+      - in `buildApiRouter`, `router.get('/trios', ...)` returning `[{host, received_at, body}]`,
+        using the read-key auth `/overview` uses (~L458).
+
+================================================================================
+3. PROVIDER CLASSIFIER - shared helper `web/src/lib/providers.ts`
+================================================================================
+  first match wins:
+    contains `:synthetic`  -> "Synthetic"            amber
+    starts with `ornith-`  -> "Local - ptait01 GPU"  green
+    ends with `:cloud`     -> "Ollama cloud"         blue
+    anything else          -> "Unknown"              grey, show the raw name
+*** NEVER classify a `:pool` model as local. `glm-5.3:pool` was an OLLAMA CLOUD pool. *** This is the
+trap the classifier exists to avoid; it must be a test case.
+
+================================================================================
+4. UI (`web/`, React + Tailwind + shadcn)
+================================================================================
+  * Add `web/src/components/ui/table.tsx` - **CONFIRMED ABSENT**; ui/ currently holds only badge,
+    button, card, scroll-area, sheet, tabs, tooltip.
+  * New page `web/src/pages/TriosPage.tsx`, route `/trios` in `web/src/App.tsx`, "Trios" link in the
+    Overview header.
+  * One card per host (Card/Badge conventions from `OverviewPage.tsx`):
+      HEADER  host; mode badge (`primary`, or `degraded` in red); cap / degradedCap; launcher sha
+              (first 7); "pushed N min ago"; a **stale** badge if the last push is over 15 min old.
+      PRIMARY TABLE  columns `#`, Manager, Executor, Auditor. Each cell = model name + provider
+              badge. Mark the row at `nextIndex` as "next". Tag rows in `synOnly`
+              "Synthetic-only fallback". Highlight a row whose EXECUTOR is local - that row pattern
+              is the whole point of the overseer's analysis.
+      DEGRADED TABLE  same columns; dim when mode is primary, highlight when degraded.
+      FOOTER  "Per-role token cost not shown: harness uses a single LiteLLM key; per-role keys
+              pending."
+  * Live updates via the existing `lib/socket.ts`, subscribed to `trios`.
+
+RULE 2 NOTE - a new page IS justified here and the check was done: RULE 2 says find an existing view
+and extend it, and there is NO trio view on any surface to extend. Run detail belongs on fleet, and
+this is launcher configuration behind every run. **But add ONE page and ONE route - nothing else.**
+If this starts growing a second view, cut it back and say so.
+
+================================================================================
+5. LAUNCHER CHANGE - *** NOT YOURS. OVERSEER-EXECUTED. ***
+================================================================================
+`C:/tmp/launch_queue.py` is the LIVE launcher on PTAIT09 that launches YOUR OWN RUN. A harness run
+must never edit it, and the push needs `LH_HARNESS_FLEET_KEY`, which a harness run is NEVER given.
+
+**DELIVER `push_trios()` AS A REVIEWABLE PATCH IN THE PR** (e.g. `docs/` or a scripts file) and STOP.
+The overseer applies it. Requirements it must meet, so write it to them:
+  * builds the payload from `_TRIOS`, `DEGRADED_TRIOS`, CAP, DEGRADED_CAP, `_SEQ`, `_SYN_DOWN`,
+    `SYN_ONLY`; signs with `hmac`/`hashlib`; POSTs with a 10 s timeout.
+  * **FAILS OPEN ALWAYS** - any exception prints ONE log line and never blocks a launch.
+  * credentials from env `LH_HARNESS_FLEET_URL` / `LH_HARNESS_FLEET_NODE` / `LH_HARNESS_FLEET_KEY`;
+    if any is missing, skip silently. **NEVER a literal key in the patch, the PR, or a doc.**
+  * call sites: after `check_pools()` at startup (line 569) and once per cycle after `_SYN_DOWN` is
+    set (line 574).
+  * COLLISION WARNING: **task 147 also edits this file** (the `C:/tmp/queue/DRAIN` flag). The
+    overseer sequences the two; write the patch so it does not assume 147 has or has not landed.
+
+Separately, and OUT OF SCOPE: the lh-harness bearer token is hardcoded at `H=` (line 349, NOT line 6
+as the spec says - line 6 is `BASE=`). It should move to an env var. **Do not touch it here and do
+not reproduce its value anywhere.**
+
+================================================================================
+TESTS
+================================================================================
+  fleet-admin node tests (existing `src/test/helpers.js`), `POST /harness/trios`:
+    bad signature -> 401 | wrong schema -> 400 | valid body -> upsert and `GET /api/fleet/trios`
+    returns it | a second push REPLACES the first
+  web vitest (`web/src/__tests__`):
+    the classifier table INCLUDING `glm-5.3:pool` -> Unknown (not local)
+    TriosPage renders 6 primary + 2 degraded rows, the next marker, and the stale badge
+
+================================================================================
+VERIFICATION
+================================================================================
+ 1. `npm test` green in `fleet-admin` AND in `fleet-admin/web`. Read the individual tests - a green
+    rollup can contain a hard-failing test.
+ 2. Deploy fleet-admin to CT202 (compose service `fleet-admin`, `infrastructure/docker-compose.yml`
+    ~L1759); the new table is created from `schema.sql`. **Do NOT touch
+    `infrastructure/litellm-config.yaml`** - any edit force-recreates the CT202 prod router.
+ 3-6. LIVE STEPS - BLOCKED UNTIL 114 LANDS (`/api/fleet/nodes` must stop returning `[]`):
+    launcher log shows the push succeeded; `GET /api/fleet/trios` with the read key returns a body
+    matching `_TRIOS` EXACTLY, tuple for tuple; `/trios?key=...` shows trios 0-1 with a green local
+    ornith executor and 2-5 Synthetic, plus D0/D1; editing one tuple in a STAGING COPY updates the
+    page next cycle and changes the sha badge.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Do NOT edit `C:/tmp/launch_queue.py`. Deliver the patch; the overseer applies it.
+ - Do NOT insert a host row to satisfy the foreign key. Report BLOCKED ON 114 instead.
+ - Change fleet-admin AT SOURCE and re-pin; a vendored-only edit is lost.
+ - Env var NAMES only - never a key, token or signature value in code, tests, docs or commits.
+ - NEVER the bare gateway `/health`; use `/health/liveliness`.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat`.
+ - **Do NOT merge, and do NOT post an `@claude` comment** - the reviewer bills Paxton's personal
+   subscription. Open the PR and STOP.
+
+DONE MEANS: the endpoint, schema, classifier, page and tests are committed and PR'd with the
+classifier's `:pool` case covered; `push_trios()` is delivered as a patch, not applied; and the live
+verification is either performed (if 114 landed) or reported BLOCKED ON 114 by name, with
+`/api/fleet/nodes` still returning `[]` as the evidence.
+
+================================================================================
+*** AMENDMENT 2026-09-11 (overseer, from audit session [fe2679] section G). MEASURED COLUMNS. ***
+================================================================================
+The trios table as specified shows WHICH models a trio uses. It does not show whether that trio
+WORKS. Add three measured things, and keep them in THIS table - do not create a second view (RULE 2,
+no spec drift; cost columns stay out of v1 as already stated at line 14).
+
+ 1. PER-TRIO EXECUTOR EPISODE SECONDS - median and max, with n, sourced from /api/runs episode
+    timings JOINED ON roles_bound. This is the column that would have made today's problem obvious:
+    a Synthetic executor episode runs about 421 s while an ornith executor runs 1,648 s against a
+    3,600 s budget. One is comfortable; the other is one slow round from a timeout. Today nothing
+    shows that difference anywhere.
+
+ 2. EMIT-PROBE LATENCY PER SEAT, last 10 per backend. Measured at launch today: 1.1 s for a healthy
+    seat versus 11.7 s for a queued local seat. The local span is SINGLE-SLOT, so a high probe
+    latency means the seat is already occupied - that is the early warning. Source it from the same
+    push_trios() payload this task already delivers (lh-trios/v1), alongside _TRIOS and
+    DEGRADED_TRIOS. No new transport.
+
+ 3. PLANNED-VS-BOUND DRIFT FLAG, per launch: set it when the chosen table row does NOT equal the
+    entry's roles_bound. roles_bound is already written by the launcher and is NEVER COMPARED to
+    what was planned. This is what hid the all-Synthetic fallback being overwritten by the rotation
+    loop: the fallback picked an all-Synthetic trio and the launcher bound an ornith executor
+    instead, putting a THIRD executor on a two-slot local lane. Task 146 fixes the CAUSE; this flag
+    is what makes a recurrence VISIBLE instead of luck-dependent.
+    *** The drift flag is display only. Do NOT fix the launcher bug here - that is task 146, and two
+    tasks editing the same launcher logic is exactly the sequencing hazard task 150 warns about. ***
+
+Local-slot queueing needs NO new column: it is covered once 146 lands. Per-role token cost stays in
+task 88 (per-role virtual keys).

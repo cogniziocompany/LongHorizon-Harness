@@ -1,0 +1,100 @@
+TASK 152 - Fix the ptait09 runner's Claude lane: a stale CLAUDE_PATH in .env.
+
+REPO: `ptait09-easybutt0n-ai`, branch `easybutt0n-runner-v2`.
+Source handoff: `docs/HANDOFF-ptait09-runner-claude-lane.md`, **ON ORIGIN as `5e8f15d`** - the tip of
+branch `easybutt0n-runner-v2`. VERIFIED by the overseer 2026-09-10 21:25 PT via `ls-remote` tip,
+`merge-base --is-ancestor`, and `ls-tree`.
+*** DO NOT GO LOOKING FOR `3b5042a`. It is an ORPHANED LOCAL COMMIT and is NOT on origin. *** The same
+handoff was re-committed and pushed as `5e8f15d`; both commits carry the byte-identical message
+"docs(runner): handoff - Claude lane broken by stale CLAUDE_PATH in .env", so they are very easy to
+confuse. An earlier version of this task cited `3b5042a` and would have STOPPED on an unreachable
+source.
+
+*** OVERSEER-EXECUTED. NOT A HARNESS RUN. IN queue/blocked/. ***
+The fix is an edit to a `.env` file on PTAIT09 plus a Windows **service** restart. A harness run on
+CT110 cannot reach that box's service manager, and the file holds live configuration. It is also
+small enough that a run adds risk without adding value.
+
+================================================================================
+THE DEFECT - already diagnosed, DO NOT RE-DERIVE IT
+================================================================================
+Any call to `POST https://ptait09.easybutt0n.ai/claude`, or `/exec` with `"shell":"claude"`, fails
+immediately with:
+
+    '"C:\Program Files\nodejs\claude.cmd"' is not recognized as an internal or external command
+
+ROOT CAUSE: `CLAUDE_PATH` in the runner's `.env` points at a file that does not exist.
+
+    .env line            CLAUDE_PATH=C:\Program Files\nodejs\claude.cmd
+    does it exist?       NO - that directory holds only node.exe, npm, npm.cmd, npm.ps1,
+                         nodevars.bat, node_modules
+    where claude IS      C:\Windows\system32\config\systemprofile\AppData\Roaming\npm\claude.cmd
+                         (runs; reports 2.1.81)
+    also present         C:\Users\PaxtonTait\AppData\Roaming\npm\claude.cmd (user-profile install)
+    runner identity      NT AUTHORITY\SYSTEM  (USERNAME=PTAIT09$;
+                         APPDATA=C:\Windows\system32\config\systemprofile\AppData\Roaming)
+
+WHY THE EXPLICIT PATH IS FATAL: `src/runner.js:43-73` defines `resolveClaudePath()`, which probes the
+SYSTEM-profile npm path, then `%APPDATA%\npm`, then `Program Files\nodejs` - **but only when
+`CLAUDE_PATH` is unset.** `CLAUDE_PATH_EXPLICIT = Boolean(process.env.CLAUDE_PATH)` short-circuits
+the probe and the bogus path goes straight to `cmd.exe` via `shell:true`
+(`execCli`/`spawnCli`, :288-305).
+**This is config drift, not a quoting bug.** `safeExe`/`winQuote` are working correctly - the handoff
+proves it by reproducing the identical failure from a plain PowerShell prompt on the box.
+
+================================================================================
+THE FIX - option 1, per the handoff's own recommendation
+================================================================================
+ 1. **DELETE the `CLAUDE_PATH` line from the runner's `.env`** and restart the service.
+    `resolveClaudePath()` then finds the SYSTEM-profile `claude.cmd` on its own, which is the
+    intended design (the code comment calls this "handoff pitfall #2").
+    Option 2 - pinning `CLAUDE_PATH=C:\Windows\system32\config\systemprofile\AppData\Roaming\npm\claude.cmd`
+    - re-introduces exactly the brittleness that caused this outage. **Prefer option 1 and say why
+    if you choose otherwise.**
+
+ 2. *** RESTART VIA THE WINDOWS SERVICE, NOT pm2. *** The supervisor is the Windows service
+    `ptait09-runner` (LocalSystem), binary `svc\publish\easysvc.exe service-run --config
+    svc\runner.svc.json`. A pm2 daemon (pid 12764) is ALSO running on the box but **does not serve
+    :7334** - restarting pm2 would look like it worked and change nothing. That trap is the main
+    reason this task exists as a written procedure rather than a one-liner.
+
+ 3. Back up `.env` before editing (timestamped copy). **Do not print, log or commit any value from
+    it** - it is a live runner config. Record only the variable NAME you removed.
+
+================================================================================
+VERIFICATION - the restart is not proof; the lane answering is
+================================================================================
+ 1. `GET https://ptait09.easybutt0n.ai/health` returns ok:true (it was already fine - confirm it did
+    not regress).
+ 2. `POST /exec` with `{"shell":"pwsh","command":"Get-Date"}` still works (regression check on the
+    lanes that were NOT broken).
+ 3. **The real test:** `POST /claude` with a trivial prompt returns a result, not exitCode 1. The
+    failing reference is task id `57cd970c`. Record the new task id and its exitCode.
+ 4. Confirm which binary actually ran - have the probe report the resolved path or `claude --version`
+    - so you can prove `resolveClaudePath()` picked the SYSTEM-profile copy rather than the lane
+    merely failing differently.
+ 5. `bash`/WSL remains BROKEN BY DESIGN on this runner and is NOT in scope: the service runs as
+    LocalSystem and WSL refuses to start under it (`Wsl/WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`), so
+    `{"shell":"bash"}` returns HTTP 500 permanently. Do not "fix" it, and do not report it as a
+    regression.
+
+================================================================================
+WHY THIS MATTERS BEYOND THE ONE LANE
+================================================================================
+`PLAN-powerplatform-session-ux-fixes.md` names this as a blocker: **until `CLAUDE_PATH` is corrected,
+the Cursor + Claude parallel QA lanes cannot run on ptait09.** So this small fix gates the
+powerplatform QA work. Do it first; it is minutes, not hours.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Restart the **Windows service**, not pm2. Verify exactly one runner is serving :7334 afterwards.
+ - No secret or config VALUES in commits, logs, docs or the ledger - names only.
+ - Never `git add -A`; commit by explicit path.
+ - Do NOT change `resolveClaudePath()` itself. The probe is correct; the config was wrong. Changing
+   working code to accommodate bad config is how this recurs.
+ - Do not post an `@claude` comment on any PR - it bills Paxton's personal subscription.
+
+DONE MEANS: `CLAUDE_PATH` is gone from `.env` (or justified if pinned), the Windows service was
+restarted, `POST /claude` returns a successful result with its task id recorded, the resolved binary
+path is proven to be the SYSTEM-profile one, and the pwsh lane is confirmed unregressed.

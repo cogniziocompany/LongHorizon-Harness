@@ -1,0 +1,16 @@
+{
+  "name": "9999zc-198-hydra-e2e-ws-dep",
+  "task_file": "C:/tmp/69d-hydra-e2e-ws-dep-task.txt",
+  "task_source": "task_file",
+  "workspace": "cognizioware-qa",
+  "max_rounds": 4,
+  "trio": "kimi",
+  "note": "Queued 2026-09-17 13:30 PT by SCHEDULED TICK #479 at the TAIL of the active band (no reordering). CORRECTS tick #478's claim that merging qa #29 ended the hydra-e2e red: QA CI 35270141949 on master 083e7b4b is red #10. 69b's path fix is PROVEN GOOD and must not be reverted - the error moved from a Windows path concatenated onto a Linux one to ERR_MODULE_NOT_FOUND for package 'ws' imported by cognizioware-hydra/design/fake-agent.js. Hydra has NO package.json anywhere (contents API 404, reader verified), so ws is declared nowhere and used to come from a global install on the retired Windows runner. Score unchanged at 76.92 passed=10 failed=3 total=13. Scope is the QA side only. DO NOT touch FACTORY_REPO_DIR - that is 69c, held in blocked/ for a human expert on Paxton's assignment. DO NOT lower the threshold or skip a checkpoint. Open the PR and STOP; never invoke @claude. | TICK #580 2026-09-18 02:24 PT: State PR. The run opened cognizioware-qa #35 fix/hydra-e2e-ws-resolution -> master at 09:08:16Z, head 954c795, MERGEABLE, unreviewed = reported. NOT merged: run 20260918T090234Z_7fdcfecf alive r3/4 = branch occupied. Owed before merge: run ends, diff --stat, then read the QA CI tests (not the rollup) on master after merge. | TICK #581 2026-09-18 02:28 PT: State LANE. Gate 3827f38e1018 resolved stop (4/4 completed), run cancelled, branch free. Overseer build on clean clone of 954c795: diff --stat 2 files +26/-3, npm ci clean, ESM import of ws 8.18.3 resolves from cognizioware-hydra/design/ by walk-up. qa #35 merged 09:27:47Z as 489c471, unreviewed = reported. NOT VERIFIED: QA CI 35329658260 hydra-e2e queued at 02:28 PT - read the 13 checkpoints (not the rollup); a new failure cause in the 3 fake-agent checkpoints is a separate defect, report verbatim. qa-run.yml red is pre-existing and separate. | TICK #582 2026-09-18 02:33 PT: State VERIFIED. QA CI 35329658260 on master 489c471, job hydra-e2e 105550903203, log read (not the rollup): fake-agent connected/registered/create_session/input, so the ws import loads; checkpoint suite run 1e9a0683 against live https://hydra.cognizioware.com passed 13 failed 0 skipped 0 total 13, score 100 (was 76.92, 10/3). Threshold and checkpoints untouched. qa-run.yml red remains pre-existing and separate.",
+  "run_id": "20260918T090234Z_7fdcfecf",
+  "roles_bound": {
+    "manager": "kimi-k3:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-18T09:02:34.840908+00:00"
+}

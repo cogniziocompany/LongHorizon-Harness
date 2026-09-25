@@ -1,0 +1,99 @@
+TASK 111 - before we test the flows, confirm the flows MAKE SENSE. Spec-first, using our own BMAD.
+
+*** GATES TASKS 112 AND 113. Those build golden QA runs against these flows; building tests for a
+flow nobody has validated bakes today's defects into the test suite. ***
+
+Paxton, 2026-09-09: *"First I recommend using our internal spec creation to confirm the process flows
+by running the BMAD cognizioware repo on these process flows to make sure they make sense, and then we
+need to make sure that it works all the way through with the golden QA runs being deployed and passing
+on each repo's admin center or any and all web ux."*
+
+REPO: cogniziocompany/BMAD_Cognizioware at `C:\Users\PaxtonTait\source\BMAD_cognizioware`
+(main @ cc0ec3b "Add BMAD Method installation: 30 skills and _bmad config").
+
+================================================================================
+WHAT IS ACTUALLY THERE - surveyed by the overseer, do not re-derive
+================================================================================
+
+    _bmad/          _config, bmm, core, custom, render, scripts, config.toml, config.user.toml
+    _bmad-output/   **EMPTY** - no spec has ever been produced by this installation
+    kb-article/     reference/
+
+**So this is a fresh BMAD install that has never been run.** Two consequences:
+  - There is no house style to match yet. **What you produce becomes the precedent**, so keep it
+    plain and reviewable rather than elaborate.
+  - **Prove the toolchain runs before promising output.** If BMAD cannot execute in this environment,
+    say so plainly at round one and stop - do NOT hand-write documents and present them as BMAD
+    output. A hand-written spec is fine; a hand-written spec mislabelled as generated is a defect.
+
+================================================================================
+THE FLOWS TO VALIDATE - and the defects they must explain
+================================================================================
+
+Primary source: `C:\Users\PaxtonTait\.claude\plans\publisher-cognizio-cgz-eager-gadget.md` (704 lines,
+read in full by the overseer). It documents four live production defects in ONE flow. Your job is to
+produce a spec of the INTENDED flow and check the intent itself holds up.
+
+FLOW 1 - **Environment -> Session setup** (cognizioware-powerplatform). The 2x2 that nobody tests:
+    {greenfield, brownfield} x {create at /environments/:envId/sessions/new, resume at /sessions/:id/setup}
+  Questions the spec must ANSWER, not restate:
+    - On the RESUME entry point the route carries no environment id. **Where is the environment
+      supposed to come from?** Today the code assumes a route param that does not exist, which is
+      defect one. A spec that does not answer this is not a spec.
+    - What is the session's state machine? `setup_step`, the `discovery_started` gate, and "a pipeline
+      may not start before setup completes" - **is that last rule written anywhere, or only assumed?**
+    - Brownfield is restricted to Cognizio-published solutions (CGZ-E202). **Is the publisher meant to
+      be per-tenant?** The DB already carries `publisher_prefix VARCHAR(10) DEFAULT 'cgz'` that the
+      frontend ignores. Spec the intent; do not implement it.
+    - `design/ux/modernist-v2/Env-to-Session-Spec.md:78` leaves OPEN whether brownfield design skips
+      the Analyst stage. **Resolve it in the spec or mark it explicitly UNRESOLVED for Paxton.**
+
+FLOW 2 - **Environment refresh**. A durable DB lock with an in-process executor, no TTL, no reaper.
+  Spec must state: who owns a refresh, how long it may hold, what happens when the owner dies, and
+  what the user is told. **A conflict is not an internal error** - today it returns a 500 telling the
+  user to contact support for something that should self-resolve.
+
+FLOW 3 - **The admin/diagnostics surface**, across every operator UI we have. RULE 2 governs and it is
+  NOT negotiable - if a flow implies a new view, CHECK WHETHER ONE ALREADY EXISTS and extend it:
+    fleet.easybutt0n.ai  wallboard, run detail lives HERE only, READ-ONLY
+    Hydra (corsairai300) device fleet + control plane, the ONLY WRITE surface
+    ops.easybutt0n.ai    infrastructure health only - 7 routes: /, overview, catalog, e2e, certs,
+                         admin-centres, audit. **There is NO /doctor route**; the doctor renders on
+                         /overview.
+    powerplatform.easybutt0n.ai   the product itself
+  Spec what each surface is FOR, and name anything that currently duplicates another. **A finding that
+  two surfaces answer the same question is a valuable output of this task.**
+
+================================================================================
+WHAT DONE LOOKS LIKE
+================================================================================
+
+Specs committed under `_bmad-output/` (the directory exists and is empty - use it), one per flow,
+each containing:
+  - the intended happy path, stated as steps a tester could follow
+  - the state machine and its guards, INCLUDING the ones currently only implied
+  - the error and conflict cases, and what the user sees for each
+  - **an explicit "OPEN QUESTIONS FOR PAXTON" section.** Do not resolve a product decision by writing
+    it down confidently. The publisher-per-tenant question and the brownfield-Analyst question both
+    belong here unless you find a written decision.
+  - a short section naming which of the four live defects the spec would have PREVENTED, and which it
+    would not. **If the spec would not have caught a defect, say so** - that tells us the spec is
+    incomplete, and that is the most useful thing this task can produce.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **This is a SPEC task. Write no application code and change no other repo.**
+ - Do not invent BMAD output. If the tool does not run, report that and hand-write clearly-labelled
+   drafts instead.
+ - Do not resolve open product questions on your own authority - list them.
+ - Respect RULE 2. Do not propose a new dashboard, page or endpoint without first showing the
+   existing one is unsuitable.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat`.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.

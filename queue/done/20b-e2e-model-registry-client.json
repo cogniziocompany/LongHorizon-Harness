@@ -1,0 +1,8 @@
+{
+ "name": "20b-e2e-model-registry-client",
+ "task_file": "C:/tmp/e2e-registry-client-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "run_id": "20260908T152131Z_d5bd5af9"
+}

@@ -1,0 +1,56 @@
+BUILD + TEST (code + docs; cognizioware-powerplatform): purge the third-party name `greg-xrm` / `Greg.Xrm.Mcp.AppMaker` from the product. It was replaced by our own implementation and the old name should not survive anywhere in the codebase, the configuration or the operator-facing surfaces. Paxton's direction, 2026-09-09. Work ONLY in /home/harness/work/cognizioware-powerplatform on branch chore/purge-greg-xrm (run `git fetch origin && git checkout -B chore/purge-greg-xrm origin/develop` first); plain git; commit by EXPLICIT PATH; no push; NO live deploys and no changes to any box; env NAMES only.
+
+## WHERE IT IS TODAY - START HERE, THEN FIND THE REST YOURSELF
+Confirmed 2026-09-09 in `packages/backend/src/config/mcp-servers.ts`: the MCP server list is an either/or, not a sum. WITH a gateway configured it returns `[cognizioware-tools-gateway, dataverseMcp]`; WITHOUT one it returns `[dataverseMcp, greg-xrm]`, where the greg-xrm entry is:
+
+    name: 'greg-xrm',
+    key: `greg-xrm@${envKey}`,
+    command: process.env.GREG_XRM_COMMAND || 'Greg.Xrm.Mcp.AppMaker',
+    args: ['--dataverseUrl', normalizedUrl],
+    readyIndicators: ['MCP', 'server'],
+    smokeTestRequiredTools: ['dataverse_metadata_list_tables', 'dataverse_appmodule_create'],
+
+That is the no-gateway fallback path. Production runs the gateway branch, so this entry is not live in prod today - which is exactly why it can rot unnoticed. DO NOT assume that file is the only place: grep the whole repo (code, tests, fixtures, docs, compose files, workflow files, scripts) case-insensitively for `greg`, `greg-xrm`, `greg_xrm`, `Greg.Xrm`, `AppMaker` and `GREG_XRM_`, and report the full list of hits BEFORE changing anything.
+
+## THE DECISION YOU MUST MAKE AND STATE
+The name is going. What replaces it is the question, and getting this wrong breaks the no-gateway path silently:
+ (a) If our own implementation is the drop-in successor for that fallback, rename the entry and its command/env var to ours and keep the fallback working.
+ (b) If the gateway is now the only supported path and the fallback is dead, DELETE the branch entirely rather than leaving a renamed stub that nobody exercises - and say plainly what happens to a deployment with no gateway configured after your change. If that configuration is no longer supported, the code should say so with a clear error, not fall through to something that does not exist.
+Read how `cognizioware-tools-gateway` and `dataverseMcp` are constructed in the same file and follow that shape. Whichever you choose, JUSTIFY IT in the completion report with what you found in the grep - do not guess which of the two is true.
+
+## ALSO PURGE, NOT JUST THE CODE
+ - the `GREG_XRM_COMMAND` environment variable: remove its use, and list every place it is DECLARED (repo `.env.example`, compose files, deployment manifests, workflow env blocks) so an operator can clean the boxes. Do NOT edit any live box from this task - produce the list.
+ - `smokeTestRequiredTools` naming those tools, if the tools themselves are gone or renamed.
+ - documentation, comments and handoff notes that describe the fallback by that name.
+ - any operator-facing string: this name can appear in a health payload (`/api/health` lists `mcpServerStatus[].name`), a log line or an admin view, and a third-party name in our product surface is the visible half of the problem.
+
+## HARD RULES
+Do not rename anything belonging to an actual third-party dependency we still USE - this task removes OUR use of a replaced component, not references to genuine upstream packages. If a hit turns out to be a real dependency, leave it and say so. No secrets, keys or tokens anywhere - env NAMES only. Do not deploy, do not touch a live box, do not change what the gateway path does. Explicit-path commits; no push.
+Completion = commits, diff stat, test counts, the FULL grep inventory before and after (it should be empty of our own uses afterwards), which of (a)/(b) you chose and why, what a no-gateway deployment does after the change, and the list of places `GREG_XRM_COMMAND` is still declared for an operator to clear. Auditor: read-only - verify the name is gone from code, config, docs and any operator-facing string; that the gateway path is unchanged; that the no-gateway path either works under the new name or fails with a clear explicit error rather than silently; and that no genuine third-party dependency was renamed by mistake.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.
+
+## REQUEUED 2026-09-09 13:50 PT - THE EVIDENCE BASE IS DONE. DO NOT REDO IT.
+
+The previous run (`20260909T185854Z_6c0a3e45`) completed the entire investigation and then could not
+land it: **its executor failed FIVE consecutive rounds with zero output and zero commits.** Its auditor
+assessed this as **infrastructure output-swallowing, not task difficulty**, and that matches the
+estate's discriminator - an oversized task moves its failure BETWEEN roles; a failing backend fails the
+SAME role repeatedly. Five failures, one role. Its executor was **`qwen3.8-nothink` on the local span**.
+
+**So the remedy is a different executor, not a smaller task.** If this run also lands on a local-span
+executor and produces zero output twice, stop and say so rather than burning the budget.
+
+**ALREADY ESTABLISHED - inherit it, do not re-derive it:**
+ - branch clean at `f2a3633`
+ - `mcp-servers.ts` construction understood
+ - **decision (b) is supported by the evidence**
+ - a **93-file hit inventory**
+ - the `GREG_XRM_COMMAND` declaration sites are known
+
+That is the expensive half and it is finished. **Start from it and land the change.**
+
+**REJECTED, and do not propose it again:** having the manager execute the purge directly to work around
+a broken executor. The manager/executor/auditor separation is what makes an audit worth anything; a
+manager that both does the work and reports on it produces a worthless next audit. A partial checkpoint
+commit is not worth that trade.

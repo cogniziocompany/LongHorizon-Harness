@@ -78,6 +78,94 @@ Tool descriptions carry the operating rules:
 - `harness_resolve_gate` rejects any `user_input` that contains non-ASCII
   characters.
 
+### MCP streamable-HTTP endpoint (`POST /mcp`)
+
+The Web API also serves the fleet tools as a real MCP server over
+streamable HTTP at `POST /mcp` (and `POST /mcp/`), so LiteLLM can register the
+service directly with `transport: http` instead of relying on a separate REST
+bridge. The endpoint speaks JSON-RPC 2.0 with these methods:
+
+| Method | Behavior |
+|---|---|
+| `initialize` | Returns `protocolVersion` (the client's is echoed when supported, otherwise `2025-03-26`), `capabilities: {"tools": {}}`, and `serverInfo.name = "lhharness"` |
+| `notifications/initialized` | Accepted with an empty `202` response |
+| `tools/list` | Returns the same tool list and input schemas as `GET /api/mcp/fleet/tools` (one shared manifest, no duplicate copy) |
+| `tools/call` | Runs the tool through the same dispatch path as `POST /api/mcp/fleet/{tool_name}` and returns `content: [{type: "text", text: "<json>"}]`; failures set `isError: true` |
+
+Any other method returns JSON-RPC error `-32601` (method not found). Unknown
+tool names in `tools/call` return a normal MCP result with `isError: true`.
+
+- **Auth**: the same `LH_HARNESS_WEB_TOKEN` bearer token as the rest of the
+  API. Requests without a valid `Authorization: Bearer <token>` header get
+  `401`.
+- **Responses**: plain `application/json` (SSE streaming is not required).
+- **Sessions**: the server is stateless. It never requires an
+  `Mcp-Session-Id` header; clients that track sessions can ignore it.
+- `Accept: application/json` is honored; a client that negotiates SSE still
+  receives JSON.
+
+Example:
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/mcp \
+  -H "Authorization: Bearer $LH_HARNESS_WEB_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}'
+```
+
+## Storage backend
+
+The queue's storage engine is selected under `[queue]`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `backend` | `"file"` | `"file"` (default) or `"postgres"`; anything else fails at service startup |
+| `database_url` | — (required when `backend = "postgres"`) | Postgres DSN the service connects to; missing with `backend = "postgres"` also fails at startup |
+
+With `backend = "postgres"` the service stores queue entries through
+`PgQueueStore` (`src/lh_harness/pg_queue.py`) instead of the default file
+store; the file store stays the default and remains fully hermetic. Two
+prerequisites apply before `backend = "postgres"` can work:
+
+1. **Migrations 001 and 002 must exist first** — `migrations/001_harness_queue.sql`
+   (the `harness.queue` table) and `migrations/002_harness_queue_events.sql`
+   (the `harness.queue_events` audit log). `PgQueueStore` applies them
+   idempotently on first connect, but the files themselves must be present.
+2. **`LH_HARNESS_DB_PASSWORD`** — the Postgres credential is supplied through
+   this environment variable name (its value is set in the deployment
+   environment only, never in config, a migration, a fixture, or a commit).
+   A password already embedded in `database_url` wins over the env variable.
+
+### Postgres cutover
+
+To switch a deployment from the file store to Postgres, add the following
+`[queue]` block to `config.toml`. Use the deployment's own user, host, and
+database **name** for the placeholders; do not put a password in the URL and do
+not copy any real host, user, or database value into the example.
+
+```toml
+[queue]
+backend = "postgres"
+database_url = "postgresql://<user>@<db-host>:5432/<database>"
+```
+
+Set the password through the environment variable **name**
+`LH_HARNESS_DB_PASSWORD` (its value is configured in the deployment
+environment only; it never belongs in `config.toml`, a migration, a fixture, or
+a commit). Before starting the service, make sure the migration files are
+present:
+
+- `migrations/001_harness_queue.sql` — creates the `harness.queue` table and its
+  enum.
+- `migrations/002_harness_queue_events.sql` — creates the
+  `harness.queue_events` audit log.
+
+`PgQueueStore` applies both migrations idempotently on first connect, but the
+files must exist before the service boots.
+
+If `database_url` is missing while `backend = "postgres"`, the service fails
+loudly at startup rather than silently falling back to the file store.
+
 ## Capacity rules
 
 Capacity is configured under `[queue.capacity]`:
@@ -139,12 +227,15 @@ visible to any caller with the bearer token through `GET /api/queue`.
 | `status` | `str` | `"pending"` | one of `pending`, `launched`, `done`, `failed` (`_VALID_STATUS` `queue.py:28`) | Store, on every transition |
 | `run_id` | `str \| None` | `None` | set when the entry is launched | Store, via `mark_launched` (`queue.py:430`–`439`) |
 | `reason` | `str \| None` | `None` | truncated to 4,000 chars (`_MAX_QUEUE_REASON_CHARS` `queue.py:26`) | Store, via `mark_done` (optional) / `mark_failed` (required) |
-| `skip_reasons` | `list[str]` | `[]` | appended only while `pending`; each item truncated to 4,000 chars | Store, via `record_skip` (`queue.py:458`–`465`) |
+| `skip_reasons` | `list[str]` | `[]` | appended while `pending` (launcher capacity skips) and while `failed` (so the reason accrues after a retryable failure); each item truncated to 4,000 chars | Store, via `record_skip` (`queue.py:497`–`505`) |
 | `created_at` | `float` | `time.time()` at create | epoch seconds | Store, at `create` |
 | `updated_at` | `float` | `time.time()` at create | epoch seconds; re-stamped on every write | Store, on every `update` |
 | `launched_at` | `float \| None` | `None` | epoch seconds; set at launch | Store, via `mark_launched` (`queue.py:438`) |
 | `last_checked_at` | `float \| None` | `None` | epoch seconds; stamped when the launcher evaluates the entry | Launcher (`launcher.py:206`, `:350`, `:365`) — never set by the store or the API |
 | `dedup_key` | `str \| None` | `None` | see *Idempotent enqueue* below | Caller, at enqueue |
+| `retry_of` | `str \| None` | `None` | queue_id of the failed entry this is a retry of | Store, via `requeue` |
+| `attempt` | `int` | `1` | attempt number (1 for original entry) | Store, via `requeue` |
+| `failure_cause` | `str \| None` | `None` | cause of failure that triggered retry | Store, via `mark_failed` / `requeue` |
 
 There is no dedicated `done_at`/`failed_at` field. The terminal time of an entry
 is the `updated_at` value at the moment `mark_done` or `mark_failed` runs (both
@@ -173,8 +264,7 @@ the nine input fields via `_normalize_request` (`queue.py:228`–`253`).
 
 `dedup_key` is the single-orchestrator floor: two orchestrators (or a retrying
 client) asking for the same work resolve to one queue entry, so the work can be
-launched at most once. It was added in commit `0de7b2d3`; the `dedup_key` field
-is the 18th `QueueEntry` field (`queue.py:79`).
+launched at most once. It was added in commit `0de7b2d3`.
 
 **Validation** (`_validate_dedup_key`, `queue.py:213`–`225`):
 
@@ -231,8 +321,8 @@ it collides with task 48). The guarantee today is "harmless via idempotency"
   happened; it can only observe that the `queue_id` is stable for a given
   `dedup_key`.
 
-`dedup_key` is recoverable after enqueue: `QueueEntry.to_dict` serializes all 18
-fields (`queue.py:81`–`86`, via `asdict`), and `GET /api/queue` returns each
+`dedup_key` is recoverable after enqueue: `QueueEntry.to_dict` serializes all 21
+fields (`queue.py:98`–`103`, via `asdict`), and `GET /api/queue` returns each
 entry through `to_dict` (`server.py:1060`, `:1062`), so the key is visible on
 entries and groups. This audit-level visibility is established by the dataclass
 serialization; it is not asserted by a dedicated endpoint test. The hermetic
@@ -240,6 +330,44 @@ test `test_api_dedup_key_passes_through` (`tests/webapi/test_queue_dedup.py`)
 proves behavioral forwarding end-to-end — two `POST /api/queue` calls with the
 same key yield one entry and a single pending count — but does not assert the
 key appears in any response or audit field.
+
+## Postgres backend and migration order
+
+The file store (atomic JSON files under the runs root) is the default. Setting
+`queue_backend="postgres"` plus a `database_url` in the project config selects
+`PgQueueStore` (`src/lh_harness/pg_queue.py`), which applies the schema
+migrations on first connect. The password is never stored in config or in a
+migration file: it comes from the `LH_HARNESS_DB_PASSWORD` environment variable
+at connect time.
+
+The migrations live under `migrations/` at the repository root and are applied
+in filename order (`001_harness_queue.sql` then `002_harness_queue_events.sql`)
+inside one transaction by `PgQueueStore._migrate` (`pg_queue.py:128`–`142`), so
+a partial file never leaves the schema half-applied.
+
+Every migration file is safe on both ends of that order:
+
+- **Fresh database** — each file applies cleanly to an empty schema owned by a
+  non-superuser role. `001` creates the `harness.queue_status` enum *before*
+  the `queue` table and declares `status` as that enum with a
+  `'pending'` default directly in `CREATE TABLE`; it never converts an existing
+  `VARCHAR` column with a default (that was the shape that failed on a fresh
+  database with `ERROR: default for column "status" cannot be cast
+  automatically to type queue_status`). `002`'s foreign key is added inside a
+  `DO` block that checks `pg_constraint`, because `ADD CONSTRAINT` has no
+  `IF NOT EXISTS`.
+- **Already-migrated schema** — re-running either file is a no-op: `CREATE
+  TYPE` is guarded by a `pg_type` check inside a `DO` block (Postgres has no
+  `CREATE TYPE IF NOT EXISTS`), the tables and indexes use `IF NOT EXISTS`, and
+  re-running the whole order changes no object definition.
+
+The fresh-apply / re-apply contract is asserted by
+`tests/webapi/test_pg_migrations.py`, which applies both files to an empty
+scratch database and asserts the final shape (enum `harness.queue_status`,
+`status` default `'pending'`, index `harness_queue_dedup_key_idx`), then
+re-applies both files and asserts nothing changed. It runs whenever
+`LH_HARNESS_DB_URL` names an empty scratch database and skips cleanly
+otherwise; the module docstring documents how to run it locally.
 
 ## Liveness (queue depth)
 

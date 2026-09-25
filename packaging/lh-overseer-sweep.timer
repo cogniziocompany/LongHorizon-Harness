@@ -1,0 +1,37 @@
+# lh-overseer-sweep.timer — fires the CT110 overseer sweep tick every 5 minutes.
+#
+# In-repo shipped copy of the systemd timer that replaces the PTAIT09
+# scheduled task `LH-Overseer-Sweep` (TASK 236; cadence preserved from
+# `tools/overseer_tick.ps1` and the doctrine header: "OVERSEER SWEEP — every
+# 5 minutes").  Conventions follow packaging/lh-harness.service; the pair of
+# units is installed by the task 224 pipeline's units stage.
+#
+# SHIPS DISABLED, ON PURPOSE (TASK 236 rollout rule).  The rollout is:
+# read-only shadow alongside the PTAIT09 sweep for 24h (>= 288 tick rows,
+# disconnect checklist D3), compare the two ledgers, THEN the operator flips
+# the mode (LH_OVERSEER_TICK_MODE in the EnvironmentFile) and — only after
+# that — disables `LH-Overseer-Sweep` on PTAIT09 (reversible with
+# Enable-ScheduledTask) and enables this timer.  Deploying the units never
+# starts the sweep; the operator step that does is documented and explicit:
+#   systemctl enable --now lh-overseer-sweep.timer
+# Read-only shadowing still requires the timer enabled but the tick in
+# read-only mode — that combination is safe to enable any time (the PTAIT09
+# sweep stays the only ACTING overseer).
+
+[Unit]
+Description=Overseer sweep timer (every 5 minutes, CT110)
+Documentation=file:/home/harness/work/LongHorizon-Harness/docs/OVERSEER-TICK-CT110.md
+
+[Timer]
+# Every 5 minutes.  OnCalendar with an *-*-: 0/5 pattern is the canonical
+# calendar form; AccuracySec tightens systemd's default 1-minute slack so
+# the cadence actually reads 5 minutes apart in the tick ledger.
+OnCalendar=*-*-* *:0/5:00
+AccuracySec=5s
+# A tick that missed its boundary while the host was asleep or the lock was
+# held fires ONCE on wake, never a burst of back-to-back catch-up ticks.
+Persistent=true
+Unit=lh-overseer-sweep.service
+
+[Install]
+WantedBy=timers.target

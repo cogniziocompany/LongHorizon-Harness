@@ -1,0 +1,196 @@
+BRANCH (overseer tick #49, 2026-09-15 01:37 PT): the CT110 mcp-tools workspace is on task 158's branch fix/task-158-litellm-router-memleak (PR #150). Never commit to or push it. Any branch you need is cut from origin/main (docs/task-97-pr-reconciliation).
+
+*** READ THE '22:18 PT' CORRECTION NEAR THE BOTTOM FIRST (overseer tick #11 [f386b4], 22:24 PT): PR #145 already put the azure-mcp fix on main - the cherry-pick route below is OBSOLETE; verify #145 covers #36, close #36, merge nothing. ***
+================================================================================
+OVERSEER CORRECTION 2026-09-14 21:40 PT (scheduled tick [251440]) - READ BEFORE PART 1
+================================================================================
+PART 1 'MERGE #36' IS SUPERSEDED. #36's base is feat/ms365-mcp-hosted-backend, and #35 (that branch
+into main) is CONFLICTING, so merging #36 restores nothing on main. A run NEVER merges.
+Route: cherry-pick #36's +16/-9 onto a fresh branch cut from origin/main, push, then
+'gh pr create --base main' stating it replaces #36, and STOP. Record the live azure_mcp row READ-ONLY;
+no POST /config/update (the overseer does steps 3-5 after its merge, in a zero-active-run window).
+Do not close #35 until the replacement PR exists. Leave #36 open for the overseer.
+
+TASK 97 - land #36 (restore the 66 dead azure- tools) and close the eight superseded PRs.
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools.
+
+Paxton, 2026-09-09, approving both: "YES another task in queue: recommends merging #36 (restores
+66 azure- tools currently returning zero) and closing eight stale PRs."
+
+Source: the open-PR audit inside the `mcp-namespace-contract-2026-09-09` plan, session
+`284a9e40-18b8-4fdb-b04d-057782f44674`. Task 96 carries that audit as REPORT-ONLY. **This task is
+the authorisation to act on it.** Task 96 still must not merge or close anything.
+
+================================================================================
+READ THIS FIRST - THE FILE IS NOT THE AUTHORITY. #36 MAY MERGE AND CHANGE NOTHING.
+================================================================================
+
+The overseer measured this on CT202 on 2026-09-09, and it directly governs whether #36 works.
+
+`general_settings.store_model_in_db: true` means five config sections live as rows in the
+Postgres `LiteLLM_Config` table: **general_settings, guardrails, litellm_settings, mcp_servers,
+router_settings.** The deployed YAML states the merge rule in its own comments:
+
+    DB-backed for keys present in the `LiteLLM_Config` row `litellm_settings`
+    (deep merge, DB WINS); FILE wins only for keys ABSENT from that row. Only the
+    17 LITELLM_SETTINGS_SAFE_DB_OVERRIDES keys live-reload from the DB onto the
+    running module. Change DB-shadowed keys via
+      POST $LITELLM_BASE_URL/config/update  -d '{"litellm_settings":{...}}'
+    then READ BACK the row and diff.
+
+**#36 fixes `azure_mcp` by editing its URL and transport - and `mcp_servers` IS ONE OF THE
+DB-SHADOWED ROWS.** So merging #36 edits the file, the deploy syncs the file, and the running
+router may keep serving the DB's stale `azure_mcp` entry. **A green lane would prove nothing.**
+
+Proof the shadowing is real and not theoretical - the overseer diffed the live
+`litellm_settings.mcp_aliases` row against the same block in the deployed YAML:
+
+    YAML entries 51   |   LIVE DB entries 50
+
+    IN THE FILE BUT NOT LIVE - 9 aliases whose file edits did NOTHING:
+        audioqa  auth  dataversedata  hydrafleet  memory  opsstatus  pac  qarun  stripe
+
+    LIVE BUT WITH NO FILE BACKING - 8:
+        n8n-docs  proxmox-cognizioware01  proxmox-corsairai300  proxmox-phx
+        proxmox-ptait01  proxmox-ptait07  proxmox-terranas01  swarms
+
+**Nine committed, reviewed, merged alias edits are dead letters on the live router.** Assume the
+same is possible for #36's `mcp_servers` edit until you have read the live row back.
+
+REQUIRED SEQUENCE FOR #36 - do not skip step 4, it is the whole point:
+  1. Read the live `mcp_servers` row for `azure_mcp` from `LiteLLM_Config` and record it.
+  2. Merge #36 through the NORMAL PIPELINE. Paxton 2026-09-09 accepted the missing-UAT gap for
+     gateway config explicitly: **deploy through the pipeline, never by hand.**
+  3. Let the lane finish. `infrastructure/litellm-config.yaml` FORCE-RECREATES the prod router
+     (the deploy job hashes the DEPLOYED file's content, so even a comment-only edit triggers it)
+     - so this MUST be merged in a window with ZERO ACTIVE RUNS on CT110. Check before merging.
+  4. **READ THE LIVE ROW BACK.** If `azure_mcp` in the DB still carries the old
+     `http://azure-mcp-auth-proxy:3000` with no `/mcp` path, the file edit was shadowed. Then and
+     only then apply `POST /config/update` with the corrected `mcp_servers` entry, and read the
+     row back AGAIN.
+  5. Prove the tools exist AND resolve: `tools/list` on the azure namespace must return ~66, and
+     a real `tools/call` on one `azure-*` tool must RESOLVE, not return "Unknown tool". A
+     namespace that lists but cannot be called is the exact failure mode of the proxmox and
+     kb-uat incidents.
+
+================================================================================
+PART 1 - MERGE #36
+================================================================================
+
+  #36  fix(azure-mcp) transport mismatch
+
+Verified MERGEABLE/CLEAN at audit time. RE-VERIFY - main has moved. `main` still carries
+`url: "http://azure-mcp-auth-proxy:3000"` with **no `/mcp` path**, and `azure_mcp` returns **0
+tools live** (no `azure-` prefix appears in the aggregate histogram). The PR adds
+`--outputTransport streamableHttp` plus the `/mcp` path, restoring **66 tools** under the
+`azure-` namespace.
+
+That is the largest single tool-surface gain available right now, and it is why this PR is first.
+
+CO-ORDINATION. Three other things edit `infrastructure/litellm-config.yaml`: PR #122 (Pi-hole
+allowlist, active), PR #120 (retire qwen3.5/3.6 - titled "DO NOT MERGE - ordering blocker", and
+that stands), and task 96's WI-1 (the `comfyui` alias). **Land #36 FIRST and let it settle**, so
+the azure surface change and the comfyui namespace change are independently attributable. Do not
+batch them.
+
+================================================================================
+PART 2 - CLOSE THE EIGHT SUPERSEDED PRs
+================================================================================
+
+RE-VERIFY EACH ONE against current `origin/main` BEFORE closing it. These verdicts were measured
+on 2026-09-09 and main moves. **If a verdict no longer holds, LEAVE THE PR OPEN and say so** - a
+wrongly closed PR loses work that nobody will go looking for again.
+
+  #55  suite 26 fleet DNS+TLS        e2e/suites/26-fleet-dns-tls.test.js is already on main.
+  #41  qwen3.6 + quota resilience    main carries qwen3.8/--128k/--256k; its
+                                     23-qwen36-vision-quota.test.js was replaced by
+                                     23-qwen38-vision-quota.test.js; #120 retires qwen3.6.
+  #40  gateway-guides-mcp            infrastructure/docker/gateway-guides-mcp/ is on main, the
+                                     service is live and registered. Also CONFLICTING/DIRTY.
+  #35  MS365 backend + decommission  ms365-mcp is on main and live (14 tools); PHX was
+       PHX                           decommissioned 2026-07-09. Also +409,333 lines / 127 files
+                                     - it carries vendored junk.
+  #37  router fallbacks              The real root cause was the LiteLLM_Config DB row shadowing
+                                     YAML fallbacks - the SAME defect class as this whole task -
+                                     and it was fixed separately. +409,024 lines / 123 files.
+  #39  cloud model retirement        Draft, ~1 month idle, +414,372 lines / 162 files, overtaken
+                                     by #120.
+  #11  ComfyUI deploy                infrastructure/docker/comfyui-mcp/ is on main and the
+                                     container runs. **SKIM IT FIRST** - confirm it does not
+                                     already contain the `comfyui` alias task 96 WI-1 adds; if it
+                                     does, say so, because that changes WI-1.
+  #2   CI workflows / suite 14       e2e/suites/14-github-ci-workflows.test.js is on main.
+                                     5 months idle.
+
+CLOSING COMMENT. Every close gets a one-line comment naming what superseded it and where that
+lives on main. A PR closed silently reads as abandoned work; a PR closed with "superseded by X on
+main" reads as bookkeeping. Do not close any PR without that comment.
+
+KEEP OPEN, explicitly - do not touch these:
+  #122 Pi-hole allowlist        active, 5h old at audit
+  #120 retire qwen3.5/3.6       BLOCKED BY DESIGN - its own title says DO NOT MERGE
+  #112 e2e model registry       active; adds suites 44/45/46, which is why task 96 takes 47
+
+================================================================================
+PART 3 - THE DRIFT IS A FINDING, NOT A FIX. REPORT IT, DO NOT RECONCILE IT HERE.
+================================================================================
+
+The 17-entry file-vs-DB alias drift above is REAL and it is a defect. **Do not fix it in this
+task.** Reconciling it renames tools for live clients and belongs with task 96's namespace work,
+under its client sweep and its suite-47 drift check (check 5 exists precisely to catch this).
+
+What this task DOES owe: a written report of the drift as measured at execution time - re-run the
+comparison, do not copy the numbers above - flagging in particular:
+
+  - **`n8n-docs` is LIVE and BROKEN by THE RULE.** `n8n` also exists as an alias, and THE RULE
+    (litellm-config.yaml:202-208) is: a dashed alias is broken if and only if another alias equals
+    its text before the first dash. `n8ndocs` (the working replacement) is live too, so the broken
+    name sits alongside the good one.
+  - **`proxmox-phx` is live and points at a host decommissioned 2026-07-09.**
+  - The six other `proxmox-*` dashed aliases are NOT broken by THE RULE - there is no bare
+    `proxmox` alias - but they have no file backing.
+  - `comfyui` is absent from BOTH the file and the DB, which confirms task 96 WI-1's gap and
+    confirms that adding it to the YAML alone would not have worked.
+
+Hand these to task 96. Do not act on them.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **ZERO ACTIVE RUNS on CT110 before merging #36.** The router force-recreate kills in-flight
+   harness runs. Check, and wait if you must.
+ - Deploy through the NORMAL PIPELINE. Paxton accepted the missing-UAT gap for gateway config on
+   2026-09-09 on the condition it ships through the pipeline and NOT by hand. A hand-applied
+   CT202 change is out of bounds even though the gap is accepted.
+ - **A green lane is NOT proof for #36.** Read the live `mcp_servers` row back, then prove a real
+   `tools/call` resolves. See the required sequence above.
+ - Re-verify every close. Leave anything open whose verdict no longer holds.
+ - Do NOT touch #122, #120 or #112.
+ - Do NOT reconcile the alias drift here - report it to task 96.
+ - NEVER use `delete_repo` (task 87). Closing a PR is not deleting a branch: leave branches alone.
+ - NEVER print, log or commit a key VALUE. The `LiteLLM_Config.general_settings` row contains the
+   master key and the database URL in plaintext - **do not select that row, and do not paste its
+   contents anywhere.** Query `litellm_settings` / `mcp_servers` specifically.
+ - Never `docker compose up` for mcp-tools without `--env-file mcp-tools.env`. Never
+   `docker compose down -v`.
+ - Commit by explicit path; never `git add -A`; clone with autocrlf=false.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+#36 merged through the pipeline in a zero-active-run window, with the live `mcp_servers` row read
+back AFTER the deploy showing the corrected azure URL and transport - and if it did not take, the
+`POST /config/update` applied and read back again; `tools/list` on the azure namespace returning
+~66; and a real `tools/call` on an `azure-*` tool RESOLVING. Plus: the eight PRs re-verified and
+closed each with a comment naming what superseded it, or left open with the reason; #122/#120/#112
+untouched; and the re-measured file-vs-DB alias drift written up and handed to task 96, including
+the live `n8n-docs` breakage and the decommissioned `proxmox-phx`.
+
+If the azure tools do not resolve after both the deploy and the config/update, STOP and report.
+Do not start editing the azure-mcp container to make the number come out right.
+
+*** CORRECTION 2026-09-14 22:18 PT (interactive [a59669]): the azure-mcp fix is already on main via PR #145 (MERGED 2026-09-11, ef4344d). This supersedes both PART 1 'MERGE #36' and the 21:40 cherry-pick route: verify #145 covers #36, then close #36 naming #145; merge nothing; branch from origin/main. ***

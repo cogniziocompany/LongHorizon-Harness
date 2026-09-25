@@ -98,6 +98,31 @@ def classify_agent_runtime_failure(result: EpisodeResult) -> AgentRuntimeFailure
         # authentication/network/quota failure keeps its terminal kind.
         candidates = _strip_guard_rejection(candidates)
     combined = "\n".join(candidates)
+    # Stalled-episode detection: the watchdog (adapters/cli_agent.py) kills a
+    # child that stops producing output entirely and appends NO_OUTPUT_STALL.
+    # Classify it before the generic provider classifiers so the hang keeps
+    # its own kind instead of decaying into provider_error/network text
+    # matching.  kind="stall" (not "timeout") keeps the manager from treating
+    # the episode as a recoverable in-run timeout and re-running it in place;
+    # the queue-level requeue is the retry path for a hang.
+    stall_detected = any(label.startswith("NO_OUTPUT_STALL") for label in hard_signals)
+    if stall_detected:
+        kind = "stall"
+        label = "Agent 执行无输出停滞"
+        message = next(
+            (
+                item
+                for item in candidates
+                if "stall" in item.lower() or "no output" in item.lower()
+            ),
+            "Episode stalled: no output from the agent runtime.",
+        )
+        return AgentRuntimeFailure(
+            kind=kind,
+            abort_reason="provider_stall",
+            message=_clean(message, 1200),
+            user_message=f"{label}：{_clean(message, 1200)}",
+        )
     kind = "timeout" if result.status == "timeout" else "provider_error"
     label = "Agent 执行超时" if kind == "timeout" else "Agent provider 启动或运行失败"
     # A command episode that reaches its harness budget is a local timeout, not

@@ -1,0 +1,8 @@
+{
+ "name": "05b-envsession-rebase",
+ "task_file": "C:/tmp/envsession-rebase-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform",
+ "max_rounds": 3,
+ "trio": "kimi",
+ "run_id": "20260907T231617Z_55bd7777"
+}

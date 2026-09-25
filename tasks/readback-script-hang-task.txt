@@ -1,0 +1,50 @@
+TASK 181 - read-back-synthetic-anthropic-fallbacks.py HANGS: fix it so the task-136 proof is a 10-second read, not a timeout.
+
+SOURCE: scheduled tick #323 (2026-09-16 16:12 PT) and the interactive overseer (16:35 PT) both ran
+infrastructure/scripts/read-back-synthetic-anthropic-fallbacks.py after applying the fallbacks (prod CT202 and
+UAT CT204). Both times it printed nothing for >120 s and had to be killed. The prepare script with --from-row,
+which reads the same row through the same psql path, returns in about two seconds on the same boxes. So the hang
+is in read-back's own code path, not in the database or the network.
+
+REPO / WORKSPACE: cognizioware-mcp-tools. Base on main (c489555 or later, which carries the three scripts).
+
+WHAT IS KNOWN (measured, do not re-derive):
+ - Environment on both boxes: python3 on the CT host, psql only inside the postgres container; the overseer ran
+   the scripts with a psql shim on PATH (exec docker exec -i -e PGPASSWORD cognizioware-mcp-tools-postgres psql "$@")
+   and DATABASE_URL / LITELLM_MASTER_KEY exported from the litellm container's env. prepare.py works in that setup.
+ - The DB row is correct on both: prod 32 entries / 10 synthetic / 0 multi-key; UAT 29 / 10 / 0 (direct SQL).
+ - read-back prints nothing before the hang, so the block happens before its first print. Suspects, in order:
+   (1) a call to GET /config or /get/config/callbacks on the router that waits on a slow endpoint (the bare /health
+   is forbidden - it bills every model; check the script does not touch it); (2) a psql invocation without -qAt or
+   with a pager / interactive prompt (stdin not closed); (3) a subprocess that inherits stdin and waits.
+   Find it by running the script under `python3 -X faulthandler` with `timeout -s USR1`, or add `PYTHONUNBUFFERED=1`
+   and trace prints, and READ the stack, do not guess.
+
+DELIVERABLE:
+ 1. The fix, with a hard overall timeout (every HTTP call and every subprocess call bounded, 30 s max), and stdout
+    flushed after each phase so a hang is at least visible.
+ 2. A `--offline` mode that verifies the DB row ONLY (single-key-map shape, the ten groups present, targets equal
+    to TARGETS) without touching the router - this is the mode the overseer will use inside a tick.
+ 3. A unit test that feeds a fake row and a fake router response and asserts the diff output; and a test that the
+    script exits non-zero within its timeout when the router does not answer (mock a socket that never replies).
+ 4. Run it for real on UAT (CT204) only, via the shim described above, and paste the output in the PR body.
+
+HARD RULES: do NOT run --apply anywhere (both rows are already applied; /config/update SETS the list, a re-apply
+with a partial body deletes entries). Do NOT edit litellm-config.yaml or docker-compose.yml. Never print
+DATABASE_URL, the master key, or any secret; env var NAMES only. NEVER git add -A; commit by explicit path; git diff
+--stat before every commit. Do NOT post an @claude comment (task 117). Open the PR and STOP; merging is the
+overseer's.
+
+DONE MEANS: on UAT, `read-back-synthetic-anthropic-fallbacks.py --offline` returns in under 10 s and reports
+29 entries / 10 synthetic / 0 multi-key, matching the SQL; and the full mode either completes in under 30 s or fails
+loudly with the phase it was in.
+
+
+=== OVERSEER CORRECTION (tick #598) - NARROWING ONLY, overrides the task text where they differ.
+
+This is a RELAUNCH. The previous run of this task was killed by a container OOM, not by its own work.
+1. NEVER touch /home/harness/work/cognizioware-mcp-tools: no checkout, stash, reset, clean, or `git add -A` there. It holds another task's uncommitted files (HEAD d0aac34, 39 porcelain lines) and must stay exactly so.
+2. Work ONLY in the existing clone /home/harness/work/_w181/cognizioware-mcp-tools, branch fix/read-back-synthetic-anthropic-fallbacks (= origin/main c548130, clean, no commits yet). `git fetch` first; do NOT re-clone.
+3. Prior executor's live hypothesis: the script blocks waiting on STDIN (probes at /tmp/fhwrap.py, /tmp/timed_stdin.py). Start there; do not re-derive from zero.
+4. Manager is read-only by role: delegate to the executor; do not ask for write permission.
+5. Stage files by explicit path. Push the branch and open the PR yourself (GH_TOKEN is in the environment), then STOP. Do not merge.

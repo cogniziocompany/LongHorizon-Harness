@@ -1,0 +1,58 @@
+TASK 201 - THE WORKSPACE BRANCH GUARD NEEDS AN OPT-IN FOR CONTINUATION TASKS, BEFORE ANY HARNESS RELEASE REACHES CT110.
+
+REPO / WORKSPACE: LongHorizon-Harness    BASE: main (the guard is already there - see below)
+
+*** THIS IS A PRE-DEPLOY BLOCKER, NOT A NEW FEATURE. *** Task 195's guard is MERGED to main as e1a4fc7
+(PR #25, 2026-09-18 07:04:34Z). The DEPLOYED harness on CT110 does NOT have it yet - measured
+2026-09-18 00:30 PT: /home/harness/venv/lib/python3.12/site-packages/lh_harness contains no
+workspace_guard.py and its launcher.py has zero calls to prepare_workspace_base. So nothing is broken
+in production today, and this task must land BEFORE the next harness deploy, not after.
+
+WHAT THE GUARD DOES TODAY (read from main, src/lh_harness/launcher.py:326 and workspace_guard.py):
+on every launch, if the workspace's checked-out branch is not the repo default, the run is moved onto a
+fresh branch lh-run/<label> cut from origin/<default> - in place when the tree is clean, in a new linked
+worktree when it is dirty or ahead, or after a named stash if worktrees are unavailable. If that branch
+carries an OPEN pull request, the entry is REFUSED: mark_failed(queue_id, "workspace base refused: ...")
+plus a queue.skipped event.
+
+WHY THAT IS WRONG AS THE ONLY BEHAVIOUR - measured, this week, repeatedly:
+A CONTINUATION TASK IS A NORMAL, COMMON SHAPE IN THIS FLEET, and it always looks exactly like the thing
+the guard refuses. Examples from 2026-09-17 alone:
+  - Task 190 (Nebo steps 2-6) was written to continue task 100's branch feat/nebo-outbound, and its own
+    text says "DO NOT START until task 100's PR is open - the branch is shared".
+  - The overseer's 9999z6 slice existed only to fix two defects ON PR #1's branch.
+  - Task 192 and 192b both worked powerplatform PR #105's existing branch task-101/build-dispatch and
+    got it green; PR #105 merged as a12a7e0.
+  - Tasks 148a/148b/148e branch from and target feat/harness-fleet-report, not main.
+Under the merged guard every one of those launches is either refused outright (open PR on the branch) or
+silently relocated to a fresh branch cut from origin/default - where a push cannot update the PR the task
+was written to finish, and the task's own instruction to share the branch becomes impossible to obey.
+mark_failed also means a refused entry needs a human requeue, so the failure is noisy as well as wrong.
+
+DELIVERABLE
+ 1. An EXPLICIT per-entry opt-in on the queue entry - e.g. `"branch": "<name>"` (use this branch as-is)
+    or `"continue_branch": true` (use the checked-out branch as-is). Named in docs/queue.md, carried by
+    QueueEntry, honoured by the launcher: when set, prepare_workspace_base returns the workspace
+    unchanged with mode "continuation" and NO relocation, NO stash, NO refusal.
+ 2. The guard's protections must still apply to the case it was built for: an entry with NO opt-in that
+    lands on someone else's branch is still relocated or refused. Do not weaken the default.
+ 3. A refusal must be RETRYABLE, not terminal: prefer marking the entry blocked (or leaving it pending
+    with the reason recorded) over mark_failed, so a queue entry that hits a transient dirty tree is not
+    converted into a dead row needing hand requeue. State which you chose and why.
+ 4. The opt-in must be VISIBLE in the round-zero record task 180 added (merged 1602f7b): the record
+    already names branch, head sha, ahead/behind and dirty paths - add the mode the guard chose
+    ("on-default" / "in-place" / "worktree" / "stash" / "continuation") so a later reader can tell
+    whether a run was relocated.
+ 5. Tests: a continuation entry with an OPEN PR on its branch LAUNCHES and stays on that branch; a
+    non-opt-in entry on the same branch is still refused; an opt-in entry with a dirty tree keeps the
+    tree; and the round-zero record carries the mode in all three.
+
+HARD RULES: the worktree path interacts with a recorded hazard - WSL-created run worktrees must be
+locked and `git worktree prune` must never run from Windows (see the memory note
+wsl-worktree-prune-hazard); if you touch worktree creation, keep that invariant and say so. Never
+git add -A; commit by explicit path; git diff --stat before every commit. No @claude comment (task 117).
+Open the PR and STOP - merging is the overseer's.
+
+DONE MEANS: a continuation entry launches on its own branch and can push to its existing PR; a
+non-opt-in entry on a foreign branch is still stopped; a refusal is retryable; the round-zero record
+names the mode; and the tests above prove all four.

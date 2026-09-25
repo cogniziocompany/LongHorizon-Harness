@@ -1,0 +1,349 @@
+TASK 135 - Ship cognizioware-powerplatform PROD backend logs to the shared Seq server.
+CONFIG + ONE SMALL HARDENING CHANGE. This is not a logging build-out.
+
+REPO / WORKSPACE: cognizioware-powerplatform
+Source: session [ce2688] (ce268840-e4b0-4677-a285-8bd8216ec9d8), plan mode, 2026-09-10.
+
+THE KEY FINDING: the Seq sink is ALREADY WRITTEN and has been dormant for six months.
+packages/backend/src/config/logger.ts builds a Pino multistream over stdout + pino-seq
+whenever SEQ_URL is set. pino-seq@^4.0.0 is declared and installed. env.ts already validates
+SEQ_URL / SEQ_API_KEY as optional zod fields. logger is imported and used with structured
+calls across ~25 files. Landed in 67c0807 (2026-03-18); SEQ_URL has NEVER been set in any
+lane. So this is config/ops, not a build.
+
+================================================================================
+STEP 0 - PRE-FLIGHT, READ-ONLY. DO NOT SKIP. This is the wrong-box guard.
+================================================================================
+Repo docs and live infra DISAGREE, and the disagreement is booby-trapped:
+  - deployments/README.md and instances.json say prod = pve151,
+    /opt/cognizioware-powerplatform.
+  - DO NOT TRUST deployments/README.md line 32 on env handling. It claims only uat.env is
+    version-controlled and that DB secrets live on the host. THAT IS FALSE: dev.env, uat.env
+    AND prod.env are all tracked WITH LIVE VALUES. The file is stale in exactly the area you
+    are touching.
+  - Live-measured (C:/tmp/HANDOFF-CT-MAP-2026-09-10.md): prod pp is the corsairai300 HOST
+    docker stack at 192.168.21.151 - and CT105 on that same host, NAMED
+    cognizioware-powerplatform, is a STALE DECOY (newest session 2026-06-09). Querying the
+    decoy has previously made a live production record appear not to exist.
+  - dev/uat are a DIFFERENT BOX: 192.168.21.163 (pp-dev-app-1 :3000, pp-uat-app-1 :3001).
+
+CONFIRM, DO NOT ASSUME:
+  1. ssh root@192.168.21.151 - hostname, then docker ps, and find the running prod app
+     container plus its compose project dir.
+  2. curl -s https://powerplatform.easybutt0n.ai/api/health - record the version/SHA and
+     confirm it MATCHES the image tag on the container you just found. THAT MATCH is what
+     proves you have the right box - not the container name.
+  3. Find the .env that container's compose stack actually reads (docker inspect, or
+     docker compose config in that dir). Write down the absolute path. DO NOT touch
+     /opt/powerplatform-dev/.env, /opt/powerplatform-uat/.env, or anything on .163.
+  4. Reachability FROM THAT HOST, both paths:
+       curl -sS -o /dev/null -w "%{http_code}" https://seq.easybutt0n.ai
+       curl -sS -o /dev/null -w "%{http_code}" http://192.168.21.147:5341
+     Default to the public https://seq.easybutt0n.ai - it works from any network position.
+     Prefer the internal 5341 only if it is reachable and you want log traffic off the tunnel.
+
+================================================================================
+STEP 1 - Seq API key (MANUAL, in the Seq UI - needs whoever holds Seq admin)
+================================================================================
+  Title: cognizioware-powerplatform-prod    Permissions: INGEST ONLY, nothing else.
+  Applied properties set SERVER-SIDE, not in code:
+      Application = cognizioware-powerplatform
+      Environment = prod
+  Server-side applied properties are the durable way to tag events on a shared Seq - a client
+  can forget to send them, a key cannot. Optionally set a minimum level on the key as a volume
+  guard for the first soak. The key is shown ONCE.
+
+================================================================================
+STEP 2 - THE ONLY CODE CHANGE: harden packages/backend/src/config/logger.ts
+================================================================================
+Keep the existing opt-in shape (if seqUrl) intact - unsetting SEQ_URL IS the rollback.
+
+  a. SELF-DESCRIBING EVENTS. Add base bindings so events carry identity even if the
+     key-applied properties are ever missing, and so they are filterable next to the other
+     services:
+         base: { application: cognizioware-powerplatform, service: backend,
+                 environment: process.env.NODE_ENV }
+     MERGE alongside pino's default pid/hostname rather than replacing them.
+
+  b. FAIL OPEN. This is the real risk. A LOG SINK MUST NEVER BE ABLE TO TAKE PROD DOWN.
+     Wrap the createStream(...) construction in try/catch falling back to stdout-only, AND
+     attach an error handler to the returned stream, so a Seq outage, DNS failure or 401
+     degrades to stdout instead of throwing on a hot log path.
+     PROVE IT in Step 4. Do not trust that pino-seq buffers politely.
+
+No change needed to env.ts (already validates both vars, optional) or tracing.ts
+(Langfuse/OTel, independent - design/rsi/cognizioware-rsi-implementation-plan.md line 100
+already fixes the split: Langfuse is the LLM trace system of record, Seq stays for infra logs).
+
+================================================================================
+STEP 3 - CONFIG, PROD HOST ONLY
+================================================================================
+  Append to the prod host .env identified in Step 0.3:
+      SEQ_URL=https://seq.easybutt0n.ai
+      SEQ_API_KEY=<key from Step 1>
+  NO compose edits. Both docker-compose.yml and deployments/tier/docker-compose.yml already
+  pass the whole file through via env_file:, so a new var reaches the app container without
+  being listed under environment:.
+  In the repo, add PLACEHOLDERS ONLY to .env.template:  SEQ_URL=  and  SEQ_API_KEY=
+  *** DO NOT write the real key into the tracked prod.env mirror. *** Paxton's decision: a
+  git-history cleanse is intended, and committing a fresh secret would add one to the very
+  history that is to be purged.
+  Leave LOG_LEVEL alone - prod already resolves to info. Revisit only if Seq volume looks
+  wrong during the soak.
+
+================================================================================
+STEP 4 - APPLY AND VERIFY
+================================================================================
+  On the prod host, in the compose dir from Step 0.3:
+      docker compose up -d --no-deps app
+  USE up -d, NOT restart. `restart` reuses the existing container and will NOT re-read .env.
+  Then re-check /api/health: the version should be UNCHANGED (this deploy changes config, not
+  code) unless Step 2 ships in the same release.
+
+  VERIFY:
+   - Seq filtered on Application = cognizioware-powerplatform shows structured events within
+     seconds of live traffic, with real properties from the existing call sites - request and
+     route context, NOT stringified blobs.
+   - Exercise a warn AND an error path. The error must arrive with its stack and surrounding
+     context.
+   - docker logs --tail 50 on the app container: stdout MUST still be feeding. Seq is
+     ADDITIVE. If stdout went quiet, something is wrong.
+   - FAIL-OPEN PROOF, the important one, IN A THROWAWAY CONTAINER, NEVER PROD: set SEQ_URL to
+     an unroutable address and confirm the app still boots, still serves /api/health, and
+     still logs to stdout. Repeat with a deliberately invalid SEQ_API_KEY for the 401 path.
+     If either wedges or crashes, Step 2 is not done.
+   - After roughly an hour of prod traffic, check events/minute and Seq disk impact before
+     walking away.
+
+  ROLLBACK: blank or remove SEQ_URL in the host .env, then
+  docker compose up -d --no-deps app. The code path reverts to stdout-only, no other change.
+
+================================================================================
+OUT OF SCOPE - deliberate, with reasons
+================================================================================
+ - Frontend/browser logs to Seq. Needs a backend relay route; A BROWSER MUST NEVER HOLD A SEQ
+   INGEST KEY. Separate design if wanted.
+ - dev/uat lanes. Same three lines in each lane .env once prod is proven.
+ - An OTel-logs path to Seq. New code, and it diverges from the documented Langfuse/Seq split.
+ - The 7-day soak into a git-history cleanse. RECORDED SO IT IS NOT LOST: dev.env, uat.env and
+   prod.env are ALL git-tracked (.gitignore covers .env and .env.* but not these dot-less
+   names) and contain live plaintext Azure client secret, DB passwords, a GitHub PAT and the
+   LiteLLM key. HISTORY REWRITING WITHOUT ROTATION IS THEATRE - the values already exist in
+   clones, forks and CI caches. Precedent: commit e9a50de stopped tracking kb-article/.env and
+   its own message says the values "must be rotated" - never done, never generalised.
+
+================================================================================
+HARD RULES
+================================================================================
+ - DO NOT place the key via hydra PR #24's Env-and-keys page. It was REVIEWED AND IS BROKEN,
+   with two silent-success failures directly relevant here:
+     catalog.js:434 - selecting prod for powerplatform executes against pp-dev-uat on .163 and
+       writes /opt/powerplatform-prod/.env THERE, reporting success. That is precisely the
+       wrong-box hazard Step 0 guards against.
+     env-service.js:276 - key verification never sends the submitted value, so an invalid key
+       "verifies", and the documented rotation flow then revokes the OLD key.
+   PLACE THE KEY BY HAND.
+ - Never git add -A; commit by explicit path; check git diff --stat first.
+ - Do NOT merge. Open the PR and STOP. The overseer merges.
+
+================================================================================
+*** ADDED BY THE OVERSEER 2026-09-10 21:00 PT - THIS FILE WAS WRITTEN AT 15:06 FROM A MIDDLE
+DRAFT OF THE PLAN AND IS MISSING FIVE LATER DECISIONS. Relayed by Paxton from the authoring
+session. THE AUTHORING SESSION HOLDS THE AUTHORITATIVE DETAIL - if anything below is ambiguous,
+ask for it rather than inventing it. ***
+================================================================================
+The run built from this file (20260911T022553Z_e0de06b4) is currently PARKED at an approval gate
+asking for SSH authorization and a Seq ingest key, so nothing has been built on the stale copy yet.
+
+ 1. **EXPECTED_VARS REGISTRATION.** The new variable must be registered in the EXPECTED_VARS list,
+    not merely set. A var that works because it happens to be in the environment, but is absent
+    from the declared set, is invisible to every later audit and will be dropped by the next person
+    who prunes config.
+
+ 2. **DO NOT REUSE THE AUTOMATION KEY.** The Seq ingest key for this application must be its own
+    key with INGEST-ONLY permission. Reusing an existing automation credential widens that key's
+    blast radius and makes per-application revocation impossible.
+
+ 3. **PROBE THE .128 IP DIRECTLY.** Verify the Seq endpoint by its IP (192.168.21.128) as well as by
+    name, so a DNS result is never mistaken for a reachability result. RULE 1: probe from the host
+    that actually fails, and verify what the probe is really measuring.
+
+ 4. **mcp-cognizioware CLEANUP** is part of this task, not a follow-up. Carry it through rather than
+    leaving it as a loose end for a later session to rediscover.
+
+ 5. **ORDERING, AND IT IS NOT NEGOTIABLE: ROTATE THE THREE KEYS ONLY AFTER THE DB WORKS.** Rotating
+    first leaves you debugging two failures at once and unable to tell which caused which. Prove the
+    database path end to end, THEN rotate.
+
+UNCHANGED AND STILL BINDING from the original text: the wrong-box guard, the fail-open requirement,
+and the rule that the key never lands in prod.env. Those were correct in the 15:06 draft.
+
+NOTE ON THE PLAN'S OTHER CLAIMS, measured by the overseer 20:53 PT: the report that "the PC launcher
+is still stopped, log frozen at 12:39" is FALSE - the launcher is PID 35540, its log was written at
+20:51:12, and cycles ran at 20:11 / 20:26 / 20:35 / 20:51. The report that this run "was started some
+other way" is also FALSE - launch_queue.log line 573 reads
+`19:25 LAUNCHED 756-135-seq-powerplatform-prod-logs 20260911T022553Z_e0de06b4`. The stale-task-file
+finding WAS correct, which is why this block exists.
+
+================================================================================
+*** ADDED BY THE OVERSEER 2026-09-10 21:40 PT - CONCRETE COORDINATES, so you do not hunt. ***
+================================================================================
+Read from the gateway's own host registry, not inferred:
+
+    SEQ SERVER      terranas01 = **192.168.21.128**, Seq on port **5341** (web UI on :5443)
+    SSH TO IT       port **9222**, user **prax211** - NOT root, NOT port 22.
+                    Its sshd `AllowUsers` BLOCKS root, and sudo there needs a password.
+    NOTE            terranas01 is a TerraMaster NAS running TOS. It has **no SFTP subsystem**, so
+                    `scp` fails - stream over ssh instead. And `scp`'s port flag is `-P`, not `-p`.
+
+*** THE SSH BLOCKER IS NOW DIAGNOSED TO A SINGLE MISSING LINE. *** Your gate reported
+`root@192.168.21.151` refusing the key. Measured 21:40 PT via the local gateway:
+
+    CT110 harness public key : SHA256:Yd0Wan9IugV02Z7RlNYTTmqCEEedE8Lf4TgpVqfutE4  (lh-harness@ct110)
+    root@192.168.21.151      : authorizes 16 keys, and that fingerprint is NOT one of them
+    sshd                     : PermitRootLogin yes, pubkey auth enabled
+
+So nothing is structurally blocked - the harness user's public key is simply absent from
+`root@192.168.21.151:~/.ssh/authorized_keys`. **Paxton adds that one line.** Until he does, this run
+stays parked; do not attempt workarounds, do not hunt for another credential, and do not weaken the
+step to proceed without it.
+**WHEN RE-TESTING, PROBE FROM CT110 AS THE `harness` USER.** A successful probe from a workstation as
+a different user proves nothing about whether this run can connect - a report that this was already
+fixed did not reproduce for exactly that reason.
+
+================================================================================
+*** SEQ KEY RESOLVED 2026-09-10 21:50 PT - USE THE EXISTING KEY, WITH ONE CAVEAT. ***
+Paxton narrowed the existing key rather than minting a new one, and told the overseer to use it.
+================================================================================
+THE KEY: the Seq key with token prefix **nSnv**, titled `cognizioware-mcp-tools`.
+Paxton changed it to **Ingest-only**, and the overseer VERIFIED the change took effect:
+
+    POST /ingest/clef        -> 201   (ingest works)
+    GET  /api/events?count=1 -> 403   (read REFUSED - it is genuinely ingest-only now)
+    same request with NO key -> 401   (so anonymous read is OFF; the 403 is about THIS key)
+
+An earlier overseer reading showed 200 on that read endpoint. That was a REAL measurement taken
+BEFORE the narrowing landed, not a mistake in either direction - it is simply superseded. Recorded so
+nobody re-opens the question.
+
+DELIVERY - **THE VALUE IS NOT IN THIS FILE AND MUST NOT BE.** It is provided to the run as an
+environment variable named:
+
+    SEQ_INGEST_KEY_PP_PROD
+
+placed in `/home/harness/.lh-harness-secrets.env` (mode 600, harness:harness). The overseer VERIFIED
+that harness worker processes INHERIT that file: every `python -m lh_harness run` child carries the
+service env. **Read it from the environment by NAME. Never echo it, never log it, never commit it,
+and never write it into prod.env or any repo file.** A harness run is never handed a credential in
+its prompt, and this is how it gets one without that.
+Seq itself: `https://seq.easybutt0n.ai` (also reachable as `192.168.21.128:5341`).
+
+*** THE CAVEAT, AND IT WILL SHOW UP IN YOUR DATA. ***
+That key carries a SERVER-SIDE APPLIED PROPERTY: `service = 'cognizioware-mcp-tools'`. Seq stamps it
+on EVERY event ingested with this key, and you cannot turn it off from the client.
+So powerplatform-prod events will arrive carrying `service=cognizioware-mcp-tools`, which is the
+WRONG service label for them.
+  * **SEND YOUR OWN PROPERTIES IN THE PAYLOAD ANYWAY**: `Application=cognizioware-powerplatform` and
+    `Environment=prod`. Those are what queries and dashboards should filter on.
+  * **EXPECT BOTH TAGS to be present** on each event. Do not treat the extra `service` tag as a bug
+    in your logger, and do not try to strip it - it is applied after your payload is accepted.
+  * **SAY THIS IN THE PR AND THE RUNBOOK.** Somebody will eventually filter by `service` and get a
+    wrong answer; the mislabel needs to be written down where they will find it.
+  * The originally-specified dedicated key (title `cognizioware-powerplatform-prod`, Ingest-only,
+    applied properties Application/Environment) would remove the caveat entirely. It does NOT exist -
+    the overseer confirmed only four keys exist and none has that title. Creating it later is a clean
+    follow-up; this task does not block on it.
+
+================================================================================
+*** CORRECTION 2026-09-10 22:05 PT - THE DELIVERY ABOVE DID NOT HOLD. READ THIS BEFORE ACTING ON IT.
+The overseer attempted the delivery, verified it, found it WRONG, and REMOVED IT. ***
+================================================================================
+The section above says `SEQ_INGEST_KEY_PP_PROD` was placed in `/home/harness/.lh-harness-secrets.env`.
+**IT IS NOT THERE. The overseer removed it.** Here is what happened, because the failure mode matters
+more than the mistake:
+
+ 1. CT110's `prod.env` holds a 20-character `SEQ_API_KEY`, so the overseer used it rather than passing
+    a secret through a chat transcript. Correct instinct, wrong key.
+ 2. That key's prefix is `PXCn`, **not** the `nSnv` key Paxton narrowed to Ingest-only.
+ 3. It is DEAD: from CT110 it returns **401 on /api/events, /api/apikeys and /api/users** - Seq does
+    not recognise it at all.
+ 4. *** BUT THE INGEST TEST RETURNED 201, WHICH IS WHY IT WAS ALMOST SHIPPED. ***
+
+*** THE TRAP, AND IT CHANGES THIS TASK'S VERIFICATION: SEQ ACCEPTS ANONYMOUS INGEST. ***
+Measured from CT110:
+        POST /ingest/clef with NO key at all -> 201
+        POST /ingest/clef with a bogus key   -> 201
+**So a 201 from the ingest endpoint proves NOTHING about your credential.** A dead key, a typo, or no
+key at all all return 201, and the events are accepted UNTAGGED. If this task verifies its logging by
+checking for a 201, it will report success while shipping unauthenticated, unattributed logs.
+**VERIFY BY READING THE EVENT BACK AND CONFIRMING ITS PROPERTIES**, not by the POST status code. That
+is the whole of RULE 1 in one endpoint.
+(Worth raising with Paxton separately: anyone on the LAN can currently inject arbitrary events into
+prod Seq. Not this task's job to change, but it should be on the record.)
+
+WHAT IS ACTUALLY NEEDED - **A PAXTON ACTION**, because the correct value cannot reach CT110 without
+passing through a transcript, and a live secret must never be written into one:
+
+    Place the **nSnv** key's value on CT110 as:
+        SEQ_INGEST_KEY_PP_PROD=<value>
+    in  /home/harness/.lh-harness-secrets.env   (mode 600, owner harness:harness)
+
+**THE DELIVERY MECHANISM IS PROVEN** - the overseer verified that every `python -m lh_harness run`
+worker process INHERITS that file's environment, so a run will see the variable by name. That part is
+not in doubt; only the value placement is outstanding.
+Until it is placed, **do not fall back to any other key and do not ingest anonymously.** Report the
+step as blocked on the credential.
+
+================================================================================
+*** CREDENTIAL DELIVERED 2026-09-10 22:30 PT - THE BLOCKER IS CLEARED. ***
+================================================================================
+Paxton created a **NEW dedicated key** (not the `nSnv` one) and the overseer VERIFIED it is correctly
+scoped before delivering it:
+
+    GET /api/events   -> 403        GET /api/apikeys -> 403        GET /api/users -> 403
+
+Three 403s = genuinely ingest-only. **Those refusals are the real test - the ingest endpoint returns
+201 even with NO key, so a 201 proves nothing** (see the anonymous-ingest note above).
+
+IT IS AVAILABLE TO YOU AS AN ENVIRONMENT VARIABLE:
+
+    SEQ_INGEST_KEY_PP_PROD
+
+in `/home/harness/.lh-harness-secrets.env` (mode 600, harness:harness). Harness worker processes
+INHERIT that file - verified. **Read it from the environment by NAME. Never echo it, never log it,
+never commit it, and never write it into prod.env or any repo file.**
+
+*** ANONYMOUS INGEST IS INTENDED - Paxton confirmed 22:30 PT. *** It is not a defect and not yours to
+change. But it means **you cannot verify your logging with a status code.** Prove it by READING THE
+EVENT BACK from Seq and confirming its properties. A run that reports success on a 201 has proved
+nothing at all.
+
+Since this key is dedicated, the earlier `service='cognizioware-mcp-tools'` mislabel caveat may no
+longer apply - **confirm what properties Seq actually stamps on YOUR events by reading one back**,
+and send `Application=cognizioware-powerplatform` / `Environment=prod` in the payload regardless.
+
+================================================================================
+*** OVERSEER TICK #378, 2026-09-16 23:16 PT - GATE 2ded74268ee9 ANSWERED. READ THIS. ***
+================================================================================
+Run 8688c2e7 asked two questions at end of round 4. Both are now answered, in-run:
+
+(1) THE READ-BACK PATH IS NOT AVAILABLE, AND NOTHING SUBSTITUTES FOR IT.
+    Measured by the overseer from inside CT110, 23:15 PT - not assumed:
+        SEQ_INGEST_KEY_PP_PROD  -> GET /api/events  403   (correctly ingest-only)
+        anonymous               -> GET /api/events  401
+        no other SEQ read variable exists in /home/harness/.lh-harness-secrets.env
+    The `SEQ_API_KEY` sitting in the mcp-cognizioware prod.env files is the dead PXCn key
+    (401 on every read route) - it is NOT a fallback, do not reach for it.
+    A read-only key is on OPEN-ASKS as `135-seq-read-key` for Paxton to mint as
+    SEQ_READ_KEY_PP_PROD. Until it lands, the read-back step is BLOCKED, and reporting it
+    blocked is the correct and complete outcome. Do not ingest anonymously. Do not accept a
+    201 as proof - Seq returns 201 to no key at all.
+
+(2) THE mcp-cognizioware CLEANUP (overseer addition 4) IS WITHDRAWN AND OUT OF SCOPE.
+    Round_001 established that no concrete target exists in this repo. Cutting it rather than
+    granting a round to hunt for one: an oversized task moves its failure between roles.
+
+WHAT THE RUN WAS TOLD TO DO: land the config change plus the one hardening change, placeholders
+only in .env.template, build + test, commit, `git push` and `gh pr create` ITSELF (it holds
+GH_TOKEN), then STOP - no merge. The PR body must state that read-back verification is the one
+outstanding step and carry the 403/401 measurements as its evidence.

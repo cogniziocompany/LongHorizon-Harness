@@ -1,0 +1,79 @@
+TASK 78 - mcp-cognizioware: main and develop have diverged, and work on main never reaches any environment
+
+AUDIT + POLICY (cognizioware repo: mcp-cognizioware). This is the SIBLING of task 59, which covers the same
+class of problem in cognizioware-powerplatform. **Task 59 does NOT cover this repo.** Do not duplicate its
+work, do not touch powerplatform, and read task 59's brief first only if it helps you reuse its shape.
+
+## MEASURED 2026-09-09 - DO NOT RE-DERIVE
+
+    GET /repos/cogniziocompany/mcp-cognizioware/compare/develop...main
+      ahead_by = 67   behind_by = 16   status = diverged
+
+Not a fast-forward in either direction. main holds 16 commits develop has never seen, and develop holds 67
+main has never seen.
+
+**The two branches are genuinely different trees, not two points on one line:**
+  - main HAS: promote-billing.yml (and build-and-deploy.yml, manual-deploy.yml)
+  - main LACKS: ci.yml, scripts/deploy/, deployments/instances.json
+  - develop HAS: ci.yml, scripts/deploy/rollout.sh, deployments/instances.json, and its own copy of
+    promote-billing.yml
+  - Only pr-checks.yml watches main, so a push to main deploys nothing.
+
+## THE TWO CONSEQUENCES ALREADY OBSERVED - these are the evidence, not hypotheticals
+
+1. **Workflow fixes merged to develop were INERT.** `workflow_dispatch` reads its definition from the
+   DEFAULT branch. PRs #97 and #98 were merged to develop and changed a file nobody executes; the same
+   fixes had to be re-applied to main as #99/#100/#101 before a promotion could succeed. The tell had been
+   visible for an hour beforehand: a dispatch returned `HTTP 422: Unexpected inputs provided` for inputs
+   that existed only on develop's copy.
+
+2. **A shipped endpoint has never been deployed.** `src/McpCognizioware.BillingService/Controllers/
+   AdminE2eController.cs` exists on **main** (PR #93, "feat(admin-e2e): model registry GET/PUT on the
+   existing admin controller", 2026-09-09). develop does not have it. The lanes deploy the
+   develop -> release -> prod lineage (dev=develop, uat=release, prod=prod), so the controller has never
+   been in any deployed build. Measured consequence: `GET /api/v1/admin/e2e/baseline` returns **404 on all
+   three lanes** - prod :20251, dev :20252, uat :20253. It is not unimplemented; it is implemented on a
+   branch that never deploys. Task 76 depends on this answer.
+
+## SCOPE
+
+ 1. **THE AUDIT** - `docs/branch-divergence-2026-09-09.md`. Enumerate EVERY difference across ALL paths,
+    not just .github. For each, classify with evidence: SUPERSEDED (develop has equivalent content - cite
+    the sha or the code), UNIQUE-TO-MAIN (exists only on main and still wanted), or OBSOLETE (only on main
+    and genuinely dead - justify). Do the same in the other direction. **A shared commit MESSAGE is not
+    evidence of shared CONTENT** where work was applied twice by hand, which it demonstrably was for
+    promote-billing.yml. State plainly where you could not determine an answer.
+ 2. **ANSWER THE QUESTION THAT MATTERS FIRST, AND PUT IT AT THE TOP**: what else is stranded on main that
+    the deployed lineage needs? AdminE2eController is one confirmed case. Enumerate the rest. Anything that
+    is a live defect - code the running service should have and does not - is to be REPORTED IMMEDIATELY in
+    the completion report, not filed quietly in a document.
+ 3. **WHICH BRANCH SHOULD OWN WHAT.** promote-billing.yml MUST live on the default branch, because that is
+    where workflow_dispatch reads it - main's own history shows this was deliberate ("ci: register
+    promote-billing on main"). Application code must live where the lanes deploy from. Write the rule down
+    in `docs/branching.md`: which branch receives what, where CI and workflow changes belong, and how a
+    change reaches production. Make it enforceable, not aspirational: name the specific branch-protection
+    or ruleset settings a repo admin must click, since you cannot set them yourself.
+ 4. **DRIFT DETECTION** - a check that reports when main and develop diverge beyond the expected shape, as
+    a CI **WARNING first, not a blocker**, with a clearly marked switch to promote it later. It must NAME
+    the specific commits and files, not just print a count - a count is what let this sit for weeks.
+    Include a test.
+
+## WHAT THIS TASK MUST NOT DO
+
+Do not force-push. Do not reset or rewrite either branch. Do not merge anything - this produces an audit, a
+policy and a detector, and a human decides the reconciliation. Do not delete or "tidy" commits on main. Do
+not declare main's work obsolete without per-file evidence. Do not touch
+`infrastructure/litellm-config.yaml` (wrong repo anyway - flag it if you see it).
+
+## HARD RULES
+
+ - Branch off develop, PR to develop, DO NOT MERGE. Commit by explicit path; never `git add -A`.
+ - This repo has CRLF line endings - do not reformat, and check `git diff --stat` before opening the PR.
+ - Do NOT deploy, do NOT dispatch a workflow, do NOT touch CT100 or any lane.
+ - Env NAMES only, never values. Do not ask for credentials.
+
+## DONE MEANS
+
+A PR against develop with the audit, the stranded-work answer at the top, `docs/branching.md` naming the
+protection settings an admin must apply, and the drift detector with a test. Report counts, baseline first,
+and state plainly anything you found stranded on main that the running services need.

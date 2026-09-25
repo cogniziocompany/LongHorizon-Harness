@@ -1,0 +1,50 @@
+TASK 208 - RLIMIT_AS CANNOT BOUND AN AGENT WORKER. PR #30's 3G FALLBACK WOULD KILL EVERY RUN ON CT110.
+
+REPO / WORKSPACE: LongHorizon-Harness    BASE: main    DO NOT MERGE PR #30 UNTIL THIS LANDS.
+
+WHAT IS MEASURED (2026-09-18 12:30 PT, interactive overseer, on CT110 against LIVE runs - do not re-derive):
+  live `claude` agent process 260577 : VmPeak 9.27 GiB   VmSize 5.31 GiB   VmRSS 0.26 GiB
+  live `claude` agent process 262081 : VmPeak 9.27 GiB   VmSize 5.30 GiB   VmRSS 0.25 GiB
+  the python worker that would carry the limit : VmPeak 0.28 GiB / 0.18 GiB
+  PR #30's default cap              : RLIMIT_AS = 3G = 3.00 GiB
+RLIMIT_AS bounds VIRTUAL ADDRESS SPACE, not resident memory. Each episode's Claude Code child is Node 22,
+and V8 plus its thread pool RESERVE about 5.3 GiB and have peaked at 9.27 GiB, while actually using a
+quarter of a gigabyte. A 3 GiB address-space cap on the worker is inherited by that child, so the child
+cannot map what it needs and the episode dies. The resident figure the cap is meant to protect - 0.26 GiB -
+is nowhere near it.
+
+WHY THIS HITS PRODUCTION AND NOT JUST THE FALLBACK PATH: task 205 measured that on CT110, as user harness,
+`systemd-run --scope` exits rc=1 with "Failed to start transient scope unit: Access denied" - a polkit
+refusal - and PR #30's own fix makes ANY non-zero systemd-run exit choose the RLIMIT_AS retry. So on the
+box that runs every harness episode, the fallback is not a fallback: it is the only path taken.
+
+WHY THE PR'S TEST GAVE FALSE CONFIDENCE: its 7 passing tests ran under `ulimit -v 2500000` (2.4 GiB) and
+passed because pytest is CPython, which reserves little address space. `claude --version` also starts fine
+under 3G - verified. Neither exercises a real episode with MCP servers attached and stream-json output,
+which is where the 5.3 GiB reservation appears. A test that cannot fail the way production fails is not
+evidence.
+
+DELIVERABLE - the instrument must match the quantity:
+ 1. BOUND RSS, NOT ADDRESS SPACE. The cgroup MemoryMax path (systemd scope) already does exactly that and
+    is the correct mechanism; make it WORK on CT110 rather than falling back. Options to evaluate and
+    choose between, with the reason recorded: a polkit rule permitting the harness user to start transient
+    scopes; running the worker under the service's own delegated cgroup subtree (Delegate=yes in
+    packaging/lh-harness.service, then write memory.max directly); or systemd-run --user with a user
+    manager enabled for harness (loginctl enable-linger).
+ 2. IF an RLIMIT fallback is kept at all, it must not be RLIMIT_AS and must not be 3G. Use RLIMIT_DATA or
+    nothing, and size any limit from a MEASURED peak (9.27 GiB observed) with headroom - or state plainly
+    in the code comment that the fallback cannot bound an agent worker and is therefore a no-op that only
+    logs, so no future reader believes the fleet is protected when it is not.
+ 3. A test that would actually have caught this: launch a REAL agent episode (or a Node child that
+    reserves a V8-sized heap) under the chosen mechanism and assert it survives, then assert a deliberate
+    RSS blowup is killed. Name the numbers in the test.
+ 4. Task 202's goal stands and is worth keeping: one run's blowup must not fail the whole lh-harness unit.
+    packaging/lh-harness.service's OOMPolicy=continue is the right half of that and can ship regardless.
+
+HARD RULES: never merge PR #30 with the 3G RLIMIT_AS default in the path CT110 actually takes. No deploy to
+CT110 as part of this task. NEVER git add -A; commit by explicit path; git diff --stat before every commit.
+No @claude comment (task 117). Open the PR and STOP - merging is the overseer's.
+
+DONE MEANS: a real agent episode runs under the chosen isolation on CT110 without dying, a deliberate
+resident blowup is killed alone without failing the unit, and the measured numbers above appear in the
+code comment or the test so the next reader cannot repeat the mistake.

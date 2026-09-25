@@ -1,0 +1,16 @@
+{
+ "name": "003-192-pp105-build-green-and-rebase",
+ "task_file": "C:/tmp/pp105-build-green-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 4,
+ "trio": "kimi",
+ "task_source": "task_file",
+ "note": "*** MOVED UP 2026-09-17 12:05 PT by the interactive session at Paxton's instruction ('move up any cognizioware-powerplatform queues unless specific blocker/reason'): prefix 9999z4 -> 003; the earlier 'queued at the END of the active band; no reorder' is superseded by Paxton's priority call. Scope unchanged. *** || CREATED 2026-09-17 03:41 PT by scheduled tick #396 as a SCOPE CUT of task 159, not a retry and not extra rounds. 159's run 20260917T064433Z_c4682f89 gated after 5 consecutive failed rounds with ZERO commits in six rounds; the tick resolved that gate with STOP and recovered the work by hand: commit 9dfda4c (4 files, +273/-161, staged BY PATH, packages/frontend/dist/ excluded) is pushed and is PR #105's head, verified from the GitHub API. Two things remain and they are this task's whole scope: (1) PR #105 base `develop` is mergeable=CONFLICTING - merge origin/develop, do not rebase a pushed branch; (2) the 'Build frontend (tsc -b + vite)' check must go green. CONSTRAINTS: append-only to the existing branch and the existing PR - no new branch, no second PR, no merge (merging is the overseer's). NEVER post an @claude comment - it bills Paxton's personal subscription (task 117). Do not `git add -A`; dist/ and node_modules/ are untracked artefacts. Queued at the END of the active band; no reorder. | TICK #469 2026-09-17 12:06 PT: launch failed 422 \"max_rounds must be an integer of at least 1\" at 11:51 - max_rounds was the STRING \"4\", not an int; every other active entry uses an int. Coerced to 4. This entry would have failed EVERY cycle silently at the head of the band after Paxton 12:05 pp-priority reorder.",
+ "run_id": "20260917T190748Z_b4c9ac89",
+ "roles_bound": {
+  "manager": "kimi-k3:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-17T19:07:48.388474+00:00"
+}

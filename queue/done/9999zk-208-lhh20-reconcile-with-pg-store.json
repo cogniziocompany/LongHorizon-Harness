@@ -1,0 +1,18 @@
+{
+ "name": "9999zk-208-lhh20-reconcile-with-pg-store",
+ "task_file": "C:/tmp/lhh20-reconcile-with-pg-store-task.txt",
+ "task_source": "task_file",
+ "workspace": "LongHorizon-Harness",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "continue_branch": true,
+ "branch": "feat/task-172-retry-requeue",
+ "note": "CREATED 2026-09-21 by the interactive session. RELEASED 2026-09-21 11:04 PDT tick #1244 (SCHEDULED TICK): LHH PR #19 merged to main (commit 45c779a2, mergedAt 2026-09-21T18:04:42Z, verified by read-back of gh pr view --json state,mergedAt,mergeCommit). Moved blocked/ -> active queue root. Carries a real gap, not just conflicts: #20 adds requeue to the file QueueStore only and PgQueueStore has none, so the post-cutover store would have no retry path. continue_branch set so the task-201 workspace guard lets it push to PR #20 on branch feat/task-172-retry-requeue.",
+ "run_id": "20260921T180550Z_361df337",
+ "roles_bound": {
+  "manager": "kimi-k3:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-21T18:05:50.171018+00:00"
+}

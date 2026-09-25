@@ -1,0 +1,9 @@
+{
+  "name": "0001-57-config-authority-drift",
+  "task_file": "C:/tmp/config-authority-drift-task.txt",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 12,
+  "trio": "kimi",
+  "run_id": "20260909T023007Z_40832e72",
+  "note": " || STATE = MERGED, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in a triage of every undispositioned failed/cancelled entry. The run ended without a disposition note, but its work SHIPPED: branch feat/config-authority-and-drift -> cognizioware-mcp-tools PR #119 is MERGED at d17e5e2. This was a RECORDS gap, not a work gap: nothing needs relaunching. LIVE/VERIFIED still require the usual lane and read-back evidence."
+}

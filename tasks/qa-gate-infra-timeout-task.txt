@@ -1,0 +1,99 @@
+FIX + TEST (cognizioware-qa): the QA gate misclassifies a HUNG provider request as a failed assertion, so a
+provider quota outage reads as a code defect and blocks deploys that contain nothing wrong. Work ONLY in the
+cognizioware-qa workspace on branch `fix/infra-retry-timeout-classification` (run
+`git fetch origin && git checkout -B fix/infra-retry-timeout-classification origin/main` first); plain git;
+commit by EXPLICIT PATH; no push; NO writes to any live router, database or box; env NAMES only.
+
+## THE OBSERVED FAILURE - reproduce from this, do not re-derive it
+QA run `34315509449` (target=litellm, UAT) reported `score=80 passed=4 failed=1 infra=1 suites=4/5` against a
+threshold of 90, and failed the `litellm` job. It was called by the mcp-tools deploy lane `34314248816`
+(sha `0d1d1a31`), whose Deploy to CT202, Post-deploy Smoke and QA Verify were all then SKIPPED. Both non-passing
+results were the SAME cause - Ollama Cloud quota exhaustion - and the gate classified them differently:
+ - `glm-5.3-flash:cloud`: retried 3x at 60s, then correctly SKIPPED as infra on
+   `429 ... you (aidev01cogniziocompany) have reached your weekly usage limit`.
+ - `kimi-k3:cloud`: **HUNG**. `litellm-acceptance/test-litellm-router.test.js:132` recorded
+   `duration_ms: 90001.698527`, `failureType: 'testCodeFailure'`, `error: ''`, stack through
+   `packages/runner/src/infra-retry.mjs:28` into undici. The client aborted at its 90s timeout, so there was no
+   status code and no error body to match on, and `withInfraRetry` fell through to "the test failed".
+Probed live at 22:48 the SAME alias returned a clean `429 ... you (aidev03cogniziocompany) have reached your
+monthly usage limit` in 2.8s. Same condition, same provider, same minute - classified two different ways purely
+by whether the upstream chose to answer or to stall.
+
+## THE PRINCIPLE
+`withInfraRetry` classifies by ERROR SHAPE, and a timeout has no shape. A request that never returns is at least
+as strong evidence of an infrastructure problem as one that returns 429 - a healthy backend answers, and an
+assertion cannot fail if it never ran. Today the gate's own retry loop guarantees the wrong verdict on the
+harder case: the more thoroughly a provider is broken, the more likely it stalls rather than replies.
+
+## WHAT TO CHANGE
+Treat a client-side timeout or aborted request against a model endpoint as an INFRA result, not a test failure -
+the same disposition a 429 already gets. Read `packages/runner/src/infra-retry.mjs` first and follow its existing
+classification structure rather than adding a parallel path. Points of judgement, decide them and SAY WHY:
+ - Distinguish a timeout on the REQUEST from a timeout in the harness itself. Only the former is infra.
+ - The retry budget matters: `kimi-k3:cloud` consumed 90s once, while `glm-5.3-flash:cloud` consumed 183s over
+   three attempts. A stalling provider must not be retried until the job's own limit - cap total time spent on a
+   single model and record what it cost.
+ - **Do not make the gate unable to fail.** The whole point of the score is that a genuine regression still turns
+   it red. If EVERY suite result is infra, the gate must report blocked-by-infrastructure - the machinery for
+   that already exists (`description="blocked by infrastructure: ${infra_reason:-rate-limit/router outage}"`) -
+   NOT report success. Reclassifying must move a result from `failed` to `infra`, never from `failed` to `passed`.
+ - Say plainly in the report which models were skipped and why, so an operator reading a green-ish gate can see
+   that coverage was reduced.
+
+## RELATED, AND IN SCOPE IF THE SAME FILES ARE OPEN
+The litellm acceptance suite asserts against alias NAMES while the router may serve a different model - measured
+2026-09-09: `glm-5.3:cloud` was served by `kimi-k2.7-code` at 22:48 and by `glm-5.3-flash` at 23:02;
+`glm-5.3-flash:cloud` is served by `kimi-k2.7-code`, whose own alias 429s in the same sweep. An assertion that
+names a model and does not read back the SERVED model (from the response body's `model` field and
+`x-litellm-model-id`) is measuring an unknown backend. Adding that read-back is a small change with high value.
+If it makes currently-green suites red, that is a true finding - REPORT it, do not suppress it.
+
+## TESTS
+Whatever this repo already uses; report counts, baseline first. Assert at minimum: a simulated request timeout
+classifies as infra and not as a failure; a genuine assertion failure still classifies as a failure; an all-infra
+run reports blocked-by-infrastructure rather than success; the per-model time cap is enforced. Use fakes for the
+provider - do NOT hit a live router to produce a timeout.
+
+## HARD RULES
+No writes to any live system. No credentials, keys or account identifiers in code, fixtures or docs - the quotes
+above contain provider account names, redact them in anything committed. Explicit-path commits; no push.
+Completion = commits, diff stat, test counts baseline-first, the classification rules as implemented, and an
+explicit statement of what can STILL turn the gate red. Auditor: read-only - verify the change cannot convert a
+real assertion failure into a pass, that an all-infra run does not report success, that the time cap exists, and
+that no account identifier or credential was committed.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.
+
+## ADDED 2026-09-09 23:25 - THE MECHANISM IS VERIFIED, AND SO IS THE RISK. READ BOTH.
+**Why this fix genuinely unblocks deploys rather than just relabelling a failure.** Traced through
+`.github/workflows/qa-gate.yml`: the suite step runs `npm test` with `continue-on-error: true`, and the job's
+verdict comes from a single later step - `Fail the job if the suite failed`, `if: steps.suite.outcome != 'success'`
+-> `exit 1`. It keys on the **exit code of `npm test`**, not on the gate report's score. Node's test runner counts a
+SKIPped test as passing, which is exactly why the `glm-5.3-flash:cloud` infra-skip did NOT fail the job on its own
+while the `kimi-k3:cloud` timeout did. So reclassifying a timeout as infra turns it into a SKIP, `npm test` exits 0,
+the job passes and the deploy proceeds. That is the whole causal chain; you do not need to rediscover it.
+
+**And that is precisely why the guardrail in this brief is not optional.** The same mechanism means a TOTAL provider
+outage would skip every model, exit 0, and wave every deploy through with the router suite having proven nothing.
+An all-infra run MUST report blocked-by-infrastructure and must not exit 0. Treat that as the acceptance criterion
+of this task, not a nicety - without it this change converts a noisy gate into a silent one, which is worse than
+what it replaces.
+
+## UAT IS SICKER THAN THE FAILING TEST SUGGESTS - measured 23:20, read-only, and it changes the framing
+Probing the UAT router (CT204) directly on both routes, 300-token budget, nonce:
+ - **Every `:cloud` model TIMES OUT at 95s** - `kimi-k3`, `kimi-k2.6`, `kimi-k2.7-code`, `glm-5.2`,
+   `deepseek-v4-pro` - on BOTH `/v1/chat/completions` and `/v1/messages`. They do not return the quota error that
+   the same models return from prod in 2.8-4.0s. **UAT hangs where prod fails fast**, which is the entire reason
+   the gate sees an unclassifiable timeout instead of a 429.
+ - `qwen3.8` hangs on `/v1/messages` **even for a single sequential request** (100s, no status) - so this is a UAT
+   routing fault, not contention from parallel probing. `qwen3.5:27b` answers on both routes but takes 40-70s.
+ - `gemini-3.1-pro-preview:latest` returns an **AuthenticationError** - a broken credential on UAT.
+ - `gemini-3-flash-preview:cloud` is retired upstream.
+ - **UAT carries 22 models to prod's 42 and NONE of the `:synthetic` twins**, so repointing `QA_LITELLM_MODELS` at
+   the models the estate actually uses is NOT available as a workaround - on UAT they do not exist.
+RECOVERY CLOCK (Paxton, 23:30): the three legacy weekly Ollama accounts return in about 4 DAYS; the two newer monthly ones in
+about 3 weeks. So this gate is blocked for days, not hours - long enough that waiting it out is not a plan.
+So do not treat this as "one flaky model". **There is currently no fast, healthy model on UAT for this gate to
+test.** Why prod fails fast and UAT stalls is worth establishing while you are in here - a timeout budget, a
+fallback chain, or a missing fast-fail on the UAT deployment - and whatever you find belongs in the report even if
+fixing it is out of scope for this task. Read-only against UAT; do not reconfigure it.

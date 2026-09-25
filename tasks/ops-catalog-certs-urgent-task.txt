@@ -1,0 +1,197 @@
+TASK 105 - URGENT. The ops catalog page reports numbers that do not match the live gateway, and
+/certs renders an empty screen.
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools. The page is the Blazor app at
+`infrastructure/docker/ops-control-center/`.
+
+Paxton, 2026-09-09: flagged https://ops.easybutt0n.ai/catalog showing "884 / 675 tools" with
+"Missing or under-counted servers: playwright_mcp (23/32)", and separately that
+https://ops.easybutt0n.ai/certs "is empty screen".
+
+*** URGENT - both are operator-facing surfaces that are currently lying or blank. ***
+
+The page's own strapline states the intent: **"The 500->30 collapse must be visible on a screen,
+not only in CI."** A catalog page whose numbers disagree with the gateway defeats that purpose
+precisely.
+
+================================================================================
+DEFECT 1 - THE CATALOG NUMBERS DO NOT MATCH THE GATEWAY
+================================================================================
+
+Measured by the overseer against CT202 at 2026-09-09 17:40 PT, through the aggregate `/mcp/`
+endpoint with the master key:
+
+    LIVE AGGREGATE NOW          966 tools, 36 namespaces
+    ops /catalog page           884 / 675, captured 2026-09-10 00:30:05 UTC
+    overseer measurement, ~13:00   973 tools, 37 namespaces
+
+So there are FOUR numbers in play - 966, 884, 675, 973 - and no two agree. **Establish what each
+one is actually counting before changing any code.** In particular:
+
+ - Is `884 / 675` "aggregate / sum-of-per-server"? If so the page is already surfacing a real
+   209-tool discrepancy and the bug is in whatever produces the smaller figure.
+ - Or is `675` a stored baseline? Then 884 EXCEEDS it and the display is misleading in the
+   opposite direction - it reads like a shortfall when it is a surplus.
+
+**Do not guess which. Read the component and say which it is.**
+
+The drift over one day (973 -> 966, and 37 -> 36 namespaces) is real and separate: **a namespace
+disappeared between 13:00 and 17:40.** Identify which and why.
+
+### THE 36 LIVE NAMESPACES (verbatim, 17:40)
+
+    audioqa auth cloudflare comfyui_mcp desk03 graphify htpc01 hydra hydrafleet kb kbuat
+    langfuse memory ms365 n8n n8ncloud opsstatus pac playwright playwright_qa1_mcp
+    playwrightqa2 playwrightqa3 postgres postgressecondary proxmoxcognizioware01
+    proxmoxcorsairai300 proxmoxptait01 proxmoxptait07 proxmoxterranas01 ptait09 puppeteer
+    qarun ruflo ssh stripe telnyx xrm
+
+### THREE EXPECTED NAMESPACES ARE ABSENT - each has a KNOWN, DIFFERENT cause
+
+  `azure`    - `azure_mcp` returns ZERO tools. Cause already established: the URL has no `/mcp`
+               path and the transport is wrong. **PR #36 fixes it and TASK 97 owns that merge.**
+               Do NOT fix it here - verify the count returns (~66 tools) after 97 lands.
+  `comfyui`  - the alias was never added, so its 12 tools surface as `comfyui_mcp-*`. **TASK 96
+               WI-1 owns this.** Do NOT add the alias here.
+  `skills`   - **UNEXPLAINED AND NEW.** `skills` was present in the live `mcp_aliases` DB row
+               earlier today but contributes NO tools now. **This one is yours: find out why.**
+
+**RULE 2 boundary: azure is task 97's and comfyui is task 96's. This task OWNS the page, the
+counting, and the `skills` disappearance - not the other two fixes.**
+
+### *** A TRAP THAT WILL COST YOU HOURS IF YOU MISS IT ***
+
+The overseer probed per-server counts at `http://localhost:4000/mcp/<server>/mcp` and got **0 for
+every server tested - including `ruflo_mcp`, which has 243 tools in the aggregate.**
+
+**That is almost certainly the WRONG ENDPOINT PATH, not six dead servers.** It is recorded here as
+a warning, NOT as a finding, because a single probe returning 0 for a server known to have 243
+tools disproves itself.
+
+**And it is the leading hypothesis for the page's under-count:** a per-server enumeration that
+calls the wrong URL returns 0 or a truncated list and looks EXACTLY like a collapsed server. Before
+concluding any server is under-counting, **prove your per-server endpoint works** by calling it for
+a server whose aggregate count you already know and confirming the two agree. If they do not, fix
+your reader before you touch the page.
+
+`playwright_mcp (23/32)` should be re-checked under that lens. Note the aggregate shows FOUR
+playwright namespaces at 23 each - `playwright`, `playwright_qa1_mcp`, `playwrightqa2`,
+`playwrightqa3` - and the page names `playwright_mcp`, which is **not** one of them. A server-key
+vs alias mismatch is a candidate explanation for the whole "under-counted" row.
+
+================================================================================
+DEFECT 2 - /certs RENDERS AN EMPTY SCREEN
+================================================================================
+
+Paxton: "this is emprty secren https://ops.easybutt0n.ai/certs its empty screen".
+
+**It is NOT a routing failure.** All seven routes were probed unauthenticated and every one returns
+302 to the auth proxy, `/certs` included:
+
+    /  /overview  /catalog  /certs  /e2e  /admin-centres  /audit    -> 302 each
+
+So the route resolves and the page is being served; it renders empty **after** authentication. The
+fault is inside the component or its data source, not in Caddy or oauth2-proxy.
+
+Find out which of these it is and say so explicitly:
+  (a) the data source returns nothing (no certs discovered / a probe failing silently),
+  (b) the data source errors and the component swallows it into an empty render,
+  (c) the component never calls anything.
+
+**(b) is the one to look hardest for.** An empty screen where a caught exception should have been
+surfaced is the same defect class as the guest-auth bug and the "Step 0 of 7" spinner: **a failure
+rendering as a blank rather than as an error.** Whatever the cause, the page must end up saying
+something - "no certificates found", or the error - and never render blank.
+
+================================================================================
+E2E COVERAGE - PAXTON ASKED FOR THIS EXPLICITLY
+================================================================================
+
+Paxton: "add e2e tests to check for that next time".
+
+**This is the deliverable that stops it recurring, not a nice-to-have.** RULE 2: there is an
+existing e2e suite - **extend it, do not create a parallel one.** Check what already covers
+ops-control-center before adding a file.
+
+Cover, at minimum:
+
+ 1. **Catalog count agrees with the gateway.** Fetch the aggregate `tools/list` and the page's
+    reported figure and assert they match within a stated tolerance - or exactly, if the page is
+    meant to be exact. **A test that only asserts "the number is > 0" would have passed all day
+    today while the page was wrong.**
+ 2. **The per-server sum reconciles with the aggregate**, or the page explains the difference.
+    This is the "500->30 collapse" the strapline promises to make visible.
+ 3. **Every route renders non-empty.** `/`, `/overview`, `/catalog`, `/e2e`, `/certs`,
+    `/admin-centres`, `/audit` - assert each returns a body containing its own heading, not merely
+    HTTP 200. **`/certs` returning 200 with an empty body is exactly today's bug and must fail the
+    test.**
+ 4. **Namespace presence.** Assert the namespaces that are supposed to exist do, so a silent
+    disappearance like `skills` fails a test instead of being noticed by a human weeks later.
+ 5. Note in the PR whether these can run unauthenticated or need a token, and how CI supplies it.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **Prove your per-server reader before trusting any per-server number.** See the trap above.
+ - Do NOT fix azure (task 97) or add the comfyui alias (task 96). Verify them after those land.
+ - Do NOT "fix" the count by changing the baseline to match the observed number. If 675 is a
+   stale baseline, say so and propose the correct one with evidence - do not quietly move it.
+ - Do NOT make `/certs` render an empty-but-valid page to make a test pass. It must show data or
+   an error.
+ - `ops-control-center` is a Blazor app and **the mcp-tools lane runs NO checks on a PR** - the
+   image builds only at merge time, on the way to prod. **Run
+   `dotnet build ./src/OpsControlCenter/OpsControlCenter.csproj -c Release` yourself before
+   opening the PR.** A one-line Razor error (RZ1010) broke Deploy to CT202 earlier today for
+   exactly this reason.
+ - Do NOT touch `infrastructure/litellm-config.yaml` - it force-recreates the prod router.
+ - Env NAMES only, never values. Commit by EXPLICIT PATH; never `git add -A`; check
+   `git diff --stat` before the PR.
+ - PR to `main`. **DO NOT post an `@claude` comment.** (CORRECTED 2026-09-15, scheduled tick #183:
+   this file used to INSTRUCT posting one on a "reviewer is BROKEN org-wide" premise. The ban does
+   not depend on that premise - an `@claude` invocation spends PAXTON'S PERSONAL SUBSCRIPTION, and
+   task 117 bans it outright.) Leave the PR unreviewed and say it needs a review.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A PR against main that: states what each of 884 / 675 / 966 actually counts and fixes whichever is
+wrong; explains the 973->966 and 37->36 drift and identifies the namespace that vanished;
+establishes why `skills` contributes no tools; makes `/certs` render either data or an explicit
+error, never blank; and extends the EXISTING e2e suite with the five checks above - including one
+that would have failed today. Plus a local `dotnet build` result pasted in the PR body, and a
+statement that azure and comfyui were deliberately left to tasks 97 and 96.
+
+
+================================================================================
+VERIFIED LIVE BY THE OVERSEER 2026-09-09 21:30 PT - CALIBRATE TO THIS, DO NOT RE-DERIVE
+================================================================================
+
+The gateway serves EXACTLY 884 tools right now - measured by POSTing tools/list to
+http://litellm-router:4000/mcp/ from inside the ops-control-center container, authed with its
+own OPS_LITELLM_KEY (used by NAME; never print the value). HTTP 200, 884 tools.
+
+**So the /catalog page number (884) is CORRECT - it matches live reality. This task is NOT about
+a display under-count.** The x/y fractions (e.g. playwright_mcp 23/32) are responding/expected,
+and the EXPECTED baseline is what is stale. The real question is which servers are below their
+expected count and why - not whether 884 is wrong.
+
+Live namespace counts (biggest first): ruflo 243 (27% of the whole catalog), langfuse 87, n8n 39,
+telnyx 36, five proxmox servers 31 each, hydrafleet 28, four playwright servers 23 each, xrm 23,
+desk03/htpc01/ptait09 22 each, ms365 14, cloudflare 13. ABSENT entirely: azure, comfyui, skills -
+those three namespaces serve ZERO tools live, which is the real catalog gap.
+
+CERTS: the empty /certs screen is a RENDER/PROBE bug, NOT missing data. The data source
+(/data/targets.generated.json, key "certs") is fully populated: 7 own-cert hostnames (aidev02,
+comfyui, fleet, litellm-gateway-api, litellm, n8n, ops), 3 PVE nodes, tailnet nodes, min_days 21.
+So a blank render has 10+ configured probes behind it - fix the render/probe path, do not treat it
+as an empty config.
+
+AUTH: ops is reachable only through ops-oauth2-proxy, which forwards a trusted identity header the
+app enforces (403 "no forwarded identity" otherwise). Non-MFA creds exist (cognizioware-qa/.env
+admin_center_ai_username / admin_center_ai_password) for a REAL browser login. Do NOT forge the
+forwarded header - the overseer flagged that the boundary is network-only-trusted as a SEPARATE
+finding; do not build on the exploit. If e2e tests need the UI, log in for real (playwright is NOT
+installed in powerplatform/e2e/node_modules - install or use the qa-repo runner).

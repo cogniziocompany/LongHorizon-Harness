@@ -1,0 +1,8 @@
+{
+ "name": "10c-pp-qa-gate-error-status",
+ "task_file": "C:/tmp/gate-error-callers-pp-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 4,
+ "trio": "kimi",
+ "run_id": "20260908T092203Z_1e9a9c30"
+}

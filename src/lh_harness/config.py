@@ -49,6 +49,7 @@ _RUN_KEYS = {
     "dashboard",
     "dashboard_port",
     "allow_auditor_write_mcp",
+    "worker_memory_max",
     "roles",
     "timeouts",
 }
@@ -59,6 +60,7 @@ _QUEUE_CAPACITY_KEYS = {
     "min_healthy_keys",
     "key_health_url",
     "poll_seconds",
+    "max_retries",
 }
 _STRING_KEYS = {
     "model",
@@ -109,6 +111,23 @@ mcp_add_dirs = []
 guard_exclude_paths = []
 
 max_rounds = 25
+
+# Per-run worker memory isolation (TASK 202 + 208). Each run's worker is
+# capped at this RESIDENT-memory limit (a per-episode child cgroup's
+# memory.max under the service's delegated cgroup subtree, or a systemd
+# scope's MemoryMax where a manager is reachable) so one run's memory blowup
+# is OOM-killed alone instead of failing the whole lh-harness service. The
+# default (2G) is sized from CT110's measured agent-worker RESIDENT use — VmRSS
+# 0.26 GiB, high-water 0.29 GiB (2026-09-18), against 6.0 GiB of physical RAM —
+# with roughly seven times headroom and still below RAM, which is what lets the
+# cgroup limit fire before the kernel OOM-kills globally. (The 9.27 GiB figure
+# often quoted for these agents is VmPeak, an ADDRESS-SPACE number, and must
+# never size an RSS bound.); a memory.max bound
+# counts resident pages only, never the ~5.3 GiB of address space Node 22/V8
+# reserves before the worker touches a page. The
+# LH_HARNESS_WORKER_MEMORY_MAX environment variable overrides this value.
+# worker_memory_max = "2G"
+
 dashboard = true
 # Embedded dashboards use an OS-assigned port by default so concurrent runs
 # cannot accidentally share or race a fixed listener. Standalone `web` keeps
@@ -181,6 +200,21 @@ reviewer = 900
 # min_healthy_keys = 2  # healthy Ollama Cloud keys required before kimi launches
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
+# max_retries = 2       # maximum number of retry attempts for failed entries
+
+# [queue]
+# observe = false       # shadow (observe) mode: the launcher computes the full
+#                       # launch decision but starts NOTHING -- it appends
+#                       # queue.shadow_launch / queue.shadow_skip records to
+#                       # runs_root/queue/shadow.jsonl and leaves every entry
+#                       # pending. Flip to false to promote the launcher; that
+#                       # is the whole code change (migration §5 Step 2).
+# occupancy_ignore_dirty = false
+#                       # Set true to stop treating a dirty tree (git status
+#                       # --porcelain non-empty) or a local branch with commits
+#                       # not on origin/main as an OCCUPIED workspace. Per-
+#                       # environment overseer override; active-run ownership
+#                       # always applies.
 """
 
 
@@ -232,6 +266,41 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     unknown_trios = set(trios) - _QUEUE_TRIOS
     if unknown_trios:
         raise ProjectConfigError(f"unknown queue trio(s): {_names(unknown_trios)}")
+    # ``database_url`` is a legitimate key (``queue.py`` reads it to build the
+    # PgQueueStore) and the flattened result carries it onward so
+    # ``_select_queue_store`` receives the DSN. The URL itself never contains
+    # the password: deployments supply it out-of-band via the
+    # ``LH_HARNESS_DB_PASSWORD`` environment variable (name only, never a
+    # value), which ``pg_queue._resolve_connection_url`` appends at connect
+    # time.
+    unknown_queue_keys = set(queue) - {
+        "trios",
+        "capacity",
+        "backend",
+        "observe",
+        "occupancy_ignore_dirty",
+        "database_url",
+    }
+    if unknown_queue_keys:
+        raise ProjectConfigError(f"unknown [queue] key(s): {_names(unknown_queue_keys)}")
+    observe = queue.get("observe", False)
+    if not isinstance(observe, bool):
+        raise ProjectConfigError("[queue].observe must be a boolean")
+    # Occupancy override (task 173, scope 4): some environments (e.g. one
+    # workspace shared by sequential operators) legitimately keep dirty trees;
+    # the overseer flips this to true to disable only the dirty-tree and
+    # unpushed-branch occupancy probes, never the active-run rule.
+    occupancy_ignore_dirty = queue.get("occupancy_ignore_dirty", False)
+    if not isinstance(occupancy_ignore_dirty, bool):
+        raise ProjectConfigError("[queue].occupancy_ignore_dirty must be a boolean")
+
+    # ``backend`` selects the storage engine. The file store is the default and
+    # stays hermetic; only ``postgres`` reaches PgQueueStore.
+    backend = str(queue.get("backend", "file")).strip().lower()
+    if backend not in {"file", "postgres"}:
+        raise ProjectConfigError(f"unknown [queue.backend]: {backend!r}")
+    normalized_backend = backend
+
     normalized_trios: dict[str, dict[str, Any]] = {}
     for name, spec in trios.items():
         if not isinstance(spec, dict):
@@ -271,6 +340,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
+        "max_retries": 2,
     }
     if isinstance(capacity.get("kimi_max"), int):
         normalized_capacity["kimi_max"] = max(0, capacity["kimi_max"])
@@ -282,7 +352,25 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["key_health_url"] = capacity["key_health_url"].strip()
     if isinstance(capacity.get("poll_seconds"), (int, float)):
         normalized_capacity["poll_seconds"] = max(1.0, float(capacity["poll_seconds"]))
-    return {"trios": normalized_trios, "capacity": normalized_capacity}
+    if isinstance(capacity.get("max_retries"), int):
+        if capacity["max_retries"] < 0:
+            raise ProjectConfigError("[queue.capacity].max_retries must be non-negative")
+        normalized_capacity["max_retries"] = capacity["max_retries"]
+    else:
+        # If present but not int, raise error
+        if "max_retries" in capacity:
+            raise ProjectConfigError("[queue.capacity].max_retries must be an integer")
+    database_url = queue.get("database_url", "")
+    if not isinstance(database_url, str):
+        raise ProjectConfigError("[queue].database_url must be a string")
+    return {
+        "trios": normalized_trios,
+        "capacity": normalized_capacity,
+        "backend": normalized_backend,
+        "observe": observe,
+        "occupancy_ignore_dirty": occupancy_ignore_dirty,
+        "database_url": database_url.strip(),
+    }
 
 
 def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
@@ -329,6 +417,8 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         defaults["allow_auditor_write_mcp"] = _boolean(
             run["allow_auditor_write_mcp"], "run.allow_auditor_write_mcp"
         )
+    if "worker_memory_max" in run:
+        defaults["worker_memory_max"] = _worker_memory_max(run["worker_memory_max"])
 
     roles = run.get("roles", {})
     if not isinstance(roles, dict):
@@ -412,6 +502,15 @@ def _boolean(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
         raise ProjectConfigError(f"{name} must be true or false")
     return value
+
+
+def _worker_memory_max(value: Any) -> str:
+    from .worker_isolation import parse_memory_limit
+
+    try:
+        return parse_memory_limit(value)
+    except ValueError as exc:
+        raise ProjectConfigError(f"run.worker_memory_max: {exc}") from exc
 
 
 def _names(values: set[str]) -> str:

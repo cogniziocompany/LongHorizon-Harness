@@ -1,0 +1,48 @@
+TASK 174 - Per-caller tool scoping and budget ceilings AT THE HARNESS (migration doc gaps 4.5 / section 3.4-3.5).
+
+SOURCE: docs/handoffs/orchestrator-migration-2026-09-08.md section 3 (the chat-agent safety contract); Paxton's
+priority-2 handoff gaps 5 and 6; audit [fe2679] section M. GATED ON TASK 134 (status set) or, if 134 has not
+landed, add `blocked` to _VALID_STATUS here with the transition table from task 172. Ordered after every
+powerplatform task.
+
+REPO / WORKSPACE: LongHorizon-Harness    BASE: origin/main
+
+================================================================================
+MEASURED 2026-09-14
+================================================================================
+ - mcp_tools.dispatch (src/lh_harness/mcp_tools.py L134-162): the ENTIRE authorization is one bearer compare.
+   No caller identity, no per-tool allowlist. harness_resolve_gate (L160-161 -> _resolve_gate L240-272) is
+   callable by ANY bearer holder. The REST twin POST /api/runs/{id}/approvals/{id}/resolve is behind the same
+   single bearer (server.py L190-195, middleware L931-936).
+ - Section 3.4 of the migration doc says so: "enforceable only at the gateway". Task 177 fixes the gateway side;
+   THIS task makes the harness enforce it too, so a leaked bearer cannot resolve gates.
+ - Enqueue has no requested_by, no rate limit, no max_rounds clamp; MAX_ROUNDS=1000 (types.py L41).
+
+================================================================================
+SCOPE
+================================================================================
+ 1. Caller identity: accept `X-Harness-Caller: <chat-agent|operator|overseer|hydra>` on REST and a `caller`
+    field on MCP dispatch, signed by an HMAC over (caller, ts) with a per-caller secret from config
+    (`[callers.<name>] secret_env = LH_HARNESS_CALLER_<NAME>_SECRET`). Missing or bad signature = caller "anon".
+ 2. Allowlist in config (`[callers.<name>] tools = [...]`), defaults:
+      chat-agent : harness_enqueue_task, harness_list_queue, harness_run_status
+      operator   : all four
+      overseer   : all four + REST run control
+      hydra      : all four (Hydra enforces its own rationale + identity on top)
+      anon       : none (401)
+    harness_resolve_gate and the REST resolve route refuse callers not in the list with 403 and an audit event
+    {caller, tool, run_id, decision}.
+ 3. requested_by stamped on every enqueued entry from the caller (docs/queue.md field), surfaced in list output.
+ 4. Ceilings (section 3.5, both new): per-caller entries per hour (`[callers.<name>] max_entries_per_hour`,
+    chat-agent default 10) -> 429 with Retry-After; per-caller max_rounds clamp (`max_rounds_clamp`, chat-agent
+    default 50) -> 422, never silently truncated. Overseer/operator: unlimited by default.
+ 5. DELETE /api/queue/{id}: chat-agent may delete only entries it created (requested_by match).
+ 6. Tests: allowlist enforced per tool and route; anon refused; ceilings return 429/422 with the right body;
+    requested_by round-trips; audit events emitted.
+
+HARD RULES: env NAMES only; no secret values in code, tests, or the PR. Push + PR yourself; DO NOT MERGE.
+Gate resolution from Fleet Chat stays disabled until per-user keys exist there (Paxton 2026-09-14, task 140 +
+177); this task must not add a "chat-agent may resolve" path.
+
+DONE MEANS: PR open; a chat-agent caller can enqueue/list/status and gets 403 on resolve; an operator caller can
+resolve; ceilings proven; docs/queue.md and README updated with the caller table.

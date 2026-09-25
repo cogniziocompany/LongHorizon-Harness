@@ -1,0 +1,73 @@
+TASK 159 - Fix PR #105's failing frontend build so the wizard Start-button fix can land.
+
+REPO / WORKSPACE: cognizioware-powerplatform (use the -evalfix tree; -c is occupied by task 154).
+BRANCH: check out PR #105's head, `task-101/build-dispatch`. Do NOT branch fresh from develop -
+you are repairing an existing open PR, not rewriting it.
+
+================================================================================
+WHY THIS IS WORTH DOING FIRST-CLASS
+================================================================================
+PR #105 is "feat(setup): wire wizard Start button to dispatch build via POST /setup/start"
+(+1127/-7, 8 files, open since 2026-09-10 07:08). It is the fix for the defect where **the button
+that advances customer setup does nothing at all** - no request, no error, no message. It has sat
+MERGEABLE/**UNSTABLE** for a day because one check is red:
+
+    FAILED STEP: "Build frontend (tsc -b + vite)"   ->  npm exit 1
+    run 34448486451, job 102778484671
+
+Nothing is wrong with the feature. The build is failing on TYPE errors.
+
+================================================================================
+THE ERRORS, MEASURED FROM THE FAILING RUN - THERE ARE TWO KINDS
+================================================================================
+**(a) TEST-FILE TYPING - mechanical, the bulk of them:**
+
+    src/sessions/__tests__/SessionList.create-dispatch.test.tsx
+        (30,5)   TS2698  Spread types may only be created from object types
+        (34,14) (34,36)  TS18046  'actual' is of type 'unknown'
+        (60,25) (70,17) (88,13) (138,17) (257,13) (299,17)
+                         TS2339  Property 'mockReturnValue'/'mockImplementation' does not exist
+    src/sessions/wizard/__tests__/SessionWizard.test.tsx
+        (30,5)   TS2698 ; (77,12) TS2559 ; (90,13) (98,25) (143,17) (189,13) (197,25) (242,17) TS2339
+
+This is the standard untyped `vi.importActual` + untyped `vi.fn()` pattern. Type the `importActual`
+result and the mocks properly. **Do not cast everything to `any` to make it compile** - that defeats
+the tests these files exist to provide.
+
+**(b) THREE ERRORS IN PRODUCT CODE - and one of them may be a real defect:**
+
+    src/workspace/WorkspaceLayout.tsx(250,40)  TS7006  Parameter 'max' implicitly has an 'any' type
+    src/workspace/WorkspaceLayout.tsx(250,45)  TS7006  Parameter 'step' implicitly has an 'any' type
+    src/workspace/WorkspaceLayout.tsx(265,19)  TS2339  Property 'phase' does not exist on
+                                                       type 'WorkspaceStatus'
+
+*** THE TS2339 IS NOT A COMPILER COMPLAINT TO SILENCE. *** The component reads `.phase` off
+`WorkspaceStatus` and the type does not declare it. **Establish WHICH of these is true before you
+change anything:**
+  - the backend really returns `phase` and the TYPE is missing it -> add it to the type, and say
+    where the backend sets it; or
+  - the backend does NOT return `phase` -> then the component is reading a field that is always
+    undefined, which is a LIVE DEFECT in the setup flow, and the fix is in the component.
+**Say which one you found, with the evidence.** Casting or optional-chaining it away without
+answering that question is a failure of this task, not a completion of it.
+
+The two TS7006s are straightforward: give `max` and `step` explicit types.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Repair PR #105 IN PLACE on `task-101/build-dispatch`. Do not open a competing PR.
+ - Run the frontend build yourself before pushing: `npm run build -w @cognizioware/frontend`
+   (that is exactly `tsc -b && vite build`). A green local build is the deliverable.
+ - Run the tests in those two files too - they were added by this PR and must actually pass, not
+   merely compile.
+ - Do NOT change the feature's behaviour. This task is "make the existing change build and test
+   cleanly", nothing more. If you believe the feature itself is wrong, STOP and say so.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat` before pushing.
+ - **Do NOT merge.** The overseer merges, and only at a moment that suits the lane.
+ - **Do NOT post an `@claude` comment** - it bills Paxton's personal subscription (task 117).
+ - Do not touch `main`. pp ships via `develop`; `main` is separately held.
+
+DONE MEANS: `tsc -b && vite build` passes, the two new test files pass, the TS2339 question is
+ANSWERED with evidence rather than suppressed, the commits are pushed to `task-101/build-dispatch`,
+and PR #105's `build` check goes green. Report the check status you actually observed.

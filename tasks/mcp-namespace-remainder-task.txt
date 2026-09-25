@@ -1,0 +1,154 @@
+TASK 179 - the MCP tool-namespace contract, REMAINDER: WI-1 (comfyui alias), WI-4 (write the
+contract down), WI-5 (the runaway `overseer-ingest` key).
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110 (CT110 lives on corsairai300,
+not ptait01): /home/harness/work/cognizioware-mcp-tools.
+Suggested branch: `fix/mcp-namespace-remainder`, cut FRESH from origin/main.
+
+================================================================================
+WHY THIS TASK EXISTS - READ THIS FIRST, IT SAVES YOU AN HOUR
+================================================================================
+
+This is the tail of TASK 96, which is DONE and SHIPPED for its central deliverable. Task 96's run
+`20260916T070917Z_0945b502` was stopped deliberately by SCHEDULED TICK #276 on 2026-09-16 07:35 PT
+after 8 rounds. It was NOT stopped for bad work. It was stopped because its work was already
+delivered and it was burning full-budget episodes re-deriving it.
+
+**ALREADY DELIVERED - DO NOT REDO ANY OF IT.** Verified on CT110 by the overseer, on disk and on
+the remote, not from a run's self-report:
+  - `7f869d1` WI-2 single source of prefix truth: e2e/lib/mcp-aliases.js (+86), suites 17/20/35
+    rewired, 4 files / 145 insertions.
+  - `a1989fb` WI-3 the enforcement suite: e2e/suites/**48**-mcp-namespace-contract.test.js, 265
+    lines, plus the e2e/package.json script. `node --check` clean.
+  - Branch `fix/mcp-namespace-contract` is PUSHED; remote head
+    `a1989fba93ba8a9ab6b9479957cfe565f5d10ded` equals local HEAD; 2 ahead / 0 behind origin/main.
+  - **PR #154 is OPEN and MERGEABLE** and carries both commits.
+
+**THE SUITE IS 48, NOT 47.** Task 96 said 47 was the first free number; by execution time
+`47-synthetic-anthropic-fallbacks.test.js` had taken it, so the run correctly used 48. Any doc you
+write in WI-4 must say **suite 48**. If you see "suite 47" in inherited text, it is stale.
+
+**DEPENDENCY ON PR #154.** WI-4 documents the suite that PR #154 adds. Write WI-4 against suite 48
+regardless of whether #154 has merged yet; do NOT re-add the suite, and do NOT merge #154 yourself
+(merging is the overseer's, always).
+
+================================================================================
+WI-1 - add the ONE missing alias: `comfyui`
+================================================================================
+
+`comfyui_mcp` is absent from `mcp_aliases`. Its 12 tools surface as `comfyui_mcp-*` while every
+sibling uses a short alias. `comfyui` is absent from BOTH the YAML and the live DB row.
+
+**THE FILE IS NOT THE AUTHORITY. A YAML-ONLY EDIT IS A NO-OP - THIS IS MEASURED, NOT FEARED.**
+`general_settings.store_model_in_db: true` puts five sections in the Postgres `LiteLLM_Config`
+table; `mcp_aliases` lives inside the `litellm_settings` row and is NOT one of the 17
+LITELLM_SETTINGS_SAFE_DB_OVERRIDES. **The DB row wins and the file loses.** On 2026-09-09 nine
+merged alias edits were measured DEAD on the live router. So:
+  1. Edit `infrastructure/litellm-config.yaml` (the seed) near the `langfuse` block, adding
+     `"comfyui": "comfyui_mcp"` with a comment recording the 2026-09-09 rename and that
+     `comfyui_mcp-*` is retired. Safe under THE RULE: no alias is a dash-prefix of `comfyui`, and
+     `comfyui` shadows nothing.
+  2. AND write the DB: `POST $LITELLM_BASE_URL/config/update -d '{"litellm_settings":{...}}'`,
+     then **READ THE ROW BACK AND DIFF IT**. A 200 from that endpoint is not proof - it returned
+     200 twice and silently discarded the key both times.
+  3. **RE-MEASURE THE DRIFT AT EXECUTION TIME.** As of 2026-09-09: YAML 51 / LIVE DB 50 / 17
+     differ. Do not trust those numbers; recompute and report them.
+  4. **CLIENT SWEEP BEFORE DEPLOY - this is the whole safety argument.** Grep `comfyui_mcp-`
+     across `.mcp.json` files, `skills/`, `design docs/`, ops-control-center baselines and the
+     ComfyUI handoff docs. This rename BREAKS any client that calls the prefixed name. Confirm
+     none do, and say so explicitly.
+  5. Requires a ROUTER RESTART, not a config sync.
+
+**DEPLOY CONSTRAINTS, BINDING:**
+  - Any edit to `infrastructure/litellm-config.yaml` **force-recreates the CT202 prod router** -
+    the deploy job hashes the deployed file's content, so even a comment-only change triggers it.
+    It may be merged ONLY in a window with **zero active harness runs**.
+  - Paxton accepted the UAT gap on 2026-09-09 ("accept the gap and deploy through the pipeline,
+    do this"), so WI-1 proceeds - but **through the NORMAL PIPELINE, NEVER BY HAND.** No
+    hand-application to CT202. Rollback: delete the alias line, redeploy, restart the router.
+  - DECIDED, do not reopen: `playwright_qa1_mcp` stays UNALIASED and allowlisted. Reversing it is
+    a client-visible rename of 23 tools and must be its own change.
+
+MERGE ORDER: #122 (Pi-hole allowlist) and #120 (retire qwen3.5/3.6, titled "DO NOT MERGE -
+ordering blocker") also edit litellm-config.yaml. **Re-verify the state of both before touching
+the file** - task 96's merge-order note also named #36, which has since landed on main as `ef4344d`
+(via #145), so that part of the inherited advice is already satisfied. Report what you find; do
+not close or merge any PR in this task.
+
+================================================================================
+WI-4 - write the contract down
+================================================================================
+
+ - Add an "MCP tool namespace contract" section to `docs/config-authority.md` stating: server key
+   => `server_name`; `mcp_aliases` is the ONLY prefix control; no alias => raw key; THE RULE (for
+   every alias containing `-`, no OTHER alias may equal its text before the first dash); alias
+   changes need a RESTART; **suite 48 enforces it**; and the DB-wins merge rule above, including
+   that a file-only alias edit is a no-op.
+ - Extend the add-a-server checklists in `readme-Cognizioware-MCP-Tools-Gateway.md:403` and
+   `design docs/cloudflare-mcp-gateway-gap.md:142` with "add an alias, or record why not."
+
+================================================================================
+WI-5 - the runaway key (`overseer-ingest`)
+================================================================================
+
+Signature: very high `tools/list` enumeration, ZERO tool calls. Its `hive-mind` group contains
+6 of the 7 `placeholder`-host stubs, so every enumeration fans out across dead backends, and
+LiteLLM's MCP discovery is SERIALIZED - so this loop degrades every other MCP call on the gateway.
+(The specific "68,692 today" figure is inherited from 2026-09-09 and task 96's own run marked it
+SUPERSEDED/untrusted. **Re-measure it; do not quote the old number.**)
+
+ 1. **FIND THE CALLER, AND CONFIRM BEFORE CHANGING.** Strongest candidate:
+    `cognizioware-hydra/scripts/overseer-session-ingest.mjs` - the transcript-ingest pipeline live
+    since 2026-09-05 that walks `~/.claude/projects/*/*.jsonl` and posts to memory-mcp every 5
+    minutes via a PTAIT09 Scheduled Task. A per-tick `tools/list` there produces exactly this
+    signature. A plausible cause is not a verified one: if it is NOT that script, SAY SO and keep
+    looking. THE FIX IS CLIENT-SIDE - discover once per session and CACHE.
+ 2. **INTERIM GATEWAY GUARD.** Set an `rpm_limit` on that key via `POST /key/update`, sized ABOVE
+    legitimate use (e.g. 120/min). It throttles `tools/call` too. **A limit that starts 429ing the
+    ingest pipeline is an outage, not a fix.**
+ 3. **NARROW THE SCOPE.** If overseer-ingest needs only a subset, move it off `hive-mind` onto a
+    group without the placeholder stubs. Scope by **`mcp_access_groups`, NEVER server IDs** - IDs
+    REGENERATE ON EVERY CONFIG RELOAD and an ID-scoped key silently goes deny-all
+    (litellm-config.yaml:386-403).
+ 4. **DETECTION.** Add a spend/usage check so a key exceeding ~500 `tools/list`/hr surfaces.
+    `infrastructure/scripts/litellm-team-audit.sh` is the closest read-only precedent.
+
+================================================================================
+SCOPE BOUNDARIES - DO NOT DUPLICATE THESE
+================================================================================
+
+  TASK 89  - WHICH tools each key/role/device is ALLOWED to see (least-privilege matrix). If you
+             find yourself proposing an access-group change for least-privilege reasons, hand it
+             to 89. The ONE exception is WI-5 step 3, which narrows `overseer-ingest`
+             specifically because it is the runaway - that is in scope HERE.
+  TASK 106 - e2e suite-number collisions (incl. the genuine `26-fleet-dns-tls` /`26-ssh-fleet`
+             duplicate). Renumbering belongs there, NOT here.
+  TASK 124 - the broader litellm YAML->DB migration. WI-1 writes ONE alias through the DB path;
+             it does not take on the migration.
+  TASK 136 - the `:synthetic-anthropic` fallback table. Do not touch router fallbacks here.
+  OPEN-PR AUDIT - task 96 carried a 13-PR verdict table. That is REPORT-ONLY and is task 117's
+             territory. **Do not close or merge any PR. Never post an `@claude` comment** - that
+             reviewer bills Paxton's personal subscription.
+
+================================================================================
+WORKSPACE HAZARD - THIS BIT COST TASK 96 REAL TIME
+================================================================================
+
+The CT110 workspace is SHARED and DIRTY: ~35 pending entries belong to OTHER tasks (.venv-audioqa/,
+.behind.py, .ci_gather.py, .triage_dump.py, a literal file named `StrictHostKeyChecking=no`,
+TASK-122/TASK-125 design docs, docs/task-89-key-audit-matrix.md.backup(.2),
+docs/fixtures/intended-key-matrix.yaml.backup, e2e/125c-findings-round2.md, suites 45/46/47,
+modified infrastructure/docker/fleet-admin/*).
+
+**NEVER `git add -A` OR `git add .`** - it sweeps other tasks' work into your commit. Add named
+paths only, and `git status --porcelain <path>` to confirm what you staged.
+
+================================================================================
+FINISH LINE
+================================================================================
+
+You hold a scoped `GH_TOKEN` (push + PR only). When the work is done: commit named paths, push,
+and `gh pr create` YOURSELF. **Then STOP - do not merge.** Merging is the overseer's.
+
+If you cannot finish every WI, ship what is complete as a PR and say plainly which WI is not done
+and why. A partial PR that states its own boundary is worth far more than a run that loops.

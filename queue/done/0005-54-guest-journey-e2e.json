@@ -1,0 +1,9 @@
+{
+  "name": "0000c-54-guest-journey-e2e",
+  "task_file": "C:/tmp/guest-journey-e2e-task.txt",
+  "workspace": "cognizioware-qa",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "run_id": "20260909T050014Z_3499e546",
+  "note": " || STATE = MERGED, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in a triage of every undispositioned failed/cancelled entry. The run ended without a disposition note, but its work SHIPPED: branch feat/guest-journey-e2e -> cognizioware-qa PR #25 is MERGED at 0c7d245. This was a RECORDS gap, not a work gap: nothing needs relaunching. LIVE/VERIFIED still require the usual lane and read-back evidence."
+}

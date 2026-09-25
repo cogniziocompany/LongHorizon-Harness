@@ -1,0 +1,133 @@
+TASK 153 - POWERPLATFORM PRODUCTION TESTING. *** HIGHEST PRIORITY - PAXTON, 2026-09-10 21:10 PT. ***
+
+REPO: `cogniziocompany/cognizioware-powerplatform`. This is the single revenue-generating live
+system, which is why it outranks everything else in the active band.
+
+================================================================================
+*** READ THIS FIRST: WHAT IS ACTUALLY LIVE IS NOT WHAT THE BRANCH SAYS. ***
+================================================================================
+From `PLAN-powerplatform-session-ux-fixes.md` (committed on ptait09 as **8210a96**, branch
+`ci/env-promotion`), and it changes what "testing prod" even means:
+
+    /api/health on prod reports  version: sha-f2a3633  == PR #102
+    PRs #103 (prod pin + billing errors) and #104 (session UX part 3: persistent stepper,
+    pending/busy Open buttons) are MERGED ON THE BRANCH BUT NOT DEPLOYED
+    /api/runtime-config on prod has NO appEnv field, which independently confirms it
+
+**SO SEVERAL REPORTED "BUGS" MAY ALREADY BE FIXED AND SIMPLY NOT SHIPPED.** Testing prod as-is and
+filing what you find would generate work that is already done.
+**STEP 1 IS THEREFORE: ESTABLISH WHAT IS DEPLOYED, THEN DEPLOY THE PENDING WORK TO dev/uat AND
+RE-TEST THERE BEFORE FIXING ANYTHING.**
+
+*** A HOST DISCREPANCY YOU MUST RESOLVE BEFORE TRUSTING ANY PROD READING. ***
+The plan says prod is "on pve151/CT105". The overseer's standing correction (measured 2026-09-09)
+says powerplatform.easybutt0n.ai is served by the **corsairai300 HOST-level docker stack, NOT CT105**,
+and that **CT105 is a stale decoy** running identically-named containers whose newest session was
+2026-06-09 - querying it first is what once made a live session appear not to exist. Proven then by
+uptime: public 21597 vs host 21598 (one second apart) vs CT105 151514.
+Complicating it: corsairai300 IS 192.168.21.151 (confirmed by the overseer 21:00 PT), and CT105 does
+run there. **So "pve151/CT105" is half right and that is the dangerous kind of half right.**
+**RESOLVE IT BY MEASUREMENT before reading any log or version from a container**: compare
+`/api/health` from the PUBLIC host against the host-level stack and against CT105, and state which
+one actually serves traffic. Record the evidence. Do not repeat the decoy mistake.
+
+================================================================================
+SCOPE - PRODUCTION TESTING, NOT BUG-FIXING
+================================================================================
+This task establishes GROUND TRUTH and TEST COVERAGE. It does not fix the UX defects; those are owned
+elsewhere (see DEDUP). If you find yourself editing `SolutionStep.tsx`, you are in another task.
+
+ 1. **What is deployed, definitively.** Version from `/api/health`, the `appEnv` presence check, and
+    which host/stack serves the public name. Compare against `origin/develop` HEAD. Report the gap in
+    commits, naming #103 and #104 explicitly.
+
+ 2. **Deploy the pending work to dev/uat and re-test there.** Lanes: dev at 192.168.21.163:3000, uat
+    at :3001 (`deployments/instances.json`). **NOT prod.** Then re-walk the reported flows and state
+    which reported symptoms survive the newer build and which were already fixed. That list is the
+    single most valuable output of this task.
+
+ 3. **Run the production-ready e2e set, and make it runnable.** MEASURED GAP from the plan:
+    `e2e/playwright/env-to-session.spec.js` and `nav-archive.spec.js` cover the flows in question but
+    **neither is tagged and NEITHER IS RUN** - `e2e/playwright.config.js` `testMatch` only includes
+    `librechat-*` and `trms-eval`, and `env-to-session` is additionally skipped unless
+    `DEV_LANE=true`. A suite that does not execute is not coverage.
+    Add `{ tag: ['@e2e','@production-ready'] }` (Playwright >= 1.42), add the specs to `testMatch`,
+    add an `e2e:prod-ready` script (`playwright test --grep @production-ready`), and document the
+    convention in `e2e/README.md`. **There is no existing production-ready convention in the repo -
+    you are establishing it, so keep it minimal and written down.**
+
+ 4. **Golden-run evidence rules apply** (from `e2e/golden-path/README.md`): commit the captures -
+    PNGs, `report.json`, `report.md` are tracked deliberately as durable evidence; only `*.webm` is
+    gitignored. Maintain the run-history table (run2 4/6, run5 5/6, run9 6/6 style); a human reads
+    the numbered PNGs plus `report.md` and appends a row. **Treat known gaps as failures, not passes.
+    Do not "fix" a run by loosening assertions.**
+
+ 5. **Do NOT create sessions in the production tenant.** `eval-gate.yml:211` already sets
+    `SKIP_CREATE` for prod. Run read-only against prod, or gate creation to dev/uat and treat that as
+    the evidence for the prod step. Say which you did.
+
+================================================================================
+DEDUP - THREE TASKS ALREADY OWN THE FIXES. THIS ONE OWNS THE TESTING.
+================================================================================
+  **107 `pp-session-flow-blockers`** (active, REQUEUED 20:55 after a 429) - Items 2/4/5 of the 7-item
+      handoff: the `useParams` route-param defect, the silent `persistStep` no-op, the environment
+      refresh lock, the blank workspace. **VERIFIED STILL LIVE on origin/develop**: SessionWizard.tsx:44
+      still reads `sessionId`, :117 still guards on `envId`, environment-refresh.service.ts has ZERO
+      `finally` blocks. **If you touch those files you are in 107.**
+  **108 `pp-admin-probes-copy`** (active, REQUEUED and RESCOPED) - Item 1, the Publisher card copy.
+      Item 3 (admin probes) ALREADY SHIPPED as PR #106 (`origin/develop` 2ea3ae2) - do not redo it.
+  **`pp-e2e-coverage-ci-gates`** (blocked/, gated on 107) - Items 6/7: the 2x2 greenfield/brownfield
+      x create/resume coverage matrix and the CI gates. **That task owns the MATRIX; this task owns
+      making the existing specs actually execute and establishing what prod really runs.** If you
+      start building the 2x2 matrix, stop - it is gated on 107 for a reason (while `envId` is
+      undefined the unmanaged-solutions list is always empty, so brownfield cannot pass).
+
+  NEW ITEMS from `PLAN-powerplatform-session-ux-fixes.md` NOT owned by any of the above - record them
+  as findings here, do NOT fix them in this task: the legacy-session "Migrate to setup" card
+  (`FlowVisualizer.tsx`/`SessionDetail.tsx` for sessions with no `solution_unique_name`/`setup_step`);
+  `ProcessStrip` steps being non-navigable (`GuardedLayout.tsx:19-30`, no step-5 route); the broken
+  `SessionList.tsx:323` back button navigating to a non-existent `/environments/:envId`; and the
+  missing footer. Queue them separately once this task reports.
+
+================================================================================
+BLOCKER TO CLEAR FIRST
+================================================================================
+**Task 152 - the ptait09 runner's Claude lane is broken** (`CLAUDE_PATH` points at a non-existent
+file), so the Cursor + Claude parallel QA lanes cannot run on that box. It is a minutes-long fix.
+Clear it before relying on those lanes.
+
+================================================================================
+HARD RULES
+================================================================================
+ - **Base on `origin/develop`, NOT main.** pp prod runs develop-derived images; main is separately
+   held. Merging to main deploys PROD - check `instances.json` and confirm `behind=0` before ANY
+   merge there.
+ - Do not create data in the production tenant.
+ - Never `git add -A`; commit by explicit path; `git diff --stat` first.
+ - Do NOT merge, and do NOT post an `@claude` comment (it bills Paxton's personal subscription).
+ - A GREEN ROLLUP CAN CONTAIN A HARD-FAILING TEST - read per-job conclusions, never the summary.
+
+DONE MEANS: the serving host for powerplatform.easybutt0n.ai is established BY MEASUREMENT with the
+CT105-decoy question settled; the deployed version and its gap to develop are stated with #103/#104
+named; the pending work is deployed to dev/uat and the reported symptoms are re-walked there with a
+survived/already-fixed verdict for each; the two e2e specs are tagged, added to `testMatch` and
+PROVEN to execute; captures and a run-history row are committed; and the four unowned findings are
+written up for separate queueing.
+
+================================================================================
+*** THIS TASK NOW GATES TASK 156 - PAXTON, 2026-09-10 23:20 PT. ***
+================================================================================
+Paxton has decided powerplatform will **auto-push through the pipeline all the way to prod**
+(task 156, `1012-156-pp-auto-promote`). He also directed that **"156 must depend on 153, not duplicate
+it."**
+
+So item 3 of this task - tagging `env-to-session.spec.js` and `nav-archive.spec.js`
+`@production-ready`, adding them to `playwright.config.js` `testMatch`, the `e2e:prod-ready` script,
+and clearing the `test.skip(!DEV_LANE, ...)` guard - **is no longer just coverage hygiene. It is the
+precondition for automatic promotion to prod.**
+
+**Until those specs actually execute, an automatic chain would ship every change to prod on a green
+that means "nothing ran."** Task 156 is written to stay DISABLED behind a kill switch until this
+lands, so finishing item 3 is what unblocks it.
+Unchanged: **task 109 owns making CI GATE** (flipping the three `continue-on-error` steps in
+`eval-gate.yml`); you own making the specs RUN. Do not flip those flags here.

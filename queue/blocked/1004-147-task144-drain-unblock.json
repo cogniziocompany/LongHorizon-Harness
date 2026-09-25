@@ -1,0 +1,8 @@
+{
+ "name": "1004-147-task144-drain-unblock",
+ "task_file": "C:/tmp/task144-drain-unblock-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 1,
+ "trio": "kimi",
+ "note": "*** 2026-09-16 15:58 PT: the window 147 drains for is now the BUNDLED one in 144's text (136 + 170 + CT105 stop + reclaim + window merges). *** || OVERSEER-EXECUTED, NOT FOR A HARNESS RUN - in blocked/ deliberately so the launcher cannot burn a slot on work a run structurally cannot do: it edits the launcher itself, and task 144 needs the LiteLLM master key plus prod credentials, which a harness run is never given. Unblocks task 144 by DRAINING ON PURPOSE via a C:/tmp/queue/DRAIN flag, instead of waiting for a zero-active window that the overseer recorded at LEDGER tick 05:41 will never arrive on its own. Diagnosis adopted from expert session [aab86b]. THREE OVERSEER CORRECTIONS folded in, measured 19:28-19:35: (1) non-terminal is 8, not 3 - runs for tasks 111, 125 and 69b are PARKED AT waiting_approval with OPERATOR QUESTIONS, so the drain flag alone would hold at ACTIVE=3 forever; the gates must be answered too. (2) GET /api/runs/<id>/approvals is HTTP 404 - approvals live in the run SNAPSHOT under approvals[]; reading the wrong route returns empty and looks like 'nothing to resolve'. (3) a launcher file edit is inert until restart - proved at 19:09 when the process had been running 15:15 code for four hours."
+}
