@@ -62,6 +62,7 @@ from .supervisor.control_bus import (
     _ensure_dir_nofollow,
     _open_nofollow,
 )
+from .workspace_guard import WORKSPACE_BASE_MODES
 from .auditor_agent import (
     VISIBLE_OUTPUT_KEYS,
     compact_auditor_report_text,
@@ -2518,13 +2519,10 @@ def _round_zero_open_prs(branch: str, timeout: float = 10.0) -> list[dict[str, A
     ]
 
 
-_WORKSPACE_BASE_MODES = (
-    "on-default",
-    "in-place",
-    "worktree",
-    "stash",
-    "continuation",
-)
+# Task 252: derived from the guard's shared constant instead of a hand-copy,
+# so a mode the launcher can emit can never fall outside the round-zero
+# record's known set again (the incident run died exactly on such a drift).
+_WORKSPACE_BASE_MODES = WORKSPACE_BASE_MODES
 
 
 def _workspace_round_zero_record(
@@ -2542,7 +2540,8 @@ def _workspace_round_zero_record(
     gate, block, or otherwise alter a launch.
 
     Task 201: ``workspace_base_mode`` names the mode the prelaunch guard
-    chose ("on-default" / "in-place" / "worktree" / "stash" / "continuation")
+    chose ("not-a-repo" / "on-default" / "in-place" / "worktree" / "stash" /
+    "continuation")
     so a later reader can tell whether the run was relocated.  It is supplied
     by the supervisor (queue-triggered launches) and omitted — not guessed —
     when unknown.

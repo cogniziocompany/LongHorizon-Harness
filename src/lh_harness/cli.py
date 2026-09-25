@@ -36,6 +36,7 @@ from .types import (
     HarnessConfig,
 )
 from .utils.agent_cli import probe_agent_cli
+from .workspace_guard import WORKSPACE_BASE_MODES
 from .supervisor.control_bus import (
     _append_jsonl as _append_jsonl_nofollow,
     _atomic_bytes_write,
@@ -517,16 +518,12 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument(
         "--workspace-base-mode",
         default=None,
-        choices=(
-            "on-default",
-            "in-place",
-            "worktree",
-            "stash",
-            "continuation",
-        ),
+        choices=WORKSPACE_BASE_MODES,
         help="Internal: the mode the prelaunch workspace guard chose for this run "
         "(task 201); recorded in the round-zero workspace record. Set by the "
-        "supervisor for queue-triggered launches.",
+        "supervisor for queue-triggered launches. 'not-a-repo' (task 252) is a "
+        "legitimate non-git workspace: the worker runs in place with no branch "
+        "work — no default-branch lookup, no branch cut, no push.",
     )
     run_parser.add_argument(
         "--prompt-language",
