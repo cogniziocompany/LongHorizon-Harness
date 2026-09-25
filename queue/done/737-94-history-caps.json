@@ -1,0 +1,15 @@
+{
+  "name": "737-94-history-caps",
+  "task_file": "C:/tmp/history-caps-task.txt",
+  "workspace": "LongHorizon-Harness",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "DISPOSITIONED 2026-09-16 08:10 PT, SCHEDULED TICK #279 [85d45f1e] - NOT A STRANDING, THE WORK LANDED AND IS VERIFIED LIVE. Run 20260910T004611Z_dc6f5cc3 reads failed, which is why six consecutive stranding scans re-flagged this entry; the deliverable nevertheless shipped. Evidence, read this tick rather than inferred: (1) MERGED - LongHorizon-Harness PR #12 (feat/make-character-limits-configurable, merge fa12f54, plus a67e377 \"fix(config): resolve caps from config.toml, warn on bad env, real CLI tests\") is on origin/main. (2) DELIVERABLE MATCHES THE NOTE EXACTLY - origin/main src/lh_harness/types.py carries all three caps with their CURRENT values as defaults (auditor_output_chars=24_000, role_verified_context_chars=60_000, role_history_chars=100_000) plus a _ENV_CAP_OVERRIDES table mapping LH_HARNESS_AUDITOR_OUTPUT_CHARS / _ROLE_VERIFIED_CONTEXT_CHARS / _ROLE_HISTORY_CHARS, and __post_init__ WARNS on an unparseable override rather than swallowing it. That is the \"configurability FIRST with current values as defaults\" this task asked for; the value change was correctly left to a separate PR. (3) LIVE ON CT110 - read from the RUNNING service venv, not from a file or a merge signal: pct exec 110 /home/harness/venv/bin/python reports lh_harness 0.1.7 at /home/harness/venv/lib/python3.12/site-packages/lh_harness/types.py with _ENV_CAP_OVERRIDES present and carrying all three pairs. So this row is VERIFIED, the terminal state, not merely MERGED. DO NOT REQUEUE this entry; a future stranding scan that re-flags it should read this line first. || PRIOR NOTE: THE DOMINANT PROMPT-SIZE LEVER, and it is three integers. types.py hardcodes role_history_chars=100_000, applied TWICE in role_prompts.py (lines 58+60) = 200k chars ~= 50k tokens of history per manager prompt; the function's own default is 36_000. Plus role_verified_context_chars=60_000, auditor_output_chars=24_000. ONE HarnessConfig( at cli.py:1644 passes NONE of them - no env, no flag, no override in src/ or tests/. Configurability FIRST with current values as defaults; the value change is a separate evidenced PR.",
+  "run_id": "20260910T004611Z_dc6f5cc3",
+  "roles_bound": {
+    "manager": "glm-5.2:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-10T00:46:11.139491+00:00"
+}

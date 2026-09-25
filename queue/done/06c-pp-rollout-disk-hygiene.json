@@ -1,0 +1,8 @@
+{
+ "name": "06c-pp-rollout-disk-hygiene",
+ "task_file": "C:/tmp/pp-rollout-disk-hygiene-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 5,
+ "trio": "kimi",
+ "run_id": "20260907T233118Z_8ae61bb8"
+}

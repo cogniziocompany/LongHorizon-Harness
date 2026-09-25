@@ -1,0 +1,36 @@
+TASK 215 - REBASE AND LAND PR #8 (working-tree contention visibility). IT IS STALE, NOT SUPERSEDED.
+
+REPO / WORKSPACE: LongHorizon-Harness    PR: cogniziocompany/LongHorizon-Harness#8, branch feat/workspace-contention
+
+WHY IT IS STILL WANTED (checked before queueing this, 2026-09-20): PR #8 makes overlapping work between
+CONCURRENT runs visible - four ascending severity tiers (same repo / same repo+branch / shared git
+directory / same tree), members are active runs only, and a gate-waiting run counts because it still
+holds its tree. That is OBSERVABILITY ACROSS RUNS. It is NOT the same thing as the workspace branch
+guard merged since (tasks 195 and 201, e1a4fc7 + cbb7d13), which PREVENTS a launch onto another task's
+branch. The two are complementary, and #8 matters MORE now, not less: the guard puts dirty workspaces
+into linked worktrees, which creates exactly the shared-git-directory overlap tier #8 reports.
+
+CURRENT STATE, measured: CONFLICTING / DIRTY, 19 files, +1900/-10, last updated 2026-09-11. main has
+moved a long way since (the guard, the round-zero record, the auditor git-metadata fix, worker RSS
+isolation and its self-relocation all landed after it).
+
+SCOPE
+ 1. Rebase feat/workspace-contention onto current origin/main and resolve conflicts IN FAVOUR OF MAIN
+    wherever main's newer work touches the same lines - launcher.py especially, which now carries the
+    branch guard's prepare_workspace_base call and the record_skip path. #8's contention check must sit
+    ALONGSIDE the guard, never replace or re-order it.
+ 2. Re-run the PR's own tests plus the ones main added since (tests/webapi/test_launcher_workspace_guard.py,
+    tests/test_workspace_round_zero_record.py). A rebase that silently breaks the guard's tests is a
+    failed rebase, not a merge candidate.
+ 3. Re-check the claim the PR makes about itself: it must NEVER block a launch. With the guard now in
+    the same path, prove by test that a contention finding is warn-only and a launch still proceeds.
+ 4. Push to the SAME branch so PR #8 updates. Do NOT open a second PR.
+
+HARD RULES: do not weaken the workspace branch guard or its refusal path. NEVER git add -A; commit by
+explicit path; git diff --stat before every commit. No @claude comment (task 117). The harness is
+deployed to CT110 by a separate overseer step, so merging here does not deploy - but a broken launcher
+on main is still a live hazard, which is why item 2 is mandatory. Open/refresh the PR and STOP;
+merging is the overseer's.
+
+DONE MEANS: PR #8 is MERGEABLE against current main, its own tests and the guard's tests both pass, and
+a test proves a contention finding does not block a launch.

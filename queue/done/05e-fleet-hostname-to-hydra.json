@@ -1,0 +1,8 @@
+{
+ "name": "05e-fleet-hostname-to-hydra",
+ "task_file": "C:/tmp/fleet-hostname-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 3,
+ "trio": "kimi",
+ "run_id": "20260908T010248Z_5f6b1eab"
+}

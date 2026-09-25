@@ -1,0 +1,15 @@
+{
+ "name": "local-executor-ollama-256k",
+ "task_file": "C:/tmp/local-executor-ollama-task.txt",
+ "workspace": "/home/harness/work/LongHorizon-Harness",
+ "max_rounds": 14,
+ "trio": "default",
+ "note": "DEPENDENT TASK - STOP GATE 0. Do not start until task 94 (737-94-history-caps) has MERGED and is DEPLOYED on CT110, and branch perf/role-context-caps (92806f2) has landed. Paxton 2026-09-09: 'make sure its behind the dependant upgrades we need for lhharness.' Executor p90 is already 133,060 tokens, so seating a local executor before the context caps come down buys a truncation bug, not capacity. Plan from session longhorizon-harness-58 (ref de5356), carried faithfully. Overseer corrections measured 2026-09-09: (1) ollama-cloud :11438 is NOT idle - it serves nomic-embed-text, mxbai-embed-large and nomic-embed-text-v2-moe, so NUM_PARALLEL 8->1 would cut embedding concurrency 8x; do :11441 (genuinely EMPTY) first. (2) span holds qwen3.8:27b, 20.6 GB, ctx 65536, NUM_PARALLEL=2, KEEP_ALIVE=30m - the audit name was right, not 'qwen3.6'. Only change to working state is span keep_alive 30m->60s, preferably per-request. No host-level changes to ptait01.",
+ "run_id": "20260910T113842Z_7069de5f",
+ "roles_bound": {
+  "manager": "glm-5.2:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "kimi-k3:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-10T11:38:42.842847+00:00"
+}

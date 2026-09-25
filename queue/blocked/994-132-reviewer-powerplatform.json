@@ -1,0 +1,9 @@
+{
+  "name": "994-132-reviewer-powerplatform",
+  "task_file": "C:/tmp/reviewer-powerplatform-task.txt",
+  "task_source": "task_file",
+  "workspace": "cognizioware-powerplatform",
+  "max_rounds": 6,
+  "trio": "kimi",
+  "note": "*** RE-SCOPED 2026-09-17 12:05 PT by the interactive session at Paxton's instruction ('move up any cognizioware-powerplatform queues unless specific blocker/reason'): BLOCKED ON has changed. Paxton decided 2026-09-16 (HANDOFF-paxton-decisions-2026-09-16.md item 4): do NOT install @claude as primary reviewer; the HARNESS is the reviewer via the PR-review-gate plan (tasks 185-188), @claude/Copilot fallback only after two failed harness reviews. So this task is no longer waiting on 'Paxton's explicit go' - it is BLOCKED ON TASK 185 (reusable PR-gate workflow) landing, then it becomes 'wire the 185 workflow into cognizioware-powerplatform, open the PR and STOP' (merge stays a quiet-window human call - main IS prod). Rewrite the task text to that scope when 185 lands. *** || Bridged 2026-09-11 ~11:20 PT by session [fe2679] via /claude-bridge (Paxton: 'can you try that now'). Discovery: 40 transcripts touched in 30 h, all read; 4 class-(a) handoffs + 1 cancelled task re-surfaced. Source [418504]. PARKED, NOT RELEASED: Paxton cancelled all three reviewer-coverage entries at 12:15 PT 2026-09-10 (LEDGER ~L13618); qa (993-130) and hydra (995-133) were later queued and hydra is done, powerplatform never was. This is the highest-blast-radius one: repo main IS prod, LAN_DEPLOY_ENABLED=1, and there is a standing hold on pp main while task 59 is unlanded. BLOCKED ON: Paxton's explicit go. Task text is the overseer's 12:10 draft (also kept as reviewer-powerplatform-task.txt.CANCELLED-1215), unchanged. Even when released: open the PR and STOP; merge is a human quiet-window call."
+}

@@ -1,0 +1,66 @@
+TASK 162 - Rebuild + redeploy the EasySvc relay (ptait09-runner), and give the C# supervisor a build path.
+
+*** OVERSEER-EXECUTED. NOT FOR A HARNESS RUN. IN queue/blocked/ DELIBERATELY. ***
+It stops/starts a Windows service on PTAIT09 from an elevated shell and needs a fleet enroll token
+from Paxton. A run on CT110 can reach neither.
+
+SOURCE: planning session [3c6c69] (3c6c6989-4afc-4f32-b9ca-01f8286888f0), plan mode, 2026-09-11 06:46 PT,
+plan file C:/Users/PaxtonTait/.claude/plans/delegated-sprouting-yao.md. Bridged 2026-09-11 by [fe2679].
+
+REPO / WORKSPACE: ptait09-easybutt0n-ai (C:/Users/PaxtonTait/source/ptait09-easybutt0n-ai), host PTAIT09.
+
+================================================================================
+IS THIS STILL NECESSARY WITH OUR INFRA? (Paxton asked; answer measured 2026-09-11)
+================================================================================
+YES, but as a SMALL task whose real deliverable is the build path, not the one-off rebuild.
+ - What the relay is: PR #45 (ce6bde4, 2026-09-08, task 05h8 "fleet device emission") made every
+   remote-pc runner function emit start/finish events to fleet.easybutt0n.ai over socket.io. Task 05h8
+   and its rebase 05h8b are in done/. THEY ARE MERGED, NOT LIVE: the running supervisor
+   svc/publish/easysvc.exe is dated 2026-08-09 (re-read today), so no host has ever run the relay.
+ - What it is NOT: it is not the harness fleet reporter (task 114, LHH -> /harness/heartbeat) and not
+   the trios table (148). Those come from LongHorizon-Harness. Hydra (hydra-agent -> wss://hydra...)
+   owns fleet CONTROL. The relay is the REPORT path for runner activity only.
+ - Why it still matters: fleet.easybutt0n.ai's device_events view is empty until it runs, and the
+   structural defect it exposed is broader than the relay: the shared repo has NO CI, the Node runner
+   deploys by git pull + restart, but the C# supervisor is only ever built by dotnet publish inside
+   scripts/onboard-device.ps1 at first install. EVERY svc/ change on EVERY host (ptait09, desk03,
+   htpc01, ptait10am5) is dead on arrival until this exists. If easysvc is kept at all, this is needed.
+ - Measured today: service ptait09-runner RUNNING; only :7334 listens (bridgeUrl says :7335, the
+   runner-v2 canary port); runner.svc.json fleet.url is "" (disabled until set); no
+   .github/workflows in the repo.
+
+================================================================================
+STEPS (verbatim from the source plan, with the ordering the bridge added)
+================================================================================
+ 0. FIRST, the build path (the follow-up the plan called "separate, needs approval" - Paxton's ask
+    to reconcile this against our infra makes it the primary deliverable):
+    scripts/update-easysvc.ps1 that: dotnet test tests/EasySvc.Tests; dotnet publish svc -c Release
+    -r win-x64 -o svc/publish-next (self-contained single-file, same as the relocate script);
+    sc stop <service>; back up svc/publish/easysvc.exe as easysvc.exe.bak-<date>; copy publish-next
+    over publish; sc start; health-check :7334/health; print the rollback command. Fix
+    scripts/cutover.ps1, which still points at the old svc/bin/Release/... path. Wire it into the
+    per-host update flow. (A GitHub Actions build producing the exe artefact is the alternative; the
+    repo has no workflows today, so the script is the smaller first step.)
+ 1. git status / git diff -- svc tests to confirm the 9/10 edits are committed or intended.
+ 2. dotnet test tests/EasySvc.Tests (must pass, especially FleetAgentRelayTests).
+ 3. Publish to svc/publish-next (the service locks svc/publish/easysvc.exe).
+ 4. From an ELEVATED prompt (about 10 s of runner downtime; Restart-Service is access-denied from the
+    user shell - the working path is sudo sc.exe stop/start ptait09-runner): stop, swap, start.
+    Do this in a window with no harness run using the ptait09 runner lanes.
+ 5. Enroll: svc/publish/easysvc.exe enroll --token <FLEET_ENROLL_TOKEN from Paxton> --url
+    https://fleet.easybutt0n.ai. Fix bridgeUrl to the port that is actually live (:7334 unless the
+    canary is started), then restart the service.
+ 6. Out of scope unless Paxton asks: desk03, htpc01, ptait10am5 have their own easysvc builds - run
+    the same script there afterwards, one host at a time.
+
+================================================================================
+VERIFICATION
+================================================================================
+ - sc query ptait09-runner shows RUNNING and svc/publish/easysvc.exe has today's timestamp.
+ - The service logs (logs/) show FleetAgent connecting to fleet.easybutt0n.ai over socket.io.
+ - The ptait09 runner appears and emits events in the fleet.easybutt0n.ai dashboard - READ IT BACK.
+ - Rollback: stop the service, restore the .bak exe, start it again.
+
+NEEDS PAXTON (credential): a fleet enroll token for https://fleet.easybutt0n.ai. Referenced only by
+name; never write it into the repo or this queue. Default if silent: rebuild and swap the exe anyway
+(the relay stays disabled with fleet.url ""), so at least the binary matches source.

@@ -1,0 +1,58 @@
+TASK 148b - Trio table, slice 2 of 5: the fleet-admin BACKEND (schema, push endpoint, read API).
+
+REPO / WORKSPACE: ptait09-easybutt0n-ai   (the fleet-admin SOURCE repo, cogniziocompany/ptait09-easybutt0n-ai)
+PARENT SPEC: C:/tmp/fleet-trios-table-task.txt (task 148). Read its sections for your slice; the
+payload schema, table, classifier rules and page layout there are binding. This slice exists because
+task 148 as one run looped 8 rounds with nothing completed (overseer, 2026-09-14).
+
+================================================================================
+*** BRANCH AND TREE RULES - MEASURED 2026-09-14, READ BEFORE ANY GIT COMMAND ***
+================================================================================
+ - The deployed fleet-admin is the PINNED COPY in cognizioware-mcp-tools, from branch
+   feat/harness-fleet-report at 804a4f07f779bd7b. THAT BRANCH IS YOUR BASE.
+ - Do NOT base on main: main has almost no fleet-admin (14,836 fewer lines than the pinned branch),
+   and the pinned commit is not an ancestor of main. Work built on main has nothing to change.
+ - This working tree is currently checked out on feat/fleet-window-harness-pull, the head of OPEN PR
+   #48 (a pull backstop, 164 files, unreviewed). Do not commit to it.
+ - FIRST: git fetch origin feat/harness-fleet-report:refs/remotes/origin/feat/harness-fleet-report
+   then: git checkout -b <your slice branch> origin/feat/harness-fleet-report
+   The tree was clean when measured; if git refuses, STOP and ask.
+ - Open your PR with BASE feat/harness-fleet-report, not main. A PR against main would show the whole
+   app as new and cannot be reviewed.
+ - PR #48 also edits fleet-admin/src/test/helpers.js, web/src/pages/OverviewPage.tsx and
+   web/src/types/index.ts. Keep your edits to those files ADDITIVE and small, so a later rebase over
+   #48 is mechanical. Do not touch the harness poller or harnessClient code from #48.
+
+HARD RULES (every 148 slice)
+ - Env var NAMES only: never a key, token or signature value in code, tests, docs or commits.
+ - Do NOT insert a fleet.hosts row to satisfy a foreign key; the live host is BLOCKED ON TASK 114.
+ - Do NOT edit C:/tmp/launch_queue.py, and do NOT edit cognizioware-mcp-tools at all.
+ - Never git add -A; commit by explicit path; git diff --stat before each commit.
+ - Read the individual tests, not the rollup: a green run can contain a hard-failing test.
+ - Do NOT merge, and do NOT post an @claude comment (it bills Paxton's personal subscription).
+   Open the PR and STOP.
+
+================================================================================
+SCOPE - PARENT SPEC SECTION 2 ONLY
+================================================================================
+ - schema.sql AND src/test/helpers.js: add fleet.harness_trio_config (host text PRIMARY KEY REFERENCES
+   fleet.hosts ON DELETE CASCADE, body jsonb NOT NULL, launcher_sha256 text, received_at timestamptz
+   NOT NULL DEFAULT now()).
+ - src/server.js: app.post('/harness/trios', harnessJson, requireDevice, ...) validating
+   schema === 'lh-trios/v1', three non-empty strings per row and contiguous idx; upsert by host; emit
+   a `trios` socket event. Follow the /harness/heartbeat pattern. In buildApiRouter, router.get('/trios')
+   returning [{host, received_at, body}] with the same read-key auth /overview uses.
+ - Auth is the existing device HMAC (X-Fleet-Host, X-Fleet-Signature over the raw body). Reuse it; do
+   not add a second scheme.
+
+TESTS (fleet-admin node tests, existing src/test/helpers.js):
+   bad signature -> 401 | wrong schema -> 400 | valid body -> upsert, and GET /api/fleet/trios returns
+   it | a second push REPLACES the first.
+   The test harness may create its own host row inside the TEST database - that is fine. Never in a
+   real database.
+
+NOT IN THIS SLICE: the classifier, the page, the launcher patch, any deploy.
+
+DONE MEANS: schema, endpoints and the four tests committed; npm test in fleet-admin green with the
+four tests read individually; PR open against feat/harness-fleet-report. The live push stays BLOCKED
+ON TASK 114 (/api/fleet/nodes returns []) and must be reported that way.

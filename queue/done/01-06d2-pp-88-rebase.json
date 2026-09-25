@@ -1,0 +1,9 @@
+{
+  "name": "06d2-pp-88-rebase",
+  "task_file": "C:/tmp/pp-88-rebase-task.txt",
+  "workspace": "cognizioware-powerplatform-evalfix",
+  "max_rounds": 3,
+  "trio": "kimi",
+  "run_id": "20260908T125816Z_abe86a74",
+  "note": " || STATE = MERGED, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in a triage of every undispositioned failed/cancelled entry. The run ended without a disposition note, but its work SHIPPED: branch fix/prod-promotion-branch-guard -> cognizioware-powerplatform PR #88 is MERGED (branch since deleted, which is why it reads ABSENT from origin). This was a RECORDS gap, not a work gap: nothing needs relaunching. LIVE/VERIFIED still require the usual lane and read-back evidence."
+}

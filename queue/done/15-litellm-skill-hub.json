@@ -1,0 +1,8 @@
+{
+ "name": "15-litellm-skill-hub",
+ "task_file": "C:/tmp/skill-hub-task.txt",
+ "workspace": "/home/harness/work/ptait09-easybutt0n-ai",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "run_id": "20260908T120718Z_2586066f"
+}

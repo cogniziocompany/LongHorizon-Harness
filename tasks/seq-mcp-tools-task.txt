@@ -1,0 +1,147 @@
+TASK 137 - Ship APP-LEVEL logs from ops-control-center and the Node/TS MCP services to prod Seq.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+Source: session [124a01] (124a01c6-449f-4cfa-9d6a-eee389ea9868), plan mode, 2026-09-10.
+
+================================================================================
+THE FRAMING THAT MATTERS: THIS IS AN APP-CODE GAP, NOT A PLUMBING GAP
+================================================================================
+https://seq.easybutt0n.ai is already the company's live prod Seq (public Cloudflare-tunnel
+route to the terranas01 instance, 192.168.21.128:5341; LAN admin UI at
+seq-terranas01.lan.easybutt0n.ai). The OTLP-to-Seq convention is ALREADY LIVE for LiteLLM's own
+telemetry (success_callback/failure_callback: ["opentelemetry"] plus the OTEL_* env vars).
+
+Confirmed during exploration: EVERY service already receives OTEL_EXPORTER_OTLP_ENDPOINT and
+OTEL_EXPORTER_OTLP_HEADERS (the Seq API key) into its container automatically via the shared
+env_file /opt/cognizioware-mcp-tools/mcp-tools.env. So nothing needs plumbing. What is missing
+is (a) first-party app code that actually emits, and (b) a DISTINCT OTEL_SERVICE_NAME per
+service - today there is one global value, so logs would not be filterable per service.
+
+Today every custom service - the .NET ops-control-center and ~15 Node/TS MCP servers under
+infrastructure/docker/ - only does console.log / ILogger to stdout to journald, with no
+structured sink.
+
+================================================================================
+PART A - ops-control-center (.NET 10 Blazor Server)
+================================================================================
+Files: infrastructure/docker/ops-control-center/src/OpsControlCenter/OpsControlCenter.csproj
+       infrastructure/docker/ops-control-center/src/OpsControlCenter/Program.cs
+
+  1. Add TWO official packages - logging and OTLP/HTTP exporter ONLY, no tracing, no metrics:
+       OpenTelemetry.Extensions.Hosting
+       OpenTelemetry.Exporter.OpenTelemetryProtocol
+     Pin the versions you actually resolve and say which. UPDATE THE CSPROJ'S "zero NuGet
+     packages" COMMENT IN THE SAME COMMIT so it does not go stale.
+  2. In Program.cs, immediately after CreateBuilder: builder.Logging.AddOpenTelemetry(...) with
+     IncludeScopes and IncludeFormattedMessage true, and AddOtlpExporter using HttpProtobuf.
+     Call AddOtlpExporter with NO manual endpoint/header wiring - it auto-binds from the
+     standard OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_HEADERS env vars already present
+     in every container, and the service name comes from OTEL_SERVICE_NAME via the SDK's
+     default resource builder. No Environment.GetEnvironmentVariable calls. No appsettings.json.
+
+  *** ADDITIVE ONLY. DO NOT CALL ClearProviders(). *** The existing console provider must keep
+  working, and a local dotnet run with no Seq reachable must keep working unchanged. Every
+  ILogger<T> call site in Services/ (AuditLog.cs, CatalogStore.cs, DoctorRunner.cs, ...) needs
+  NO change - they already flow through ILoggingBuilder.
+
+================================================================================
+PART B - Node/TS MCP services: ONE PILOT, THEN REPEAT
+================================================================================
+There is NO shared workspace or common directory across the ~15 service folders - each has its
+own build context - and a workspace refactor is OUT OF SCOPE. Use a CANONICAL-COPY pattern:
+one source-of-truth file, duplicated per service with a "synced from" comment.
+
+  Create infrastructure/docker/_shared/otel-logger.mjs (canonical; not itself deployed). It
+  wraps console output with an optional OTLP log emitter and MUST:
+    - be a COMPLETE NO-OP when OTEL_EXPORTER_OTLP_ENDPOINT is unset;
+    - fire console FIRST, always, before any emit attempt;
+    - NEVER throw or reject into the caller - guard init in try/catch and guard emit in
+      try/catch. A logging path that can throw is worse than no logging.
+    - take service.name from OTEL_SERVICE_NAME, and parse OTEL_EXPORTER_OTLP_HEADERS into a
+      headers object.
+  Packages: @opentelemetry/api-logs, @opentelemetry/sdk-logs,
+  @opentelemetry/exporter-logs-otlp-http, @opentelemetry/resources. VERIFY the exact
+  latest-compatible versions at implementation time rather than copying versions from a doc.
+
+  PILOT: ops-status-mcp only. Smallest surface (268-line single file, one existing
+  console.error), low traffic, already an ES module, no build step. Copy the logger in, add the
+  four deps, add one COPY line to its Dockerfile next to the server.js copy, and swap its
+  console call sites for the wrapper with a component attribute.
+
+  THEN repeat for the remaining ~14 services, ONE PR OR COMMIT PER SERVICE so a bad one does
+  not block the rest. For TS services (e.g. ssh-mcp) use a .ts variant under src/ - their
+  tsconfig include glob already covers src/**.
+
+================================================================================
+PART C - docker-compose.yml
+================================================================================
+Add ONE line to each target service's EXISTING environment: block:
+    OTEL_SERVICE_NAME: "ops-control-center"      (~line 1569)
+    OTEL_SERVICE_NAME: "ops-status-mcp"
+LEAVE env_file AND the logging: driver: journald block UNTOUCHED. Do NOT duplicate
+OTEL_EXPORTER_OTLP_ENDPOINT or _HEADERS here - they keep flowing from the shared env_file.
+
+================================================================================
+PART D - .env.example and the durability rule
+================================================================================
+  - infrastructure/.env.example: add ONE comment line above the existing OTEL block noting that
+    docker-compose.yml now sets a literal per-service OTEL_SERVICE_NAME which overrides this
+    fallback. No per-service entries needed.
+  - OTEL_EXPORTER_OTLP_ENDPOINT is non-secret and already documented - no further mirror.
+  - OTEL_EXPORTER_OTLP_HEADERS IS SECRET (it carries the real Seq API key). Per the live-env
+    durability rule, add a runbook line to design docs/mcp-placeholder-services-audit-and-plan.md
+    noting it is now consumed by EVERY env_file-sharing service, not just litellm-router.
+    NEVER write the key value itself anywhere - env var NAMES only.
+
+================================================================================
+PART E - VERIFICATION
+================================================================================
+  1. Local smoke test BOTH directions before deploying: endpoint unset, and endpoint set.
+     dotnet run for ops-control-center, node server.js for ops-status-mcp. Confirm no crash or
+     throw either way and that console output is unaffected.
+  2. Deploy both pilots to CT202, docker compose up -d ops-control-center ops-status-mcp, then
+     trigger one log line in each.
+  3. CONFIRM IT LANDED IN SEQ - not that the container started. Read the LAN admin UI
+     https://seq-terranas01.lan.easybutt0n.ai/ (same instance the public tunnel reaches, no API
+     key needed) filtered by Application = ops-control-center / ops-status-mcp and a recent
+     timestamp. Secondary read path if needed: aidev02-app's /api/seq-events proxy. DO NOT rely
+     on the seq_mcp gateway backend - it is currently a 0-tool stub.
+  4. Only once BOTH pilots are confirmed landing, repeat Parts B/C for the rest.
+
+================================================================================
+DEFERRED - NOT FORGOTTEN. SAY THIS IN THE PR SO IT IS NOT MISTAKEN FOR SCOPE CREEP.
+================================================================================
+Disabling the now-redundant local console/journald logging is a DELIBERATELY SEPARATE next
+step, to be done ONLY after Seq shipping is confirmed working in prod. Do not do it here, and
+do not let a reviewer read its absence as something skipped.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Never write a secret into a file, fixture, doc or commit message. Env var NAMES only.
+ - NEVER the bare gateway /health - it fans a completion out to every configured model,
+   including paid and GPU ones. Use /health/liveliness.
+ - Do NOT edit infrastructure/litellm-config.yaml - any edit force-recreates the CT202 prod
+   router and kills in-flight runs. Nothing in this task needs it.
+ - Never git add -A; commit by explicit path; check git diff --stat first.
+ - Do NOT merge. Open the PR and STOP.
+
+================================================================================
+*** AMENDMENT 2026-09-14 (Paxton, via the overseer): SEQ INGEST NEEDS NO AUTH. THE KEY ASK IS CLOSED. ***
+================================================================================
+Seq is a DEV environment. No ingest API key will be created, and none is needed. PROVEN by the
+overseer on 2026-09-14: POST /api/events/raw?clef with NO Authorization header returns HTTP 201
+{"MinimumLevelAccepted":null} on BOTH https://seq.easybutt0n.ai and http://192.168.21.128:5341.
+(The /api/events QUERY endpoint returns 401 "Please log in" without a session - that is the UI
+login, not ingest, and is irrelevant to shipping logs.)
+
+THEREFORE:
+  - SEQ_API_KEY / the OTLP auth header is OPTIONAL. Ship with it UNSET. Do not block startup, do not
+    downgrade logging, and do not emit a "configuration incomplete" warning when it is absent.
+  - *** Any guard that refuses to log without SEQ_API_KEY is a BUG - remove it. *** Task 161's run
+    on 2026-09-12 stopped on exactly that guard ("seq logging configuration incomplete; missing
+    environment variables: SEQ_API_KEY"), which is why this amendment exists.
+  - If a key IS present, send it; if not, send nothing. Both paths must be tested.
+  - Verification stays the same and is now unblocked: emit a uniquely-tagged event from the service
+    and confirm it arrives - the overseer can eyeball it in the Seq UI, and the run should assert the
+    201 from the ingest endpoint it actually used.

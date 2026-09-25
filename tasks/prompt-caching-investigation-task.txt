@@ -1,0 +1,148 @@
+TASK 91 - the LiteLLM cache is enabled and doing NOTHING for the traffic that costs money. Find out what would.
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools.
+
+Paxton, 2026-09-09: "we enabled cache on litellm, or at least one part. create a task to investigate
+this with web search and our mcp tools sonar pro."
+
+## WHAT IS ENABLED - read from the DEPLOYED config on CT202, not from the repo
+
+    litellm_settings:
+      cache: true
+      cache_params:
+        type: redis
+        host: os.environ/REDIS_HOST
+        port: os.environ/REDIS_PORT
+        password: os.environ/REDIS_PASSWORD
+        ttl: 300
+
+The config's own comment says: *"Backing store: in-stack `redis` service (docker-compose.yml). Purpose
+is cost caching - hence the deliberately short 300s TTL."* The `cognizioware-mcp-tools-redis`
+container is **Up 21 hours (healthy)**, so the backend is fine.
+
+## AND IT IS ACHIEVING NOTHING WHERE IT MATTERS - measured, 6-hour window
+
+From `LiteLLM_SpendLogs.cache_hit` on CT202:
+
+| backend | cache_hit | requests | prompt tokens |
+|---|---|---|---|
+| **SYNTHETIC** | **False** | **2,107** | **111,654,216** |
+| local | False | 20,662 | 18,166,274 |
+| local | None | 2,404 | 8,248 |
+| local | **True** | **71** | 43,979 |
+
+**Synthetic: 2,107 requests, ZERO cache hits.** Local: 71 hits out of ~23,000 (0.3%).
+
+**The hypothesis to test (do not assume it - prove or refute it):** LiteLLM's `cache: true` is
+**exact-match RESPONSE caching** - identical request in, stored response out. Harness agent rounds are
+never byte-identical, because the conversation grows every turn, so a 300s exact-match cache can
+essentially never hit on this traffic. If that is right, **the cache that is enabled is the wrong KIND
+of cache for our problem**, and the 300s TTL is irrelevant either way.
+
+## WHY THIS MATTERS - the number it would attack
+
+Synthetic averages **~52,700-55,000 PROMPT tokens per request** (two independent windows agree),
+against ~604 for local models - roughly **87x more context per call**. Prompt volume is the dominant
+cost driver, and the weekly credit ran out on 2026-09-09 with **no manual reset available until
+~2026-10-09**.
+
+**So: if a large, stable prefix is being re-sent every round, prefix/prompt caching is the lever that
+costs nothing in model quality and requires no routing change.** That is a far better first move than
+moving roles onto local hardware.
+
+## SCOPE
+
+1. **Confirm or refute the hypothesis** with LiteLLM's own documentation and behaviour: is `cache:
+   true` + redis exact-match response caching, and does it therefore never hit for multi-turn agent
+   traffic? Say which, with a citation.
+2. **RESEARCH, and this is what Paxton asked for explicitly.** Use web search AND the gateway's
+   **`sonar-pro`** model (also available: `sonar-pro:perplexity`, `sonar-reasoning-pro:perplexity` -
+   confirmed live on the router 2026-09-09) to establish:
+   - What prompt/prefix caching does **Synthetic** (api.synthetic.new) support, if any? Their docs are
+     at `https://dev.synthetic.new/docs/api/overview`. **If they support none, say so plainly** - that
+     is a real and useful answer.
+   - What does **LiteLLM** support for prompt caching / `cache_control` pass-through to providers, and
+     at which version? Our router image is digest-pinned; state whether the installed version has it.
+   - Do the **local Ollama** endpoints support prefix/KV reuse across requests, and does that already
+     happen implicitly?
+3. **Measure what is actually cacheable BEFORE proposing anything.** A prefix is only worth caching if
+   it is stable across rounds. Use the harness's own trajectory artifacts -
+   `GET /api/runs/{run_id}/rounds/{n}/trajectory/{role}` on CT110 - to compare consecutive rounds of
+   the same run and report **what fraction of the prompt is byte-identical round to round**.
+   **`LiteLLM_SpendLogs.messages` is EMPTY (`{}`) - request bodies are not persisted. Do not look
+   there.**
+4. **Then recommend**, with the saving quantified: enable provider prompt caching / restructure the
+   prompt so the stable part is a cacheable prefix / raise or lower the TTL / turn the response cache
+   off entirely if it is only adding latency and redis load for a 0.3% hit rate.
+
+## HARD RULES
+
+ - **Do NOT enable, disable or reconfigure caching on the live router in this task.** Produce the
+   finding and the recommendation. `infrastructure/litellm-config.yaml` FORCE-RECREATES the prod
+   router, so any change to it must be flagged prominently and merged in a window with no active runs.
+ - Do not purchase anything or change any subscription.
+ - **A cache that returns a stale answer is worse than no cache.** If you recommend enabling anything,
+   state explicitly what could go stale and how a wrong cached response would be detected. Agent runs
+   acting on a stale tool result is a correctness bug, not a performance one.
+ - Env NAMES only, never values (`REDIS_HOST`, `REDIS_PASSWORD`, `SYNTHETIC_API_KEY`).
+ - Trajectories may contain repository contents: report SIZES and PROPORTIONS, never prompt bodies. If
+   anything resembling a credential appears, say that it appeared and where - do not reproduce it.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+ - PR to `main`, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR against main that states plainly whether the enabled redis cache can ever help agent traffic (with
+the measured 0-hits-on-2,107-Synthetic-requests as the evidence); what prompt/prefix caching Synthetic,
+LiteLLM and local Ollama each actually support, cited from research including `sonar-pro`; the measured
+round-to-round identical fraction of a real harness prompt; and a costed recommendation - with the
+staleness risk of anything it proposes turning on.
+
+
+
+## RETRACTED RESCOPE - 2026-09-09 13:38 PT. DO NOT AIM THIS TASK AT A "FIXED PREFIX".
+
+An earlier addendum re-aimed this task at a "~33k byte-identical fixed prefix" said to be ~60% of
+daily volume. **That claim is RETRACTED. It was wrong, and it has been disproved with percentiles.**
+
+Session `longhorizon-harness-58` raised it, then retracted it themselves; the overseer verified the
+disproof independently against CT202. `glm-5.2:synthetic-anthropic` (manager), 09-09, calls >= 1k
+tokens, 796 real calls:
+
+    floor = 2,994    p25 = 12,322    p50 = 28,931    p90 = 80,427    max = 149,043    mean = 38,433
+
+**A floor of 2,994 makes a 33k fixed prefix impossible.** A quarter of calls sit under 12,322. The
+"32,979 average" was the MEAN OF A WIDE RIGHT-SKEWED DISTRIBUTION being read as if it were a constant.
+
+**What is actually there:** the manager's real base is roughly **3k tokens** (harness doctrine ~2k
+measured + task text ~1.6k median), and the manager gets **no tools** (0 `tool_use`, consistent with
+the tiny floor). Everything above ~3k is **INJECTED HISTORY that grows across rounds** - auditor
+reports and harness feedback. **It is not fixed, not byte-identical, and therefore largely NOT
+prefix-cacheable.**
+
+**So this task is worth substantially LESS than the rescope claimed.** The genuinely stable prefix is
+~3k per call, not ~33k. **Keep it queued, at LOWER priority. Do not rescope it around the 33k figure.**
+The original scope - measure what is actually stable round-to-round from the trajectories before
+proposing anything - was right, and stands.
+
+**The real lever is TASK 94** (history caps in lh-harness), not caching.
+
+**Also correct any 64k planning in this task.** Share of real calls already exceeding 64k on 09-09:
+
+| model | over 64k | p90 | max |
+|---|---|---|---|
+| nemotron-3-super (executor) | **44.9%** | 133,092 | **222,019** |
+| glm-5.3-flash | **52.0%** | 123,820 | 154,314 |
+| glm-5.2 (manager) | 19.3% | 80,427 | 149,043 |
+| syn:large:vision (auditor) | 7.2% | 56,218 | 96,670 |
+
+**No role fits a 64k window reliably today**, and the executor is hopeless at any cap. An earlier claim
+that the auditor "fits today" at ~42k is also retracted - 7.2% of its calls bust 64k.
+
+**One more measured fact:** 754 of 12,015 requests (6.3%) are **sub-1k probes**. They cost almost
+nothing in tokens but they **do consume the 500/hr request budget** - relevant to the rate-cap
+overrun, not to caching.
+
+**What survives from that session unchanged and verified:** the 2.8x rate-cap overrun, `spend = 0.00`
+blindness, tokens-XOR-tags, and that VOLUME rather than composition burned the credit.

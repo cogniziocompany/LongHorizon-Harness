@@ -1,0 +1,8 @@
+{
+ "name": "12-harness-queue-api-ux-speed",
+ "task_file": "C:/tmp/harness-queue-api-task.txt",
+ "workspace": "/home/harness/work/LongHorizon-Harness",
+ "max_rounds": 10,
+ "trio": "kimi",
+ "run_id": "20260908T095205Z_ad2ec433"
+}

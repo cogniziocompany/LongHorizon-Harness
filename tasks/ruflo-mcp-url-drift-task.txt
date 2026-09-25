@@ -1,0 +1,107 @@
+TASK 171 - RUFLO_MCP_URL HAS THREE DIFFERENT VALUES AND THE LIVE ONE IS IN NO REPO FILE.
+
+SOURCE: planning session [5b1a13], Appendix A of task 165, which flagged this deliberately rather
+than fixing it because the fix touches litellm-config.yaml. Queued separately by the overseer
+2026-09-11.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+
+================================================================================
+THE DRIFT, AS MEASURED
+================================================================================
+  192.168.21.155   LIVE on CT202 (mcp-tools.env:49, set 2026-09-11 to fix the dead .218 host).
+                   *** ZERO occurrences anywhere in the repo. ***
+  192.168.21.218   infrastructure/.env.example:66, mcp-tools.env:49 (the committed/example copies),
+                   infrastructure/litellm-config.yaml:592
+  192.168.21.118   infrastructure/ruflo-uat/README.md, e2e/lib/api-client.js:37,
+                   e2e/.env.example:13-14
+
+Two consequences, and the second is the dangerous one:
+ 1. The value that is actually serving production is recorded in NO file, so the next person to
+    deploy from the repo silently reverts it.
+ 2. The deploy tooling AND the e2e default still assume the .118 host - *** the same host that
+    caused the 2026-07-14/15 NIGHTLY-RED incident. *** So a fresh clone points the tests at a host
+    with a known history of exactly this failure.
+
+MITIGATION THAT ALREADY EXISTS, and why it is not a fix: register-mcp-tools-stack.py:85-87 has a
+dead-IP guard. It stops the worst outcome; it does not make the files agree, and it does not stop a
+deploy from writing the wrong value.
+
+================================================================================
+WHAT TO DO
+================================================================================
+ 1. Establish the ONE canonical value by reading the LIVE gateway, not by picking from the list.
+    Confirm ruflo actually answers on it: a tools/list through the gateway with x-mcp-servers: ruflo
+    returning a non-zero tool count. Note e2e/baseline.json already pins ruflo at 243 tools, so
+    compare against that pin rather than inventing a threshold.
+ 2. Make every one of the six locations agree with it, or say explicitly why one should differ (a
+    uat target legitimately might - if so, name it as such rather than leaving it looking like drift).
+ 3. Add the value to e2e/baseline.json or the manifest pattern the repo already uses, and assert it
+    from an e2e suite, so a future divergence fails a test instead of surfacing as a nightly RED.
+    This is the part that stops recurrence.
+ 4. Update register-mcp-tools-stack.py's guard to name the canonical value in its error message, so
+    a dead IP reports WHICH value it expected.
+
+================================================================================
+HARD RULES
+================================================================================
+ - *** infrastructure/litellm-config.yaml:592 IS ONE OF THE FILES TO FIX, AND ANY EDIT TO THAT FILE
+   FORCE-RECREATES THE CT202 PROD ROUTER *** - the deploy job hashes the DEPLOYED file, so even a
+   comment-only change triggers it. That edit therefore lands ONLY in a zero-run window
+   (running + waiting_approval == 0, COUNTED from GET /api/runs). The overseer owns the window.
+   Split the PR if it helps: everything except the yaml can merge freely.
+ - mcp_servers is ALSO one of the five Postgres-shadowed config sections, so check whether the
+   registration is DB-backed before assuming a file edit changes anything. As of 2026-09-11
+   LiteLLM_MCPServerTable had ZERO rows, which means this one IS file-driven - but RE-CHECK, do not
+   inherit that reading.
+ - Do NOT stage infrastructure/mcp-tools.env - it is gitignored but present in the working tree with
+   a live bearer token on line 50. Commit by explicit path; NEVER git add -A.
+ - No secrets in docs or commits - env var NAMES only. Never print the token.
+ - Do NOT post an @claude comment (task 117).
+ - Open the PR and STOP.
+
+================================================================================
+VERIFICATION
+================================================================================
+ 1. Enumerate every occurrence of RUFLO_MCP_URL in the repo and show that they agree - grep and
+    print the LIST, do not sample one file.
+ 2. The live gateway still serves ruflo tools after any registration change, proven by a tools/list
+    count read back and compared to the 243-tool baseline pin.
+ 3. The new assertion FAILS when the value is changed to .118, proven by changing it in a test.
+ 4. If the yaml changed: the CT202 router was recreated in a counted zero-run window, and
+    /health/liveliness returns 200 afterwards.
+
+DONE MEANS: one canonical RUFLO_MCP_URL in every file, recorded in git, asserted by a test that
+fails on divergence, with the dead-IP guard naming the expected value - and the prod router healthy
+after any recreate.
+
+================================================================================
+CORRECTION TO THIS FILE - overseer scheduled tick #502, 2026-09-17 17:35 PT.
+MEASURED ON CT202 THIS TICK, NOT QUOTED FROM A REPO FILE OR AN EARLIER TICK.
+================================================================================
+ - CANONICAL VALUE, settled: RUFLO_MCP_URL=http://192.168.21.155:3000/mcp
+   Read from the LIVE /opt/cognizioware-mcp-tools/mcp-tools.env line 49. NOTE THE PATH: the live
+   file sits at the CT202 REPO ROOT. There is no infrastructure/mcp-tools.env on the container -
+   looking there returns nothing and reads like a missing file. The canonical value carries the
+   scheme, port 3000 AND the /mcp path; a bare "192.168.21.155" is NOT the canonical value.
+   Line 50 is RUFLO_MCP_TOKEN. It is a SECRET: env-var reference only, never into a repo file,
+   doc, baseline or PR body.
+ - *** THE "243 TOOLS" PIN NAMED ABOVE IS WRONG AND UNSOURCED. DO NOT WRITE 243 ANYWHERE. ***
+   An authenticated tools/list (Authorization: Bearer $RUFLO_MCP_TOKEN, x-mcp-servers: ruflo)
+   against the canonical URL returns HTTP 200 with result.tools length = 240 - identical to the
+   unauthenticated count, so auth changes nothing. And e2e/baseline.json has NO real ruflo entry,
+   so 243 was never in the repo to begin with. Establish the baseline entry at the MEASURED 240
+   and say in the PR body that 243 was unsourced and is superseded by a live reading. This is the
+   task's own "surface it, do not invent a threshold" rule being applied - it is not a licence to
+   pick a new number either.
+ - LiteLLM_MCPServerTable = 0 rows (container cognizioware-mcp-tools-postgres, creds
+   litellm_user / litellm_mcp_tools - "llmproxy" and "postgres" are both FATAL). Zero rows
+   CONFIRMS the 2026-09-11 reading: the gateway's MCP servers are file/env-driven, so
+   mcp-tools.env is authoritative for ruflo and NO DB row shadows it. That is precisely why the
+   file reconciliations below are safe to land now.
+ - infrastructure/litellm-config.yaml:592 STAYS UNTOUCHED in this run. Any edit force-recreates
+   the CT202 prod router and needs a counted zero-run window the overseer owns. It is a stale
+   DESCRIPTION only - the yaml `url:` field is an os.environ pass-through - so the fix is cosmetic
+   and belongs in a SEPARATE follow-up PR. Never bundle it with the free-to-merge edits.
+ - This run holds a scoped GH_TOKEN (push + PR). Push and open the PR yourself, then STOP.
+   Merging is the overseer's.

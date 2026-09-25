@@ -1,0 +1,66 @@
+TASK: PR reviewer coverage — cognizioware-hydra (verification, NOT new code)
+
+Read this brief first, in full, before doing anything:
+  C:\Users\PaxtonTait\source\cognizioware-hydra\tasks\handoff-reviewer-hydra-2026-09-10.md
+
+It carries the measured state (verified live against the GitHub API 2026-09-10), the blast radius,
+the open questions, and what "done" means. Do not re-derive facts it already establishes.
+
+TWO HARD RULES — these override any instinct to be helpful:
+
+  1. DO NOT OPEN A SECOND PR. PR #26 (ci/add-claude-reviewer, +65/-0, OPEN, MERGEABLE) already
+     adds the reviewer workflow to this repo, and already carries the two fixes the other repos
+     learned the hard way (claude_code_oauth_token not anthropic_api_key; fetch-depth: 0; job-level
+     timeout-minutes: 20 because the action's timeout_minutes INPUT is rejected as unknown).
+     Your job is to verify #26, not to replace it.
+
+  2. DO NOT MERGE. Merging #26 pushes to main, and hydra-ci.yml triggers on ANY push to main with
+     NO path filter — so a workflow-only merge still runs the full deploy job against
+     cognizio03-corsairai300, the same host CT110 runs on. Paxton decides merge timing, in a quiet
+     window. Open / verify / report / stop.
+
+  3. COPY THE REFERENCE FILE, DO NOT RETYPE THE GATE. The copy source is
+     cognizioware-mcp-tools/.github/workflows/claude-code.yml (2,491 B). Never retype the
+     write-access gate from a prose document: author_association == 'OWNER' || 'MEMBER' ||
+     'COLLABORATOR' is ALWAYS TRUE in Actions expression syntax and silently disables the gate.
+
+DELIVERABLES (report back, do not act beyond them):
+
+  A. Re-verify PR #26's file byte-for-byte against the 2,491 B mcp-tools reference. Say plainly:
+     matches, or drifted — with the diff. Use: gh api repos/cogniziocompany/<repo>/contents/
+     .github/workflows/claude-code.yml --jq .size and compare content.
+
+  B. Recommend whether hydra should also carry the event-driven, no-@claude reviewer pattern —
+     prior art is mcp-cognizioware/.github/workflows/pr-failure-investigator.yml, on
+     workflow_run: completed + conclusion == 'failure'. It reviews only failures, so it costs far
+     less than review-on-open. Cost is the whole reason nobody chose review-on-open: each @claude
+     invocation spends a PERSONAL SUBSCRIPTION QUOTA, not a metered key. Justify your answer.
+
+  C. Confirm hydra INHERITS the false-green guard being proven on cognizioware-qa — do not design
+     a competing one. Background: on 2026-09-09 a review run reported completed/success with every
+     step green and posted NO review; the credential resolved empty and the action's internal steps
+     were outcome=skipped/conclusion=skipped. A green "PR Review" run is NOT evidence anything was
+     reviewed. The guard is a precondition step that exits non-zero when the credential is absent.
+     Say where in #26's file it would go.
+
+  D. **DO NOT comment `@claude` on any PR.** (CORRECTED 2026-09-15, scheduled tick #183: this step
+     used to instruct exactly that on hydra PR #25. hydra #26 MERGED 2026-09-11, so the reviewer is
+     LIVE there and an invocation is NO LONGER INERT - it bills Paxton's personal subscription.
+     Paxton has ACCEPTED that spend for hydra specifically, but acceptance is not an instruction:
+     it is routed through task 117's triage or his explicit say-so, never by a run.)
+     Instead, RECOMMEND the verification and name the candidate PR (#25, green and unreviewed). Record repo, PR number, run id, and what the reviewer
+     said. A green run is not the test; the posted comment is the test. If #26 is still open when
+     you run, skip D and say so — do not merge it to unblock yourself.
+
+  E. Regression check for the guard: a run with NO credential must FAIL, not skip-and-pass.
+
+CREDENTIAL — already solved, do not re-derive: orgs/cogniziocompany/actions/secrets/
+CLAUDE_CODE_OAUTH_TOKEN, visibility = all. Every repo can already read it. No per-repo secret, no
+token minting, no org change. Adding the workflow file costs nothing.
+
+CORRECTION TO THE RECORD you may see repeated elsewhere: the stated hold reason for #26 — the
+2026-09-08 CT110 .env wipe — is STALE. That wipe is now guarded ([ -f /opt/.../.env ], bootstrap
+only when absent, documented inline in the deploy job with the wipe as the reason). It is no longer
+a reason to hold. The remaining reason to be deliberate is only that merging deploys prod.
+Also: re-check disk on corsairai300 before anyone merges — it was 10% used / 99 G free on
+2026-09-10, but the box has hit 0 bytes before on the Chromium terminal-host rebuild.

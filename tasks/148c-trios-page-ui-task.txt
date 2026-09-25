@@ -1,0 +1,58 @@
+TASK 148c - Trio table, slice 3 of 5: the TriosPage UI.
+*** BLOCKED until 148a (classifier) and 148b (backend) are both merged into feat/harness-fleet-report.
+The page imports the classifier and reads the /api/fleet/trios shape; building it first guesses both. ***
+
+REPO / WORKSPACE: ptait09-easybutt0n-ai   (the fleet-admin SOURCE repo, cogniziocompany/ptait09-easybutt0n-ai)
+PARENT SPEC: C:/tmp/fleet-trios-table-task.txt (task 148). Read its sections for your slice; the
+payload schema, table, classifier rules and page layout there are binding. This slice exists because
+task 148 as one run looped 8 rounds with nothing completed (overseer, 2026-09-14).
+
+================================================================================
+*** BRANCH AND TREE RULES - MEASURED 2026-09-14, READ BEFORE ANY GIT COMMAND ***
+================================================================================
+ - The deployed fleet-admin is the PINNED COPY in cognizioware-mcp-tools, from branch
+   feat/harness-fleet-report at 804a4f07f779bd7b. THAT BRANCH IS YOUR BASE.
+ - Do NOT base on main: main has almost no fleet-admin (14,836 fewer lines than the pinned branch),
+   and the pinned commit is not an ancestor of main. Work built on main has nothing to change.
+ - This working tree is currently checked out on feat/fleet-window-harness-pull, the head of OPEN PR
+   #48 (a pull backstop, 164 files, unreviewed). Do not commit to it.
+ - FIRST: git fetch origin feat/harness-fleet-report:refs/remotes/origin/feat/harness-fleet-report
+   then: git checkout -b <your slice branch> origin/feat/harness-fleet-report
+   The tree was clean when measured; if git refuses, STOP and ask.
+ - Open your PR with BASE feat/harness-fleet-report, not main. A PR against main would show the whole
+   app as new and cannot be reviewed.
+ - PR #48 also edits fleet-admin/src/test/helpers.js, web/src/pages/OverviewPage.tsx and
+   web/src/types/index.ts. Keep your edits to those files ADDITIVE and small, so a later rebase over
+   #48 is mechanical. Do not touch the harness poller or harnessClient code from #48.
+
+HARD RULES (every 148 slice)
+ - Env var NAMES only: never a key, token or signature value in code, tests, docs or commits.
+ - Do NOT insert a fleet.hosts row to satisfy a foreign key; the live host is BLOCKED ON TASK 114.
+ - Do NOT edit C:/tmp/launch_queue.py, and do NOT edit cognizioware-mcp-tools at all.
+ - Never git add -A; commit by explicit path; git diff --stat before each commit.
+ - Read the individual tests, not the rollup: a green run can contain a hard-failing test.
+ - Do NOT merge, and do NOT post an @claude comment (it bills Paxton's personal subscription).
+   Open the PR and STOP.
+
+================================================================================
+SCOPE - PARENT SPEC SECTION 4, plus the 2026-09-11 MEASURED COLUMNS amendment (display only)
+================================================================================
+ - Add fleet-admin/web/src/components/ui/table.tsx (absent on the pinned branch; shadcn conventions).
+   NOTE: a table.tsx and a types/index.ts edit exist in the cognizioware-mcp-tools VENDORED copy from
+   the looped 148 run. Those are vendored-only edits and are discarded at re-pin. Do not copy them.
+ - New page web/src/pages/TriosPage.tsx, route /trios in web/src/App.tsx, one "Trios" link in the
+   Overview header. ONE page and ONE route, nothing else (RULE 2).
+ - One card per host: host, mode badge (degraded in red), cap/degradedCap, launcher sha (first 7),
+   "pushed N min ago", a stale badge past 15 minutes. PRIMARY and DEGRADED tables with columns #,
+   Manager, Executor, Auditor; each cell is the model name plus the 148a provider badge; mark the
+   nextIndex row "next"; tag synOnly rows "Synthetic-only fallback"; highlight a row whose EXECUTOR is
+   local. Footer: "Per-role token cost not shown: harness uses a single LiteLLM key; per-role keys
+   pending." Live updates through the existing lib/socket.ts, subscribed to `trios`.
+ - MEASURED COLUMNS (render only if present in the payload; 148e supplies them): executor episode
+   seconds median/max/n per trio, last-10 emit-probe latency per seat, and a planned-vs-bound drift flag.
+
+TESTS (vitest): TriosPage renders 6 primary + 2 degraded rows, the next marker, the stale badge, and
+renders without the measured columns when the payload lacks them.
+
+DONE MEANS: page, route, link, table component and tests committed; npm test in fleet-admin/web green
+with those tests read; PR open against feat/harness-fleet-report.

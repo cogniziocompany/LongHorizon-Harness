@@ -1,0 +1,8 @@
+{
+ "name": "02b-guest-e2e-readiness-kimi",
+ "task_file": "C:/tmp/guest-e2e-readiness-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "run_id": "20260907T191831Z_25706f79"
+}

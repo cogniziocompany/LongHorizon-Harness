@@ -29,6 +29,7 @@ from ..dashboard.state import DashboardState
 from ..launcher import Launcher
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
+from ..overseer_state import resolve_overseer_root
 from . import mcp_jsonrpc as mcp_protocol
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
@@ -38,6 +39,7 @@ from ..fleet import get_reporter
 from ..queue import (
     PgQueueStore,
     QueueStore,
+    UnknownQueueFieldError,
     default_queue_config,
     queue_config_from_config,
     read_lease,
@@ -886,7 +888,12 @@ def create_app(
     allowed_origins: set[str] | list[str] | tuple[str, ...] | None = None,
     bind_host: str = "127.0.0.1",
 ) -> FastAPI:
-    """Create an API app over a live shared state or a historical runs root."""
+    """Create an API app over a live shared state or a historical runs root.
+
+    ``supervisor`` accepts the real :class:`RunSupervisor` or any stand-in
+    exposing the same surface (tests pass an in-memory fake so the launcher
+    the app builds can be driven without spawning workers).
+    """
 
     dashboard_state = state or DashboardState(
         log_dir,
@@ -935,6 +942,11 @@ def create_app(
     launcher: Launcher | None = None
     if supervisor is not None and queue_store is not None:
         launcher = Launcher(supervisor, queue_store, queue_config=queue_config)
+
+    # Task 235: the overseer-state tools read the migrated apparatus archive
+    # (tasks/, queue/done, queue/blocked, docs/) from this checkout. Resolve
+    # the root once; None just means those tools report themselves unavailable.
+    overseer_root = resolve_overseer_root()
 
     snapshot_cache = _SnapshotCache(ttl_seconds=2.0)
 
@@ -1030,12 +1042,37 @@ def create_app(
         )
         reporter = get_reporter()
         fleet_state = reporter.registration_state() if reporter is not None else {}
+        # Drain state (task 242): surfaced here so the fleet window, Hydra and
+        # deploy tooling see a maintenance window in the same handshake they
+        # already poll.  A store without drain support reports not-drained —
+        # the flag is an explicit operator action, so absence must fail open.
+        drain: dict[str, Any] = {"enabled": False, "reason": None, "since": None}
+        get_drain = getattr(queue_store, "get_drain", None) if queue_store is not None else None
+        if get_drain is not None:
+            try:
+                drain = get_drain()
+            except Exception:
+                pass
+        # Launcher stall detector (task 230): read the launcher's own state,
+        # never a re-created one, so the flag reflects live passes.  Fail-open:
+        # a launcher that cannot report its stall state degrades to "not
+        # stalled" rather than aborting the metadata handshake.
+        launcher_stalled = False
+        launcher_stall_cycles = None
+        if launcher is not None:
+            try:
+                launcher_stalled = bool(launcher.stall_fired)
+                launcher_stall_cycles = launcher.stall_cycles or None
+            except Exception:
+                pass
         return build_meta(
             endpoint=endpoint,
             fleet_configured=bool(reporter is not None and reporter.configured),
             fleet_ever_succeeded=bool(fleet_state.get("ever_succeeded", False)),
             fleet_last_ok=fleet_state.get("last_ok"),
             fleet_last_error=fleet_state.get("last_error"),
+            launcher_stalled=launcher_stalled,
+            launcher_stall_cycles=launcher_stall_cycles,
             capabilities={
                 "approvals": live_control,
                 "injections": live_control,
@@ -1046,6 +1083,7 @@ def create_app(
                 "abort": supervisor is not None,
                 "fleet_mcp_tools": queue_store is not None,
             },
+            drain=drain,
             mcp_gateway_alias="lhharness",
             agents=catalogue["agents"],
             models=catalogue["models"],
@@ -1091,9 +1129,53 @@ def create_app(
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
         try:
             entry = queue_store.create(body)
+        except UnknownQueueFieldError as exc:
+            # Task 233: a body with keys outside the accepted set is a client
+            # error (400) that names every offending field -- never a silent
+            # drop and never a generic 422.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"ok": True, "queue_id": entry.queue_id}
+
+    @app.post("/api/queue/drain")
+    def set_queue_drain(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        """Set/clear the queue drain flag (task 242).
+
+        ``{"enabled": true, "reason": "deploy 228"}`` stops NEW queue launches
+        (live runs are untouched) and ``{"enabled": false}`` resumes.  The
+        flag persists across service restarts — a deploy must come back up
+        still drained until it is verified and an operator clears it.  The
+        current state is always visible in GET /api/meta under ``drain``.
+
+        This inherits the single bearer-token boundary that guards every
+        /api/ route (no separate role-token layer exists in this codebase).
+        """
+
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        set_drain = getattr(queue_store, "set_drain", None)
+        if set_drain is None:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "queue drain is not available for the "
+                    f"{type(queue_store).__name__} queue store"
+                ),
+            )
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            raise HTTPException(status_code=422, detail="enabled must be a boolean")
+        reason = body.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise HTTPException(status_code=422, detail="reason must be a string")
+        if enabled and not (reason or "").strip():
+            raise HTTPException(status_code=422, detail="reason is required when enabling drain")
+        try:
+            state = set_drain(enabled, reason if isinstance(reason, str) else None)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"could not persist drain state: {exc}") from exc
+        return {"ok": True, "drain": state}
 
     @app.get("/api/queue")
     def list_queue(
@@ -1158,6 +1240,7 @@ def create_app(
             supervisor=supervisor,
             auth_token=token,
             request_token=normalize_request_token(request.headers.get("authorization")),
+            overseer_root=str(overseer_root) if overseer_root is not None else None,
         )
 
     @app.post("/api/mcp/fleet/{tool_name}")

@@ -1,0 +1,9 @@
+{
+ "name": "9999b-162-easysvc-relay-rebuild",
+ "task_file": "C:/tmp/easysvc-relay-rebuild-task.txt",
+ "task_source": "task_file",
+ "workspace": "ptait09-easybutt0n-ai",
+ "max_rounds": 1,
+ "trio": "kimi",
+ "note": "Bridged 2026-09-11 ~11:20 PT by session [fe2679] via /claude-bridge (Paxton: 'can you try that now'). Discovery: 40 transcripts touched in 30 h, all read; 4 class-(a) handoffs + 1 cancelled task re-surfaced. Source [3c6c69]. OVERSEER-EXECUTED (elevated sc stop/start on PTAIT09; fleet enroll token from Paxton). BLOCKED ON: a window with no run on the ptait09 lanes + the enroll token. Necessity answer is in the task text: yes, small, the deliverable is scripts/update-easysvc.ps1 because the C# supervisor has no build path anywhere in the fleet; the exe on disk is 2026-08-09 while the relay merged 09-08 (MERGED not LIVE, tasks 05h8/05h8b)."
+}

@@ -1,0 +1,8 @@
+{
+ "name": "05h-guest-slices-2-3",
+ "task_file": "C:/tmp/guest-slices-2-3-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "run_id": "20260908T043301Z_5c336376"
+}

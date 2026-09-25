@@ -1,0 +1,45 @@
+# Task 180 (RE-CUT by scheduled tick #446, 2026-09-17) — Round-zero workspace RECORD only
+
+## Read this first: why this task is now much smaller
+The previous attempt (run 20260917T141501Z_2d94e58d) burned THREE full executor rounds
+(1800203 / 1800245 / 1800148 ms — the cli_executor budget, to the millisecond) and committed
+NOTHING. Verified on CT110: branch `task-180-prelaunch-guard` was ZERO commits ahead of
+origin/main, empty diff, no new file. Each round restarted exploration from scratch and the
+executor prompt GREW 34k -> 36k -> 40k chars. The cause was scope: the contract had accreted a
+`run.timeouts` config repair AND a 429 `failure_cause` regression fix on top of the guard.
+
+So this task is now ONE read-only slice. Everything else moved to task 195. Do not pull it back in.
+
+## The ONLY deliverable
+Before a run is handed a workspace, emit ONE round-zero record into the run's log containing:
+  a. the workspace's current branch,
+  b. its HEAD sha,
+  c. whether it is ahead of its remote,
+  d. the list of uncommitted paths,
+  e. any OPEN PR whose head is that branch (so a collision is visible to a human later).
+
+That is all. **Observe and record. Change NO behaviour.** Do not check out anything, do not
+stash, do not create branches, do not repair config, do not fail a launch. A run that would
+have launched before this change must still launch, on the same branch, byte-for-byte.
+
+## Start HERE — these locations are already audited, do NOT re-derive them
+Round 1 of the previous run cost ~23 minutes establishing exactly this, and its auditor
+independently confirmed every line. Treat as trusted:
+- `src/lh_harness/launcher.py:377-418` — `_launch` calls `supervisor.create_run(..., workspace=entry.workspace, ...)`.
+- `src/lh_harness/supervisor/service.py:1747` — `process = subprocess.Popen(command, cwd=str(workspace_path), ...)`,
+  inside `_launch_worker` (defined at `service.py:1679`). This is the workspace handoff point.
+- `src/lh_harness/cli.py:1896-1913` — worker entry via `asyncio.run(_run_with_attached_control(...))`.
+- `src/lh_harness/manager.py:254-258` — builds `role_orchestration/events.jsonl`.
+- `src/lh_harness/manager.py:284-299` — appends the `role_harness_start` event, whose payload ALREADY
+  carries the budget fields. **This is the audited carrier for the round-zero record.** Add fields here.
+- `C:/tmp/launch_queue.py` DOES NOT EXIST on CT110. The live launcher is `src/lh_harness/launcher.py`.
+  Do not go looking for the Windows path again; that search is already known to return nothing.
+
+## Time discipline — this is what killed the last three rounds
+Your episode budget is 1800 s of wall clock and you have burned 90 minutes of it historically on
+exploration. Go straight to `manager.py:284-299` and write the change. No repo-wide survey, no full
+test suite, no scratch clones. A targeted unit test plus one real round-zero log line is the proof.
+
+## Done means
+Branch cut from `origin/main`, the change committed, pushed, and a PR opened against `main` with one
+real round-zero record pasted into the body. **Open the PR and STOP** — do not merge.

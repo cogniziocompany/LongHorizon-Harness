@@ -1,0 +1,9 @@
+{
+  "name": "47-synthetic-provider",
+  "task_file": "C:/tmp/synthetic-provider-task.txt",
+  "workspace": "cognizioware-mcp-tools-b",
+  "max_rounds": 4,
+  "trio": "kimi",
+  "run_id": "20260908T174858Z_556f6388",
+  "note": " || STATE = MERGED, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in a triage of every undispositioned failed/cancelled entry. The run ended without a disposition note, but its work SHIPPED: branch feat/synthetic-provider -> cognizioware-mcp-tools PR #114 is MERGED (branch since deleted, which is why it reads ABSENT from origin). This was a RECORDS gap, not a work gap: nothing needs relaunching. LIVE/VERIFIED still require the usual lane and read-back evidence."
+}

@@ -1,0 +1,42 @@
+TASK 218 - SHIP THE QUEUE/TASK VALIDATOR AND WIRE IT INTO THE TICK
+
+ORIGIN: Paxton asked (2026-09-22) whether KubeRocketAI was worth adopting. Audit:
+C:/tmp/HANDOFF-kuberocketai-audit-2026-09-22.md. Verdict: NO - its validation is a file-graph check and every
+defect that actually bit us this week was a CROSS-BOUNDARY reference (queue -> Python source, queue -> live
+gateway, queue -> queue numbering) that no generic validator can see. Take the idea, not the tool.
+
+WORKING PROTOTYPE ALREADY EXISTS AND ALREADY FINDS REAL THINGS: C:/tmp/validate_queue.py (read-only, exit 0/1).
+First run against the live queue, 32 entries, found 4 true positives - all still open as of 2026-09-23:
+  WARN blocker-may-be-satisfied  994-132-reviewer-powerplatform  says BLOCKED ON TASK 185; 185 is launched
+  WARN blocker-may-be-satisfied  9999h-168-harness-queue-cutover says BLOCKED ON TASK 134; 134 landed (PR #19)
+  WARN name-filename-mismatch    744-103-hivemind-booking-branch-merge declares name='hivemind-booking-branch-merge'
+  WARN name-filename-mismatch    747-114-fleet-heartbeat-413        declares name='fleet-heartbeat-413'
+The name mismatch matters because launch_queue.py:681 sends `j.get("name") or <filename>` as the RUN name, so a
+mismatched entry produces a run whose name cannot be traced back to its queue file - exactly the shape that made
+the 24 strandings hard to disposition.
+
+RULES IMPLEMENTED (each exists because it caught a real defect):
+ 1 duplicate-task-number        - two live entries sharing a number (caught: two entries numbered 208)
+ 2 task-file-not-found          - task_file points at a path that does not exist
+ 3 blocker-target-does-not-exist / blocker-may-be-satisfied
+ 4 env-name-not-in-source       - a task file naming LH_HARNESS_* that appears in no harness .py
+                                  (caught: a runbook said LH_HARNESS_DATABASE_URL; code reads LH_HARNESS_DB_PASSWORD)
+ 5 schema                       - required fields, trio in {kimi,qwen,degraded}, name/filename agreement,
+                                  continue_branch without branch
+
+SCOPE OF THIS TASK
+ A. Move validate_queue.py into LongHorizon-Harness (tests + a console entry point), not C:/tmp. It is
+    infrastructure and must be versioned.
+ B. Add unit tests with FIXTURE queues - do not assert against the live queue, whose findings change hourly.
+ C. Wire it into the scheduled tick: run it each tick, report the finding COUNT in the ledger row in one clause,
+    and only enumerate NEW findings. Treat ERROR as something that needs a disposition; WARN is advisory.
+ D. Two rules worth adding once A-C are green, both cross-boundary and both caught real defects this week:
+    - gateway-alias-exists: a task file naming an MCP alias (e.g. `lhharness`) that is not in the live
+      /v1/mcp/server registry. Task 177 sat blocked for days on an alias that no longer existed. Needs a
+      gateway key - read-only, and it must SKIP (not fail) when no key is present.
+    - open-asks-row-integrity: every OPEN-ASKS row has a recommendation and a default-if-silent, per LOOP-PROMPT.
+ E. Do NOT try to validate prose semantics. Rule 3 can prove a number exists; it cannot know that 187's "179"
+    meant 186. Say so in the docstring so nobody assumes more coverage than there is.
+
+HARD RULES: read-only, never writes to the queue. Exit non-zero only on ERROR, so it can gate a tick without
+blocking on advisories. No secret values in output - env-var NAMES only. Push + PR; DO NOT MERGE.

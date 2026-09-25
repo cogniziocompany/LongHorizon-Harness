@@ -1,0 +1,107 @@
+TASK 142 - Fix `read-back-synthetic-anthropic-fallbacks.py`. It CANNOT return exit 0 against a real
+`router_settings` row, so the acceptance test task 136 is built around does not work.
+
+REPO / WORKSPACE: cognizioware-mcp-tools    BRANCH: fix/synthetic-anthropic-fallbacks
+Blocks: PR #140 must NOT merge until this lands.
+
+================================================================================
+WHY THIS EXISTS - found by the automated reviewer on PR #140, not by inspection
+================================================================================
+Task 136 delivered three scripts whose entire premise is: **a 200 from POST /config/update is not
+proof, so re-read the row and diff it.** The reviewer traced the diff logic and found it broken in a
+way that makes it useless in BOTH directions.
+
+This is worse than a script that silently passes a bad write: **a genuinely SUCCESSFUL write also
+reports FAIL**, which could push an overseer into an unnecessary retry or rollback of a good change.
+
+The overseer pre-merge check (py_compile, YAML parse, credential-guard exits, secret scan) passed
+all three scripts and could NEVER have caught this - every script exits 1 on its `DATABASE_URL`
+guard before the diff path is reached. Do not treat "it compiles and refuses safely" as evidence the
+logic works.
+
+================================================================================
+THE FOUR DEFECTS - all in read-back-synthetic-anthropic-fallbacks.py
+================================================================================
+ 1. **SHAPE MISMATCH (lines ~126-158). The primary bug.**
+    `fetch_row()` returns the UNWRAPPED `router_settings` content - confirmed by `prepare-...py`
+    itself accessing it as `row["fallbacks"]` directly (~:165), NOT `row["router_settings"]["fallbacks"]`.
+    But the expected body piped in from `prepare --apply` is WRAPPED: `{"router_settings": {"fallbacks": [...]}}`.
+    So `flatten(expected)` yields `{"router_settings.fallbacks": ...}` while `flatten(live)` yields
+    `{"fallbacks": ..., "routing_strategy": ..., ...}`. **The key sets never intersect**, so
+    `missing_keys` / `extra_keys` fire unconditionally on every run.
+
+ 2. **THE DUPLICATE GUARD HAS THE SAME BUG (~:165-166).**
+    `rs = live.get("router_settings", {})` is therefore ALWAYS `{}`, so `fb_list` is always `[]`, so
+    every one of the five groups is reported as "0 time(s)" and `dup_ok` is ALWAYS False - regardless
+    of what is actually in the DB.
+
+ 3. **THE DIFF IS UNSCOPED even after 1 and 2 are fixed.**
+    The intended body from `prepare.py` contains ONLY `fallbacks`. The live row also contains
+    `routing_strategy`, `num_retries`, `timeout`, `retry_after`, `allowed_fails`, `cooldown_time`,
+    `allowed_fails_policy.*` and `context_window_fallbacks`. The script would report every one of
+    them as `extra_keys`. Its docstring claims it verifies "no other key changed", but it has NO
+    baseline to compare those keys against - it currently treats their mere presence as a mismatch.
+    FIX: either scope the diff to the `fallbacks` key only, or take a PRE-WRITE BASELINE snapshot and
+    diff the other keys against that. If you choose the baseline, the prepare script must emit it.
+
+ 4. **THE DOCUMENTED USAGE DOES NOT RUN.**
+    The header comment's own example is `prepare-...py --apply | read-back-...py`. But
+    `prepare --apply` prints a diagnostic header, a "groups to add" list, a POST-status line, and TWO
+    separate `json.dumps(...)` blocks interleaved with plain text (~:171-208). Piped into
+    `read-back`'s `load_expected()` (~:100-108, an UNGUARDED `json.loads(raw)`), that raises
+    `JSONDecodeError` before the diff logic ever runs.
+    FIX: make the handoff machine-parseable - e.g. `prepare --apply --emit-expected <file>`, or put
+    the JSON on stdout and ALL prose on stderr, and guard the parse with a clear error.
+
+================================================================================
+TWO MINOR ISSUES, same file - fix while you are here
+================================================================================
+ * `LITELLM_MASTER_KEY` is `_require`d (~:134) but NEVER USED. The script only performs a Postgres
+   read; there is no HTTP call, so nothing consumes the key after the gate. The comment claiming it
+   is "required for the read-back read-only SELECT to be permitted" OVERSTATES what the code does.
+   Either drop the requirement or make the comment honest. Do not leave a misleading credential gate.
+ * `--expected <file>` parsing (~:131-133) blindly indexes `sys.argv[1:][1]`, i.e. it assumes
+   `--expected` is literally the FIRST CLI argument. Passing it after any other flag silently grabs
+   the wrong token. Parse properly.
+
+================================================================================
+CONFIRMED CORRECT - DO NOT "FIX" THESE
+================================================================================
+ * `prepare-synthetic-anthropic-fallbacks.py` idempotence is CORRECT. `build_new_fallbacks()`
+   (~:139-150) re-fetches the live row each run and only appends a group whose `source` is not
+   already present (`_group_keys`, ~:134-136). A second run against a patched row adds nothing.
+ * `rollback-synthetic-anthropic-fallbacks.py` being DATA-DRIVEN is the RIGHT call - it reads the
+   live row and strips exactly the five `STRIP_GROUPS`, rather than restoring a hardcoded 22-entry
+   snapshot which would silently discard anyone else's drift between apply and rollback.
+ * SECRET HANDLING is clean across all three and was independently verified twice: keys come only
+   from `os.environ` (name-configurable via `FALLBACKS_ENV`/`ROLLBACK_ENV`, no literal default),
+   are used only in an `Authorization` header or reconstructed into `PGPASSWORD` for the subprocess
+   ENV (not argv, so no `ps` leak), and never appear in any `print()`. Subprocess calls use static
+   argument lists - no `shell=True`, no interpolated SQL. **Do not refactor this.**
+
+================================================================================
+PROVE THE FIX - testing the symptom is not testing the fix
+================================================================================
+Do NOT just re-run it and see a different message. Demonstrate BOTH directions:
+ 1. A simulated live row that MATCHES the intended body must exit **0**.
+ 2. A simulated live row with a DISCARDED `fallbacks` key (the exact 2026-09-09 failure - a 200 that
+    silently dropped the write) must exit **2**.
+ 3. The documented pipe form must actually run end to end without a JSONDecodeError.
+Use fixtures, not the live router. **This run must NOT call /config/update, /model/*, or restart
+anything, and must not be given or seek credentials.**
+
+================================================================================
+HARD RULES
+================================================================================
+ - Do NOT edit `infrastructure/litellm-config.yaml`. Any edit force-recreates the CT202 prod router.
+   Note the merge plan is to DROP commit `0079e7d` (the YAML edit) from PR #140 entirely - it is dead
+   because the DB row wins, and none of the three scripts read that file.
+ - No secrets in scripts, fixtures, docs, logs or commit messages - env var NAMES only.
+ - Never `git add -A`; commit by EXPLICIT PATH; check `git diff --stat` first.
+ - Commit onto the EXISTING branch `fix/synthetic-anthropic-fallbacks`. Do NOT open a second PR -
+   PR #140 is already open and will pick the commit up.
+ - Do NOT merge.
+
+DONE MEANS: read-back exits 0 on a matching row and 2 on a silently-discarded write, both proven
+against fixtures; the piped usage runs; the two minor issues are resolved; and nothing confirmed
+correct above was refactored.

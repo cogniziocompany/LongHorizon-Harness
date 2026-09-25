@@ -1,0 +1,14 @@
+TASK 224 - DEPLOY LongHorizon-Harness TO CT110 FROM CI, NOT FROM PTAIT09
+
+WHY: plan C:/tmp/HANDOFF-ptait09-disconnect-plan-2026-09-23.md row 6. Today every CT110 harness deploy is pushed from
+PTAIT09 by C:/tmp/optimistic_deploy_harness.py, which streams deploy-harness-v2.sh into `pct exec 110` over ssh. Once
+PTAIT09 is disconnected, CT110 can no longer be upgraded. Lessons already paid for in that script - keep them:
+  - send the script as BYTES (a text pipe added CRLFs on 2026-09-18 and bash died with $'do\r');
+  - exit code 2 is OVERLOADED (the script's own idle-recheck abort AND a bash syntax error) - read stderr first;
+  - a deploy RESTARTS the service and kills every in-flight run: only in a counted zero-active window;
+  - honour a hold file (the 09-18 DEPLOY-HOLD mechanism) so a known-bad main cannot ship.
+SCOPE: a `workflow_dispatch`-only GitHub Actions workflow in LongHorizon-Harness, running on the LAN runner (CT210,
+label lan-deploy): preflight (tag/sha, main green) -> wait for zero active runs via GET /api/runs -> deploy ->
+verify (service active, installed lh_harness.__version__ == target, /api/meta 200) -> automatic rollback on failure,
+and fail LOUDLY if the rollback also fails. Secrets by NAME in a `ct110-prod` environment. Never auto-trigger on push.
+DONE MEANS: one real deploy through the workflow (disconnect checklist D5). Push + PR; DO NOT MERGE.

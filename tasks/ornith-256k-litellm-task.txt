@@ -1,0 +1,137 @@
+TASK 143 - Surface ornith-1.5 256K as its own LiteLLM model. DB-OWNED, NO YAML CHANGE.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+Source: Paxton 2026-09-10, session [837df7] (837df772-b388-4796-b3e3-b0a4a556e5ed), plan mode,
+with an expert's live verification already folded in.
+
+================================================================================
+CONTEXT
+================================================================================
+ptait01's two RTX 3090 Ollama instances (:11441 gpu1, :11438 cloud/gpu0) already run
+`ornith-1.5:9b-256k`, but LiteLLM only exposes it under LEGACY QWEN ALIASES (`qwen3.8`,
+`general-chat`, ...; DB rows, max_input_tokens 262144). **There is no model with an ornith name.**
+
+The old `qwen3.8--256k` tier was dropped because it ADVERTISED 256K WHILE SERVING 64K. Do not
+repeat that. The whole point of this task is that the advertised context is the served context.
+
+================================================================================
+*** THE CONTEXT QUESTION IS ALREADY ANSWERED - MEASURED, NOT ASSUMED. DO NOT RE-DERIVE. ***
+================================================================================
+An expert tested each instance DIRECTLY on ptait01 by hiding a random code inside a very long
+prompt and asking for it back:
+
+    lane            context loaded   prompt size        result                      time
+    :11441 (GPU1)   262144           185,851 tokens     returned ZX-800824, CORRECT  285 s
+    :11438 (GPU0)   262144           186,069 tokens     returned ZX-161229, CORRECT   84 s
+
+The model is loaded at the FULL 262144 on both, using ~10.8 GB of each 24 GB card.
+
+*** THE CRITICAL FINDING, AND IT IS A LANDMINE: the 262144 comes from `num_ctx` INSIDE THE MODEL
+TAG, NOT from the container. Both containers set OLLAMA_CONTEXT_LENGTH=16384, which the tag's own
+num_ctx overrides. IF ANYONE REBUILDS THAT TAG WITHOUT num_ctx, THE LANE SILENTLY DROPS TO 16K -
+which is exactly the qwen3.8--256k failure, in a new place. ***
+Flag the misleading `OLLAMA_CONTEXT_LENGTH=16384` in
+`/opt/cognizioware-ptait01-inference/docker-compose.ptait01-inference.yml` as worth correcting, but
+DO NOT change it here - a compose change on ptait01 is a host-level change needing its own approval,
+and it takes `--env-file ptait01-inference.env`.
+
+TWO MORE MEASURED NOTES, neither a blocker:
+  * GPU1 was ~3x slower (285 s vs 84 s). It was ALREADY at 95% load from other traffic before the
+    test, so this is most likely CONTENTION, not a fault. **Unconfirmed** - do not state it as fact.
+  * `OLLAMA_NUM_PARALLEL=8` is set on both containers, but this model serves ONE request at a time
+    per instance (hybrid SSM, arch qwen35, n_seq_max=1), so the setting has no effect. The handoff
+    doc and the containers disagree; harmless, but say so rather than silently "fixing" either.
+
+The expert made NO LiteLLM changes and did NOT test through the router. So the Ollama side is
+proven; the LiteLLM side is entirely unproven and is what this task delivers.
+
+================================================================================
+*** SCOPE SPLIT - THE PROD WRITE IS NOT YOURS ***
+================================================================================
+A harness run is NEVER given credentials. You will not have the master key, must not ask for one or
+read one out of a container, and must NOT call `/model/new`, `/model/update`, `/model/delete` or
+`/config/update` against UAT or prod.
+
+YOU PREPARE AND PROVE. THE OVERSEER EXECUTES. Deliver:
+  * an idempotent script that builds and prints the exact `/model/new` bodies for all four rows;
+  * a read-back-and-diff script that proves each row landed (see the 200 warning below);
+  * the repo doc + test changes below;
+  * a plain statement of what proves the lane is really serving 256K after the rows exist.
+
+================================================================================
+THE ROWS - four of them: 2 aliases x 2 GPUs
+================================================================================
+Aliases: `ornith-1.5--256k` (the repo's `<alias>--<N>k` convention) AND a bare `ornith-1.5`.
+Each gets TWO rows, one per lane:
+
+    api_base  http://192.168.21.110:11441      and      http://192.168.21.110:11438
+    model     ollama_chat/ornith-1.5:9b-256k
+    rpm       20                                  <-- MANDATORY, see below
+    model_info.max_input_tokens   262144
+    max_tokens                    ~32768
+    supports_vision               true
+    NO num_ctx param              <-- sending one RELOADS AND RESIZES the live lane
+
+*** `rpm: 20` IS NOT COSMETIC AND OMITTING IT BREAKS THE LANE SILENTLY. Measured 2026-09-10:
+LiteLLM's `simple_shuffle` weights deployments by `rpm`, and line 46 defaults a MISSING key to 0 -
+so a deployment without `rpm` beside one with `rpm=20` gets weight **0 and is NEVER SELECTED**. That
+is precisely why one 3090 sat idle all day. Set it on BOTH rows of BOTH aliases. ***
+
+================================================================================
+ORDER: UAT FIRST, THEN PROD
+================================================================================
+ 1. UAT is CT204 - **and CT204 MOVED on 2026-09-10**: it now runs on host ptait07 (.138), with the
+    container itself still at 192.168.21.162. Re-measure rather than trusting any doc, including
+    this one. See C:/tmp/HANDOFF-CT-MAP-2026-09-10.md.
+ 2. `POST /model/new` for the four rows, then `GET /model/info` to READ BACK.
+ 3. Only once UAT reads back correctly, repeat on prod CT202 (192.168.21.161:4000).
+
+*** READ BACK EVERY ROW WITH `GET /model/info`. A 200 IS NOT PROOF: `/model/update` has returned 200
+while SILENTLY IGNORING `max_input_tokens`. The read-back diff is the acceptance test, not the
+status code. ***
+
+================================================================================
+REPO CHANGES - docs and tests ONLY
+================================================================================
+ * `design docs/handoff-docs/ornith-db-owned-local-lane.md` - add BOTH aliases to the routing table,
+   plus the measured context and VRAM figures above.
+ * `infrastructure/litellm-config.yaml:1075-1082` pointer comment - **SKIP IT.** Even a
+   comment-only edit force-recreates the CT202 prod router, because the deploy job hashes the
+   deployed file's content. Not worth a prod recreate for a comment.
+ * `e2e/suites/02-litellm-models.test.js` - assert `ornith-1.5--256k` appears in `/v1/models`.
+ * `e2e/suites/13-litellm-model-inference.test.js` - add it to `LOCAL_MODELS` (~L298). ALSO assert
+   that `/model/info` reports `max_input_tokens == 262144`, and that `/api/ps` `context_length` on
+   EACH lane is 262144. Reuse the existing `QWEN38_LANES` guard pattern (~L645) rather than inventing
+   a second mechanism.
+
+================================================================================
+VERIFICATION - and note which parts are the overseer's
+================================================================================
+ 1. `GET /model/info` shows FOUR new rows (2 aliases x 2 GPUs), each with `rpm 20` and 262144.
+ 2. Send ONE UNIQUE-PROMPT chat to `ornith-1.5--256k` per lane, and **PROVE IT ARRIVED BY COUNTING
+    `POST "/api/chat"` IN `docker logs --since` ON BOTH DAEMONS - NOT by the 200.** A cached response
+    returns 200 with zero GPU arrivals; that has already fooled this project once.
+    Counting traps, all previously paid for: the GIN line is `POST     "/api/chat"` - QUOTED and
+    MULTI-SPACE, so a naive grep matches nothing; `docker logs --since` parses a bare timestamp as
+    HOST LOCAL time, not UTC; and the log writes only on COMPLETION, so a long request in flight is
+    invisible.
+ 3. LONG-CONTEXT SMOKE: a ~150K-token prompt must SUCCEED and must NOT fall back to the
+    context-window cloud chain. That is the test the old 256K tier would have failed.
+ 4. `cd e2e && npx jest suites/02 suites/13` green on UAT, then on prod.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Do NOT edit `infrastructure/litellm-config.yaml` at all. Any edit recreates the CT202 prod router
+   and kills in-flight runs. This task is DB-owned precisely to avoid that.
+ - Do NOT send `num_ctx`. It reloads and resizes the live lane out from under running work.
+ - Do NOT change anything on ptait01 (compose, env, model tags). Host-level, separate approval.
+ - NEVER the bare gateway `/health` - it fans a completion out to every configured model, including
+   paid and GPU ones. Use `/health/liveliness`.
+ - No secrets in scripts, docs, tests or commit messages - env var NAMES only.
+ - Never `git add -A`; commit by EXPLICIT PATH; check `git diff --stat` first.
+ - Branch + PR. NO direct push to main. Do NOT merge.
+
+DONE MEANS: the four row bodies prepared idempotently, a read-back-diff that would catch a silently
+ignored `max_input_tokens`, the doc and both e2e suites updated, and a plain statement of what proves
+the lane truly serves 256K. Nothing written to UAT or prod by this run.

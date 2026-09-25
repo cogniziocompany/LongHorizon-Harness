@@ -1,0 +1,32 @@
+BUILD + TEST (code; mcp-cognizioware): the billing service can never report healthy again after the dual-write was switched off, because a replication ack that can never arrive still marks it degraded. Found live on the dev lane 2026-09-09, minutes after PR #92 deployed. Work ONLY in /home/harness/work/mcp-cognizioware-b on branch fix/billing-health-degraded-when-secondary-disabled (run `git fetch origin && git checkout -B fix/billing-health-degraded-when-secondary-disabled origin/develop` first); plain git; commit by EXPLICIT PATH; no push; NO live database writes and NO calls to the deprecated secondary; env NAMES only.
+
+## WHAT WAS OBSERVED, VERBATIM
+`GET http://192.168.21.153:20252/api/health` on the dev lane, running `sha-20f07d1` (PR #92, merged 03:05Z), returns **HTTP 503** with:
+
+    {"status":"unhealthy","service":"Cognizioware Billing Service","version":"sha-20f07d1",
+     "databases":{"primary":"configured","secondary":"disabled","secondaryRequired":false,"error":null,
+       "replicationHealth":{"pendingSecondaryAck":1,"pendingRepairQueueItems":0,
+                            "failedRepairQueueItems":0,"degraded":true}},
+     "dependency":null,"message":null}
+
+Probed three times in a row: `pendingSecondaryAck` stays at **1** and never drains.
+
+## WHY THIS IS A DEFECT AND NOT JUST A STALE COUNTER
+PR #92 did exactly what was asked - `secondary: "disabled"`, `secondaryRequired: false`, and the endpoint answers in ~10ms instead of hanging. That part is correct and must NOT be undone. But the replication health check still counts records awaiting an acknowledgement from the secondary, and with the secondary disabled **nothing will ever acknowledge them**. So `degraded` is stuck true, `status` is stuck `unhealthy`, and HTTP 503 is now the service's permanent steady state. A health endpoint that can never go green is worse than no health endpoint: everything that watches it learns to ignore it.
+
+## FIX - DECIDE THE RULE, DO NOT JUST ZERO THE COUNTER
+When the secondary is disabled and not required, a pending secondary ack is **not evidence of ill health** - it is a leftover from a replication relationship that no longer exists. Establish and implement the rule: replication health must only contribute to `degraded` when the secondary is actually a participant. Read `DualDatabaseSettings`, `HealthCheckService` and whatever computes `replicationHealth` before changing anything, and say in the report which flag you keyed off and why.
+Keep the counts VISIBLE in the payload - an operator should still be able to see that one record was left un-acked when the dual-write was turned off. Do not delete the field, do not silently zero it, and do NOT write to the database to drain the queue. Report the number honestly and stop letting it decide `status`.
+Consider whether the leftover records deserve a one-line note in the payload (something an operator can act on later) rather than vanishing into a green light, and say what you decided.
+
+## SECOND, SMALLER DEFECT IN THE SAME PATH
+The deploy lane's own post-deploy check printed `=== [dev] OK — health reports sha-20f07d1` and passed - it compared only the version string and never looked at `status`. So the lane green-lit a service that was reporting itself unhealthy. Make the rollout check assert the health STATUS as well as the sha, or say plainly why it should not. Find it in `scripts/deploy/` rather than assuming the path.
+
+## TESTS (this repo's hermetic pattern; exclude the DataIntegrity tests, which dial a LAN database and can never pass in CI)
+With the secondary DISABLED and a non-zero pending-ack count, health reports `healthy` and HTTP 200, and the count is still present in the payload. With the secondary ENABLED and a non-zero pending-ack count, it still reports degraded exactly as it does today - that path must not regress. Cover the repair-queue counters the same way. Report counts, baseline first: 376 hermetic tests were passing on this repo on 2026-09-08.
+
+## HARD RULES
+Do NOT re-enable the dual-write or make the secondary required again - that decision is settled and PR #92 is live. No writes to any database, and nothing that contacts the deprecated secondary host. No credentials in the repo, fixtures or output - env NAMES only. Explicit-path commits; no push.
+Completion = commits, diff stat, test counts, the exact health payload before and after for both the disabled and enabled cases, which setting you keyed the rule off, and whether the rollout check now asserts status. Auditor: read-only - verify the dual-write remains off and the secondary remains not-required, that the pending counts are still visible rather than deleted or zeroed, that nothing writes to a database to make the number go away, and that the secondary-enabled degraded path still behaves as before.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.

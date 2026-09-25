@@ -1,0 +1,15 @@
+{
+  "name": "40-mcp-tools-resilience",
+  "task_file": "C:/tmp/mcp-tools-resilience-task.txt",
+  "workspace": "/home/harness/work/cognizioware-mcp-tools",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "run_id": "20260909T101209Z_4a2dbd31",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "syn:large:vision:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-09T10:12:09.604816+00:00",
+  "note": " || STATE = MERGED, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in a triage of every undispositioned failed/cancelled entry. The run ended without a disposition note, but its work SHIPPED: branch fix/ops-resilience-2026-09-07 -> cognizioware-mcp-tools PR #121 is MERGED at 828ccce. This was a RECORDS gap, not a work gap: nothing needs relaunching. LIVE/VERIFIED still require the usual lane and read-back evidence."
+}

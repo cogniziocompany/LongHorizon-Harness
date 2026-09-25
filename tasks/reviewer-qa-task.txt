@@ -1,0 +1,119 @@
+*** SCHEDULED TICK #123 2026-09-15 10:12 PT: STATE PR. cogniziocompany/cognizioware-qa#32 (feat/claude-pr-reviewer 32fc3c1 -> master, +75/-0) was opened by the overseer after run b7c6f7fa gated on the workflow scope and was stopped. The temporary job and the workflow_dispatch trigger are removed. Option (a) proven on throwaway #31 (closed): run 34999185824 guard step FAILED on the empty credential, claude job skipped. Live reviewer firing is UNVERIFIED by design. DO NOT MERGE without task 117 triage or Paxton's say-so. ***
+*** SCHEDULED TICK #110 2026-09-15 07:40 PT: run 20260915T143500Z_b7c6f7fa (launched 07:35, ornith-1.5:pool/ornith-1.5:pool/glm-5.3:cloud) INJECTED cmd-53337d84ac664fe3 (1565 chars, POST 200, read back 1 opmsg): STEP 4 items 1-3 (@claude verify) withdrawn in-run, guard proof by option (a) only, resume from CT110 local commit 1014007; origin feat/claude-pr-reviewer still e92b19b, no PR (07:38). Push + PR yourself, STOP. ***
+*** OVERSEER CORRECTION 2026-09-15 02:10 PT (tick 54, injected into run 20260915T085502Z_17bfd030 as cmd-52ae6c1341d74f39, read back): the 'VERIFY LIKE THIS: comment @claude' instruction below is WITHDRAWN - it predates the 2026-09-10 19:50 PT ban (mcp-tools #131: the reviewer bills Paxton's personal subscription; task 117). Post NO @claude comment anywhere and do not dispatch the reviewer; prove the empty-credential guard by option (a) only; state in the PR body that the live reviewer firing is UNVERIFIED by design, left for Paxton's say-so after merge. Rest stands: push + open PR, STOP. ***
+
+TASK 130 - Add the @claude PR reviewer to cognizioware-qa, AND design the false-green guard that
+the other repos inherit. This repo is the proving ground. OPEN THE PR AND STOP.
+
+REPO / WORKSPACE: cognizioware-qa   ***DEFAULT BRANCH IS master, NOT main***
+
+Source: session [a6ad1e] (a6ad1e6a-f2fe-47bd-92f1-019292085b24), plan mode, 2026-09-10.
+
+================================================================================
+MEASURED STATE (gh api, 2026-09-10 - do not re-derive)
+================================================================================
+  .github/workflows/claude-code.yml    -> 404. Only qa-ci.yml and qa-gate.yml exist.
+  default branch                        -> master
+  open PRs                              -> ZERO (so verification needs a throwaway PR)
+  org secret CLAUDE_CODE_OAUTH_TOKEN    -> orgs/cogniziocompany, visibility=all,
+                                           created 2026-09-10T02:04:01Z
+  reference file                        -> cognizioware-mcp-tools/.github/workflows/claude-code.yml
+                                           2,491 bytes / 65 lines
+
+OVERSEER CORRECTION: it is THREE repos missing the reviewer, not four. LongHorizon-Harness got it
+at 11:12 PT today (PR #15, 7b27032, read back at 2,491 bytes on main) and it FIRED FOR REAL:
+run 34512622903, completed/success in 2m 45s, POSTING a review that found a genuine security defect.
+Missing now: cognizioware-hydra, cognizioware-powerplatform, cognizioware-qa (this one).
+
+WORKSPACE CONTENTION: task 69 (711-69-hydra-e2e-repo-dir) also runs in the cognizioware-qa
+workspace. The launcher guards workspaces so these serialise - never run both on one tree.
+
+NOTE: cognizioware-qa QA CI is currently RED on master (hydra-e2e; repo variable
+HYDRA_REPO_DIR is a Windows path on a Linux runner). That is TASK 69's job, not yours.
+Do not fix it. But do not read a red master as evidence your change broke something.
+
+================================================================================
+BLAST RADIUS - why this repo goes first
+================================================================================
+qa-ci.yml hydra-e2e job: runs-on [self-hosted, qa-host], concurrency group qa-hydra-e2e,
+cancel-in-progress false, needs build, fires on workflow_dispatch or repository_dispatch or
+schedule or (push and ref_name == master). THERE IS NO DEPLOY STEP IN THAT JOB. Merging to master
+queues one more hydra-e2e run that OCCUPIES the QA runner for the length of the suite. It changes
+no host and deploys nothing. That is the whole risk.
+
+================================================================================
+STEP 1 - COPY THE FILE, DO NOT RETYPE THE GATE
+================================================================================
+Copy the reference byte-for-byte via the GitHub API. The condensed form that appears in some prose
+documents - author_association compared once and then OR-ed against two bare string literals - is
+ALWAYS TRUE in Actions expression syntax, because || short-circuits on the first truthy operand and
+a non-empty string literal is truthy. That silently disables the write-access gate entirely. The
+reference spells out three separate == comparisons per event, twice, deliberately. This bug was
+found in the wild on 2026-09-10 in LongHorizon-Harness's own handoff doc, by the reviewer itself.
+
+The reference already carries the two fixes that matter:
+  - fetch-depth: 0  - a depth-1 clone holds only the PR head commit, so the reviewer cannot see the
+    base branch. On 2026-09-09 that made it call a real commit nonexistent and accuse correct work
+    of being fabricated.
+  - JOB-LEVEL timeout-minutes: 20 - the action input named timeout_minutes is NOT valid for
+    claude-code-action@v1 (it emits "Unexpected input(s)") and was never in effect. With
+    cancel-in-progress false, a hung job blocks every later @claude mention on that PR.
+
+NO SECRET WORK. The org secret already reaches every repo. Do not mint, place or rotate anything.
+
+================================================================================
+STEP 2 - THE DESIGN WORK: the false-green guard
+================================================================================
+On 2026-09-09 a review run reported completed/success with EVERY STEP GREEN and posted NO review:
+the credential resolved empty and the action's internal steps reported outcome=skipped.
+A GREEN "PR Review" RUN IS NOT EVIDENCE THAT ANYTHING WAS REVIEWED.
+
+Add a precondition step that EXITS NON-ZERO when the credential resolves empty.
+  - It must FAIL, not skip-and-pass.
+  - It must NOT print, echo or leak the credential - presence and LENGTH only.
+  - It must be trivially copyable into the other repos, because it is going into all of them.
+
+*** HOW TO GET A CREDENTIAL-LESS RUN - THIS IS NOT OBVIOUS. Paxton called it out. ***
+The org secret CLAUDE_CODE_OAUTH_TOKEN has visibility: all, so every run in every repo now resolves
+it. YOU CANNOT PROVE THE FAILURE CASE JUST BY RUNNING THE WORKFLOW. Pick one and SAY WHICH YOU USED:
+
+  - PREFERRED, and touches nothing shared: in the same PR, have the guard read its input from an
+    intermediate env var, and add a temporary matrix/second job (or a workflow_dispatch input) that
+    runs ONLY the guard step with that var forced empty. Proves the step's own logic, deletes
+    cleanly before merge.
+  - FORK PR: secrets are not passed to workflows triggered from a fork, so a PR from a fork gives a
+    genuinely empty credential. Costs nothing but needs a fork.
+  - DO NOT delete, unset, or re-scope the org secret to test this. It is shared by six repos, and
+    visibility: all was set at 2026-09-10T02:04:01Z - breaking it to test a guard would take the
+    reviewer DOWN FLEET-WIDE.
+
+================================================================================
+STEP 3 - THE SECOND QUESTION: is @claude-on-comment the right trigger here
+================================================================================
+Prior art exists in the org: mcp-cognizioware/.github/workflows/pr-failure-investigator.yml
+(3,335 B), on workflow_run completed plus conclusion == failure. It reviews only failures.
+Cost is why this matters: adding the file costs nothing, but EACH @claude invocation spends a
+PERSONAL SUBSCRIPTION QUOTA, not a metered key. That is the only reason review-on-open was never
+chosen anywhere in this fleet. Say in the PR body whether the failure-triggered pattern belongs
+here too, and why.
+
+================================================================================
+STEP 4 - VERIFY. A GREEN RUN IS NOT A PASS.
+================================================================================
+Zero PRs are open, so open a throwaway PR, verify against it, and close it when done.
+  1. Comment @claude from an OWNER/MEMBER/COLLABORATOR account.
+  2. Confirm a REVIEW COMMENT WAS POSTED BACK - not merely that the run went green. Green is
+     exactly the failure mode above.
+  3. Record: repo, PR number, run id, and what the reviewer actually said.
+  4. Regression: the credential-less run must FAIL, not skip-and-pass.
+Then open the real PR against master and record the final file size - it becomes the number the
+other repos are checked against once the guard propagates.
+
+================================================================================
+HARD RULES
+================================================================================
+ 1. OPEN THE PR AND STOP - DO NOT MERGE. Merge timing is Paxton's call.
+ 2. COPY THE REFERENCE FILE, DO NOT RETYPE THE GATE.
+ 3. Do not touch qa-ci.yml, qa-gate.yml or prod.env.
+ 4. Do not open PRs against, or write files into, any other repo.
+ 5. Never git add -A; commit by explicit path; git diff --stat first.

@@ -1,0 +1,89 @@
+TASK 90 - put the run hierarchy on fleet.easybutt0n.ai: run -> round -> session, live, and make it readable by the orchestrator too
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools.
+App: infrastructure/docker/fleet-admin/web/
+
+## THE ACTUAL PROBLEM, stated by Paxton 2026-09-09
+
+The overseer has been hand-building this table every five minutes by querying each run's snapshot and
+reconstructing round numbers from raw events:
+
+    run        round   last event
+    a69d150    4/6     1m ago
+    9d20e13    6/8     7m ago
+    cb389a0    3/8     11m ago
+    38acf19    2/8     2m ago
+    6c0a3e4    2/6     0m ago
+    742af8c    0       just launched, no events yet
+
+Paxton: *"this needs to be a process that is run consistently to update on the page but also for the
+orchestrator agent to not get lost in general status. Also this should be hierarchical with the data
+view, so session underneath each round should expand and that's where the live feed was supposed to
+be."*
+
+**There are TWO audiences and the task fails if it only serves one:**
+ 1. **A human looking at fleet.easybutt0n.ai** - sees fleet-wide progress without clicking into runs.
+ 2. **The orchestrator agent** - gets the same picture from ONE cheap call instead of N snapshot
+    fetches parsed by hand.
+
+## THIS IS AN EXTEND, NOT A BUILD. Read these FIRST.
+
+**Most of it already exists** - do not rebuild any of it, and do not create a new page or route
+(RULE 2: run detail lives on fleet.easybutt0n.ai and nowhere else):
+
+| file | what it already does |
+|---|---|
+| `web/src/pages/RunPage.tsx` (416 lines) | tabs for **Rounds / Trajectories / Artifacts / Events / Gates / Report / Provenance**; fetches rounds, per-round artifacts, and per-round-per-role trajectories keyed `${round}:${role}`; a websocket already updates `status` and `round` live |
+| `web/src/components/TrajectoryView.tsx` | virtualised step list with role badges |
+| `web/src/lib/socket.ts` | the live feed |
+| `web/src/lib/api.ts` | `/runs`, `/runs/{host}/{runId}`, `/runs/{host}/{runId}/rounds`, `/rounds/{n}/artifacts`, `/rounds/{n}/trajectory/{role}` |
+
+**So the hierarchy run -> round -> role/session -> trajectory steps is ALREADY modelled and fetched on
+the run detail page.**
+
+**The gap is the OVERVIEW.** `web/src/pages/OverviewPage.tsx` currently renders essentially two
+strings: `Fleet Window` and `No active runs`. Everything hierarchical is one click deep and invisible
+at a glance.
+
+## SCOPE
+
+1. **Extend OverviewPage** so each active run shows, without navigating away: current round / max
+   rounds, current role, time since last event, and status. **Expandable in place** - clicking a run
+   expands to its rounds; expanding a round shows the per-role sessions underneath; that is where the
+   live feed belongs, per Paxton. **Reuse `RunPage`'s existing fetchers and `socket.ts`** - if you
+   find yourself writing a second websocket client or a second API layer, stop and reuse.
+2. **Do not fetch N snapshots from the browser.** If an aggregate endpoint is needed, add ONE to the
+   fleet API that returns every active run with its round/role/last-event in a single response, and
+   have both the page and the orchestrator use it. Say what you added.
+3. **Serve the orchestrator explicitly.** The same aggregate must be consumable by a script - stable
+   JSON, documented shape. **State the exact call** the overseer should make each tick to replace its
+   hand-rolled table. That sentence in the PR body is a deliverable, not a nicety.
+4. **"No events yet" must be distinguishable from "stalled".** A run launched 30 seconds ago and a run
+   whose executor has been silent for 25 minutes look identical if you only show "last event: none".
+   The overseer nearly killed a healthy run over exactly this. Show elapsed-since-launch as well as
+   elapsed-since-last-event, and do not label anything "stalled" that is merely new.
+5. **The badge must not lie.** The overview's connection badge previously read "connected" while zero
+   nodes were registered - it described the socket, not registration. Whatever you render, make it say
+   what it actually measures.
+
+## HARD RULES
+
+ - **No new route and no new page.** Extend `OverviewPage`. Run detail stays on fleet.
+ - Do not duplicate `RunPage`'s fetchers, types, or socket handling - import them.
+ - Ship tests: `web/src/__tests__/RunPage.test.tsx` already exists; follow its style and add coverage
+   for the expand behaviour and for the new-vs-stalled distinction.
+ - No live calls to third parties in tests; stub fetch and the socket.
+ - Env NAMES only, never values.
+ - Any change to `infrastructure/litellm-config.yaml` force-recreates the prod router - you should not
+   need to touch it; if you do, flag it prominently.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+ - PR to `main`, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR against main that extends the EXISTING overview page with an expandable run -> round -> session
+hierarchy fed by the EXISTING socket and fetchers; one aggregate call that serves both the page and the
+orchestrator, with its exact shape and URL written in the PR body; a visible distinction between "just
+launched" and "stalled"; tests for the expansion and that distinction; and no new route, no second
+socket client, and no duplicated API layer.

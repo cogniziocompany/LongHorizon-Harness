@@ -33,7 +33,11 @@ pytest.importorskip("psycopg")
 REPO_MIGRATIONS = Path(__file__).resolve().parents[2] / "migrations"
 
 # Applied in filename order, exactly as PgQueueStore._migrate does.
-MIGRATION_FILES = ("001_harness_queue.sql", "002_harness_queue_events.sql")
+MIGRATION_FILES = (
+    "001_harness_queue.sql",
+    "002_harness_queue_events.sql",
+    "003_harness_queue_continuation.sql",
+)
 
 
 def _migration_sql() -> list[str]:
@@ -217,6 +221,32 @@ def test_fresh_apply_then_reapply_is_noop(scratch_conn) -> None:
         "AND n.nspname='harness'"
     )
     assert cur.fetchone() is not None, "queue_events foreign key is missing"
+
+    # 003's columns (task 233): the continuation fields exist with the right
+    # types and non-NULL defaults.
+    cur.execute(
+        "SELECT data_type, column_default, is_nullable "
+        "FROM information_schema.columns "
+        "WHERE table_schema='harness' AND table_name='queue' "
+        "AND column_name='branch'"
+    )
+    row = cur.fetchone()
+    assert row is not None, "harness.queue.branch column is missing"
+    assert row[0] == "character varying", f"branch wrong type: {row[0]}"
+    assert row[1] == "''::character varying", f"branch wrong default: {row[1]}"
+    assert row[2] == "NO", "branch must be NOT NULL"
+
+    cur.execute(
+        "SELECT data_type, column_default, is_nullable "
+        "FROM information_schema.columns "
+        "WHERE table_schema='harness' AND table_name='queue' "
+        "AND column_name='continue_branch'"
+    )
+    row = cur.fetchone()
+    assert row is not None, "harness.queue.continue_branch column is missing"
+    assert row[0] == "boolean", f"continue_branch wrong type: {row[0]}"
+    assert row[1] == "false", f"continue_branch wrong default: {row[1]}"
+    assert row[2] == "NO", "continue_branch must be NOT NULL"
 
     # Re-apply: must succeed and must not change any object definition.
     _apply_migrations(conn)

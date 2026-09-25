@@ -1,0 +1,43 @@
+TASK 214c — fix two correctness bugs found in code review of PR #181 (mcp-tools, branch `task-214-restart`)
+
+SCOPE IS NARROW. Do not re-touch anything else in the PR. Do not open a new PR — push additional
+commit(s) onto the EXISTING branch `task-214-restart` (origin already has it, PR #181 is open
+against `main`). Your own `GH_TOKEN` can push directly to that branch; do so and STOP. Do not merge —
+merging stays the overseer's job.
+
+File: `infrastructure/scripts/azure-mcp-supervised-restart.sh` (the script added by PR #181).
+The script runs under `set -euo pipefail` and its own header states its purpose is to NEVER fail
+silently — every outcome (SKIPPED/FAILED/RESTARTED) must write a reason line. A code review found
+two places where that guarantee is actually violated by `set -e` itself:
+
+1. Around the pre-restart status read:
+   `status="$(docker inspect -f '{{.State.Status}}' "$CONTAINER")"`
+   This is an unguarded command substitution assigned directly. Under `set -e`, if `docker inspect`
+   exits non-zero here (container removed/recreated, daemon hiccup), the WHOLE SCRIPT exits
+   immediately at that line — the `if` block below that is supposed to `emit FAILED reason=...` for
+   exactly this case never runs, and no reason line is ever written. FIX: guard the assignment so a
+   failing `docker inspect` is caught and routed through the existing FAILED-emission path instead of
+   killing the script (e.g. `if ! status="$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>&1)"; then emit FAILED reason=...; exit 1; fi`, matching the style already used a few lines earlier for the `docker inspect -f '{{.Id}}'` read, which IS correctly guarded with `if !`).
+
+2. The identical bug exists at the post-restart status read:
+   `pstatus="$(docker inspect -f '{{.State.Status}}' "$CONTAINER")"`
+   Same fix: guard the assignment so a failing inspect right after `docker restart` is caught and
+   logged as FAILED (`reason=post-restart-inspect-failed` or similar) instead of silently exiting
+   with nothing written to the log for that cron fire.
+
+Also flagged, lower priority, fix only if it does not risk scope creep: a container that stops
+normally (operator `docker stop`, redeploy) between the running-status check and the cgroup read can
+be misclassified as FAILED (`cgroup-dir-not-found`) instead of SKIPPED, because the script already
+treats "not running" elsewhere as SKIPPED but doesn't re-check running status before deciding
+FAILED vs SKIPPED when `detect_cgroup` comes back empty. If you fix this, re-check the running
+status inside that branch and route to SKIPPED when it is no longer running; if it's not a small
+change, skip it and note why in your final report — the two `set -e` bugs above are the required
+fix, this third one is optional.
+
+NOT in scope: do not add a test file, do not touch the cron schedule, do not touch
+`design docs/TASK-214-supervised-restart.md`, do not touch anything already merged in PR #179.
+
+Verify your fix with the script's own `--self-test` mode (it exercises the cgroup parser) plus a
+manual `--dry-run` invocation if docker is available in the sandbox; if it is not, say so plainly
+rather than claiming a test that didn't run. Report exactly what you changed (line numbers, diff
+summary) and push to `task-214-restart`, then stop — do not merge, do not open a second PR.

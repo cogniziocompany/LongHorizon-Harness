@@ -1,0 +1,79 @@
+TASK 120 - the key-grant-drift doctor check is now WIRED IN but its query targets a table that does
+not exist. Three defects, all found by the PR #133 reviewer, all deliberately deferred from that PR.
+
+REPO / WORKSPACE: cognizioware-mcp-tools.
+
+*** WHY THIS EXISTS SEPARATELY: PR #133 fixed the three findings that were safe to fix in place
+    (vendoring, the master-key caveat, the fixture placeholders). These three are BEHAVIOUR changes
+    to a check that is now registered and will run, so they were split out rather than smuggled into
+    a docs PR. The commit body of 0d3ff8c names them. ***
+
+================================================================================
+THE THREE DEFECTS - do not re-derive them, they are quoted from the review
+================================================================================
+
+1. **THE SQL TARGETS A TABLE THAT DOES NOT EXIST.** `infrastructure/scripts/litellm-key-grant-drift.py`
+   queries `FROM litellm_keys WHERE alias IS NOT NULL`, selecting `alias`, `model_allow_list`,
+   `mcp_access_groups`. Its own comment (around line 71-72) admits this is "a placeholder query that
+   would need to be adapted to the actual LiteLLM database schema".
+   **Real LiteLLM key storage is `LiteLLM_VerificationToken`, not `litellm_keys`.**
+   So the check now runs on every doctor pass and fails - safely, as a `warn`, but permanently and
+   noisily. FIND the real column names by reading the live schema, do not guess them.
+
+2. **The script requires `LITELLM_MASTER_KEY` and never uses it.** It reads the variable and refuses
+   to run if it is empty (around line 59), but makes no API call with it - only `DATABASE_URL` is
+   used, to connect. Either wire the direct-API probe it was presumably meant for, or drop the
+   requirement. As written it blocks the check from running anywhere `DATABASE_URL` is set but the
+   master key is not.
+
+3. **Dead copy-pasted hazard handling in `ops_doctor.py`** (around line 767):
+   `hazard = payload.get("two_rows_hazard", []) or []` plus its message-building code, lifted from
+   `check_config_drift`. `litellm-key-grant-drift.py` never emits a `two_rows_hazard` key - its own
+   header says that check was left out as "less applicable to key grants". `hazard` is therefore
+   always `[]`. Harmless, but it implies the check does something it does not. Delete it.
+
+================================================================================
+THE THING THE FIX MUST GET RIGHT - and it is the whole point of the check
+================================================================================
+
+This check compares INTENDED key grants against ACTUAL ones. Two traps:
+
+ - **`docs/fixtures/intended-key-matrix.yaml` currently holds literal placeholders** (`model1`,
+   `model2`, `specific-model`, `kb-model`, `telnyx-model`). PR #133 marked the file with a warning
+   header. **Wiring this check to a real query while those placeholders remain produces permanent
+   spurious divergence** - which trains everyone to ignore the check. Either fill in the real
+   allow-lists first or make the check refuse to compare against a file still carrying the marker.
+ - **Probe as the key under audit, never the master key.** MEASURED 2026-09-10: a newly registered
+   model returned `403 key not allowed to access model` for the harness virtual key while the SAME
+   call succeeded for the master key, because the master key carries no allow-list. Any verification
+   you write must authenticate as the key being checked. This is now documented in
+   `docs/task-89-key-audit-matrix.md`; read that caveat before writing probe code.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - The vendored copy at `infrastructure/docker/ops-control-center/doctor/litellm-key-grant-drift.py`
+   must stay **BYTE-IDENTICAL** to `infrastructure/scripts/litellm-key-grant-drift.py` - the check
+   verifies this and warns "missing from the image" otherwise. Change both, verify with md5sum.
+ - **Do NOT touch `infrastructure/litellm-config.yaml`.** Any edit force-recreates the CT202 prod
+   router. This task has no reason to go near it.
+ - READ-ONLY against the live database. Do not write to LiteLLM's tables to make a test pass.
+ - Never print, echo or commit a credential value - names and paths only.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat`.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+The query targets the real table and columns, verified by reading the live schema rather than
+assuming; the unused master-key requirement is either wired or removed, with the choice explained;
+the dead hazard block is gone; both copies of the script are byte-identical; and the check has been
+run once against the live database with its actual output quoted in your report - including what it
+says when the fixture still carries placeholders.

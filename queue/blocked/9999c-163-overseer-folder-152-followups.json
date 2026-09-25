@@ -1,0 +1,9 @@
+{
+ "name": "9999c-163-overseer-folder-152-followups",
+ "task_file": "C:/tmp/overseer-folder-152-followups-task.txt",
+ "task_source": "task_file",
+ "workspace": "LongHorizon-Harness",
+ "max_rounds": 1,
+ "trio": "kimi",
+ "note": "Bridged 2026-09-11 ~11:20 PT by session [fe2679] via /claude-bridge (Paxton: 'can you try that now'). Discovery: 40 transcripts touched in 30 h, all read; 4 class-(a) handoffs + 1 cancelled task re-surfaced. Source [421241] + LongHorizon-Harness PR #16 (audit of task 152 and the overseer process, doc only). OVERSEER-EXECUTED: edits the queue tree and LOOP-PROMPT.md. Encodes Paxton's decisions: queue/overseer/ folder, verified_at + evidence[] on entries, ready-for-overseer status, runner=REST lanes / Hydra=terminals. BLOCKED ON: nothing but the overseer's own tick; read PR #16 first."
+}

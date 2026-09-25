@@ -1,0 +1,16 @@
+{
+ "name": "9999g-167-lh-orchestrator-skill",
+ "task_file": "C:/tmp/lh-orchestrator-skill-task.txt",
+ "task_source": "task_file",
+ "workspace": "cognizioware-mcp-tools",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "note": "*** STATE: PR - recorded 2026-09-17 14:47 PT by SCHEDULED TICK #483. Run 20260917T205714Z_349ba049 reached its completion gate 8156526b9711 at r4 and was ENDED with action=stop (read back: cancelled, alive=False, exit 0, approval resolved). VERIFIED FROM GITHUB FIRST: PR cognizioware-mcp-tools#166 OPEN, head 99a1af8475325264bc335610d86232524ee9ec9d, base main, mergeable MERGEABLE, diff is exactly the two intended files (infrastructure/docker/gateway-skills-mcp/skills/lh-orchestrator/SKILL.md + e2e/suites/25-gateway-skills-mcp.test.js). **PR carries ZERO comments - the run posted no @claude**, which is the standing ban (that reviewer bills Paxton's personal subscription since #131). 'no checks reported' on this branch is the KNOWN mcp-tools condition - images build only AT MERGE TIME - so per doctrine the overseer must BUILD IT LOCALLY before merging; a bad merge here blocks the CT204->CT202 deploy lane, which is how an RZ1010 Razor error broke it once. NEXT: overseer build + merge. *** || Queued by the overseer 2026-09-11 from audit session [fe2679] section H, 'the hard requirement that got lost'. VERIFIED UNOWNED THIS TICK: gateway marketplace.json returns plugins:[]; cognizioware-skills is README-only; the catalog has 4 skill folders and the only 'orchestrator' text is the Hydra paragraph in remote-pc; LOOP-PROMPT.md still hard-codes C:/tmp/queue. Task 140 is a DIFFERENT thing (Open WebUI / BMAD chat overseer) and is itself a stranding requeued this tick. This task is the SKILL ONLY and ships first because it is additive; the cutover is task 168. Adds the two traps the audit named: gate detection must read GET /api/runs not a scratch file, and launch-is-not-done (16 strandings). Also carries the full-run-id trap: truncating an id by one character returns 'run not found' and reads like a deleted run. litellm-config.yaml untouched, so no zero-run window needed.",
+ "run_id": "20260917T205714Z_349ba049",
+ "roles_bound": {
+  "manager": "syn:large:vision:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "kimi-k3:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-17T20:57:14.690264+00:00"
+}

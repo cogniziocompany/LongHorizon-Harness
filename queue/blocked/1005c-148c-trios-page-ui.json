@@ -1,0 +1,9 @@
+{
+  "name": "1005c-148c-trios-page-ui",
+  "task_file": "C:/tmp/148c-trios-page-ui-task.txt",
+  "task_source": "task_file",
+  "workspace": "ptait09-easybutt0n-ai",
+  "max_rounds": 6,
+  "trio": "kimi",
+  "note": "BLOCKED until 148a and 148b are merged into feat/harness-fleet-report. Sliced from task 148 by the overseer 2026-09-14 12:40 PT after 148 looped 8 rounds with 'Completed: None'. Base branch feat/harness-fleet-report (the deployed pinned source), PR base the same; never main. "
+}

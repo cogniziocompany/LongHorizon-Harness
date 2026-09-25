@@ -1,0 +1,76 @@
+TASK 148e - Trio table, slice 5 of 5: the push_trios() LAUNCHER PATCH, delivered as a file, not applied.
+
+REPO / WORKSPACE: ptait09-easybutt0n-ai   (the fleet-admin SOURCE repo, cogniziocompany/ptait09-easybutt0n-ai)
+PARENT SPEC: C:/tmp/fleet-trios-table-task.txt (task 148). Read its sections for your slice; the
+payload schema, table, classifier rules and page layout there are binding. This slice exists because
+task 148 as one run looped 8 rounds with nothing completed (overseer, 2026-09-14).
+
+*** CORRECTION 2026-09-14 23:03 PT (overseer ticks #18/#19): the first run of this slice spent three
+executor rounds (~50 min) and authored ZERO lines, then died on a provider 429. DO NOT re-read the
+parent spec or fleet-admin at length. Order of work: (1) branch per the rules below; (2) write
+fleet-admin/docs/push_trios_patch.py and its pytest; (3) git diff --stat, commit those files BY PATH
+within your first 15 minutes; (4) README note; (5) push, open ONE PR base feat/harness-fleet-report,
+STOP. Leave the pre-existing untracked tests/ directory alone. If the MEASURED COLUMNS amendment cannot
+be done quickly, commit the core patch first and list the columns as a follow-up in the PR body.
+
+================================================================================
+*** BRANCH AND TREE RULES - MEASURED 2026-09-14, READ BEFORE ANY GIT COMMAND ***
+================================================================================
+ - The deployed fleet-admin is the PINNED COPY in cognizioware-mcp-tools, from branch
+   feat/harness-fleet-report at 804a4f07f779bd7b. THAT BRANCH IS YOUR BASE.
+ - Do NOT base on main: main has almost no fleet-admin (14,836 fewer lines than the pinned branch),
+   and the pinned commit is not an ancestor of main. Work built on main has nothing to change.
+ - This working tree is currently checked out on feat/fleet-window-harness-pull, the head of OPEN PR
+   #48 (a pull backstop, 164 files, unreviewed). Do not commit to it.
+ - FIRST: git fetch origin feat/harness-fleet-report:refs/remotes/origin/feat/harness-fleet-report
+   then: git checkout -b <your slice branch> origin/feat/harness-fleet-report
+   The tree was clean when measured; if git refuses, STOP and ask.
+ - Open your PR with BASE feat/harness-fleet-report, not main. A PR against main would show the whole
+   app as new and cannot be reviewed.
+ - PR #48 also edits fleet-admin/src/test/helpers.js, web/src/pages/OverviewPage.tsx and
+   web/src/types/index.ts. Keep your edits to those files ADDITIVE and small, so a later rebase over
+   #48 is mechanical. Do not touch the harness poller or harnessClient code from #48.
+
+HARD RULES (every 148 slice)
+ - Env var NAMES only: never a key, token or signature value in code, tests, docs or commits.
+ - Do NOT insert a fleet.hosts row to satisfy a foreign key; the live host is BLOCKED ON TASK 114.
+ - Do NOT edit C:/tmp/launch_queue.py, and do NOT edit cognizioware-mcp-tools at all.
+ - Never git add -A; commit by explicit path; git diff --stat before each commit.
+ - Read the individual tests, not the rollup: a green run can contain a hard-failing test.
+ - Do NOT merge, and do NOT post an @claude comment (it bills Paxton's personal subscription).
+   Open the PR and STOP.
+
+================================================================================
+SCOPE - PARENT SPEC SECTION 1 (payload) and SECTION 5 (launcher change), plus the 2026-09-11 amendment
+================================================================================
+Deliver fleet-admin/docs/push_trios_patch.py (a reviewable Python snippet plus a short README section
+saying where it goes). *** You do NOT have C:/tmp/launch_queue.py and must NOT try to reach it. *** The
+overseer applies the patch in 148d. Current launcher facts, measured 2026-09-14, so the patch fits:
+ - Trio tables: _TRIOS (6 rows) and DEGRADED_TRIOS (2 rows); both are lists of (manager, executor,
+   auditor) tuples. SYN_ONLY is computed from _TRIOS. _SEQ[0] is the rotation counter; _SYN_DOWN[0] the
+   mode flag. The live CAP is the LAST assignment (CAP=6), plus DEGRADED_CAP=2, SYN_CAP=3.
+ - The file uses CRLF line endings.
+Requirements:
+ - Build the lh-trios/v1 payload exactly as the parent spec defines; sign the raw body with HMAC-SHA256
+   using the host device key; POST with a 10 second timeout.
+ - FAIL OPEN ALWAYS: any exception prints ONE log line and never blocks a launch.
+ - Credentials only from env LH_HARNESS_FLEET_URL / LH_HARNESS_FLEET_NODE / LH_HARNESS_FLEET_KEY; if any
+   is missing, skip silently. NEVER a literal key.
+ - Call sites: once after startup checks, and once per cycle after the synthetic-down flag is set.
+ - MEASURED COLUMNS (amendment): include, when computable on the launcher side, per-trio executor episode
+   seconds (median/max/n from /api/runs episode timings joined on each queue entry's roles_bound),
+   last-10 emit-probe latency per seat, and a planned-vs-bound drift flag. Display-only data; the drift
+   flag must never change a launch decision.
+TESTS: a pytest that builds the payload from a fixture table and asserts the schema, the HMAC over the
+raw body, and that a raised network error is swallowed with one log line.
+
+DONE MEANS: the patch file, README note and tests committed; PR open against feat/harness-fleet-report;
+nothing applied to any live launcher.
+
+[2026-09-14 23:23 PT, tick #23 9b01b5] STATUS: run 20260915T060755Z_e82479ec committed 6279cd0, pushed feat/push-trios-patch-slice5e, opened PR #51 (base feat/harness-fleet-report). Open the PR and STOP was honoured so far; merge stays the overseer's.
+
+[2026-09-15 00:21 PT, tick #34 1998e8] STATUS: round 3 pushed d681ce2b (corrected patch: pools, idx, measured fields, X-Fleet headers, drift vs roles_bound); PR #51 head d681ce2b, 2 commits, +652/-0; overseer pytest 12 passed. Round 4 told by injection: do not rewrite; fix only a named remaining defect, else STOP.
+
+[2026-09-15 00:36 PT tick #37 445437] VERIFIED FACT: round-4 executor completed 00:31:37 (842 s, exit 0) and FORCE-PUSHED PR #51 head d681ce2b -> 271909ff (1 commit, parent 804a4f07). CONTENT-NEUTRAL: both commits have tree e100644fe6ab; all 3 files byte-identical; overseer ran pytest on both heads: 12 passed each. It squashed 6279cd0+d681ce2b; its report's claim '6279cd0 remains its parent' is FALSE. Violated #34's 'no commit unless named defect' narrowing but changed nothing, so no inject. Auditor running. State PR, unreviewed.
+
+[2026-09-15 01:12 PT tick #44 15073f] RUN ENDED BY DESIGNED STOP: round 6 manager next_step=done, final_response accepted, completion gate d2e727e3b0ab resolved action=stop (200, read back resolved; run status cancelled + run.completed). PR #51 re-read from GitHub: OPEN, head 271909ff, 1 commit +652/-0, base feat/harness-fleet-report. State PR, unreviewed; not a stranding. Next: review via task 117 path, then 148d applies the patch.

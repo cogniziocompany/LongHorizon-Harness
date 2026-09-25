@@ -1,0 +1,56 @@
+TASK 163 - Encode Paxton's queue decisions from the task-152 audit: queue/overseer/ folder, evidence fields,
+ready-for-overseer status, and the three spin-off tasks.
+
+*** OVERSEER-EXECUTED. IN queue/blocked/ DELIBERATELY. *** It edits the queue tree and LOOP-PROMPT.md,
+which no harness run may touch.
+
+SOURCE: session [421241] (4212416b-7566-4042-9ea2-ee0599ff77ab), 2026-09-10 21:46 PT. It audited task
+152's text and the overseer process, landed the audit as LongHorizon-Harness PR #16 (doc only, on purpose),
+and listed four follow-ups it did NOT do. Bridged 2026-09-11 by [fe2679]: no ledger entry for [421241]
+or PR #16, no queue/overseer/ directory exists.
+
+================================================================================
+DECISIONS PAXTON MADE (verbatim) - encode, do not re-open
+================================================================================
+ - Tasks the overseer runs itself get their own folder, queue/overseer/, with no new field/status.
+ - Task 134's move to Postgres keeps that folder as "blocked" with reason "overseer-executed".
+ - Evidence goes in the ledger AND as verified_at and evidence[] on the queue entry.
+ - These tasks use the same spec template, marked ready-for-overseer.
+ - The runner keeps the REST lanes and Hydra keeps the terminals. Skill-doc fix is a separate task.
+
+================================================================================
+FOLLOW-UPS (verbatim) - the work
+================================================================================
+ 1. Correct the task 152 text: the commit, the restart command, the restart-scope note, and the
+    evidence fields. Load-bearing corrections:
+      - The task says to stop unless 3b5042a is on origin. The rebase replayed it as 5e8f15d on
+        origin/easybutt0n-runner-v2. The handoff file is byte-identical in both, so the precondition
+        is met, but a literal reader would stop. (The queue NOTE was already corrected; the TASK TEXT
+        C:/tmp/ptait09-claude-lane-task.txt still needs the same fix - check it.)
+      - The restart also deploys other code: the runner service runs straight from the dev checkout
+        on ptait09 and has been up since 09-07; restarting starts the node half of the runner PRs
+        already on disk. The easysvc relay binary is from 08-09 and does not get rebuilt (task 162).
+      - Restart-Service is access-denied from the user shell. Working path: sudo sc.exe stop/start
+        ptait09-runner.
+ 2. Create queue/overseer/, move the overseer-executed entries into it (today at least 144, 147, 149,
+    150, 152, 157-if-not-closed, 162, 163 and 135-ssh's Seq step), and add the rule to LOOP-PROMPT.md.
+    The PC launcher never globs subdirectories, so the move is safe for it.
+ 3. Queue three tasks: the ready-for-overseer spec status (LongHorizon-Harness queue.py
+    _VALID_STATUS + spec staging, coordinate with 134 and 150); running the ptait09 runner from a
+    pinned copy instead of the dev checkout; and the skill-doc fix (runner = REST lanes, Hydra =
+    terminals, in the remote-pc skill).
+ 4. Add the folder-to-status mapping and the evidence fields (verified_at, evidence[]) to task 134's
+    note so PgQueueStore carries them.
+
+================================================================================
+WHAT THE BRIDGE ADDED
+================================================================================
+ - This plan and the audit plan at C:/tmp/HANDOFF-overseer-audit-2026-09-11.md (section A/H) both
+   want a state between "filed" and "done"; that plan proposes running/ for launcher-launched entries.
+   queue/overseer/ (Paxton's decision) and running/ are complementary: overseer/ = who executes,
+   running/ = launched-not-finished. Implement Paxton's first; note running/ in 134's note as well.
+ - PR #16 on LongHorizon-Harness must be read before doing any of this; it is the source document.
+
+DONE MEANS: queue/overseer/ exists and holds the overseer-executed entries; LOOP-PROMPT.md names the
+folder rule; task 152's text carries the four corrections; three spin-off tasks exist with no
+duplicates; task 134's note carries the mapping and the evidence fields; a ledger row records all of it.

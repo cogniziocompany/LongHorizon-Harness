@@ -1,0 +1,39 @@
+VERIFY + RECORD (cognizioware-mcp-tools): finish the half of the config-authority work that could not be done from a harness seat - the LIVE read-only capture, and proof that the new operator rows actually render. Work ONLY in /home/harness/work/cognizioware-mcp-tools-b on branch feat/config-drift-live-capture (run `git fetch origin && git checkout -B feat/config-drift-live-capture origin/main` first; if PR #119 has not merged yet, branch from `origin/feat/config-authority-and-drift` instead and SAY SO); plain git; commit by EXPLICIT PATH; no push; **READ-ONLY against every live system**; env NAMES only.
+
+## THIS TASK WAS RE-SCOPED 2026-09-09. READ THIS FIRST.
+It used to ask for doctor rows, an e2e suite, lane wiring and a reconcile runbook. **All of that is already built** - harness task 57 delivered it in this same repo and it is now **PR #119** (11 commits, 12 files, +2346/-3: `docs/config-authority.md`, `docs/reconcile-config-drift.md`, `e2e/suites/44-config-authority-drift.test.js`, the ops-control-center doctor scripts and `targets.json` rows, the lane reporting step, and the annotated `litellm-config.yaml`).
+**DO NOT REBUILD ANY OF IT.** Read PR #119's branch first. If you find yourself writing a doctor row or an e2e suite, stop - you are duplicating, and that is the exact failure this re-scope exists to prevent. Your job is to VERIFY what exists and fill in the figures it could not capture.
+
+## WHY THE GAP EXISTS
+Task 57 hit its round limit before any seat could do the live read-only capture, and it did the right thing: it marked **every "today" figure as UNVERIFIED rather than inventing one**. Those placeholders are now the only thing standing between that work and being trustworthy.
+
+## WHAT TO DO
+ 1. **Capture the live figures the docs are missing.** For every key `docs/config-authority.md` marks DB-backed, read the live value from the router's API and record it beside the committed YAML value, with the date and how it was read. Where they diverge, say so plainly - the divergences ARE the finding, and at least one is expected (this is why the drift work exists).
+ 2. **Prove the doctor rows render.** `targets.json` gained rows for config drift, disk capacity on CT202/CT204/CT210/corsairai300, and harness health. Adding a row is NOT proof an operator can see it. There is **no `/doctor` route** - results render on **`/overview`**. Confirm each new row appears there and **state how you confirmed it**. If a row does not render, that is a defect to report, not to paper over.
+ 3. **Record what each disk row reads today**, so the first run is a real baseline rather than an empty one.
+ 4. **Run the drift check read-only and record its exit code and output.** Task 57 wrote it; nobody has yet recorded what it says about the live estate.
+
+## HARD RULES - THIS TASK WRITES NOTHING TO A LIVE SYSTEM
+Read-only against the router, the database and every box: **no `/config/update`, no `/model/new`, no `/model/delete`, no container restart, no reconcile.** The reconcile runbook exists precisely so a HUMAN performs that step deliberately; this task documents the divergences and stops. Never print a key, a token or a database URL, and redact anything key-shaped in captured output - a config dump is exactly where a credential leaks. Env NAMES only. Explicit-path commits; no push.
+Completion = commits, diff stat, the live-vs-committed table with capture date, what each disk row reads today, HOW you confirmed the rows render on `/overview`, the drift check's exit code and output, and the list of divergences that exist right now. Auditor: read-only - verify NOTHING was rebuilt that PR #119 already provides, that no write reached any live system, that no credential appears in any captured output, and that the rendering claim is backed by a stated method rather than asserted.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.
+
+## ADDED 2026-09-09 23:20 - A CONCRETE DIVERGENCE, ALREADY MEASURED. CAPTURE THIS ONE FIRST.
+Measured tonight, read-only, from both routers' `/v1/models` with the same key:
+ - **PROD (CT202) serves 42 models to the harness key. UAT (CT204) serves 22, and NONE of them are the
+   `:synthetic` or `:synthetic-anthropic` twins.** The whole Anthropic-route split - eleven `:synthetic-anthropic`
+   models registered so agents can reach Synthetic through `/v1/messages` - exists **only in prod's database**.
+ - UAT is also missing `glm-5.3-flash:cloud` and `glm-5.3:cloud` entirely, while the QA acceptance suite's
+   `REQUIRED_MODELS` asserts both are present and that assertion PASSES. Establish why: either the QA virtual key
+   resolves a different catalogue than the key used above, or the assertion is not reading what it appears to.
+   **Do not assume - read it.** An assertion that passes against a catalogue that does not contain the model is a
+   defect at least as serious as one that fails.
+This is the sharpest possible illustration of why config authority matters here: `store_model_in_db: true` makes
+Postgres authoritative and the committed YAML a seed, so models added to prod at runtime NEVER reach UAT, and the
+lane's "Apply LiteLLM config to UAT" step reports success while applying a file that does not describe either box.
+**The gate that guards every deploy is therefore validating a router that is materially different from the one the
+estate actually runs on.** Record the full model-set difference both ways (in prod not UAT, in UAT not prod) as the
+headline divergence, with the capture command and date.
+STILL READ-ONLY. Do not reconcile, do not register anything on UAT, do not restart a router. The reconcile runbook
+exists so a human does that deliberately; this task documents the gap and stops.

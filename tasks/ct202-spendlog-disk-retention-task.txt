@@ -1,0 +1,176 @@
+TASK 115 - CT202 production disk will hit 80% in 1-3 days. Root cause found and VERIFIED. Stop the
+growth, then reclaim - in a window, with Paxton's go on the parts that need it.
+
+*** URGENT but NOT an emergency: ~1-3 days to 80%, ~3-6 days to 100%. Plan a window inside 48h. ***
+*** This is the box that SILENTLY hit 100% on 2026-09-08 and took the prod router down for ~1h,
+    destroying 23 in-flight runs. Nothing on any operator surface showed it. ***
+
+REPO: cogniziocompany/cognizioware-mcp-tools (the LiteLLM config + the ops doctor live here).
+TARGET: CT202 (prod LiteLLM router + MCP gateway), an LXC on ptait01 (192.168.21.110), reached via
+`pct exec 202 -- ...`. Service IP 192.168.21.161 is NOT a shell.
+
+================================================================================
+THE DIAGNOSIS - complete, evidenced, VERIFIED by the overseer. Do NOT re-derive from scratch.
+================================================================================
+
+Disk 52G/80G (65%) and climbing. Two independent readings (overseer 20:10->21:24 and a read-only
+investigation 04:33->05:01 UTC) agree the growth is Postgres.
+
+**THE GROWTH IS `LiteLLM_SpendLogs` - specifically its TOAST, which stores the full prompt/response
+JSON of every gateway request. No retention policy exists in EITHER authority layer.**
+
+    /var/lib/docker/volumes/.../postgres-data   = 18G   (VERIFIED by overseer du: 18G, dominant volume)
+    pg_toast of LiteLLM_SpendLogs                = 18G   (9.88M live chunks, 0 dead - all live data)
+    LiteLLM_SpendLogs heap                        = 490M  (the accounting columns - small)
+
+Daily payload written to SpendLogs, roughly DOUBLING per day since Sep 05:
+
+    Sep 05  450 MB    Sep 06 1517 MB    Sep 07 1952 MB
+    Sep 08  4405 MB  <- the day it hit 100%
+    Sep 09  6907 MB
+    90% of the entire 18G was written in the last 7 days. Everything older (back to Mar 29) = 1.7G.
+
+Live rate: overall +467 MB/hr over 28 min; 12-hour payload accounting says 182 MB/hr; the load is
+spiky. **Honest working band: 5-11 GB/day.** A 6-hour df sampler (one reading / 10 min) would settle
+the exact rate; nothing stored on the box can, since no host here keeps disk history (task 83).
+
+TWO drivers, different problems:
+  - ROW driver: the `overseer-ingest` key wrote 21,463 rows in 3h (~7,200/hr), 85%+ of all rows,
+    mostly repeated `MCP: list_tools`. Small bytes (~46M) but inflates every index. This is the
+    hivemind transcript-ingest chatter.
+  - BYTE driver: long-context routes on the `lh-harness` key. nemotron-3-super ~3,004 KB/row,
+    kimi-k2.6 ~9,673 KB/row, glm-5.3-flash ~2,920 KB/row. ~160 requests can write 400 MB.
+  Both happen with ZERO active harness runs - it is the overseer + queue traffic, not run output.
+
+WHY IT NEVER STOPS - confirmed absent in BOTH the file AND the DB `LiteLLM_Config` row:
+    maximum_spend_logs_retention_period   NOT set
+    store_prompts_in_spend_logs           NOT set
+    disable_spend_logs                    NOT set
+  No purge cron. Oldest row 2026-03-29; nothing has ever been deleted.
+
+Containerd is 32G but FLAT as a flow (newest snapshot ~5h stale) - a large STOCK, not the growth.
+Docker json logs 3.9M total - NOT the cause, but there is no daemon.json/logrotate so it is a latent
+unbounded writer. journald 1.3G, no SystemMaxUse cap - latent, will drift to ~8G.
+
+================================================================================
+THE FIX - ordered by value. Several steps NEED A WINDOW and some NEED PAXTON'S EXPLICIT GO.
+================================================================================
+
+**1. STOP STORING PAYLOADS. This kills ~95% of the FLOW, not just the stock.**
+   Set `general_settings.store_prompts_in_spend_logs: false`. The heap is only 490M for 362k rows, so
+   spend/usage accounting SURVIVES - only the message bodies stop being stored.
+   ** HAZARD: `general_settings` is DB-SHADOWED. The `LiteLLM_Config` DB row WINS over the YAML.**
+   So: edit the file for the repo record AND `POST /config/update`, then READ THE ROW BACK AND DIFF.
+   A 200 is not proof - it has silently discarded a key twice.
+   ** HAZARD: any edit to `infrastructure/litellm-config.yaml` FORCE-RECREATES the CT202 prod router
+   (the deploy job hashes the deployed file). Merge/apply only with ZERO active runs and no gate or
+   promotion mid-flight.**
+
+2. SET `maximum_spend_logs_retention_period`. NOTE: 30 days frees only 1.7G - the old data is NOT the
+   problem. To matter it must be ~3-7 days, and it only caps the STOCK, not the rate. Do #1 as well.
+   Same DB-shadow + router-recreate hazards as #1.
+
+3. RECLAIM THE 18G. A plain DELETE returns NOTHING to the filesystem. It needs `VACUUM FULL` (ACCESS
+   EXCLUSIVE lock on the prod router's DB, needs ~18G free to rewrite) or `pg_repack` (avoids the long
+   lock). **THIS IS THE STEP THAT MOST NEEDS A DELIBERATE WINDOW.** Recommend pg_repack. Do NOT run
+   VACUUM FULL on the live prod DB without a window - it locks the router's own database.
+
+4. `docker builder prune` - 10.4-15.9G reclaimable, 0 active build-cache records. LOWEST-RISK single
+   win, biggest immediate headroom, does NOT touch running containers. Still a prod-box mutation:
+   PAXTON'S GO before running it on CT202. Recommend this FIRST once he approves - it buys ~2 days.
+
+5. Fix the `overseer-ingest` chatter - cache the tool list instead of re-listing per ingest
+   (~7,200 rows/hr from one key, mostly `MCP: list_tools`). This is a code fix in the ingest path,
+   not a CT202 change - it may belong in its own task; scope it and say so.
+
+6. Cap journald (`SystemMaxUse=512M`) and add Docker log rotation (`daemon.json` max-size/max-file) -
+   closes the two latent unbounded writers before they become the next silent fill.
+
+7. ZFS snapshots on the HOST: `@uat-clone-src` (3.93G) + `@pre-litellm-1100` (7.57G) pin 16.7G on
+   rpool. They do NOT count against the container's 80G refquota, so they are not causing THIS fill -
+   but anything deleted inside CT202 frees refquota immediately while freeing NO pool space until they
+   are destroyed. **Destroying them is a HOST-LEVEL change on ptait01 - it needs Paxton's EXPLICIT GO,
+   naming the change + rollback + a quiet window. Do NOT do it as a side effect.**
+
+8. ADD A DISK ALARM. Both the 2026-09-08 outage and this one were SILENT - nothing on any operator
+   surface showed it. The ops doctor already has a `check_disk` with an 80% threshold and CT202 rootfs
+   targets (verified in task 83) - the gap is that it is not visibly ALARMING at 75%. Wire a threshold
+   that actually surfaces, so the next fill is seen days out. This is the single highest-leverage
+   preventive item and it belongs in this repo's ops-control-center.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - READ-ONLY until a window and the required go. **Do NOT delete, VACUUM FULL, prune, or edit config
+   on CT202 outside a window.** The investigation that produced this changed nothing; keep it that way
+   until approved.
+ - The DB `LiteLLM_Config` row WINS over the YAML. Read back and diff after any config change.
+ - Any litellm-config.yaml edit recreates the prod router - zero active runs, no gate mid-flight.
+ - VACUUM FULL locks the prod router's own database. pg_repack or a window, not a live lock.
+ - ZFS snapshot destroy = host change on ptait01 = explicit go + rollback + quiet window.
+ - NEVER the bare gateway /health (fans out to every paid+GPU model). This is a disk task; stay off
+   the router API except /config/update with read-back.
+ - Never print, echo or commit any credential value seen in a container env - names and paths only.
+ - Never `git add -A`; commit by explicit path.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+   In your report, say which steps need Paxton's window/go.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A branch with: the config change to stop storing payloads (#1) and a retention setting (#2) prepared,
+with the read-back-and-diff step documented; the ops disk alarm (#8) implemented so the next fill is
+visible; and a written runbook for the window-only steps (#3 pg_repack, #4 builder prune, #7 snapshot
+destroy) naming exactly what needs Paxton's go and what the rollback is. **Nothing on CT202 mutated
+until the window.** Verify any config change by reading the DB row back, and state the disk % before
+and after any reclaim that actually runs.
+
+
+================================================================================
+PAXTON DECISION 2026-09-09 22:40 PT: 7-DAY RETENTION - and it is NOT sustainable
+with full payloads on the current 80G disk. Read this before implementing.
+================================================================================
+
+Paxton: "yes create a 7 day window, unless its not sustainable. is it not in a db?
+we can move to /point too."
+
+ANSWER, computed from the measured rate:
+  non-payload base (containerd 32G + pg heap/other) = 34G
+  7 days of FULL request/response payloads at 5-11 GB/day = 35-77G
+  34G + 35-77G = 69-111G against an 80G disk = 86%-138%. **OVER 80% at every rate.**
+  So a 7-day window that KEEPS the message bodies does NOT fit on 80G.
+
+Yes, it IS in a database - Postgres, a docker volume (cognizioware-mcp-tools-postgres-data)
+on ZFS. So it IS movable, which is Paxton's "/point" option.
+
+THREE ways to honour the 7-day decision. Implement whichever Paxton confirms; DEFAULT to (A):
+
+ (A) **RECOMMENDED: 7-day retention + STOP STORING BODIES.**
+     Set `general_settings.store_prompts_in_spend_logs: false` AND
+     `maximum_spend_logs_retention_period: "7d"`. The payload flow drops ~95%; 7 days of
+     retention then costs ~0.5G (accounting rows only, ALL history). Total ~34G / 43% -
+     trivially sustainable, and it keeps full spend/usage accounting. You lose only the
+     request/response BODY audit trail. This is the right default unless the bodies are
+     needed for debugging.
+
+ (B) **Keep the bodies + MOVE the volume** (Paxton's /point idea). Move
+     cognizioware-mcp-tools-postgres-data onto a larger ZFS dataset / mount with ~120G+
+     headroom, then 7-day full-payload retention fits. This is a HOST-LEVEL change on
+     ptait01 (moving a docker volume / ZFS dataset) - explicit go + rollback + quiet
+     window, and it must not disrupt the running prod router. Bigger operation than (A).
+
+ (C) **Keep the bodies + GROW the CT202 disk.** Paxton has standing authorisation to grow
+     a disk over 80%. Grow subvol-202 refquota + the zvol to ~150G, then 7-day full-payload
+     retention fits. Host-level (ZFS on ptait01), same go/rollback/window discipline.
+
+WHICHEVER: the retention setting is DB-SHADOWED (LiteLLM_Config row wins over the yaml) and
+any litellm-config.yaml edit force-recreates the CT202 prod router. So apply in a zero-active-run
+window, POST /config/update, and READ THE ROW BACK AND DIFF. The reclaim of the existing 18G
+still needs pg_repack in a window regardless of which option is chosen.

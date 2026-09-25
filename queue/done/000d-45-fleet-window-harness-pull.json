@@ -1,0 +1,9 @@
+{
+  "name": "45-fleet-window-harness-pull",
+  "task_file": "C:/tmp/fleet-window-pull-task.txt",
+  "workspace": "ptait09-easybutt0n-ai",
+  "max_rounds": 5,
+  "trio": "kimi",
+  "run_id": "20260908T160511Z_059e273a",
+  "note": " || STATE = PR, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in the same triage. The run ended without a disposition, but its branch feat/fleet-window-harness-pull is on origin at d44293c with ptait09-easybutt0n-ai PR #48 STILL OPEN. It needs review and a merge decision, NOT a relaunch. || MERGEABLE BUT NEEDS A DEPLOY-SAFE REVIEW - disposition 2026-09-20 20:24 PT [5321285c]: ptait09-easybutt0n-ai PR #48 is MERGEABLE/CLEAN but enormous (+27507/-1716 across 164 files) and that repo DEPLOYS TO THE MACHINE THAT RUNS THE JOBS on merge - the recorded hazard is that two such deploys wiped its setup. Do not merge it as a routine backlog item: it needs a scoped review and a quiet window, or slicing."
+}

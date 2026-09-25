@@ -1,0 +1,16 @@
+{
+ "name": "9999zs-218-queue-task-validator",
+ "task_file": "C:/tmp/queue-validator-task.txt",
+ "task_source": "task_file",
+ "workspace": "LongHorizon-Harness",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "note": "CREATED 2026-09-23 by the interactive session. Outcome of Paxton's KubeRocketAI question: verdict was DO NOT ADOPT (its validation is a file-graph check; every defect that bit us this week was cross-boundary). A working prototype already exists at C:/tmp/validate_queue.py and found 4 true positives on its first run against the live 32-entry queue - those findings are in the task text as the acceptance baseline. Scope is: version it into the harness, fixture-based tests, wire into the tick, then add the gateway-alias and OPEN-ASKS integrity rules. Read-only by construction; ERROR gates, WARN advises. || TASK-NUMBER COLLISION recorded 2026-09-23 00:21 PT [5321285c]: two different tasks share this number. 217 = fleet-heartbeat-413 (created 09-22 00:3x by the interactive overseer, VERIFIED) AND clawdtalk-deprecation-removal (created 09-22 23:2x by scheduled tick #1609, run 5879857b LIVE). 218 = migration-001-fresh-db (09-22 00:3x, interactive, VERIFIED) AND queue-task-validator (09-23 00:1x by a tick, run 24b4a1ad LIVE). The later pair did not read max+1 at write time. NOT renamed: both later entries back live runs and renaming mid-run risks the launcher losing track. Refer to them by slug, not number, until the runs finish; then renumber the later pair to the next free numbers. || 2026-09-23 05:10 PDT [session 5321285c iter39]: STATE=MERGED -> VERIFIED: PR #43 merged 4dc0dfb. Reviewed: +1050 additive (module, tests, docs, console script), LF, 37/37 after my Windows-only test fix (entry-point subprocess had no HOME). Validator runs clean.",
+ "run_id": "20260923T071954Z_24b4a1ad",
+ "roles_bound": {
+  "manager": "nemotron-3-super:synthetic-anthropic",
+  "executor": "kimi-k3:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-23T07:19:54.410416+00:00"
+}

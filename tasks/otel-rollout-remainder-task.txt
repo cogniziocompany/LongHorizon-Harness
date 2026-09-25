@@ -1,0 +1,52 @@
+TASK 191 - Finish the OTLP->prod Seq rollout across the remaining mcp-tools services.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+Source: the DISCLOSED follow-on scope of task 137, cut out by overseer tick #390 (2026-09-17)
+rather than granted extra rounds. Task 137's run shipped PR #160 and stopped; this is the rest.
+
+WHAT ALREADY EXISTS - DO NOT REBUILD IT
+PR #160 (branch task-137-otel-seq-logging, remote a6f0eac, base main, open and UNMERGED at the time
+this task was written) already contains:
+  - the canonical shared wrapper `_shared/otel-logger.mjs` - no-op when the endpoint is unset,
+    console-first, throw-guarded. REUSE IT. Do not write a second logger.
+  - 4 services converted: ops-control-center (.NET, AddOpenTelemetry + AddOtlpExporter),
+    ops-status-mcp (pilot), langfuse-mcp, comfyui-mcp.
+  - one literal OTEL_SERVICE_NAME line per converted service in docker-compose.yml;
+    env_file and the journald logging blocks untouched.
+  - the .env.example comment and the runbook entry.
+IF PR #160 IS STILL OPEN when you start, BRANCH FROM IT, not from main - otherwise you will
+recreate the wrapper and collide. If it has merged, branch from main.
+
+SCOPE - the remaining ~11 services
+1. Convert each remaining Node/TS MCP service to the shared wrapper, ONE COMMIT PER SERVICE:
+   copy/import `_shared/otel-logger.mjs`, add the Dockerfile COPY line and the four deps, swap the
+   console call sites to the wrapper with a `component` attribute, and add exactly one literal
+   OTEL_SERVICE_NAME line for that service to docker-compose.yml. Enumerate the services from the
+   compose file FIRST and put the list in your round-1 plan - do not guess the count from this text.
+2. Complete the deeper audit of the langfuse-mcp and comfyui-mcp wiring that PR #160 labels
+   PROVISIONAL, and fix what it finds.
+
+EXPLICITLY OUT OF SCOPE
+- Disabling console/journald logging. That was deliberately deferred by 137 and stays deferred.
+- litellm-config.yaml: ZERO diff. Any edit to it force-recreates the CT202 PROD router.
+- .github/workflows/: ZERO diff - your token is refused there by permission anyway.
+
+MEASURED FACTS - these cost task 137 real rounds, do not re-derive them
+- Seq ingest needs NO AUTH (Paxton, dev environment). POST /api/events/raw?clef with NO
+  Authorization header works on both https://seq.easybutt0n.ai and http://192.168.21.128:5341.
+  Do NOT require SEQ_API_KEY; ship with it unset. A guard that blocks logging on a missing key
+  is a BUG to remove.
+- Seq's OTLP endpoint returns HTTP **200** on success, NOT 201. Task 137 wasted effort on an
+  "assert 201" probe. Prove ingest by the EVENTS LANDING IN SEQ, attributable by service.name -
+  never by a status code alone, and never by container health.
+- The mcp-tools working tree on CT110 carries ~37 PRE-EXISTING dirty files unrelated to this work.
+  NEVER absorb them into a commit. Commit named paths only.
+- `.lh-harness/` is overseer-created infrastructure, untracked on purpose. Do not flag, commit or
+  delete it, and exclude it from any baseline comparison.
+
+DEFINITION OF DONE
+Each service in its own commit; the branch pushed; ONE PR opened against the right base with a body
+that states honestly how many services were converted and how many remain; and at least one
+uniquely-tagged log event per converted service confirmed ARRIVING in prod Seq and attributable by
+service.name. Then STOP. Open the PR and STOP - merging is the overseer's, never yours. Do not
+@claude anything.

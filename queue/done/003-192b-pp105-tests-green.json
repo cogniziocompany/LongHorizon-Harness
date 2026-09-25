@@ -1,0 +1,16 @@
+{
+ "name": "003-192b-pp105-tests-green",
+ "task_file": "C:/tmp/pp105-tests-green-task.txt",
+ "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+ "max_rounds": 4,
+ "trio": "kimi",
+ "task_source": "task_file",
+ "note": "*** STATE: PR - recorded 2026-09-17 14:47 PT by SCHEDULED TICK #483. Run 20260917T200944Z_87d3aa17 reached r4/4, raised the 'task complete' gate e29e386b7071, and was ENDED with action=stop (read back: status cancelled, alive=False, exit 0, approval resolved). ITS CLAIM WAS VERIFIED AGAINST GITHUB BEFORE THE GATE WAS RESOLVED, because the previous run on this PR (b4c9ac89, tick #476) claimed build-passes/mergeable while `test` was FAILING. This one holds: PR #105 head 10fbb3caeac93068fd4d2527a39e15ce0819c27b, checks run 35274348334 - build PASS 43s, **test PASS 44s**, image+deploy skipping, base develop, mergeable MERGEABLE, state OPEN, NOT merged. The three vitest failures #476 identified (WorkspaceLayout stall-detection :163 and :292, SessionWizard:189) are closed; one commit 10fbb3ca on branch task-101/build-dispatch touching exactly the 3 intended files. NEXT: merge is the OVERSEER's and is still pending - base is `develop`, so landing it deploys DEV ONLY (branch-per-env: develop->dev, release->uat, main->prod). reviewDecision is empty; nothing reviews it today and no @claude may be bought. *** || CUT SLICE of task 192, created 2026-09-17 13:0x PT by scheduled tick #476 on 192s round-ceiling gate. NOT a retry and NOT extra rounds. 192s run 20260917T190748Z_b4c9ac89 hit r4/4 and gated; the tick resolved it STOP. Two of 192s three deliverables are DONE and VERIFIED from the GitHub API: PR #105 base conflict cleared (mergeable=MERGEABLE at head 196bf784, the develop merge) and the BUILD check = SUCCESS. ONE thing is left and it is this tasks whole scope: CI run 35263388178 on that head has test=FAILURE, while base develop (3bd9040) CI = SUCCESS - so the regression is the branchs own, introduced by the merge resolution, not inherited and not flaky. Three vitest failures, all inside the two files the merge resolved: WorkspaceLayout.stall-detection.test.tsx:163 and :292 (expected '' to contain 'Test Session' - empty render), and SessionWizard.test.tsx:189 (Start button calls /sessions/<id>/flow, test expects /sessions/<id>/setup/status - which is the PRs own subject, so the resolution likely took the wrong side). CONSTRAINTS: append-only to the existing branch and existing PR - no new branch, no second PR, no merge (merging is the overseers). Do not git add -A; dist/ and node_modules/ are untracked artefacts. NEVER post an @claude comment (task 117). Position 003 per Paxtons 12:05 PT priority call (all cognizioware-powerplatform tasks to the head of the active band unless specifically blocked) - inherited from 192, not a reorder by the tick.",
+ "run_id": "20260917T200944Z_87d3aa17",
+ "roles_bound": {
+  "manager": "kimi-k3:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-17T20:09:44.821696+00:00"
+}

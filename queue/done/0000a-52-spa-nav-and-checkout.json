@@ -1,0 +1,9 @@
+{
+  "name": "0000a-52-spa-nav-and-checkout",
+  "task_file": "C:/tmp/spa-nav-checkout-task.txt",
+  "workspace": "cognizioware-powerplatform",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "run_id": "20260909T040816Z_343a7826",
+  "note": " || STATE = MERGED, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in a triage of every undispositioned failed/cancelled entry. The run ended without a disposition note, but its work SHIPPED: branch feat/spa-nav-and-checkout-entry -> cognizioware-powerplatform PR #99 is MERGED at 3907abc. This was a RECORDS gap, not a work gap: nothing needs relaunching. LIVE/VERIFIED still require the usual lane and read-back evidence."
+}

@@ -1,0 +1,15 @@
+{
+ "name": "711-69a-hydra-checkpoint-identify",
+ "task_file": "C:/tmp/69a-hydra-checkpoint-identify-task.txt",
+ "workspace": "cognizioware-qa",
+ "max_rounds": 3,
+ "trio": "kimi",
+ "note": "*** TASK 69 WAS SLICED BY PAXTON 2026-09-10 17:00 PT. This is slice 1 of 3. *** THE REASON, MEASURED not assumed: task 69 was attempted THREE times and produced ZERO commits every time. On attempt 3 (run 20260910T230152Z_70f383f9) the executor_raw_trajectory reached 13,357,549 bytes, per-request latency on the local ornith pool climbed 3m9s -> 3m30s -> 3m44s as the context grew, and the executor sat blocked on ONE in-flight request for over ten minutes until its 3600 s budget ran out. Round 1 completed BOTH its executor and auditor and still left zero commits. The failure is CONTEXT SIZE driving prefill time past the budget - not a hard bug and not a dead backend (both GPUs were serving, model resident in VRAM on each). SO: KEEP THE EPISODE SMALL. Open the named files and nothing else. If you are grepping the whole tree, stop and report what you have. SLICE 1 IS READ-ONLY: name the three failing checkpoints from src/flows/hydra-checkpoint-suite.ts, PROVE each dereferences HYDRA_REPO_DIR, and report how far back the red goes. *** IF THEY ARE NOT THE ONES, SAY SO AND STOP - that is a SUCCESS for this slice, because slices 69b and 69c are built on that diagnosis and must not proceed on a wrong one. *** No code change, no commit, no push. Reporting IS the deliverable. ALREADY MEASURED - DO NOT RE-DERIVE: runner ct210-qa is LINUX (self-hosted,X64,qa-host,Linux); repo vars HYDRA_REPO_DIR=C:\\hydra-ci and FACTORY_REPO_DIR=C:\factory-ci are BOTH Windows paths; on CT210 a search of /home/runner and /opt to depth 3 found NO hydra dir, NO factory dir, and no fake-agent.js anywhere; the error is a Windows path concatenated onto a Linux one. Suite reports score=76.92 passed=10 failed=3 total=13. cognizioware-hydra is a PRIVATE repo so a cross-repo actions/checkout needs a token, and NO qa workflow does one today - there is no proven-good token to copy. DO NOT lower the 76.92 threshold. DO NOT delete a checkpoint. No secrets in repo or output - env var NAMES only, never invent a secret name. No live Hydra calls, no QA backend calls, no deploys. Plain git, commit by EXPLICIT PATH, never git add -A, check git diff --stat first. ",
+ "run_id": "20260911T013304Z_b54a6f2c",
+ "roles_bound": {
+  "manager": "nemotron-3-super:synthetic-anthropic",
+  "executor": "syn:large:vision:synthetic-anthropic",
+  "auditor": "kimi-k3:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-11T01:33:04.716581+00:00"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "721-77b-fleet-e2e-mcp-tools",
+  "task_file": "C:/tmp/fleet-e2e-mcp-tools-task.txt",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "BLOCKED_UNTIL (moved from an unread key, 2026-09-14): 77a merged AND lh-harness deployed AND /api/fleet/nodes non-empty (overseer confirms)\nGATED BEHIND TASK 114 (fleet-heartbeat-413) as of 2026-09-09 22:15 PT. The run 20260910T043111Z did 3 rounds then correctly BLOCKED: its own gate says stop if https://fleet.easybutt0n.ai/api/fleet/nodes returns []. It does return [] - because the harness heartbeat POSTs every run ever (265 runs, 763KB gzipped) and the fleet endpoint 413s it. That is task 114 and it needs a CT110 deploy window. 77b cannot write an honest fleet-registration e2e suite until a node actually registers, so it waits for 114. DO NOT relaunch until GET /api/fleet/nodes is non-empty. ORIGINAL NOTE: UNBLOCKED 2026-09-09 21:10 PT: its gate is MET. /api/meta now exposes all four fields - fleet_configured=True, fleet_ever_succeeded=False, fleet_last_ok=False, fleet_last_error=HTTP 413 - after the overseer deployed PR #11 (d62dff2) at 20:58 in the idle window. CARRY THIS FORWARD: the fleet currently registers ZERO nodes and the reason is now known - the heartbeat POSTs every run that has ever existed (265 runs, 763KB gzipped) and gets a 413. That is task 114. So an e2e test of fleet registration SHOULD FAIL TODAY and must be written to fail honestly on an empty node list rather than being softened to pass. ORIGINAL NOTE: BLOCKED - DO NOT PUT THIS BACK IN C:/tmp/queue UNTIL THE HARNESS DEPLOY IS LIVE. Gate on: GET /api/meta on the lh-harness API must expose fleet_configured / fleet_ever_succeeded / fleet_last_ok / fleet_last_error. Those four fields are what PR #11 (task 77a) adds; their ABSENCE is the proof it is not deployed. Two runs have now been spent discovering this - 20260909T181331Z_8f041627 (77a, which produced the fix) and 20260909T205233Z_54b7ba42 (77b, which correctly refused to proceed on an unconfirmed precondition). The launcher has no knowledge of cross-task dependencies, so leaving this file in the queue guarantees it relaunches and asks the same question again.",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "kimi-k3:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  }
+}

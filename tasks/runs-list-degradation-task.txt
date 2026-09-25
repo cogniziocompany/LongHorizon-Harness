@@ -1,0 +1,86 @@
+TASK 194 - `GET /api/runs` has degraded to 168 s. Make gate detection cheap again.
+
+REPO / WORKSPACE: LongHorizon-Harness
+Source: SCHEDULED TICK #420, 2026-09-17 06:2x PT. Measured, not inferred.
+
+================================================================================
+WHY THIS MATTERS - it is the gate-detection path
+================================================================================
+Overseer doctrine: "GATE DETECTION READS `GET /api/runs`, NEVER A SCRATCH FILE OR A DIRECTORY
+LISTING." Every sweep tick starts by enumerating that endpoint to find runs in `waiting_approval`.
+If the call does not return inside a tick's budget, GATES GO UNDETECTED and runs park silently.
+That is the failure this task prevents. It is not a cosmetic performance nit.
+
+================================================================================
+MEASURED THIS TICK - do not re-derive, but DO re-measure before and after
+================================================================================
+From 192.168.21.135 to http://192.168.21.168:8799 (CT110), bearer LH_HARNESS_WEB_TOKEN:
+
+    curl -m 60  /api/runs   -> HTTP 000, "Operation timed out after 60009 ms with 0 bytes received"
+    curl -m 240 /api/runs   -> HTTP 200, bytes 4,868,247, time 168.371 s
+
+TCP connect succeeded immediately in both cases; the socket was open and silent. So this is
+SERVER-SIDE RESPONSE ASSEMBLY, not a network fault and not a dead service.
+
+Proof the service itself is healthy, same tick, same host, same token:
+    GET /api/runs/<full-id>/status     -> 200 in 0.31 s  (x2, two different live runs)
+    GET /api/runs/<full-id>/snapshot   -> 200 in ~1 s    (x3, 117-325 KB each)
+    GET /api/health, /health           -> 404 in 0.012 s (routes do not exist; latency is the point)
+So EVERY per-run route is fast and only the LIST route is slow.
+
+Payload shape, from the 200 body:
+    461 runs, 4,868,247 bytes  =  ~10.5 KB per run
+    The list embeds each run's FULL `task` text - one row's `task` field alone is several KB of
+    task-file prose. The overseer's use of this endpoint needs `id`, `status` and enough to filter
+    by prefix. It does not need the task body, and never has.
+
+Growth, from earlier ticks' saved response files on this box:
+    tick #411 05:21  4,846,147 bytes  (458 runs)
+    tick #418 06:11  4,862,695 bytes  (460 runs)
+    tick #420 06:27  4,868,247 bytes  (461 runs)
+Runs are append-only and nothing prunes them, so this gets monotonically worse.
+
+================================================================================
+SCOPE
+================================================================================
+ 1. REPRODUCE AND PROFILE FIRST. Time the handler on CT110 itself and establish where the 168 s
+    goes - per-run directory stat/read, trajectory parsing, JSON serialisation, or something
+    pathological like re-reading each run's traj file. DO NOT optimise on a guess. Report the
+    breakdown in the PR body with the numbers you measured.
+ 2. Add a cheap enumeration mode to `GET /api/runs`, defaulting to CHEAP:
+      * a `fields=` / summary projection that omits `task`, `task_summary` and anything else
+        per-run-large, returning id + status + workspace + started_at + round;
+      * a `status=` filter accepting a comma list, so `?status=running,waiting_approval,starting`
+        answers the gate question directly.
+    *** BACKWARD COMPATIBILITY IS NOT OPTIONAL: the response MUST stay `{"runs":[...]}` with the id
+    keyed as `id`, NOT `run_id`. A reader that keys `run_id` prints Nones and looks like a corrupt
+    API - that has already cost a tick once. Existing callers that pass no parameters must keep
+    working; if you change the DEFAULT projection, say so loudly in the PR body and grep the repo
+    plus the hydra fleet-scheduler contract (`listQueue`, `listAllQueue`, fleet-routes.js
+    `{runs, queue, errors}`) for readers that would break. ***
+ 3. Whatever the profile shows, make the common path not scale with total run count where it can
+    be avoided - an index/cache of run status, invalidated on write, is the obvious shape. State
+    the staleness window you chose; a gate that is 5 s stale is fine, one that is 5 min stale is not.
+ 4. Tests: the summary projection omits the large fields; the status filter returns exactly the
+    matching rows; the default response still carries `id` and still parses for an existing reader;
+    a fixture with several hundred runs asserts the cheap path's cost does not grow per-run in the
+    way the current one does.
+ 5. OUT OF SCOPE: deleting or archiving old runs. 461 rows with 264 cancelled and 191 failed is a
+    retention question, and retention is somebody's decision, not this task's. Do NOT prune runs.
+    Do NOT touch the stranding-detection semantics either - `done/` is an upper bound by design.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Merging this restarts `lh-harness.service` on CT110 and KILLS EVERY IN-FLIGHT RUN; the deploy
+   script aborts unless zero runs are active. The overseer picks that window. YOU DO NOT MERGE.
+ - Do NOT push to `.github/workflows/` - CT110's GH_TOKEN refuses it by permission, and a run that
+   needs to is a run that should stop and say so.
+ - No secrets in code, logs or commit messages - env var NAMES only.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat` first.
+ - Push and open the PR yourself, then STOP.
+
+DONE MEANS: a PR open on LongHorizon-Harness; the profile breakdown in the body with measured
+before/after timings for BOTH the default and the cheap path; the `{"runs":[...]}` / `id` contract
+proven unchanged by a test; and a one-line statement of the exact call an overseer tick should now
+make to detect gates.

@@ -46,6 +46,38 @@ _VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked"})
 _NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
 _VALID_TRIOS = frozenset({"kimi", "qwen"})
 
+# Body keys accepted by _normalize_request (task 233).  Anything else is
+# rejected with the offending key names in the message instead of being
+# dropped silently.  ``task_file`` and ``roles`` are alternative input keys
+# for ``task`` and ``trio`` respectively.
+KNOWN_REQUEST_KEYS = frozenset(
+    {
+        "name",
+        "task",
+        "task_file",
+        "workspace",
+        "max_rounds",
+        "trio",
+        "roles",
+        "priority",
+        "branch",
+        "continue_branch",
+        "base_check",
+        "requested_by",
+        "dedup_key",
+    }
+)
+
+
+class UnknownQueueFieldError(ValueError):
+    """An enqueue body carried keys outside ``KNOWN_REQUEST_KEYS``.
+
+    Subclasses ``ValueError`` so every existing caller (both stores, the
+    requeue path, the MCP tool) treats it as a validation failure; the REST
+    route (server.py ``create_queue_entry``) re-raises it as HTTP 400 with
+    the key names in the message.
+    """
+
 # Allowed queue-entry state transitions. Keyed by (from, to); the value is the
 # operation that performs the move. Read-only edges ("update (record_...)") are
 # not a first-class QueueStore method: they are applied by the launcher by
@@ -241,10 +273,21 @@ def _validate_workspace(value: Any) -> str:
 
 def _validate_trio(value: Any) -> str:
     if value is None:
-        raise ValueError("trio/roles is required")
+        # Optional (task 233): no default is invented here.  Persisting unset
+        # is safe because the launcher defers such an entry: remaining
+        # capacity exists only for configured trios (launcher.py
+        # _remaining_capacity), so _check_eligibility records an " at
+        # capacity" skip each pass and the entry stays pending, unlaunched;
+        # _launch/_shadow_launch_decision guard the same condition with an
+        # "unknown trio ..." skip.
+        return ""
     if isinstance(value, bool) or not isinstance(value, str):
         raise ValueError("trio/roles must be a string")
     text = value.strip().lower()
+    if not text:
+        # An explicitly empty trio is the same "not supplied" state as an
+        # omitted key (MCP clients may fill a declared default of "").
+        return ""
     if text not in _VALID_TRIOS:
         raise ValueError(f"trio must be one of: {', '.join(sorted(_VALID_TRIOS))}")
     return text
@@ -334,7 +377,20 @@ def _validate_continue_branch(value: Any) -> bool:
 
 
 def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
-    """Convert a POST /api/queue body into validated launch parameters."""
+    """Convert a POST /api/queue body into validated launch parameters.
+
+    Unknown body keys are rejected (task 233) with an error naming every
+    offending key -- they were previously dropped silently, which filed
+    continuation tasks as fresh ones when ``continue_branch``/``branch`` went
+    missing. ``KNOWN_REQUEST_KEYS`` is also the allowlist behind the MCP tool
+    schema and the REST 400 mapping (server.py ``create_queue_entry``).
+    """
+
+    unknown = sorted(set(body) - KNOWN_REQUEST_KEYS)
+    if unknown:
+        raise UnknownQueueFieldError(
+            "unknown field(s): " + ", ".join(unknown)
+        )
 
     task = body.get("task")
     task_file = body.get("task_file")
@@ -856,7 +912,9 @@ class QueueStore:
         if entry.status != "failed":
             raise ValueError("can only requeue failed entries")
 
-        # Create successor entry
+        # Create successor entry. The continuation opt-ins (branch /
+        # continue_branch) carry over (task 233): a retried continuation
+        # task stays a continuation task, not a fresh one.
         successor = QueueEntry(
             queue_id=f"q-{uuid.uuid4().hex[:16]}",
             name=entry.name,
@@ -866,6 +924,8 @@ class QueueStore:
             trio=entry.trio,
             priority=entry.priority,
             requested_by=entry.requested_by,
+            branch=entry.branch,
+            continue_branch=entry.continue_branch,
             base_check=entry.base_check,
             status="pending",
             retry_of=entry.queue_id,
@@ -884,6 +944,77 @@ class QueueStore:
         for entry in self.list():
             counts[entry.status] = counts.get(entry.status, 0) + 1
         return counts
+
+    # ------------------------------------------------------------------
+    # Drain flag — task 242.
+    #
+    # One JSON file at ``runs_root/queue/drain.json``.  While ``enabled`` is
+    # true the launcher launches NOTHING new (the eligibility gate returns a
+    # "queue drained" skip for every pending entry) but live runs are never
+    # touched — they keep running and keep being promoted to done/failed by
+    # the normal reconciliation pass.  The flag lives next to the entries so
+    # it survives a service restart: a deploy comes back up drained (new
+    # launches still blocked) until an operator explicitly clears it.
+    # ``since`` records when the current drain period started and is kept
+    # across repeat enable calls so an operator flipping the reason does not
+    # re-age an open maintenance window.
+    # ------------------------------------------------------------------
+
+    _DRAIN_FILE = "drain.json"
+
+    def _drain_path(self) -> Path:
+        return self._root / self._DRAIN_FILE
+
+    def get_drain(self) -> dict[str, Any]:
+        """Return the persisted drain state; disabled defaults when absent."""
+
+        state: dict[str, Any] = {"enabled": False, "reason": None, "since": None}
+        try:
+            raw = self._drain_path().read_text(encoding="utf-8")
+        except OSError:
+            return state
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return state
+        if not isinstance(data, dict):
+            return state
+        if data.get("enabled") is True:
+            reason = data.get("reason")
+            since = data.get("since")
+            state["enabled"] = True
+            state["reason"] = str(reason) if reason is not None else None
+            state["since"] = float(since) if isinstance(since, (int, float)) else None
+        return state
+
+    def set_drain(self, enabled: bool, reason: str | None = None) -> dict[str, Any]:
+        """Persist the drain flag and return the resulting state.
+
+        ``reason`` is operator-facing text bounded to the queue reason limit.
+        Disabling clears ``reason``/``since``; a fresh enable starts a new
+        ``since`` while a re-enable of an already-drained queue keeps it.
+        """
+
+        now = _now()
+        bounded_reason = str(reason)[:_MAX_QUEUE_REASON_CHARS] if reason else None
+        if enabled:
+            previous = self.get_drain()
+            since = (
+                float(previous["since"])
+                if previous.get("enabled") and isinstance(previous.get("since"), (int, float))
+                else now
+            )
+            payload = {
+                "enabled": True,
+                "reason": bounded_reason,
+                "since": since,
+                "updated_at": now,
+            }
+        else:
+            payload = {"enabled": False, "reason": None, "since": None, "updated_at": now}
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+        _atomic_bytes_write(self._drain_path(), text.encode("utf-8"))
+        return self.get_drain()
 
     # ------------------------------------------------------------------
     # Shadow (observe) log — task 173.

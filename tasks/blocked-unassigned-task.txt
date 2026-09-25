@@ -1,0 +1,135 @@
+TASK 138 - Fix the two "blocked, nobody assigned" items: a red preview build nobody owns, and
+duplicate tunnel routing over a stale twin stack.
+
+REPO / WORKSPACE: LongHorizon-Harness  (this is where the record lives; see the SCOPE SPLIT below -
+the Track A code fix may land in a DIFFERENT repo, and that part is the overseer's to land.)
+Source: Paxton 2026-09-10, session [3846cf] (3846cfb4-28c1-41da-bc8a-af734d66013e), plan mode.
+
+================================================================================
+WHY THIS EXISTS
+================================================================================
+Two rows on the Ship Plane sit under "Blocked with nobody assigned". Neither is blocking a merge,
+which is exactly why both have been ignored - and one of them touches LIVE TRAFFIC.
+
+ 1. A PREVIEW BUILD IS RED on one repo. It fails on both recently-branched PRs and passes on older
+    ones, so the break is on the SHARED BASE BRANCH, not in either PR. It is not a required check,
+    so nothing is blocked - but a red check nobody owns is worse than no check.
+
+ 2. DUPLICATE ROUTING + A STALE TWIN STACK. Three tunnel connectors share one name, so incoming
+    traffic reaches one of two stacks unpredictably - which makes a fault appear and vanish at
+    random. A months-old copy of the app runs with IDENTICAL container names. That copy has already
+    made a live record appear not to exist once. Likely candidate: corsairai300/CT105, the "stale
+    decoy powerplatform" named in tasks/guest-e2e-readiness-2026-09-09.md lines 99-102.
+
+*** THE SOURCE TABLE DOES NOT SAY WHICH REPO OR WHICH TUNNEL. Step 0 of each track PINS THAT DOWN
+BY MEASURING IT, NOT BY TRUSTING OLD NOTES - including not trusting the CT105 guess above. ***
+
+================================================================================
+*** SCOPE SPLIT - READ THIS BEFORE PLANNING ***
+================================================================================
+A harness run has ONE workspace and is NEVER given credentials.
+
+ TRACK A: you DIAGNOSE and produce the exact fix. If the failing repo is not this workspace, you do
+ NOT clone it and do NOT push to it - you deliver the diagnosis, the failing job log excerpt, the
+ offending commit, and the exact patch. THE OVERSEER LANDS IT in the right repo.
+
+ TRACK B: MEASUREMENT ONLY (steps 1-3). Steps 4-7 stop connectors and containers carrying LIVE
+ PUBLIC TRAFFIC and need an explicit go on the timing from Paxton. DO NOT run them. Deliver the
+ mapping and the runbook; the overseer executes the window.
+
+================================================================================
+TRACK A - the red preview build (do this first; low risk)
+================================================================================
+ 0. FIND THE REPO. `gh pr checks` across the open PRs in the fleet repos (mcp-cognizioware,
+    cognizioware-mcp-tools, cognizioware-powerplatform, cognizioware-hydra). Look for a NON-REQUIRED
+    check with "preview" in its name that is RED on new PRs and GREEN on older ones.
+    NOTE: `gh api <path> --jq '.name'` on a 404 returns the literal string "null", which passes a
+    non-empty test. Verify the reader before trusting the reading.
+ 1. BISECT ON THE BASE BRANCH. Take the base sha of the last GREEN PR and the first RED one, then
+    `git log <green>..<red>` on the shared branch. Read the failing job log with
+    `gh run view --log-failed` and MATCH THE ERROR TO A COMMIT in that range. Name the commit.
+ 2. FIX THE CAUSE on a branch cut from the BASE - not inside either PR. The two affected PRs go
+    green by rebasing onto the fixed base, which also proves the diagnosis.
+ 3. ASSIGN OWNERSHIP. Add a one-line owner entry to that repo's CODEOWNERS or the workflow header.
+    If nobody wants it, DELETE the preview workflow instead. Either outcome is acceptable; leaving
+    an unowned red check is not.
+
+ CONSTRAINT: if the repo turns out to be cognizioware-powerplatform, `main` DEPLOYS PROD and main is
+ far behind. Land on the dev branch ONLY; check instances.json and confirm behind=0 before anything
+ goes near main. Do not merge to pp main - it is separately held on task 59.
+
+================================================================================
+TRACK B - tunnel duplicates + stale stack (MEASURE ONLY)
+================================================================================
+ 1. FIND THE TUNNEL. List cloudflared containers/services on EVERY host: ptait01 (.110),
+    ptait07 (.138), corsairai300 (.151), and the CTs on each. For each record the tunnel id (from
+    its token or config) and its ingress origin. Confirm the three connectors and which two stacks
+    they point at.
+    *** ALWAYS WRITE A CONTAINER AS <host>/CT<id>. CTIDs ARE REUSED ACROSS HOSTS - 100, 101 and 105
+    each exist on more than one host, and a `pct exec` against the wrong host answers about a
+    different machine SILENTLY. That has already produced one fabricated incident report. ***
+    *** THE CT MAP CHANGED TODAY: CT204 moved to ptait07 (container IP .162), and billing moved from
+    CT100 on ptait01 to CT120 on corsairai300 (IP .153). Read C:/tmp/HANDOFF-CT-MAP-2026-09-10.md,
+    and re-measure rather than trusting even that. ***
+ 2. FIND THE STALE STACK. On corsairai300/CT105 and any host with matching container names, record
+    image tags, container start dates, and WHICH DATABASE each uses. Compare against the live stack.
+    Decide which is CANONICAL - defined as the one the deploy lane actually writes to, proven by
+    matching a deployed sha, NOT by the container's name.
+ 3. WRITE DOWN the hostname -> stack mapping and the rollback for each: which container to restart,
+    and the compose --env-file path. For mcp-tools that is ALWAYS `--env-file mcp-tools.env`; a bare
+    `docker compose up` is forbidden.
+
+ THE WINDOW (DO NOT RUN - deliver as a runbook for the overseer):
+ 4. `docker stop` the connectors pointing at the non-canonical stack. STOP ONLY, never `rm`, so
+    rollback is a single `docker start`. Set `restart: no` / `pct set onboot 0` so a reboot does not
+    resurrect them.
+ 5. Hit each public hostname with 20 UNIQUE requests and COUNT ARRIVALS in the canonical stack's
+    access log. Status codes prove nothing - a cached 200 has already hidden a dead backend here.
+ 6. Stop the stale stack's containers (stop, not remove), `onboot 0` its CT, keep 7 days, then
+    vzdump and destroy only if nothing broke.
+ 7. Prevent recurrence: rename the containers in the stale compose file, and add a note to the
+    handoff naming the canonical stack and the <host>/CT<id> convention.
+
+ CONSTRAINTS: NO host-level changes on ptait01 without Paxton's explicit go naming change, rollback
+ and quiet window. Do NOT recreate any container sharing a netns with a tunnel
+ (chat.easybutt0n.ai, the billing tunnel) without the reconnect steps - a compose recreate drops the
+ cross-network attach and 502s the site.
+ ALSO KNOWN, UNVERIFIED, AND POSSIBLY CHANGES TRACK B: the infra expert reports that
+ billing.easybutt0n.ai is NOT in the tunnel config at all and its cloudflared says
+ "Unauthorized: Tunnel not found" (deleted Cloudflare-side). If true, some of this premise is stale.
+ MEASURE IT; do not inherit it.
+
+================================================================================
+VERIFICATION
+================================================================================
+ A: the fix branch's preview check is GREEN, and both affected PRs go green after rebasing.
+ B: (window, overseer) each hostname gets 20/20 arrivals on the canonical stack; the Cloudflare
+    connector list shows only the intended connectors; the record that once "did not exist" now
+    resolves through the public URL; 24h later, no intermittent errors.
+ Record the outcome in tasks/ for 2026-09-10 and remove both rows from the
+ "blocked, nobody assigned" table.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Never git add -A; commit by explicit path; check git diff --stat first.
+ - NEVER the bare gateway /health - use /health/liveliness.
+ - Do NOT edit infrastructure/litellm-config.yaml (any edit force-recreates the CT202 prod router).
+ - No secrets in scripts, docs, fixtures or commit messages - env var NAMES only.
+ - Do NOT merge. Deliver the branch/diagnosis and STOP.
+
+DONE MEANS: Track A's repo NAMED and its breaking commit NAMED with the fix, plus an ownership
+decision; Track B's full hostname->stack mapping with rollbacks, and an explicit statement of which
+steps still need Paxton's window. Nothing stopped, nothing deleted, no live traffic touched.
+
+================================================================================
+AMENDMENT 2026-09-16 15:38 PT (session [fe2679]; Paxton's decisions) - READ THE QUEUE NOTE FOR THE STEP 0 MEASUREMENTS
+================================================================================
+ - TRACK A IS REMOVED FROM THIS TASK. Measured: the only red build check on any open PR is powerplatform #105 `build`,
+   owned by task 159. Do not search for a preview check.
+ - TRACK B: connectors and the stale twin are measured (see note). What remains for the run: read each connector's
+   tunnel id + ingress (7 connectors, 4 hosts/CTs listed in the note) and produce the hostname -> connector -> origin
+   table and the rollback list. STOP THERE. The stop of CT105 (`pct stop 105`, `onboot=0`, postgres volume backup
+   first) is Paxton's decision, executed by the OVERSEER in the 144 window. A run never touches a PVE host.
+ - The third 'nobody assigned' item (a green build that runs no tests, pp PR #107 on 09-11) is NOT this task: the fix
+   is a test job in powerplatform ci.yml (task 183) and, fleet-wide, the pr-gate workflow (task 185).

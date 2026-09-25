@@ -1,0 +1,111 @@
+TASK 184 - one MCP container is allowed to eat CT202 and take the PROD LITELLM ROUTER down with it.
+Cap the container memory budgets so a single leaking backend can never OOM the router again, and
+find why azure-mcp-backend grows.
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110: use a FREE mcp-tools tree
+(-b or -c; check which is idle - NEVER two runs on one working tree).
+
+================================================================================
+WHAT HAPPENED - measured 2026-09-16 by overseer tick #331, not inferred
+================================================================================
+
+At 17:16:06 PT the kernel on ptait01 logged:
+
+  oom-kill:constraint=CONSTRAINT_MEMCG, oom_memcg=/lxc/202,
+  task_memcg=/lxc/202/ns/system.slice/docker-5eb9a5e...scope, task=litellm, pid=894368
+  Memory cgroup out of memory: Killed process 894368 (litellm) anon-rss:1376052kB
+
+The PROD LiteLLM router died and entered a restart loop (RestartCount 3 -> 4, health=unhealthy).
+litellm.easybutt0n.ai served 502 and 192.168.21.161:4000 refused connections for ~13 minutes
+(17:16:06 -> 17:29:17, when it returned 200 again).
+
+THE ROUTER WAS NOT THE LEAK. Measured at the time of the kill:
+
+  cognizioware-mcp-tools-azure-mcp-backend   14.59 GiB / 16 GiB     <-- this one
+  cognizioware-mcp-tools-puppeteer-mcp        1.243 GiB / 2 GiB
+  cognizioware-mcp-tools-litellm              745.2 MiB / 6 GiB     <-- the victim
+
+CT202's cgroup was at 20297 MB of its 20480 MB limit with 182 MB available. The kernel picked
+litellm. Restarting azure-mcp-backend took the cgroup to 6.02 GB / 21.47 GB and the router came
+back on its own 9 seconds later. That is the proof of cause: one container, one restart, both the
+CT and the host (38 GB -> 18.9 GB used of 43.6) recovered.
+
+DO NOT CONFUSE THIS WITH TASK 158. Task 158 (`litellm-router-memleak`, PR #150 open) is about the
+ROUTER's own growth. This is a DIFFERENT container. Both can be true; do not close 158 with this.
+
+================================================================================
+THE DEFECT, STATED PLAINLY
+================================================================================
+
+`azure-mcp-backend` carries a 16 GiB memory limit inside a container that has 20 GiB total. So the
+compose file PERMITS a single non-critical MCP backend to consume 80% of CT202 and starve
+everything else in it, including the production router that the entire agent fleet routes through.
+The limit is doing the opposite of its job: it is large enough to guarantee the CT dies first.
+
+--- CORRECTION, MEASURED 2026-09-17 04:39 PT BY SCHEDULED TICK #405 -----------------------------
+THERE IS NO 16 GiB LIMIT. azure-mcp-backend runs with NO memory limit at all.
+  docker inspect -f '{{.HostConfig.Memory}}'  ->  0
+  cgroup memory.max (docker-a854d4f9...scope) ->  max
+  litellm, read the same way, returns 6442450944 (6 GiB) - so the reader distinguishes a real
+  limit from an absent one; "max" is not a read failure.
+The "16 GiB" quoted above (and in the queue note, and in PR #153's own comment) is the DISPLAY
+COLUMN of `docker stats`, which falls back to a total when no limit is set. It was never a
+configured cap. The DEPLOYED compose on CT202 confirms it: mem_limit appears for litellm (6g) and
+the browser services (2g), and NOWHERE in the azure-mcp-backend block.
+
+This makes the defect WORSE, not different: the backend is permitted ALL 20 GiB, not 16.
+
+CONSEQUENCE FOR PR #153 (task/122-ct202-mem-limits, OPEN, MERGEABLE, base main, 15 lines, does not
+touch litellm-config.yaml): it ADDS `mem_limit: 16g` + `memswap_limit: 16g` to azure-mcp-backend.
+That is an improvement on unlimited, but it DOES NOT SATISFY STEP 1 BELOW: 16g (azure) + 6g
+(litellm) + 5x2g (browser services) = 32 GiB of limits inside a 20 GiB CT, so the router can still
+be starved before azure's own cap bites. PR #153's comment argues 16g because azmcp "peaks at
+~15.7 GiB" - but that peak was the LEAK running unbounded, not demand. Do not treat #153 as
+closing this task; either raise its cap budget to fit 20 GiB or supersede it.
+-------------------------------------------------------------------------------------------------
+
+================================================================================
+WHAT TO DO
+================================================================================
+
+1. **Enumerate every service's mem_limit in the CT202 compose file(s)** and total them against the
+   CT's 20 GiB. Show the table and the sum. Expect the sum to exceed the CT by a lot; say by how
+   much. ENUMERATE, do not sample - there are 40+ services.
+
+2. **Give the router headroom that cannot be taken.** Reserve for `litellm` (and postgres, which it
+   depends on) via `mem_reservation`, and bring every MCP backend's `mem_limit` down to a size
+   justified by its MEASURED steady-state usage, not a round number. Record the measurement you
+   sized each one from. `azure-mcp-backend` in particular must not exceed a single-digit GiB.
+
+3. **Find why azure-mcp-backend grows.** Read the service's code and its restart history. Is it an
+   unbounded cache, a session/connection list, an accumulating log buffer, retained Azure SDK
+   responses? **Name the object that grows.** If you cannot prove it within the round budget, say
+   so plainly and ship the caps plus a documented periodic restart - a mitigation you can prove
+   beats a root cause you are guessing at.
+
+4. **Make the next occurrence visible before it is fatal.** Today nothing on any operator surface
+   showed CT202 approaching its memory ceiling - the overseer found it only because a probe hung.
+   Add memory to whatever ops.easybutt0n.ai/overview already renders for CT health. **CHECK WHAT
+   EXISTS AND EXTEND IT** - do not add a new page or a new endpoint (RULE 2, no duplicate surfaces).
+
+5. Add a test or a check that fails when the sum of compose mem_limits exceeds the CT's memory.
+
+================================================================================
+DEPLOY HAZARD - READ BEFORE YOU TOUCH ANY FILE
+================================================================================
+
+ - **Do NOT edit `infrastructure/litellm-config.yaml`.** ANY edit to it, even a comment, hashes
+   differently and FORCE-RECREATES the CT202 prod router on deploy. Nothing in this task needs it.
+ - The compose change WILL recreate the containers it touches. That is expected, and it is why the
+   merge belongs in a window with zero active harness runs - the OVERSEER merges it, not you.
+ - **Open the PR and STOP.** Push with your own token and open the PR. Never merge.
+
+================================================================================
+OUT OF SCOPE
+================================================================================
+
+ - Do not resize CT202 itself and do not change anything on the ptait01 HOST. Host changes need
+   Paxton's explicit go, a rollback plan and a quiet window. If you conclude the CT genuinely needs
+   more RAM, write that as a recommendation with the numbers behind it and stop.
+ - Do not touch the router's own memory behaviour - that is task 158.
+ - No new dashboards, no new MCP servers, no new endpoints.

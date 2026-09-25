@@ -1,0 +1,62 @@
+TASK 204 - record "memory limit exceeded (<limit>)" when a run worker dies from a memory kill (LongHorizon-Harness)
+
+SOURCE: item 3 (and its test, from item 4) of task 202, CUT OUT by overseer tick #655 (2026-09-18 08:58 PT)
+after task 202's run 20260918T144029Z_2c24dc5f timed out three times (r1 executor 1800s, r2 manager 900s,
+r3 executor 1800s). Task 202 keeps the per-run memory isolation itself; this is the rest.
+
+PRECONDITION - SATISFIED, VERIFIED 2026-09-22 17:26 PDT BY SCHEDULED TICK #1555: task 202's PR is
+cogniziocompany/LongHorizon-Harness **#30, MERGED 2026-09-18T23:27:25Z**. PR **#33 (task 208) merged one
+second earlier** and SUPERSEDES #30's mechanism. Build on origin/main; do not rebuild the isolation
+mechanism.
+
+*** SCOPE CORRECTED 2026-09-22 BY TICK #1555, READ FROM origin/main - THE TEXT BELOW WAS WRITTEN AGAINST
+THE PRE-208 DESIGN AND TWO OF ITS PREMISES ARE NOW FALSE:
+  (i) **RLIMIT_AS NO LONGER EXISTS.** `git grep -c RLIMIT_AS origin/main -- src/lh_harness/worker_isolation.py`
+      = 0; task 208 retired the address-space rlimit for a delegated-cgroup `memory.max` subtree. The three
+      live mechanisms are MECHANISM_SCOPE (`systemd-run --scope`), MECHANISM_CGROUP (delegated subtree, the
+      CT110 path) and MECHANISM_UNBOUNDED (log-only, applies NO limit - its deaths must NEVER be attributed
+      to a memory limit). "both mechanisms" below means these three, not scope-vs-rlimit.
+  (ii) **THE CLASSIFIER IS ALREADY WRITTEN - DO NOT REWRITE IT.** `worker_isolation.classify_memory_death`
+      (worker_isolation.py:~575) and `memory_kill_reason` / `is_memory_kill_reason` (:140/:146) are on main
+      with tests in tests/test_worker_rss_bound.py:263. classify_memory_death already returns None for
+      MECHANISM_UNBOUNDED and uses positive evidence only (memory.events oom_kill vs the launch baseline,
+      or a MemoryError traceback in the worker log tail).
+THE ACTUAL REMAINING WORK IS ONE WIRE-UP: **supervisor/service.py never calls classify_memory_death.**
+`git grep -n classify_memory_death origin/main -- src` returns only the definition and a COMMENT at
+service.py:1946. The unconditional string is written at **service.py:1379** ("worker disappeared without a
+final report"), and service.py:1401 re-reads that exact literal to persist a failure report - so a naive
+string swap at :1379 SILENTLY BREAKS :1401. The isolation `record` you need is already built in the same
+class at service.py:~897/:912 (it sets `oom_kill_base`). Use `is_memory_kill_reason` at :1401 rather than
+comparing to the literal. ***
+
+SCOPE (one PR, base main, open the PR and STOP - no merge, no deploy, no service restart):
+1. When a worker dies from a memory kill (cgroup OOM kill of its transient scope, or RLIMIT_AS MemoryError /
+   SIGKILL under the fallback), record failure_reason "memory limit exceeded (<limit>)" instead of
+   "worker disappeared without a final report". Other disappearance causes stay unchanged.
+2. Tests for that mapping, both mechanisms, without needing systemd in the test environment.
+Every pytest call on CT110 MUST be wrapped `( ulimit -v 2500000; timeout 900 ... )` using
+/home/harness/work/LongHorizon-Harness/.venv/bin/python. Commit early: commit the implementation BEFORE
+running the test suite, so a timeout cannot lose it.
+OUT OF SCOPE: the isolation mechanism, the unit file, CT110 memory, SYN_CAP, the running service.
+LIVE = CT110 deploy (overseer's, needs zero active runs).
+
+*** OVERSEER FINDING - SCHEDULED TICK #1560, 2026-09-22 18:17 PDT, READ FROM THE LIVE BRANCH ON CT110 ***
+State of the work at this tick (branch `feat/task-204-memory-death-reason`, head 261ddc4, ahead of
+origin/main by 1, NOT pushed):
+ - SCOPE 1 IS IMPLEMENTED AND COMMITTED: service.py +19/-8 wires worker_isolation.classify_memory_death
+   at :1383, taking the no-report/no-report_reason branch and reading the owner's `memory_isolation`
+   record plus worker.log. This is the correct shape and does NOT do the naive :1379 string swap.
+ - SCOPE 2 IS WRITTEN BUT NOT COMMITTED: tests/supervisor/test_memory_kill_reason.py (10,405 B) is
+   UNTRACKED, and tests/supervisor/test_hardening.py, tests/supervisor/test_supervisor.py,
+   tests/test_resume.py, tests/webapi/test_resume_routes.py are modified-uncommitted. The first attempt
+   (run ...Z_ef0cfa47) died with this same work on disk only; committing it is the priority.
+ - ONE REAL DEFECT IN THE COMMIT, at service.py:1412. The guard on _persist_failure_report was changed
+   from `status=='failed' and failure_reason=='worker disappeared without a final report'` to the bare
+   `status=='failed'`. That does not decouple the literal, it REMOVES the condition, so the failure
+   report is now persisted for EVERY failed run - including runs that delivered a proper final report
+   with their own failure_reason. It contradicts scope 1's "Other disappearance causes stay unchanged".
+   THE FIX the task text already specified: key the guard off the reason via
+   worker_isolation.is_memory_kill_reason (:146), OR-ed with the unchanged disappearance string.
+Injected verbatim into live run ...Z_c1724ef3 as operator message cmd-16c7ffc820e04780 (accepted,
+revision 1, read back from the snapshot). If that run dies before acting on it, the next attempt must
+start from this finding rather than re-deriving it.
