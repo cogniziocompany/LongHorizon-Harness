@@ -1,0 +1,87 @@
+TASK 93 - the cost column is BLIND and the tags are broken. Fix both, or no capacity decision can be measured.
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools.
+
+## WHY THIS IS FIRST, before any routing or capacity work
+
+On 2026-09-09 Synthetic's weekly credit was exhausted in a single day. **Nothing alerted, and nothing
+could have**, because LiteLLM recorded the entire day's spend as **$0.00**.
+
+Measured on CT202, `LiteLLM_SpendLogs`, hourly, synthetic models only:
+
+| hour (Z) | requests | prompt tokens | **spend_usd** |
+|---|---|---|---|
+| 09-09 10 | **1,409** | 77,927,137 | **0.0000** |
+| 09-09 06 | 1,283 | 85,997,455 | **0.0000** |
+| 09-09 05 | 1,173 | 60,213,654 | **0.0000** |
+| 09-09 19 | 1,144 | 66,603,766 | **0.0000** |
+
+**77.9 million prompt tokens in one hour, costed at zero.** Across the day: **11,885 requests, 643M
+prompt tokens, $0.00.**
+
+## THE TWO DEFECTS - separate causes, separate fixes
+
+### 1. NO PRICE IS CONFIGURED FOR THE `:synthetic-anthropic` ALIASES
+LiteLLM cannot cost a model it has no price for, so `spend` is 0.00 on all 11,885 rows. Every
+budget, alert, dashboard and projection built on that column is reading zero.
+
+**This is NOT task 82.** Task 82 is the streaming spend-logging crash
+(`cannot pickle '_thread.RLock'` in `copy.deepcopy` inside `spend_log_error_logger`) which corrupts
+**`completion_tokens`**. This one blinds the **entire cost column** and is separately fixable. Fix
+both; do not conflate them.
+
+### 2. THE TAGS ARE ON THE WRONG DAY'S ROWS
+The harness stamps `x-litellm-tags` with `lh-run/<id>`, `round_00N`, and a role
+(`manager` / `cli_executor` / `cli_auditor`). But:
+
+ - **09-09: 11,884 of 11,885 rows are UNTAGGED** (`request_tags = []`).
+ - **09-08: rows ARE tagged - but carry `prompt_tokens = 0` on every row.**
+
+**So you can have tokens or tags, never both, and neither day is fully attributable.**
+
+**The lead worth chasing:** the tagged rows carry model `glm-5.2:synthetic`, while the untagged rows
+carry `glm-5.2:synthetic-anthropic`. **The `-anthropic` alias variant - the one the harness now uses -
+is the one losing its tags.** Start there.
+
+## SCOPE
+
+1. **Price the aliases.** Add cost-per-token entries for every `:synthetic-anthropic` model (and check
+   the `:cloud` / `:pool` families for the same gap). Use Synthetic's published rates; if a model has
+   no published rate, say so rather than inventing one - **a wrong price is worse than a visible
+   zero**, because it looks authoritative.
+2. **Prove it works.** After the change, a request must produce a **non-zero `spend`** row. Read the
+   row back and show it. A config edit is not proof - the router keeps settings in Postgres
+   (`store_model_in_db: true`) and the YAML is a seed.
+3. **Fix the tag loss on the `-anthropic` variants.** Determine why tags survive on `glm-5.2:synthetic`
+   but not `glm-5.2:synthetic-anthropic` - a route-prefix difference, a header not propagated on that
+   path, or the alias being resolved through a different provider block. **Prove the fix with a tagged
+   row that ALSO has non-zero `prompt_tokens`** - that combination is what does not exist today.
+4. **Then, and only then, add an alert.** A budget or threshold on Synthetic spend that fires BEFORE
+   exhaustion. It is worthless until steps 1-3 land, because it would be watching a zero.
+
+## HARD RULES
+
+ - **Any change to `infrastructure/litellm-config.yaml` FORCE-RECREATES the prod router.** Say so
+   prominently in the PR body so the merge is scheduled into a window with no active runs.
+ - **Do NOT set a spend LIMIT that could block the fleet mid-run** as part of this task. Visibility
+   first; enforcement is a separate, explicitly approved change. A budget that silently starts
+   returning 429 is an outage.
+ - Env NAMES only, never values.
+ - Never `docker compose up` for mcp-tools without `--env-file mcp-tools.env`. No `down -v`.
+ - Do not trigger a Synthetic quota reset - it is spent until ~2026-10-09.
+ - Commit by explicit path; never `git add -A`. Check `git diff --stat` before opening the PR.
+ - PR to `main`, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR against main that prices the `:synthetic-anthropic` aliases with a **read-back row showing
+non-zero spend** as evidence; identifies and fixes why the `-anthropic` variants lose their tags, with
+a **read-back row that is BOTH tagged and has non-zero prompt_tokens**; states plainly which models
+still have no published rate; and proposes (without enabling) an alert threshold that would have fired
+before the 2026-09-09 exhaustion.
+
+## CREDIT
+
+The spend-blindness and tag-split findings are from session `longhorizon-harness-58`, measured
+independently against CT202 and verified by the overseer before this task was written.

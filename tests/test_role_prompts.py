@@ -136,3 +136,35 @@ def test_role_prompts_distinguish_workspace_from_run_records() -> None:
     assert "not require every subtask to create a file" in auditor
     assert "Private Dashboard trajectory images" in auditor
     assert ".longhorizon-evidence" not in auditor
+
+
+@pytest.mark.parametrize("language", ["en", "zh"])
+def test_role_prompts_contain_guard_text(language: str) -> None:
+    """Test that all role prompts contain the guard text about not reaching outside workspace."""
+    from lh_harness.prompt_texts import (
+        MANAGER_INSTRUCTIONS,
+        CLI_EXECUTOR_INSTRUCTIONS,
+        GUI_EXECUTOR_INSTRUCTIONS,
+        CLI_AUDITOR_INSTRUCTIONS,
+        GUI_AUDITOR_INSTRUCTIONS,
+    )
+    
+    # Get the appropriate language strings
+    manager_prompt = MANAGER_INSTRUCTIONS[language]
+    cli_executor_prompt = CLI_EXECUTOR_INSTRUCTIONS[language]
+    gui_executor_prompt = GUI_EXECUTOR_INSTRUCTIONS[language]
+    cli_auditor_prompt = CLI_AUDITOR_INSTRUCTIONS[language]
+    gui_auditor_prompt = GUI_AUDITOR_INSTRUCTIONS[language]
+    
+    # Define the expected guard text snippets for each language
+    if language == "en":
+        guard_snippet = "no run under your role reaches a host outside the workspace by any route"
+    else:
+        guard_snippet = "不会通过任何路径（包括ssh、pct、远程执行代理或网关ssh工具）到达工作区以外的主机"
+    
+    # Check that each role prompt contains the guard text
+    assert guard_snippet in manager_prompt, f"Manager prompt missing guard text for {language}"
+    assert guard_snippet in cli_executor_prompt, f"CLI executor prompt missing guard text for {language}"
+    assert guard_snippet in gui_executor_prompt, f"GUI executor prompt missing guard text for {language}"
+    assert guard_snippet in cli_auditor_prompt, f"CLI auditor prompt missing guard text for {language}"
+    assert guard_snippet in gui_auditor_prompt, f"GUI auditor prompt missing guard text for {language}"

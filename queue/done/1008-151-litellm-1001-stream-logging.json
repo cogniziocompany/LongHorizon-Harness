@@ -1,0 +1,8 @@
+{
+  "name": "1008-151-litellm-1001-stream-logging",
+  "task_file": "C:/tmp/litellm-1001-stream-logging-task.txt",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 1,
+  "trio": "kimi",
+  "note": "*** CLOSED VERIFIED 2026-09-11 10:36 PT by the overseer. *** PR #142 'fix(litellm): v1.100.1 + PR #38998 arity backport, and the cache_namespacer isolation gap' MERGED 2026-09-11T06:25:36Z. PROVEN BY READING THE LIVE SYSTEM, not the merge: CT202 runs image sha256:d85c0b36e2fd (v1.100.1), restarts=0, up since 07:29:21Z; the arity backport is bind-mounted READ-ONLY at /opt/cognizioware-mcp-tools/hooks/litellm_v1_100_1_common_request_processing.py -> site-packages/litellm/proxy/common_request_processing.py; main's cache_namespacer.py line 133 reads 'data = dict(data)' with the comment naming the deepcopy pickle TypeError. LIVE LOG EVIDENCE, last 30 min across 19,094 lines: 'cannot pickle' 0, 'cache_namespacer' 0, arity TypeError 0. A 2026-09-11 plan [8c54cf] proposed doing this work again; it was written against the pre-#142 state and was NOT queued. || PRIOR NOTE: OVERSEER-EXECUTED / WINDOWED - in blocked/ deliberately: it recreates the CT202 PROD router, needs prod credentials, and requires a drained fleet. A run must never restart the router it routes through. Paxton 2026-09-10, plan from session [f335d2]. Upgrade LiteLLM v1.100.0 -> v1.100.1 and BACKPORT upstream PR #38998 as a bind-mounted file (image stays digest-pinned so CI, the e2e version check and the runbook keep working). *** PREMISE VERIFIED BY THE OVERSEER ON THE LIVE PROD ROUTER 21:05 PT - not taken on trust: CT202 is on ptait01 (pct config 202 -> ip=192.168.21.161/24; its name 'cogniziow"
+}

@@ -216,7 +216,13 @@ def test_configured_false_warns_only_missing_when_partial(_isolate_reporter, cap
 
 
 def test_hmac_signature_correct(http_server, _isolate_reporter):
-    """Requests carry HMAC-SHA256 over the raw (gzipped) body."""
+    """Requests carry HMAC-SHA256 over the JSON body (what fleet-admin verifies).
+
+    fleet-admin inflates a gzip body before its HMAC check (express.json
+    ``verify`` receives the decoded buffer), so the signature must cover the
+    JSON bytes, not the compressed stream. A signature over the gzip bytes is
+    exactly the bug that produced 9,098 ``bad signature`` rejections.
+    """
     _setenv(http_server, "test-node", "secret-key", None)
     reporter = get_reporter(reset=True)
     assert reporter.enabled
@@ -228,8 +234,11 @@ def test_hmac_signature_correct(http_server, _isolate_reporter):
     assert _StubHandler.requests, "request should have reached stub"
     req = _StubHandler.requests[0]
     assert req["path"] == "/harness/heartbeat"
-    assert _hmac_match(req["raw"], req["headers"], "secret-key", "test-node")
     assert req["headers"].get("Content-Encoding") == "gzip"
+    inflated = gzip.decompress(req["raw"])
+    assert _hmac_match(inflated, req["headers"], "secret-key", "test-node")
+    # And explicitly NOT over the wire bytes (the pre-fix behaviour).
+    assert not _hmac_match(req["raw"], req["headers"], "secret-key", "test-node")
 
 
 def test_batching_groups_events(http_server, _isolate_reporter):
@@ -519,6 +528,184 @@ def test_parse_labels():
     assert _parse_labels("") == {}
     assert _parse_labels("  a = b , c=d  ") == {"a": "b", "c": "d"}
     assert _parse_labels("no-equals") == {}
+
+
+# Audited failure envelope for the old full-run-list heartbeat (round_001):
+# 532 runs -> 5,469,390 bytes JSON / 1,698,083 bytes gzipped, ~10,280 B per run.
+_AUDITED_GZIP_BYTES = 1_698_083
+_HEARTBEAT_WIRE_BUDGET = 256 * 1024  # 256 KiB, ~15% of the audited gzipped size
+
+_TERMINAL_STATUSES = ("completed", "failed", "cancelled", "blocked", "incomplete")
+
+
+def _run_dict(i: int, status: str, *, fat: bool = False) -> dict[str, Any]:
+    """Build one registry-style run summary as produced by ``build_run_summary``."""
+    run = {
+        "id": f"20260922T000000Z_{i:08d}",
+        "status": status,
+        "updated_at": float(i),
+        "log_dir": f"/home/harness/work/runs/run-{i:08d}/lh_harness",
+        "model": "kimi-k2.7-code:cloud",
+        "repo": "LongHorizon-Harness",
+        "workspace": "/home/harness/work",
+    }
+    if fat:
+        # Terminal runs on a long-lived node carry large task summaries
+        # (~10 KB each on CT110); the heartbeat must not depend on their size.
+        run["task"] = f"task {i} " + "x" * 10_000
+    else:
+        run["task"] = f"task {i}"
+    return run
+
+
+def _store_of_532(fat_terminal: bool = True) -> list[dict[str, Any]]:
+    """532 runs mirroring the audited CT110 store: 2 active, 530 terminal."""
+    runs = [
+        _run_dict(0, "running", fat=fat_terminal),
+        _run_dict(1, "waiting_approval", fat=fat_terminal),
+    ]
+    for i in range(530):
+        runs.append(_run_dict(i + 2, _TERMINAL_STATUSES[i % len(_TERMINAL_STATUSES)], fat=fat_terminal))
+    return runs
+
+
+def test_heartbeat_excludes_terminal_runs_and_reports_counts(
+    http_server, _isolate_reporter
+):
+    """runs[] carries only non-terminal runs; the whole store is aggregated."""
+    _setenv(http_server, "bound-node", "bound-key", "kind=ct110")
+    reporter = get_reporter(version="1.1.0", capacity=5, reset=True)
+    assert reporter.enabled
+
+    store = _store_of_532()
+    reporter.queue_heartbeat(store, active=2, cap=5, queue_len=0)
+    reporter.stop(timeout=30.0)
+
+    requests = [r for r in _StubHandler.requests if r["path"] == "/harness/heartbeat"]
+    assert len(requests) == 1
+    body = requests[0]["body"]
+
+    # Only the two non-terminal runs are serialized.
+    sent_runs = body["runs"]
+    assert {r["runId"] for r in sent_runs} == {
+        "20260922T000000Z_00000000",
+        "20260922T000000Z_00000001",
+    }
+    statuses = {r["status"] for r in sent_runs}
+    assert statuses == {"running", "waiting_approval"}
+    assert statuses.isdisjoint(set(_TERMINAL_STATUSES))
+
+    # Aggregates cover the entire store.
+    assert body["runsTotal"] == 532
+    assert body["runsByStatus"] == {
+        "running": 1,
+        "waiting_approval": 1,
+        "completed": 106,
+        "failed": 106,
+        "cancelled": 106,
+        "blocked": 106,
+        "incomplete": 106,
+    }
+    assert body["runsTruncated"] is False
+
+    # Fleet-plane contract fields are unchanged.
+    assert body["node"]["name"] == "bound-node"
+    assert body["capacity"] == {"active": 2, "cap": 5}
+    assert body["queueLen"] == 0
+
+
+def test_heartbeat_payload_far_below_failure_envelope(
+    http_server, _isolate_reporter
+):
+    """A 532-run store of terminal runs must stay far under the audited envelope.
+
+    The old full-list heartbeat measured 5,469,390 B JSON / 1,698,083 B gzipped
+    and was rejected with HTTP 413.  With terminal runs aggregated the wire
+    payload must be small regardless of how large the terminal summaries are.
+    """
+    _setenv(http_server, "small-node", "small-key", None)
+    reporter = get_reporter(version="1.1.0", capacity=5, reset=True)
+
+    store = _store_of_532(fat_terminal=True)
+    reporter.queue_heartbeat(store, active=2, cap=5, queue_len=0)
+    reporter.stop(timeout=30.0)
+
+    requests = [r for r in _StubHandler.requests if r["path"] == "/harness/heartbeat"]
+    assert len(requests) == 1
+    req = requests[0]
+    body = req["body"]
+
+    assert body["runsTotal"] == 532
+    assert len(body["runs"]) == 2
+    assert len(body["runs"]) <= 200
+    # Far below the audited failure envelope: gzipped wire bytes, and the
+    # decompressed JSON the fleet plane would parse.
+    assert len(req["raw"]) < _HEARTBEAT_WIRE_BUDGET
+    assert len(json.dumps(body).encode("utf-8")) < _HEARTBEAT_WIRE_BUDGET
+    # Sanity anchor against the measured rejection: >8x smaller, not marginally.
+    assert len(req["raw"]) * 8 < _AUDITED_GZIP_BYTES
+
+
+def test_heartbeat_caps_active_runs_with_truncation_flag(
+    http_server, _isolate_reporter, caplog
+):
+    """More than 200 active runs: keep the 200 most recent, flag truncation."""
+    _setenv(http_server, "cap-node", "cap-key", None)
+    reporter = get_reporter(version="1.1.0", capacity=5, reset=True)
+
+    store = [_run_dict(i, "running") for i in range(250)]
+    with caplog.at_level(logging.INFO, logger="lh_harness.fleet.reporter"):
+        reporter.queue_heartbeat(store, active=5, cap=5, queue_len=0)
+    reporter.stop(timeout=30.0)
+
+    requests = [r for r in _StubHandler.requests if r["path"] == "/harness/heartbeat"]
+    assert len(requests) == 1
+    body = requests[0]["body"]
+
+    sent_runs = body["runs"]
+    assert len(sent_runs) == 200
+    assert body["runsTruncated"] is True
+    # The kept runs are the most recent by updated_at: ids 50..249.
+    kept_ids = {int(r["runId"].split("_")[1]) for r in sent_runs}
+    assert kept_ids == set(range(50, 250))
+    # Aggregates still describe every run, not just the capped page.
+    assert body["runsTotal"] == 250
+    assert body["runsByStatus"] == {"running": 250}
+
+    truncation_logs = [
+        r for r in caplog.records
+        if r.name == "lh_harness.fleet.reporter" and "capping active runs" in r.getMessage()
+    ]
+    assert truncation_logs, "active-run capping should be logged at INFO"
+
+
+def test_heartbeat_counts_unknown_status_as_non_terminal(
+    http_server, _isolate_reporter
+):
+    """Blank/unknown statuses are reported, not dropped: they count and stay in runs[]."""
+    _setenv(http_server, "unknown-node", "unknown-key", None)
+    reporter = get_reporter(version="1.1.0", capacity=2, reset=True)
+
+    store = [
+        {"id": "run-known", "status": "completed", "updated_at": 3.0},
+        {"id": "run-blank", "status": "", "updated_at": 2.0},
+        {"id": "run-odd", "status": "weird_future_state", "updated_at": 1.0},
+    ]
+    reporter.queue_heartbeat(store, active=0, cap=2, queue_len=0)
+    reporter.stop(timeout=30.0)
+
+    requests = [r for r in _StubHandler.requests if r["path"] == "/harness/heartbeat"]
+    assert len(requests) == 1
+    body = requests[0]["body"]
+    assert body["runsTotal"] == 3
+    # "completed" is terminal and excluded; the unknowns canonicalize to
+    # non-terminal statuses and are serialized.
+    sent_ids = {r["runId"] for r in body["runs"]}
+    assert sent_ids == {"run-blank", "run-odd"}
+    assert body["runsByStatus"]["completed"] == 1
+    assert body["runsByStatus"]["idle"] == 1
+    assert body["runsByStatus"]["weird_future_state"] == 1
+    assert body["runsTruncated"] is False
 
 
 def test_round_content_path_traversal(tmp_path):

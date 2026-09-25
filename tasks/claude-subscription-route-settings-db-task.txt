@@ -1,0 +1,90 @@
+TASK 164 - Claude subscription as a per-role harness route THROUGH LiteLLM, plus harness settings in a
+database instead of env vars.
+
+SOURCE: planning session [3f5e1b] (3f5e1b89-af3d-42f8-99b9-6a6f02566ff5), plan mode, 2026-09-10 23:56 PT,
+plan file C:/Users/PaxtonTait/.claude/plans/melodic-spinning-stallman.md. Bridged 2026-09-11 by [fe2679]:
+no ledger entry for [3f5e1b]; no queue task mentions the subscription route or a settings store.
+
+REPO / WORKSPACE: LongHorizon-Harness   (Phase 0 also touches the CT202 LiteLLM router - overseer)
+
+WHY: Paxton was told the harness "could not have backends tied to Claude Code". That is wrong: every
+queued role already uses the claude_code backend, pointed at LiteLLM with non-Claude models. GOAL: let any
+role use the Claude subscription WHILE STILL GOING THROUGH LITELLM, so spend, Langfuse and x-litellm-tags
+keep working. Separately, move settings out of env vars into a DB.
+
+MECHANISM: Claude Code sends its subscription OAuth token as Authorization: Bearer <CLAUDE_CODE_OAUTH_TOKEN>.
+LiteLLM authenticates the caller from a separate x-litellm-api-key header and, with
+forward_client_headers_to_llm_api, forwards the OAuth header to Anthropic. Billed to the subscription,
+still logged under the lh-harness key. Token valid ~1 year (claude setup-token).
+
+================================================================================
+PHASE 0 - PROVE THE ROUTE ON CT202 BEFORE WRITING CODE.  *** STOP GATE. OVERSEER-EXECUTED. ***
+================================================================================
+ - LiteLLM has had OAuth-forwarding bugs: issue #19618 (sk-ant-oat not forwarded -> "x-api-key
+   required"). FIRST read CT202's LiteLLM version (v1.100.1 as of PR #142, 2026-09-11 - re-read it).
+ - Register claude-opus-5:subscription / claude-sonnet-5:subscription (anthropic/claude-...) through
+   POST /model/new. That is a DB row and does not recreate the router (store_model_in_db: true).
+   Enable header forwarding FOR THIS MODEL GROUP ONLY if the version supports it. Otherwise note that
+   the global flag also affects the other routes, and DECIDE BEFORE turning it on.
+ - Probe from CT110 with a UNIQUE prompt (the response cache hides a dead backend):
+     curl $LITELLM/v1/messages -H "x-litellm-api-key: Bearer $LH_KEY" -H "Authorization: Bearer $OAUTH"
+   PASS: 200, served model reads as Claude, request appears in LiteLLM spend logs under lh-harness.
+   IF IT FAILS, STOP AND REPORT. Do not fall back to bypassing LiteLLM.
+ - Bridge note: the overseer NEVER posts @claude comments (task 117) because that bills Paxton's
+   subscription; this route bills the SAME subscription for harness rounds. Paxton accepted that for
+   the hydra reviewer (OPEN-ASKS hydra-26). Confirm the SPEND decision for harness roles before
+   Phase 1 leaves one opt-in trio. Quota is shared with the PR reviewer and interactive sessions.
+
+================================================================================
+PHASE 1 - HARNESS CODE: a per-role `auth` mode   (harness run; release from blocked/ after Phase 0)
+================================================================================
+Values: key (default) and subscription. Only valid for claude_code; any other backend with
+subscription fails fast.
+ - adapters/claude_code.py: on subscription, keep ANTHROPIC_BASE_URL (LiteLLM); do NOT set
+   ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN and add both to _env_unset_keys for every role
+   (_EnvUnsetWrapper ~L249). Put the LiteLLM key into ANTHROPIC_CUSTOM_HEADERS as
+   "x-litellm-api-key: Bearer ..." and MERGE with the existing x-litellm-tags header (~L217-223) as a
+   newline-separated list, not a replacement. On key, strip CLAUDE_CODE_OAUTH_TOKEN so a LiteLLM-key
+   role can never pick up the subscription by accident.
+ - cli.py: add --auth plus --manager-auth / --executor-auth / --auditor-auth, following the existing
+   --*-reasoning-effort registration and _resolve_role_option. In build_role_agent (~L1831) pass auth
+   through _build_agent (~L2295). ADD auth TO THE agent_cache KEY (~L1840). In
+   _public_role_configs_from_args (~L2165) record auth so the run manifest shows which role billed where.
+ - Queue/web role dicts gain an optional "auth", mapped the way reasoning_effort is (queue.py,
+   webapi/server.py, config.py).
+ - C:/tmp/launch_queue.py: a trio row can mark a role auth:"subscription" with a :subscription model;
+   the emit probe sends the same two headers. START WITH ONE OPT-IN TRIO (auditor on the subscription).
+   Bridge note: the PC launcher is being retired for the CT110 queue (audit section A); put the trio
+   row in the CT110 Launcher's role selection if the cutover has happened by then.
+
+================================================================================
+PART 2 - APP SETTINGS IN A DATABASE INSTEAD OF ENV VARS   (harness run; independent of Phase 0)
+================================================================================
+Correction: CT110 is NOT an image deploy - it is systemd lh-harness on a root-owned venv
+(/home/harness/venv). Only fleet nodes use the image.
+ - New src/lh_harness/settings_store.py: SQLite at $LH_HARNESS_STATE_ROOT/settings.db, table
+   settings(key PK, value, is_secret, updated_at, updated_by) + append-only settings_audit.
+   One accessor get_setting(key, default) resolving DB -> env -> default.
+ - Replace direct env reads at mcp_profiles.py:119, fleet/reporter.py:34, model_catalog.py:227, the
+   adapters' *_MCP_CONFIG reads, and web defaults in cli.py / webapi.
+ - Bootstrap values STAY in env: LH_HARNESS_WEB_TOKEN, LH_HARNESS_STATE_ROOT, CODEX_HOME, PWD, SESSIONNAME.
+ - Live updates: settings read per run/episode at adapter construction, not cached at process start,
+   so a change applies to the NEXT episode with no restart.
+ - Bridge note: task 134 is putting the QUEUE in Postgres (schema harness, db lh_harness on CT103).
+   Settings in SQLite next to a Postgres queue is a second store; say in the PR why SQLite (or move
+   settings to the same harness schema). Do not duplicate 134's migrations.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Secrets by ENV NAME only: CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN,
+   ANTHROPIC_BASE_URL, LITELLM_MASTER_KEY, LH_HARNESS_WEB_TOKEN, LH_HARNESS_STATE_ROOT,
+   LH_HARNESS_MCP_GATEWAY_KEY, LH_HARNESS_FLEET_KEY. Never in a file, note or PR.
+ - Never bypass LiteLLM. Never touch CT202 from a harness run. Do not post @claude comments.
+ - DO NOT MERGE. Commit by explicit path, then `git push` and `gh pr create` YOURSELF and STOP -
+   your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14 16:21 PT. (The old
+   'CT110 has no gh; the overseer pushes' note is RETIRED - corrected by scheduled tick #183.)
+
+SLICING PRE-AUTHORISED: 164a = Part 2 settings store (can run now); 164b = Phase 1 auth mode (after
+Phase 0 passes). If the overseer releases 164a first, copy this file's Part 2 and hard rules into its
+own task text rather than pointing two entries at one file.

@@ -1,0 +1,42 @@
+TASK 200 - wire the workspace branch guard into POST /api/runs (LongHorizon-Harness)
+
+MEASURED 2026-09-18 00:12 PT (overseer tick #555), do not re-derive:
+- PR #25 (task 195, merged e1a4fc79) added src/lh_harness/workspace_guard.py and calls
+  prepare_workspace_base() ONLY from Launcher._launch in src/lh_harness/launcher.py - the
+  server-side /api/queue path.
+- The fleet's real launches do not use that path. C:/tmp/launch_queue.py:808 creates every run with
+  POST /api/runs (src/lh_harness/webapi/server.py, @app.post("/api/runs")), which goes straight to
+  supervisor.create_run. So the guard covers none of the launches that produced the defect.
+- The defect is live on CT110 now: work/cognizioware-mcp-tools sits on fix/mcp-namespace-remainder
+  with 37 dirty paths, work/LongHorizon-Harness on feat/task-186-review-runs with a dirty review.py.
+
+DO:
+1. Call prepare_workspace_base() in the POST /api/runs create path, before supervisor.create_run,
+   with the same semantics Launcher._launch uses (worktree mode -> pass base.workspace; include
+   base.summary() in the run-created event). Prefer ONE shared helper used by both call sites over a
+   second copy of the try/except.
+2. On WorkspaceBaseError return HTTP 409 with the reason in the body. Do not create the run.
+3. HARD REQUIREMENT, unchanged from 195: NEVER destroy leftover work. No reset, no clean, no stash
+   drop, no checkout that discards changes. Failing loudly beats launching onto a foreign branch.
+4. Tests beside tests/webapi/test_launcher_workspace_guard.py: clean default branch passes through
+   unchanged; dirty foreign branch yields a worktree base and leaves the original tree byte-identical;
+   refused base -> 409 and no run row; probe_open_pr disabled path.
+5. Run the FULL suite on Linux (583 passed / 2 skipped on main at e1a4fc79 is the baseline).
+
+DO NOT: touch launch_queue.py, change the round-zero record (task 180), fix the 429 failure_cause
+regression, or deploy. Push the branch, open the PR yourself, and STOP. Merging and the CT110 deploy
+are the overseer's.
+
+
+=== OVERSEER CORRECTION (tick #598) - NARROWING ONLY, overrides the task text where they differ.
+
+This is a RELAUNCH. The work is ALREADY DONE and pushed: branch task-200-workspace-guard-webapi, head d1516b1, PR #28. Do NOT rebuild it and do NOT open a new PR.
+
+The previous run was killed at 10:56:14Z because a full pytest run ballooned to 5.7 GB and the container OOM-killed the whole harness service, taking another run with it.
+
+REMAINING SCOPE, nothing else:
+1. d1516b1 has ONE regression: tests/test_supervisor.py::test_run_summary_and_snapshot_expose_launch_provenance gets 400 instead of 200, because a workspace that is NOT a git repo now returns 400. It passes on main e1a4fc7. Make the guard a no-op/pass-through for a non-git workspace (the launcher path must behave the same) and add a test for that.
+2. Push to the SAME branch / PR #28.
+3. EVERY pytest call MUST be wrapped: ( ulimit -v 2500000; timeout 900 /home/harness/work/LongHorizon-Harness/.venv/bin/python -m pytest ... ) with PYTHONPATH=src. The worktree's task-200/venv is EMPTY (no pytest, no fastapi) - do not use it. Never run pytest unwrapped.
+4. If a test dies with MemoryError under the cap, NAME it in the PR and stop - do not raise the cap.
+5. STOP after the push. Do not merge.

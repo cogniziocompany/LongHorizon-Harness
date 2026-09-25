@@ -1,0 +1,365 @@
+TASK 101 - sessions NEVER dispatch a build, and the dual build path was never wired.
+*** TOP PRIORITY - PAXTON, 2026-09-09: "add as a new task TOP priority ... more issue in live
+powerplatform PRODUCTION." ***
+
+REPO: cogniziocompany/cognizioware-powerplatform. Workspace on CT110:
+/home/harness/work/cognizioware-powerplatform. Branch from **origin/develop**.
+
+Source: plan `breezy-floating-river.md`, session `01ec251f-1b4a-4a48-a9a9-10e8a4521c04`, audit
+performed 2026-09-09 ~22:27-22:50 UTC from PTAIT09. Plan file:
+C:\Users\PaxtonTait\.claude\plans\breezy-floating-river.md
+
+================================================================================
+PROD DEPLOY IS AUTHORISED. PAXTON LIFTED THE HOLD 2026-09-09.
+================================================================================
+
+Paxton: "get these deploy all the changes needed for powerplatform prod since i cannot test
+anymore and need these bugs fixed as they are blockers."
+
+The earlier "DO NOT DEPLOY - Paxton is testing" instruction in this task is **SUPERSEDED**. He can
+no longer test AROUND these bugs, so shipping them is what unblocks him. Build it, prove it on dev,
+then ship it.
+
+WHAT "SHIP" MEANS HERE - AND IT IS NOT "MERGE TO main":
+**Production already runs DEVELOP-derived images.** The live container is
+`app:sha-f2a3633`, and `f2a3633` is on `origin/develop` and `fix/prod-pin-and-billing-errors` -
+it is NOT on `origin/main`. Measured independently twice on 2026-09-09.
+  - `develop` is **142 commits ahead of and 33 behind `main`**, so a develop->main promotion is not
+    a fast-forward and is not this task's job.
+  - The standing hold on powerplatform `main` still stands. **Do NOT merge to main.**
+  - Ship the way prod already got f2a3633: land on `develop`, then deploy through the normal
+    pipeline. **NEVER hand-deploy** - that is exactly how the unpromoted-code finding arose.
+
+STILL BINDING:
+ - **Verify on dev FIRST** (`http://192.168.21.163:3000`). A fix that has not run on dev does not
+   go to prod.
+ - **DO NOT TOUCH CT110** - other agents run deployment-pipeline work there.
+ - Prod is the corsairai300 **host-level** stack, NOT CT105. CT105 is a stale decoy with identical
+   container names whose newest session is 2026-06-09. Deploying to CT105 changes nothing a user
+   can see.
+ - Report, don't act on, the CT105 stack and the duplicate cloudflared replica.
+ - If a gate goes red, STOP and report. "He said ship it" is not a reason to push past a failing
+   gate - a broken prod is worse than a blocked test.
+
+================================================================================
+THE SYMPTOM
+================================================================================
+
+Session `023aab18-5fa6-418c-a997-b3ab53529bff` (`trms99`, owner paxton@cognizio.company, created
+2026-09-09 22:27:59 UTC, target env `4d4ffe7f-1a69-40a6-90d6-a93069f070fb` = Cogniziodemo) hung
+permanently on **"Starting... Step 0 of 7"**, gate badge `Discovery`, with **no error, no incident
+row, and no n8n execution** - because **no build was ever dispatched.**
+
+Live DB state - nothing failed, because nothing ever started:
+
+    status / session_v2.phase                 setup
+    gate_state                                discovery_started
+    setup_step                                1
+    solution_mode / display_name / unique_name  ALL NULL/empty   <- quick-create origin
+    session_setup_steps rows                  0
+    incidents rows                            0
+    n8n_execution_id                          NULL
+    build_status / build_dispatched_at        pending / NULL
+
+Prod app log for the session, matching Path A byte-for-byte - note what is absent:
+
+    POST /                          201    <- POST /api/sessions (quick-create)
+    POST /<id>/attachments  x3      201    <- 3 spec files
+    GET  /<id>, /status, /setup/status, /docs  200   <- workspace polling
+                                           <- NO POST /<id>/setup/start, EVER
+
+`SELECT DISTINCT solution_mode FROM sessions` in prod returns **NULL only** - so the wizard path
+has effectively never completed a dispatch either.
+
+================================================================================
+FINDING 1 - NO CREATION PATH DISPATCHES A BUILD (orphaned endpoint)
+================================================================================
+
+`POST /api/sessions/:id/setup/start` (`packages/backend/src/routes/session.routes.ts:590`) is
+FULLY IMPLEMENTED - it calls `startSessionSetup(...)`, which writes `session_setup_steps` and
+dispatches the build. Verified by `git grep "setup/start"` against deployed `f2a3633`,
+`origin/develop` and `origin/main`: **ZERO frontend callers on ANY branch.**
+
+`GET .../setup/status` (same file, line 175) derives progress from `session_setup_steps`. Empty
+table -> `currentStep` is `null` -> **"Step 0 of 7" forever.**
+
+PATH A - SessionList quick-create (`packages/frontend/src/sessions/SessionList.tsx:197`
+`createSession()`). This created the stuck run. It does exactly three things:
+
+    POST /api/sessions                    { title, targetEnvironmentId, userRequirements }
+    POST /api/sessions/:id/attachments    x each file
+    navigate(`/sessions/${session.id}`)   // and that is it. No mode, no dispatch.
+
+PATH B - the wizard. `SolutionStep` -> `SpecsStep` -> `ReviewStep`. `persistStep` correctly saves
+`solutionMode` / `solutionUniqueName` / `solutionDisplayName`, but the Start button only navigates
+(`packages/frontend/src/sessions/wizard/SessionWizard.tsx:205`):
+
+    onStart={() => {
+      if (!sessionIdLocal) return;
+      navigate(`/sessions/${sessionIdLocal}/setup/status`);   // navigates, never POSTs
+    }}
+
+### THE FIX
+
+**Path B (wizard)** - dispatch before navigating, reusing the file's EXISTING `apiFetch` /
+`saving` / `setError` machinery (already used by `persistStep` and `handleCancel`) so the button
+disables and errors surface instead of navigating into a dead screen:
+
+    onStart={async () => {
+      if (!sessionIdLocal) return;
+      setSaving(true);
+      try {
+        await apiFetch(`/api/sessions/${sessionIdLocal}/setup/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sprintLengthDays: state.sprintLength, sessionMode: state.mode }),
+        });
+        navigate(`/sessions/${sessionIdLocal}/setup/status`);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Could not start setup');
+      } finally {
+        setSaving(false);
+      }
+    }}
+
+*** THE ROUTE USES `upload.none()` (multer) AND READS `{ sprintLengthDays, sessionMode }` FROM
+`req.body`. CONFIRM WHETHER IT PARSES JSON OR EXPECTS FORM-ENCODED. Guessing wrong fails SILENTLY
+in exactly the way this bug already does. VERIFY WITH A REAL RUN, NOT A TYPE-CHECK. ***
+
+**Path A (quick-create)** - decide and make it EXPLICIT. Either dispatch after creating (defaulting
+mode per Finding 2), or remove the quick-create form and funnel users into the wizard. Leaving it
+as-is keeps producing dead sessions. **Recommendation: dispatch** - the form already collects
+`userRequirements`, the only input the build strictly needs.
+
+**FAIL LOUDLY** - in the status screen, if `phase === 'setup'` with zero step rows after ~60s,
+render an actionable error plus a retry wired to the existing
+`POST /api/sessions/:id/setup/retry` (`session.routes.ts:614`), instead of an indefinite spinner.
+**A spinner that never resolves is the reason this sat undiagnosed.**
+
+### UNSTICKING THE EXISTING RUN - Paxton's call, not the harness's
+Row, specs and attachments are all intact; nothing needs re-entering. It has no `solution_mode`, so
+set one (or let the Finding 2 default apply), then
+`POST /api/sessions/023aab18-5fa6-418c-a997-b3ab53529bff/setup/start` authenticated as
+paxton@cognizio.company (the route enforces `ownsSessionOr404`). `.../setup/retry` if it has gone
+stale. **Do not do this from the harness run against prod - propose it and let Paxton run it.**
+
+================================================================================
+FINDING 2 - THE DUAL BUILD PATH IS NOT WIRED (the main new work)
+================================================================================
+
+WHAT EXISTS TODAY. `startSessionSetup` -> `dispatchDesignAgents`
+(`packages/backend/src/services/session-setup.service.ts:464`) forks between **two n8n webhooks** -
+NOT between n8n and the graph engine:
+
+    const brownfieldPath = env.BMAD_DESIGN_BROWNFIELD_WORKFLOW_ID;
+    const greenfieldPath = env.N8N_START_WEBHOOK_PATH;
+    const startPath = params.sessionMode === 'brownfield' && brownfieldPath ? brownfieldPath : greenfieldPath;
+
+Mode resolves at line 666 as `input.sessionMode ?? session.solution_mode ?? 'greenfield'`.
+
+THE GRAPH ENGINE IS FULLY BUILT AND COMPLETELY DISCONNECTED. `packages/backend/src/factory/`
+(`orchestrator.ts`, `worker-runner.ts`, `pg-factory-repo.ts`, `factory-state.ts`,
+`validate-run.ts`) is instantiated and mounted at `/api/factory`
+(`packages/backend/src/index.ts:97-114`), exposing `POST /api/factory/run`
+(`routes/factory.routes.ts:164`). But:
+
+  - **ZERO frontend callers** of `/api/factory` on any branch - the same orphan pattern as
+    `setup/start`
+  - `factory_runs` = **0 rows in dev, uat AND prod** - it has never executed, anywhere
+  - `factory_runs` has **no `session_id` column** (migration `026_factory_runs.sql`), so a run
+    cannot even be linked to a session
+
+THE ROUTING SIGNAL ALREADY EXISTS AND NEEDS NO NEW SCREEN.
+`packages/frontend/src/sessions/wizard/SolutionStep.tsx` already presents the dual choice - type a
+new name -> `mode: 'greenfield'` (line 103); pick an existing unmanaged solution ->
+`mode: 'brownfield'` (line 97), under the copy *"Pick a name for the new Cognizio workspace, or
+choose an existing unmanaged solution to extend."* It persists to `sessions.solution_mode`.
+**The user-facing screen is DONE. Only the backend fork is missing.**
+
+### THE CHANGE - route on `solution_mode`, invisibly to the user
+
+    solution_mode   meaning                              engine
+    brownfield      extending a pre-existing solution    LEGACY n8n - existing dispatchDesignAgents
+    greenfield      new solution                         GRAPH/FACTORY - FactoryOrchestrator.startRun
+
+1. **Migration `028_factory_run_session.sql`** (highest existing is `027`; follow the repo's
+   `CREATE ... IF NOT EXISTS` + `-- DOWN` convention) - add nullable
+   `session_id UUID REFERENCES sessions(id) ON DELETE CASCADE` to `factory_runs`, plus an index.
+   Needed to correlate a run with its session and to drive `setup/status`.
+   **NOTE: this repo is NOT mcp-cognizioware - the hand-write-migrations rule is that repo's. Here,
+   follow THIS repo's existing migration convention.**
+
+2. **Fork in `startSessionSetup`** (`session-setup.service.ts:661`) - branch on the resolved `mode`
+   BEFORE `dispatchDesignAgents`. **Reuse the existing `FactoryOrchestrator` instance from
+   `index.ts:98-105` rather than constructing a second one**; pass it in as a dependency so it
+   stays unit-testable.
+
+3. **Map session -> `StartRunInput`.** `POST /api/factory/run` validates against
+   `StartRunPayloadSchema` and requires `goal`, `runSha` and target env fields, then calls
+   `validateFactoryTarget(...)`. Map the session's composed requirements -> `goal`; reuse the
+   environment's name/type for the target fields.
+   *** `validateFactoryTarget` ENFORCES THE PRODUCTION GUARDRAIL (`is_production` ack). Going
+   through the orchestrator keeps that intact - so call `orchestrator.startRun` (or the route's own
+   validation helpers), NEVER the repo directly. Bypassing it would let a session build straight
+   into a production Dataverse environment. ***
+
+4. **Unify progress reporting.** `GET .../setup/status` reads only `session_setup_steps`. Graph
+   runs record progress in `factory_run_phases`. Either have the factory path ALSO write
+   `session_setup_steps` rows (smaller change, keeps one status contract and the "Step N of 7" UI
+   intact - **PREFERRED**), or teach `setup/status` to read both. Pick one DELIBERATELY:
+   **a graph run that reports no steps reproduces the exact hang in Finding 1.**
+
+5. **Default for sessions with no mode** - every existing prod session has `solution_mode = NULL`.
+   Line 666 currently defaults `greenfield`, which under this change routes to the **graph engine
+   that has never executed a single run anywhere.** Make that choice EXPLICIT and argued, not
+   incidental. Quick-create sessions (Path A) hit this default. Defaulting every legacy session
+   onto a never-run engine is a decision worth stating out loud in the PR.
+
+Keep the fork **server-side only**. No new UI, no new copy, no exposure of which engine ran.
+
+================================================================================
+FINDING 3 - "Session (per Solution)" UX RELABEL
+================================================================================
+
+A full `Session` -> `Solution` rename was scoped and **REJECTED**: "Solution" is already a
+load-bearing noun (a Session HAS a Dataverse Solution via `solution_display_name` /
+`solution_unique_name` / `solution_mode`; the demo environment alone holds 128). Renaming would
+yield `solution.solution_unique_name`. **DECISION: relabel in the web UX ONLY.** Do not reopen.
+
+SCOPE: **user-visible strings only.** No changes to tables, columns, API routes, URL paths,
+component names, props or identifiers. `/sessions/:id` URLs stay.
+
+Apply the qualifier where the concept is INTRODUCED or NAMED; do not paste it into every string
+(`"+ New Session (per Solution)"` reads badly).
+
+  GETS THE QUALIFIER - list heading, nav entry, breadcrumb, admin tab:
+    packages/frontend/src/App.tsx:30,36            route label: 'Sessions'
+    packages/frontend/src/sessions/SessionList.tsx:289 (breadcrumb), :308 (`Sessions in ${envName}`)
+    packages/frontend/src/admin/AdminPage.tsx:973  admin tab
+    breadcrumb label 'Sessions' ALSO in sessions/SessionDetail.tsx:141,
+      workspace/WorkspaceLayout.tsx:262, flow/FlowVisualizer.tsx:188
+  STAYS UNQUALIFIED - actions, placeholders, tooltips, aria-labels:
+    '+ New Session', 'Create Session', 'Session title (optional)', 'Untitled Session',
+    'Session actions', 'Session is locked during setup', ui/ProcessStrip.tsx:28 'Session setup'
+
+**The breadcrumb literal is duplicated across FOUR files - define it once** (a shared constant
+beside the existing crumb builders, or in `packages/frontend/src/ui/`) and import it, rather than
+editing four copies that will drift.
+
+**TESTS ASSERT ON THESE STRINGS** and must be updated in the same change. Most assert the
+UNQUALIFIED strings, so **confirm per file rather than blanket-replacing**:
+  sessions/__tests__/SessionList.access-denied.test.tsx:137,152
+  sessions/__tests__/SessionList.billing-restriction.test.tsx:114
+  ui/__tests__/ProcessStrip.test.tsx:39,80
+  admin/components/__tests__/AdminShell.test.tsx:12
+  ui/__tests__/NavFlyout.test.tsx:366
+
+================================================================================
+FINDING 4 - OPERATIONAL. REPORT ONLY, NO CODE CHANGE, DO NOT ACT ON PROD.
+================================================================================
+
+Not the cause of the stuck run, but it made diagnosis misleading and carries real risk.
+
+1. **`deployments/README.md` DOCUMENTS THE WRONG PROD STACK.** It says prod is CT105 at
+   `/opt/cognizioware-powerplatform`. The public hostname actually serves a **host-level** stack on
+   pve151 at that same path. CT105 runs a SECOND stack with IDENTICAL container names whose DB's
+   newest session is **2026-06-09** and which lacks the `factory_runs` tables entirely - querying
+   it first is what made the session appear not to exist. Proven by simultaneous `/api/health`
+   uptime (public 20425 vs uat 21892 vs dev 5119) and by log container hostname `336a2fe3d5fd`
+   matching the host-level container id.
+   **FIXING THE README IS IN SCOPE. Decommissioning the CT105 stack is NOT - propose it.**
+
+   *** OVERSEER CORROBORATION, measured independently 2026-09-09 before this plan arrived: the
+   corsairai300 host runs `cognizioware-powerplatform-app-1` on image `app:sha-f2a3633` created
+   16:52:30Z, while CT105's app image dates from 2026-06-29. Two separate audits reached the same
+   conclusion. Treat this finding as CONFIRMED. ***
+
+2. **PROD RUNS UNPROMOTED CODE.** `f2a3633` is on `origin/develop` and
+   `fix/prod-pin-and-billing-errors` - **NOT on `origin/main`.** The documented `release -> main`
+   promotion with the eval-gate as a required check was bypassed.
+   *** OVERSEER CORROBORATION: independently measured that `develop` is 142 commits AHEAD of and 33
+   BEHIND `main`, and that the guest-auth strings from PR #102 are present on develop and absent on
+   main while being present in the RUNNING container. CONFIRMED. ***
+   **ACTION: report only.** Promoting or rolling back prod is Paxton's decision and is blocked by
+   the standing hold on powerplatform `main`. Do NOT merge to main.
+
+3. **Two `cloudflared` replicas share tunnel `4a6e0d37-98a1-4186-aa2d-e7405db4199d`** (pve151 host
+   since Sep 07; inside CT105 since 15:32 Sep 09). Same-tunnel replicas resolve `localhost`
+   differently per namespace, so **ingress could reach either stack nondeterministically** - which
+   would make bugs appear and disappear at random. **ACTION: report; propose stopping the CT105
+   replica. Do not stop it yourself.**
+
+================================================================================
+VERIFICATION - run against DEV first (http://192.168.21.163:3000, branch develop)
+================================================================================
+
+1. **Unit/component tests** - frontend suite (vitest, `__tests__` beside sources); confirm relabel
+   assertions pass. Add BACKEND coverage for the Finding 2 fork: `brownfield` -> n8n dispatch,
+   `greenfield` -> `orchestrator.startRun`.
+
+2. **GREENFIELD -> GRAPH, END TO END.** New session via the wizard, type a NEW solution name,
+   upload a spec, Start. Within ~30s assert:
+     - a `factory_runs` row exists with the new `session_id` and `status` advancing off `created`
+     - `session_setup_steps` has **> 0 rows** - *the assertion that would have caught Finding 1*
+     - the modal moves off "Step 0 of 7"
+     - the dev log shows `POST /<id>/setup/start` -> 2xx
+
+     ssh -i ~/.ssh/id_ed25519_proxmox root@192.168.21.163 \
+       "docker exec pp-dev-postgres-1 psql -U cogni -d cogniplatform \
+        -c \"SELECT step_no,name,status FROM session_setup_steps WHERE session_id='<id>' ORDER BY step_no;\" \
+        -c \"SELECT id,status,session_id FROM factory_runs WHERE session_id='<id>';\""
+
+3. **BROWNFIELD -> LEGACY n8n.** New session, pick an EXISTING unmanaged solution, Start. Assert
+   `session_v2.n8n_execution_id` is populated (or `async` true), **NO `factory_runs` row is
+   created**, and the n8n execution appears in the n8n UI.
+
+4. **QUICK-CREATE PATH** - create from the SessionList form and confirm whichever behaviour was
+   chosen in Finding 1. **Confirm it can no longer produce a session sitting at `setup_step=1` with
+   zero step rows.**
+
+5. **FAILURE PATH** - with n8n or the factory unreachable, confirm Start surfaces an error and does
+   NOT navigate into the spinner; confirm the 60s stall detector offers retry.
+
+6. **RELABEL** - nav, breadcrumb, list heading and admin tab read "Session (per Solution)";
+   buttons/placeholders unchanged; `/sessions/:id` URLs still resolve.
+
+7. **REGRESSION GUARD** - add a test asserting Start issues `POST .../setup/start`. **There is
+   currently NO coverage of the dispatch, which is how an orphaned endpoint reached prod
+   unnoticed.** Do the same for `/api/factory/run`.
+
+8. Promotion is Paxton's: `develop` -> PR to `release` (uat) -> PR to `main` (prod), letting the
+   eval-gate run. **The harness opens the develop PR and stops.**
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **NO PROD. NO MERGE TO main. NO PROMOTION. NO HAND-DEPLOY.** Paxton is testing live.
+ - **DO NOT TOUCH CT110** - other agents are running there.
+ - Do NOT unstick session `023aab18...` against prod from the harness. Propose the call.
+ - Do NOT decommission the CT105 stack or stop a cloudflared replica. Report them.
+ - Do NOT bypass `validateFactoryTarget` - it is the production-environment guardrail.
+ - Do NOT rename Session -> Solution anywhere but user-visible strings. That was decided.
+ - Verify the `setup/start` body encoding with a REAL request. `upload.none()` + a JSON body is
+   precisely the silent-failure shape this whole task exists to fix.
+ - Env NAMES only, never values. Commit by EXPLICIT PATH; never `git add -A`; clone with
+   autocrlf=false; check `git diff --stat` before the PR.
+ - PR to `develop`. **DO NOT MERGE.**
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A PR against `develop` where: the wizard Start button actually POSTs `setup/start` with the body
+encoding PROVEN by a real request; the quick-create path either dispatches or is removed, stated
+explicitly; the status screen fails loudly with a retry after ~60s instead of spinning forever;
+migration `028` links `factory_runs` to a session; `startSessionSetup` forks on `solution_mode`
+(brownfield -> n8n, greenfield -> the existing FactoryOrchestrator instance, through
+`validateFactoryTarget`); progress reporting is unified so a graph run reports steps; the NULL-mode
+default is an argued decision; the UX relabel is applied only where the concept is named, with the
+duplicated breadcrumb defined once and the five test files updated; and Finding 4 is reported with
+the README corrected and the CT105 stack + duplicate tunnel replica raised as proposals.
+
+Evidence required: a greenfield run showing a `factory_runs` row WITH `session_id` and
+`session_setup_steps` > 0 on **dev**, and a brownfield run showing an n8n execution and NO
+`factory_runs` row. **Not deployed, awaiting Paxton's go.**

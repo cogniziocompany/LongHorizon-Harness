@@ -1,0 +1,8 @@
+{
+ "name": "05-litellm-upgrade-1100",
+ "task_file": "C:/tmp/litellm-upgrade-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "run_id": "20260907T081439Z_50b1e8a7"
+}

@@ -1,0 +1,119 @@
+TASK 170 - SPEND-LOG RETENTION IS NOT LIVE ON THE PROD ROUTER. TASK 115 WAS CLOSED ON A CLAIM THE
+LIVE SYSTEM CONTRADICTS.
+
+SOURCE: overseer, 2026-09-11 16:20 PT, while verifying audit [fe2679] section K before acting on it.
+The audit said to verify retention was live BEFORE closing the 125 export family. It is not.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+
+================================================================================
+THE MEASUREMENT - READ IT BEFORE FORMING A THEORY
+================================================================================
+Read from the LIVE prod router on CT202 via GET /config/list?config_type=general_settings,
+authenticated with the master key (28 fields returned, so the reader worked):
+
+    store_prompts_in_spend_logs          value = True    stored_in_db = True
+    maximum_spend_logs_retention_period  value = None    stored_in_db = None
+    maximum_spend_logs_cleanup_batch_size        value = None
+    maximum_spend_logs_cleanup_max_batches       value = None
+    maximum_spend_logs_cleanup_run_budget        value = None
+    maximum_spend_logs_cleanup_batch_timeout     value = None
+
+Task 115 is recorded DONE with "a 7-day window and store_prompts_in_spend_logs:false". The live
+router says the retention period is NOT SET AT ALL and prompt storage is ON.
+
+*** AND NOTE stored_in_db = True ON store_prompts_in_spend_logs. *** general_settings is one of the
+five Postgres-shadowed sections, and the DB ROW WINS OVER THE YAML. So this is very likely the
+DB-shadow trap rather than anyone undoing the work: the file was edited, the merge went green, and
+the live setting never changed. That is the same class of failure that left 9 merged alias edits dead
+on the live router on 2026-09-09. CONFIRM WHICH IT IS before writing the fix - read the YAML in the
+deployed tree and compare it to the DB row, and say plainly which one disagrees with which.
+
+WHY THIS MATTERS MORE THAN IT LOOKS
+================================================================================
+ 1. CT202 already hit 100% disk once, killed the prod router for an hour, and destroyed 23 harness
+    runs with nothing visible on any operator surface. Spend logs with prompts stored were the
+    growth driver: a measured 5-11 GB/day, ~18 GB of TOAST and 9.88M chunks.
+ 2. The whole 125 export-to-NAS family was deprecated ON THE BELIEF that retention had replaced it.
+    With retention not live, NOTHING is currently bounding that table. The queue believes a problem
+    is solved that is not.
+ 3. Storing prompts also means PROMPT TEXT is being retained in the spend-log table indefinitely.
+    Treat that as a data-retention concern in the report; do not quote any prompt content.
+
+WHAT TO DO
+================================================================================
+ 1. Set the retention period and turn prompt storage off, USING POST /config/update - not a YAML
+    edit alone, because the DB row wins.
+ 2. *** THEN READ THE ROW BACK AND DIFF IT. A 200 FROM /config/update IS NOT PROOF. *** That exact
+    endpoint has returned 200 and silently discarded the key TWICE. Re-read /config/list and show
+    the before and after values side by side.
+ 3. Make the YAML and the DB AGREE, so the next deploy does not reintroduce the drift, and so a
+    reader of the file is not misled.
+ 4. Set the cleanup batch controls (batch size, max batches, run budget, batch timeout). They are all
+    unset, and an unbounded first cleanup pass against the live router's database is exactly the
+    long-running statement that caused the original outage. The backlog goes back to 2026-03-29, so
+    the FIRST pass is not like the others - bound it and let it work through over several runs.
+ 5. Add an e2e assertion that reads the LIVE value of both settings, so a silent revert fails a test
+    instead of being discovered by a disk alarm. This is the part that stops a third recurrence.
+ 6. Report the SpendLogs table size and dead-tuple count before and after the first cleanup.
+
+HARD RULES
+================================================================================
+ - Any edit to infrastructure/litellm-config.yaml FORCE-RECREATES the CT202 prod router, because the
+   deploy job hashes the DEPLOYED file - even a comment-only change. So the YAML half of step 3 must
+   land in a ZERO-RUN WINDOW (running + waiting_approval == 0, counted from GET /api/runs). The
+   /config/update half needs no window.
+ - Do NOT run VACUUM FULL on the live table. A plain VACUUM is fine; the one-time stock reclaim is a
+   pg_repack decision for the overseer, not this run.
+ - No credentials anywhere - env var NAMES only. Never print the master key. Never quote prompt text
+   out of the spend logs.
+ - NEVER git add -A; commit by explicit path; git diff --stat before every commit.
+ - Do NOT post an @claude comment (task 117).
+ - The live /config/update call is the OVERSEER's to execute (a harness run is never given
+   credentials). The run DELIVERS the exact call, the read-back procedure and the tests, and STOPS.
+
+VERIFICATION
+================================================================================
+ 1. /config/list on the LIVE prod router shows maximum_spend_logs_retention_period SET and
+    store_prompts_in_spend_logs FALSE - quoted as before/after, read back after the write.
+ 2. The deployed YAML and the DB row agree.
+ 3. The new e2e assertion FAILS when the value is flipped back, proven by flipping it on UAT.
+ 4. SpendLogs table size and n_dead_tup reported before and after, with the chunk size used.
+
+DONE MEANS: retention is live and PROVEN BY READ-BACK on prod, the YAML and DB agree, the cleanup
+controls are bounded, and a test now fails if this silently reverts again.
+
+=== TICK #495 ADDENDUM, 2026-09-17 16:35 PT - THE CONFIG IS LIVE BUT THE CLEANUP IS NOT RUNNING ===
+Ticks #493 and #494 wrote the six retention keys to the prod router and read them back from the
+Postgres row (acceptance 6/6, then max_batches 50->250). BOTH CLAIMED THE DEFECT WAS FIXED. It is
+not. The row is correct; the RUNNING PROCESS IGNORES IT.
+
+Measured this tick on CT202, litellm_user/litellm_mcp_tools (the psql creds - `llmproxy` and
+`postgres` are NOT roles here, a wrong user reads exactly like a dead DB):
+  LiteLLM_SpendLogs: 2,063,079 rows, 30 GB, oldest startTime 2026-09-08 23:18, newest 23:34 UTC.
+  #494 measured 2,059,492 rows. So rows went UP by 3,587, and the oldest row DID NOT MOVE.
+  Retention is '7d' and today is 09-17: everything before 09-10 should already be gone. Nine days
+  of rows are sitting under a 7-day policy.
+
+ROOT CAUSE - the cleanup job was never registered with the scheduler. Enumerated every apscheduler
+job name over the container's whole life (`grep -oE 'Execution of job "[a-zA-Z_.]+"' | uniq -c`):
+  update_spend 155, flush_gateway_requests 153, ProxyConfig.add_deployment 82,
+  ProxyConfig.get_credentials 51, ProxyConfig.check_periodic_reloads 50, update_daily_tag_spend 37.
+  SIX JOBS, AND NOT ONE CLEANUP/SPENDLOG/RETENTION JOB AMONG THEM (a targeted grep for job names
+  matching clean|spendlog|retention returns nothing).
+The container started 2026-09-17T20:55:48Z = 13:55 PT, which PREDATES the #493 write at ~16:10 PT.
+LiteLLM registers the spend-log cleanup at STARTUP from config; `ProxyConfig.check_periodic_reloads`
+reloads config values every 30 s but does NOT register new scheduler jobs. So a live
+`/config/update` can never start this job.
+
+WHAT THIS MEANS FOR THE TASK: the acceptance criteria as written ("read the six keys back from the
+live router") are NOT sufficient - they pass right now while the table grows. Acceptance must
+include a BEHAVIOURAL check: the oldest `startTime` is within the retention window, or the row
+count falls across two reads.
+
+REMEDY, and it needs a zero-active-run window: RESTART the CT202 litellm container so the job
+registers, then re-read oldest startTime and row count to prove deletion. Do NOT do it with runs
+live - all three live runs route their :synthetic-anthropic roles through this router. This folds
+into the zero-run window task 170 already owes for the YAML landing; one window serves both.
+AND STILL OWED AFTERWARDS: a VACUUM (FULL or pg_repack) - DELETE frees no OS space, so the 30 GB
+does not shrink on deletion alone, and CT202 is at 62%.

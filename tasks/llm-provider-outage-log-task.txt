@@ -1,0 +1,143 @@
+BUILD + TEST (code + docs; cognizioware-mcp-tools): give the estate an LLM PROVIDER OUTAGE LOG - newest event first - visible in the web UX, so an orchestrator picking up the work does not have to rediscover which provider was degraded and when. Paxton's direction, 2026-09-09. Work ONLY in /home/harness/work/cognizioware-mcp-tools-b on branch feat/llm-provider-outage-log (run `git fetch origin && git checkout -B feat/llm-provider-outage-log origin/main` first); plain git; commit by EXPLICIT PATH; no push; NO writes to any live router, database or box; env NAMES only.
+
+## WHY THIS EXISTS
+Provider state changes constantly and invisibly, and every time it does, whoever is driving the fleet rediscovers it from a failed run instead of from a record. In ONE evening: Synthetic 404'd every harness call for a day because of a provider-prefix mistake; the prod router died for an hour when a disk filled; the router benched its own models on a 300s cooldown; and Ollama Cloud hit an account-level WEEKLY limit that will not clear on its own. None of that was written down anywhere an operator could see. The next person - or the next orchestrator session - starts from zero.
+
+## EXTEND THE EXISTING ADMIN SURFACE. DO NOT BUILD A NEW ONE.
+Paxton's standing rule, and this estate keeps breaking it: check what already exists and extend it. The Ops Control Center in this repo is `infrastructure/docker/ops-control-center/`. Verified 2026-09-08 it exposes exactly SEVEN routes - `/`, overview, catalog, e2e, certs, **admin-centres**, audit. **`admin-centres` is the intended home** unless reading the code shows a better fit; if you conclude otherwise, SAY WHY in the report before adding anything. There is no `/doctor` route - the doctor's results render on `/overview`, and that is the pattern to copy for how data reaches a page.
+DO NOT duplicate the other two surfaces: **fleet.easybutt0n.ai** owns harness RUN detail and **Hydra** is the device fleet and the only write surface. This log is about PROVIDERS - Synthetic, Ollama Cloud, the local span, the LiteLLM router itself - not about runs.
+
+## WHAT AN ENTRY MUST CARRY
+Newest first. Each entry needs: **when it started**, **when it was resolved** (or blank if still open), **which provider and which specific models**, **the observed symptom in the provider's own words**, **the cause once known**, and **what was done**. A log that says "Ollama degraded" is worth nothing; "glm-5.3-flash:cloud and kimi-k3:cloud returned the account weekly-usage-limit error while glm-5.3:cloud, kimi-k2.6:cloud and deepseek-v4-pro:cloud kept serving" is worth a great deal, because it tells the next person exactly which routes to avoid.
+Distinguish clearly between **still open** and **resolved** - an operator's first question is always "is this happening now".
+
+## SEED IT WITH THE REAL HISTORY (verbatim where quoted; all observed first-hand)
+-  **2026-09-10 05:29 PT, OPEN. SYNTHETIC PACK BUDGET EXHAUSTED - and this is the entry that proves the log needs
+   a SECOND axis.** Every Synthetic model began returning
+   `429 Custom_openaiException - "You've exceeded your subscription rate limits. Upgrade, or try again later."`
+   Four harness runs died within minutes (`5e1ce75d`, `be11b7c1`, `944f8dc8`, `d6fde00f`), all four with the
+   IDENTICAL error, and the fleet went from six concurrent runs to zero with sixteen tasks queued.
+   **This is the PACK request budget - 2500 requests per 5 hours - NOT the 5-concurrent-per-model ceiling.** Those
+   are different limits and the estate had been guarding only the second one all night. A log entry that says
+   "Synthetic rate limited" without saying WHICH limit is useless: one is fixed by lowering concurrency, the other
+   only by waiting or buying more. **Record the limit type, not just the provider.**
+   Affected: `nemotron-3-super`, `kimi-k3`, `glm-5.2`, `syn:large:vision`, `glm-5.3-flash` - every
+   `:synthetic-anthropic` model, probed directly at 05:29, 05:33, 05:40, 05:45 and 05:50, all 429.
+   NOT affected and carrying the whole estate since: the **local dual-3090 span** - `qwen3.8-nothink` **1.27s**,
+   `qwen3.8` **1.22s**, measured the same minute. Free, and unaffected by any provider budget.
+   **THE DETECTION LESSON, and it is the sharpest one this log exists for: the prod router logged ZERO rate-limit
+   lines in the twenty minutes around the outage.** `docker logs --since 20m litellm-router | grep -ci 429` = **0**.
+   The 429 originates UPSTREAM at Synthetic and is passed through to the caller, so the router - the place an
+   operator naturally looks - shows nothing wrong while every run dies. **The only thing that detected this was a
+   direct probe of the provider.** Whatever this page does, it must not infer provider health from router logs.
+   Mitigation applied 05:37-05:42: the launcher's local-only fallback was re-enabled, gated on a live per-cycle
+   probe, limited to ONE run at a time because the span is single-slot. Throughput went from 0 to 1 concurrent run
+   on free hardware. Recovery: unknown - a rolling 5-hour window, so it depends when the requests were spent.
+ - **2026-09-09 ~22:15, still OPEN and WIDER THAN FIRST RECORDED.** Ollama Cloud is exhausted across FOUR
+   DISTINCT ACCOUNTS, not one key, and not all on the same window. Re-measured 23:00 by probing every registered
+   `:cloud` alias on `/v1/messages` with a 300-token budget and a nonce, reading both the served model name and
+   `x-litellm-model-id`:
+     * Hard 429, quota: `kimi-k3:cloud`, `kimi-k2.7-code:cloud`, `deepseek-v4-pro:cloud`, `minimax-m3:cloud`,
+       `nemotron-3-ultra:cloud`, `gpt-oss:120b-cloud`, `mistral-large-3:675b-cloud`, `qwen3.5:397b-cloud`.
+       Accounts named in the provider's own errors: `prax211`, `ai-dev01`, `ai-dev03`, `ai-dev0x`.
+       **There are TWO account tiers and they recover on different clocks - an entry that blurs them is worse than
+       no entry.** The THREE LEGACY accounts (`prax211`, `ai-dev01`, `ai-dev02`) reset WEEKLY and have no monthly cap at all;
+       they return in about **4 DAYS**. The TWO NEWER accounts (`ai-dev03`, `paxton@`) are the ones carrying a
+       MONTHLY $300 cap; ai-dev03 sits at
+       $284.57 of $300 with $0 usage credits and auto-reload OFF, resetting in about **3 weeks**. So the same
+       provider is simultaneously "back on Saturday" and "back in three weeks" depending on which key a model is
+       bound to. **Every entry must carry its own reset clock**, because "the provider is limited" tells an
+       operator nothing about whether to wait or reroute - which is the entire decision this log exists to serve.
+     * **RETIRED UPSTREAM, not a quota problem at all:** `qwen3-coder-next` and `devstral-2:123b` return
+       `BadRequestError ... was retired at <date>`. These are still registered in the router config. They belong in
+       this log as a distinct CAUSE - "the model no longer exists" is not an outage and must not read like one.
+     * **The dangerous case - aliases that return 200 while lying about who answered.** `glm-5.3:cloud`,
+       `glm-5.3-flash:cloud`, `glm-5.2:cloud` and `kimi-k2.6:cloud` all answered 200. All four were served by a
+       DIFFERENT model. `glm-5.3-flash:cloud` was served by `kimi-k2.7-code`, whose own alias returned 429 in the
+       same sweep; `glm-5.3:cloud` was served by `kimi-k2.7-code` at 22:48 and by `glm-5.3-flash` at 23:02 - the
+       fallback target moves between probes. **This is the single most important thing this page must surface**: a
+       green light on an alias is not evidence that the named model is serving. Show the SERVED model beside the
+       alias always, and treat "answered, but by someone else" as its own state - neither healthy nor down.
+   Action taken: every `:cloud` model removed from the harness trio table. Synthetic-only, with the local span
+   still preferred for executors when it can answer.
+ - **2026-09-09 23:00, NOT AN OUTAGE - recorded so it is not mistaken for one.** The local dual-3090 span
+   (`qwen3.8`, `-nothink`, `--128k`) timed out at 150s on every probe, which looks identical to a dead backend.
+   It was not down: `qwen3.8:27b` was resident at 20.5 GB across both GPUs at `context_length` 65536, GPU0 at 100%
+   and GPU1 at 50%, load average 38.9 falling to 3.4, and a non-streaming probe returned the CORRECT answer in
+   119s. It was saturated serving the CI eval gate, which owns that span by settled doctrine. A log that cannot
+   distinguish "saturated" from "down" will send the next operator to restart a healthy service - so give
+   saturation its own state, and record queue wait rather than a bare timeout.
+ - **2026-09-09 ~21:05, RESOLVED by routing around.** Ollama Cloud 429s across the cloud models; harness manager/auditor roles moved to Synthetic.
+ - **2026-09-09 ~02:00, RESOLVED.** Synthetic returned 404 on `/v1/messages` for EVERY model while returning 200 on `/v1/chat/completions`. Cause: the models were registered with the `openai/` provider prefix, so LiteLLM translated the Anthropic route into a call to the OpenAI **Responses** API, which Synthetic does not implement. Fix: re-register the same upstreams under `custom_openai/` as `:synthetic-anthropic` twins. Both sets are kept deliberately - one per route.
+ - **2026-09-08, RESOLVED.** CT202 root disk reached 100%, killed the prod LiteLLM router for about an hour and destroyed 23 harness runs. Nothing on any operator surface showed it coming.
+ - **2026-09-08, RESOLVED.** The router benched its own deployments for 300s after 2 failures, and a rate limit counted as a failure, so a momentary limit became a five-minute outage. Cooldown cut to 20s; rate limits no longer trigger a cooldown.
+ - **2026-09-07, RESOLVED.** After the LiteLLM 1.100.0 upgrade, 55 of 266 virtual keys 404'd because their `team_id` was not registered.
+Mark the first entry OPEN and the rest RESOLVED. Where a time is approximate, say so rather than inventing precision.
+
+## WHERE THE DATA LIVES
+Prefer a committed, human-editable file (the operator writes an entry when they fix something) over a schema and a write API - this is a log, not a system of record, and nothing should need a database to read it. Follow whatever the Ops Control Center already does for static content. **Adding the data is not the deliverable: it must RENDER.** Confirm the entries actually appear on the page and say how you confirmed it - a row in a file that no page reads is the exact failure this task exists to prevent.
+
+## TESTS
+Whatever this repo already uses; report counts, baseline first. Assert at minimum: entries render newest-first; an OPEN entry is visually distinct from a RESOLVED one; an entry missing a required field fails rather than rendering blank.
+
+## HARD RULES
+No credentials, keys, tokens or account identifiers beyond what an operator needs - the quote above contains an account name, keep it only if the repo already carries that name publicly, otherwise redact it. No writes to any live system. Do not build a run wallboard - that is fleet.easybutt0n.ai. Do not add a new top-level route if `admin-centres` can carry it. Explicit-path commits; no push.
+Completion = commits, diff stat, test counts, which route it lives on and why, HOW you confirmed it renders, and the entries as they appear. Auditor: read-only - verify no new parallel surface was created where the existing one could carry it, no run detail was duplicated from the fleet window, no secret or unnecessary account identifier is present, that OPEN vs RESOLVED is genuinely distinguishable, and that the rendering was actually confirmed rather than assumed.
+
+STANDING RULES (every harness task; the harness enforces the first two, state them so the run does not fight them): the AUDITOR runs on the read-only `audit` MCP profile and is blocked from network git operations (no git fetch/pull/push/clone, no gh) - it audits by reading the working tree, the diff and the round reports, and it must NOT run anything that writes into the workspace (no builds that emit artifacts, no test runs that regenerate fixtures, screenshots or baselines; use the hermetic unit target). MANAGER and EXECUTOR run on the `default` MCP profile (kb, gateway guides/skills, hivemind memory, langfuse, github, youtrack, ssh). Every episode carries a session id `<run_id>.<round_tag>.<role>` on the LLM path (x-litellm-tags lh-session/...) and the MCP path (X-LH-Session), so quote the run id in the completion report and reference it when citing evidence. Before declaring completion, `git fetch origin && git merge origin/<base>` so the branch is not stale, and report the merge result.
+
+## ADDED 2026-09-09 BY PAXTON: SHOW THE EMIT-PROBE READINGS IN THE SAME PLACE
+"all this emit should be displayed in the web UX for the user." The outage log answers *what broke and when*; the emit readings answer *is it healthy right now*. They belong on the same page - a reader looking at an OPEN incident immediately wants to know whether the provider is answering this second, and making them open a second surface to find out is the failure this page exists to fix. **Do NOT build a separate health page.**
+
+WHAT THE EMIT PROBE IS. Before committing a 30-minute round, the launcher asks each of a run's three role models to emit one token and times it on the STREAMING path, using the harness's own virtual key. A backend that cannot emit within ~3s is starved, and the run is held rather than launched. A second probe now also runs MID-ROUND (`C:/tmp/spin_watchdog.py`): when a round has been going a long time it re-probes that run's bound executor, which is what distinguishes a starved backend from a model genuinely working - the two look identical from outside at minute ten.
+
+WHAT TO DISPLAY, per model:
+ - the alias, and **the model actually SERVED** for it - these differ, and that is not a curiosity: `kimi-k3:cloud` is served by `glm-5.3-flash:cloud` via a fallback chain, so anything that picks models by name is being quietly lied to. Read it from the `message_start` event.
+ - **time to first token** from the most recent probe, and when that probe ran.
+ - a plain healthy / slow / not-answering state, with the ~3s budget shown so the number means something.
+ - which harness ROLE the model currently serves (manager / executor / auditor), or none.
+Order so the unhealthy ones are visible first. If a reading is stale, say how old it is rather than presenting it as current - a stale green light is worse than no light.
+
+WHERE THE DATA COMES FROM. Prefer having the launcher and watchdog WRITE their existing probe results to a small file the page reads, over the page probing models itself. A page that probes on render bills a request per model per page load against a pack limited to 2500 requests per 5 hours, and would be a self-inflicted outage. If you conclude the page must probe, cap and cache it, and say exactly why.
+
+CALIBRATION TRAPS - all three cost real time tonight, do not repeat them:
+ - measuring time to a TEXT delta with a small token budget fails every thinking-capable model, because the thinking block eats the budget. Accept any content event; the question is whether the backend is SERVING, not what it says.
+ - responses are cached, so a probe without a nonce can return in 0.0s and make a dead backend look instant.
+ - probing with the master key passes models the harness cannot actually reach. Use the harness's own key, or the reading is about the wrong credential.
+
+================================================================================
+DELTA FROM THE OVERSEER, 2026-09-10 08:40 PT - SYNTHETIC HAS **TWO** FAILURE MODES, NOT ONE.
+This corrects the brief above, which treats "Synthetic limited" as a single state. It is not, and the
+difference decides whether waiting helps. An entry that blurs these is worse than no entry - the same
+argument the brief already makes for the two Ollama account tiers.
+
+Both observed first-hand on 2026-09-09/10, quoted verbatim from the response bodies:
+
+ (a) HTTP 429 - THE ROLLING PACK BUDGET. SELF-CLEARS.
+     "You've exceeded your subscription rate limits. Upgrade, or try again later.
+      You can view your usage at https://synthetic.new/billing"
+     This is the per-pack request budget over a rolling 5-hour window. It recovers WITHOUT anyone doing
+     anything. Reset clock for an entry of this kind: "~5h from first refusal".
+     Observed fleet-wide: 7 of 7 Synthetic models returning this simultaneously.
+
+ (b) HTTP 402 - BALANCE EXHAUSTED. DOES NOT SELF-CLEAR.
+     "Insufficient quota and token balance: consider upgrading your subscription"
+     This needs money or a plan change. Reset clock: NONE - it is an action item, not a wait.
+     Observed ONCE, on a single run, while other runs in the same minute got 429.
+
+WHY THIS MATTERS FOR THE LOG, and it is the whole point of the entry:
+An operator seeing "Synthetic: limited" cannot tell whether to wait two hours or go and pay. The status code
+is the discriminator and it is already in the error body we receive. **The log must record the CODE and the
+verbatim message, and derive the reset clock from the code** - 429 gets a countdown, 402 gets an action item
+and NO countdown. Do not collapse them into one "rate limited" state.
+
+Note also, because it will confuse whoever writes the mapping: a 429 body can name a DIFFERENT cause than the
+code implies. `glm-5.3:cloud` returned 429 with "retired at" in the body - the alias resolved onto a retired
+backend. Record the body verbatim rather than re-deriving a reason from the code alone. That specific
+alias-substitution defect belongs to task 64, NOT to this task - do not try to fix routing here.
+
+Ollama Cloud, measured the same tick for contrast (7 of 7 `:cloud` aliases, all 429):
+     "you (prax211) have reached your weekly usage limit, add usage credits: https://ollama.com/settings"
+Note it names the ACCOUNT (`prax211`) in the message. That is the field that tells an operator WHICH tier is
+affected and therefore which clock applies - capture it.
+================================================================================

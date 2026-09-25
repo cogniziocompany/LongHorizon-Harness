@@ -57,10 +57,22 @@ class ExecResult:
 @dataclass
 class EpisodeBudget:
     max_duration_seconds: int = 1800
+    # Stalled-episode watchdog: fail the episode after this many seconds of
+    # zero stdout/stderr output instead of consuming the full budget.  None
+    # derives a conservative quarter of max_duration_seconds (120 s floor,
+    # 900 s cap); 0 disables the watchdog.
+    stall_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if self.max_duration_seconds < 1:
             raise ValueError("max_duration_seconds must be at least 1")
+        if self.stall_seconds is not None:
+            if isinstance(self.stall_seconds, bool) or not isinstance(
+                self.stall_seconds, (int, float)
+            ):
+                raise ValueError("stall_seconds must be a number or None")
+            if self.stall_seconds < 0:
+                raise ValueError("stall_seconds must be non-negative")
 
 
 @dataclass
@@ -120,6 +132,12 @@ class HarnessConfig:
     harness_dir: str = DEFAULT_HARNESS_DIR
     log_dir: str = DEFAULT_LOG_DIR
     runs_root: str = DEFAULT_STATE_ROOT
+    # Task 201: the mode the prelaunch workspace guard chose for this run
+    # ("on-default" / "in-place" / "worktree" / "stash" / "continuation"), set
+    # by the supervisor from the launcher's resolved base and surfaced in the
+    # round-zero record.  None means the launch was not queue-triggered (or the
+    # running harness predates the guard), and the record omits it.
+    workspace_base_mode: str | None = None
     auditor_output_chars: int = 24_000
     role_verified_context_chars: int = 60_000
     role_history_chars: int = 100_000

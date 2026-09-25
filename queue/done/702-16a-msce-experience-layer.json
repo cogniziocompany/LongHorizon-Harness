@@ -1,0 +1,15 @@
+{
+  "name": "16a-msce-experience-layer",
+  "task_file": "C:/tmp/msce-experience-task.txt",
+  "workspace": "/home/harness/work/LongHorizon-Harness",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "run_id": "20260909T094159Z_2e6c2cbf",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "kimi-k3:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-09T09:41:59.295003+00:00",
+  "note": " || STATE = PR, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in the same triage. The run ended without a disposition, but its branch feat/experience-layer is on origin at c5a0044 with LongHorizon-Harness PR #10 STILL OPEN. It needs review and a merge decision, NOT a relaunch. || STALE, NOT SUPERSEDED - disposition 2026-09-20 20:24 PT [5321285c]: LongHorizon-Harness PR #10 (feat/experience-layer) is CONFLICTING/DIRTY, +6236/-1 across 31 files, untouched since 2026-09-09, against a main that has since taken the workspace guard, the round-zero record, the auditor git-metadata fix and the worker RSS isolation. It needs a rebase-and-reconcile task of its own before any merge decision is meaningful; it is NOT a relaunch, and it is NOT a close - nobody has shown the work is unwanted."
+}

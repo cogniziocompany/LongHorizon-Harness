@@ -1,0 +1,15 @@
+{
+ "name": "735-92-session-bridge-process",
+ "task_file": "C:/tmp/session-bridge-process-task.txt",
+ "workspace": "cognizioware-hydra",
+ "max_rounds": 10,
+ "trio": "kimi",
+ "note": "Paxton 2026-09-09: per-tick process for finding work other Claude sessions assume the overseer is doing, templated on the lh-harness task conventions, surfaced on the web UX for everyone. RULE 2: the ingest ALREADY EXISTS (overseer-session-ingest.mjs, live since 2026-09-05, every 5 min on PTAIT09) - the missing half is that nothing READS it back. Build the read side, not a second ingest. No new ops route. Coordinate with task 90.",
+ "run_id": "20260910T003100Z_eb0b64ec",
+ "roles_bound": {
+  "manager": "glm-5.2:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-10T00:31:00.605011+00:00"
+}

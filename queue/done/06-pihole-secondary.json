@@ -1,0 +1,8 @@
+{
+ "name": "06-pihole-secondary",
+ "task_file": "C:/tmp/pihole-secondary-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "run_id": "20260907T194833Z_2002f145"
+}

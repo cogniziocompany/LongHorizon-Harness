@@ -1,0 +1,15 @@
+TASK 209 - RECONCILE pp PR #116 (ruflo drift pre-flight, TASK-165) ONTO develop
+
+REPO: cogniziocompany/cognizioware-powerplatform. EXISTING branch fix/ruflo-drift-preflight, EXISTING PR #116.
+continue_branch: CONTINUATION task - keep pushing to PR #116. No second PR. Never rebase a pushed branch.
+
+WHY: #116 was opened against `main`, where a merge deploys PROD with every gate bypassed. On 2026-09-21 Paxton
+decided to RETARGET it to `develop` (done: base=develop, read back) so it ships dev -> release -> prod through
+promote.yml like everything else. After the retarget it reports CONFLICTING/DIRTY.
+
+DO: git fetch; merge origin/develop INTO the branch; resolve; run the repo's build + test scripts; push; read back
+that #116 is mergeable=MERGEABLE against develop; STOP. Merging is the overseer's.
+KNOWN FROM TASK 199: this branch's copy of kb-hook.py LACKS the LH_HARNESS_CLAUDE_ROLE / KB_HOOK_DISABLE guard that
+upstream has (harness 375778c) - take develop's version of that file if they differ, do not reintroduce the unguarded one.
+Because the branch was cut from main, expect the diff against develop to contain commits that are NOT part of
+TASK-165; the PR must end up carrying ONLY the ruflo pre-flight change. If that cannot be done by merge, say so and stop.

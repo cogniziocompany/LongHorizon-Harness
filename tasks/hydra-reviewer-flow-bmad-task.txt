@@ -1,0 +1,119 @@
+TASK 116 - take the Hydra reviewer + PR flow through the BMAD spec process BEFORE building/merging.
+
+*** GATED BEHIND TASK 111 (BMAD must be proven runnable first). Paxton 2026-09-09 22:40 PT:
+    "run this also through a new queue lh-harness task, bmad_cognizioware process to finish the flow
+     before build and specs" - re: adding the reviewer to hydra (#26) and the PRs it unblocks. ***
+
+REPOS: cogniziocompany/BMAD_Cognizioware (the process) applied to cognizioware-hydra (the target).
+BMAD at C:\Users\PaxtonTait\source\BMAD_cognizioware.
+
+================================================================================
+WHAT PAXTON ASKED FOR - and my interpretation, stated so he can correct it
+================================================================================
+
+I proposed merging hydra #26 (adds the @claude reviewer to the hydra repo, which has NONE) to unblock
+reviewing hydra #5, #23, #24 - PRs that include a page WRITING CREDENTIALS TO PRODUCTION HOSTS with two
+silent-failure bugs. Paxton's direction: **do NOT just merge #26 raw. Run the flow through the
+bmad_cognizioware process first - spec before build.** This is the same spec-first sequencing as task
+111 (validate the flow before writing tests/code).
+
+**INTERPRETATION (correct me if wrong):** produce a BMAD spec of the Hydra device-fleet control-plane
+flow - specifically the surfaces the open PRs touch - so that #5 (device-token provisioning), #23
+(overseer-ingest), and #24 (Env & keys page) are validated against an intended design BEFORE they are
+merged and built on. #26 (the reviewer) is the ENABLER: once merged, the reviewer checks future PRs;
+but the flow those PRs implement should be specced first.
+
+================================================================================
+WHAT TO DO
+================================================================================
+
+1. **Confirm BMAD runs** (task 111 is its prerequisite; if 111 has not proven the toolchain, STOP and
+   say so). Do not hand-write documents and label them BMAD output.
+
+2. **Spec the Hydra control-plane flow the open PRs touch**, under `_bmad-output/`, RULE 2 governing:
+   Hydra is the device fleet + control plane and the ONLY WRITE surface; fleet.easybutt0n.ai is
+   read-only; ops is infrastructure-only. The spec must answer, not restate:
+     - **Device-token lifecycle** (from #5): how a token is provisioned, rotated, and REVOKED, and the
+       hard requirement that revocation SURVIVES a restart. #5's reviewers found revocation silently
+       reverses on the next deploy because the env seed re-adds the id. The spec must state the intended
+       durable-revocation semantics (tombstone vs authoritative-file) so the implementation is judged
+       against intent.
+     - **The Env & keys page** (from #24): which host each target writes to, per environment. #24's
+       reviewers found production writes go to the WRONG machine (dev box) while reporting success -
+       the same decoy-container hazard this estate has been bitten by. The spec must pin
+       environment->host routing so a prod write cannot land on dev.
+     - **Key VERIFICATION** (from #24): verifying a key must exercise the SUBMITTED credential against
+       its real provider, never a local proxy - because #24 verifies a key that is never sent, so an
+       invalid key "verifies" and the rotation flow then revokes the good one.
+     - **Overseer-ingest observability** (from #23): the scheduled ingest must fail LOUDLY, not record
+       success having ingested nothing. Spec the success/failure signal.
+
+3. **Explicit OPEN QUESTIONS FOR PAXTON** section - do not resolve product decisions on your own.
+
+4. **State which of the PR defects the spec would have PREVENTED**, and which it would not.
+
+5. On #26 itself (the reviewer add): it is a trivial CI file copied from mcp-tools main (OAuth token,
+   fetch-depth 0, job timeout). Per Paxton's direction it goes through this flow rather than a raw
+   merge. **Recommend in your report whether #26 should merge once the spec is accepted** - the
+   overseer opens/merges it, not this run.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - SPEC task. Write no application code; do not merge #26 or any hydra PR.
+ - RULE 2: do not propose a new surface. Hydra writes, fleet reads, ops is infra-only.
+ - Do not invent BMAD output; if the tool cannot run, report that and stop.
+ - Never print, echo or commit a credential value.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+   Say what needs Paxton - including whether #26 is cleared to merge and whether the hydra PRs are
+   cleared to build. Do NOT merge #26 or any hydra PR.
+ - Merging #26 also DEPLOYS corsairai300 (hydra-ci.yml has no path filter) - the overseer picks that
+   window; note it.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A BMAD spec under `_bmad-output/` for the Hydra control-plane flow covering device-token lifecycle,
+per-environment host routing, key verification, and ingest observability; an OPEN QUESTIONS FOR PAXTON
+section; a statement of which live PR defects it would have prevented; and a recommendation on whether
+#26 merges and whether #5/#23/#24 are cleared to build. No code, no merges.
+
+================================================================================
+*** ADDED 2026-09-11 BY THE OVERSEER: THE AUTO-SIZING TRIGGER APPLIES TO THE
+    SPECS THIS TASK PRODUCES. CROSS-REFERENCE ONLY - DO NOT RESTATE TASK 150. ***
+================================================================================
+Task 150 (`spec-staging-land`, LongHorizon-Harness) OWNS the mechanism: `spec_stats.py`
+(median +/- 3 scaled MAD over the last 50 finished specs) and `templates/task-spec.md`.
+**Do not re-specify, re-implement, or re-tune any of that here.** Read it there.
+
+WHAT IS BINDING ON *THIS* TASK, AND ONLY THIS:
+
+ 1. **A SPEC YOU EMIT IS AN INPUT TO `classify()`, SO EMIT IT IN THE TEMPLATE'S SHAPE.**
+    A spec that does not parse is not "slightly off" - it is invisible to the sizer, and
+    the sizer's whole purpose is to know BEFORE the launch instead of after the burn.
+    150 already records that ONE format must have ONE parser; a second ad-hoc shape
+    emitted from here is exactly the silent drift it warns about.
+
+ 2. **`above` IS ADVISORY AND MUST STAY ADVISORY.** If a spec you write measures `above`,
+    that is a signal to SLICE IT BEFORE IT IS QUEUED - not a reason to block, and not a
+    reason for this task to grow a gate of its own. The launcher decision is 150's.
+
+ 3. **SIZE IS A PROXY, NOT THE CAUSE.** Task 125 ran FIVE HOURS and was not killed by its
+    word count: all three roles were on `ornith-1.5:pool`, and `ornith-1.5:9b` is
+    `n_seq_max=1` - one request in flight per instance, so a single run can never use more
+    than one GPU no matter how long it runs. **Record the executing trio alongside the
+    size**, or the sizer will learn to blame big specs for what a single-slot local lane
+    did. Task 69 is the same lesson: three failures at 3600s unsliced, 69a done in 8 min.
+
+ 4. **THIS TASK IS STILL SPEC-ONLY.** No code, no merges, RULE 2 unchanged. Adding the
+    sizing hook itself here would duplicate 150 and is out of scope.
+
+DEPENDENCY UNCHANGED: still blocked behind task 111 proving BMAD emits a real spine. If
+BMAD cannot run, STOP and say so - do not hand-write a spec and call it BMAD output.

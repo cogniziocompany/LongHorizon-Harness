@@ -54,6 +54,12 @@ export function phaseLabel(type: string): string {
     'operator.approval.resolved': 'Approval resolved',
     'operator.instruction.queued': 'Instruction queued',
     'operator.instruction.applied': 'Instruction applied',
+    'queue.launched': 'Queue launched',
+    'queue.skipped': 'Queue skipped',
+    'queue.done': 'Queue done',
+    'queue.failed': 'Queue failed',
+    'fleet.contention.detected': 'Workspace overlap detected',
+    'fleet.contention.cleared': 'Workspace overlap cleared',
   };
   const safeType = typeof type === 'string' ? type : 'unknown event';
   return labels[safeType] || safeType.replaceAll('.', ' ');

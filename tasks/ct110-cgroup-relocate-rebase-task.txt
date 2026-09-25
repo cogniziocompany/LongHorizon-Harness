@@ -1,0 +1,74 @@
+================================================================================
+TASK 211b — REBASE, VERIFY AND PUSH THE CGROUP SELF-RELOCATION FIX (TASK 211)
+================================================================================
+Workspace: LongHorizon-Harness
+Repo: cogniziocompany/LongHorizon-Harness
+Follow-up to task 211 (run 20260919T002249Z_d860a9e7), which hit its 6/6 round
+ceiling with the code written and committed but never pushed. Do NOT redo the
+design work — read it, then finish landing it.
+
+WHAT ALREADY EXISTS, READ BEFORE TOUCHING ANYTHING
+- Two commits exist ONLY in CT110's local workspace at
+  /home/harness/work/LongHorizon-Harness, on branch feat/task-208-rss-bound,
+  on top of a now-STALE tip 45e1aeb:
+    1a8a4bd task 211: implement self-relocation of service PID into leaf cgroup
+            to enable subtree_control for worker isolation
+    906409e task 211: relocate the service PID into a leaf main cgroup at
+            startup, and target the worker parent after relocation (audited
+            on top of 1a8a4bd)
+  These touch src/lh_harness/worker_isolation.py,
+  src/lh_harness/supervisor/service.py, and
+  tests/test_worker_isolation_fallback.py. Read both commits' full diffs on
+  CT110 (`git show 1a8a4bd`, `git show 906409e`) before doing anything else.
+- The workspace also has an UNCOMMITTED edit to tests/conftest.py that the
+  run's own final_response called "load-bearing for test-source resolution"
+  — it must ride along with whatever you push. Read the diff
+  (`git diff -- tests/conftest.py`) and fold it into your rebase (as part of
+  906409e or its own commit — your call once you've read it).
+- IGNORE the rest of the workspace's untracked/modified clutter: add_guard*.py,
+  fix_*.py, insert_guard*.py, e2e/review_run.py, *.backup*, docs/*.bak,
+  tests/supervisor/test_hardening.py, tests/supervisor/test_supervisor.py,
+  tests/test_resume.py, tests/webapi/test_resume_routes.py. These are NOT
+  part of task 211 — do not commit, stage, or otherwise touch them.
+
+THE PROBLEM YOU MUST SOLVE
+origin/feat/task-208-rss-bound has moved on 7 commits since 45e1aeb (the base
+task 211 was built on): 64f0b86, 3704a9a, d501b24, eca7b69, e950340, cae28a7,
+194a5b9 — all about sizing the RSS default from resident measurements instead
+of VmPeak. They touch the SAME THREE FILES as task 211's commits
+(worker_isolation.py, supervisor/service.py, test_worker_isolation_fallback.py).
+This is a real content conflict, not a mechanical fast-forward — you must
+read both sides and reconcile them so the final tree has BOTH: the corrected
+RSS-default sizing AND the self-relocation fix, with neither regressed.
+
+DONE MEANS
+1. Rebase (or equivalent reconciliation — your judgment once you've read both
+   diffs) the self-relocation commits onto the current origin/feat/task-208-rss-bound
+   tip (194a5b9), folding in the load-bearing conftest.py edit.
+2. The full existing test suite passes on CT110, including
+   tests/test_worker_isolation_fallback.py (fake-cgroupfs suite) and the new
+   self-relocation coverage from 906409e.
+3. `git push` the reconciled branch (the run's own GH_TOKEN can do this —
+   verify it's present in the environment first, same as prior runs since
+   2026-09-14 16:21 PT).
+4. Open the PR yourself and STOP — do not merge. In the PR description,
+   state PLAINLY that acceptance item A3 (live proof of all four
+   tests/test_worker_rss_bound.py tests passing inside the real delegated
+   cgroup) is STILL OUTSTANDING: it requires deploying this branch to
+   /home/harness/release-src and restarting lh-harness.service in an
+   ACTIVE=0 window, which only the overseer can schedule (it kills every
+   in-flight run) — do not attempt it yourself, do not claim it as done.
+5. No change to the RSS bound value beyond what's already settled upstream on
+   this branch (the 194a5b9 tip's own numbers) — task 211 never touched that,
+   don't touch it either.
+
+CONTEXT YOU DO NOT NEED TO RE-DERIVE
+- The cgroup v2 no-internal-process root cause and why self-relocation fixes
+  it: fully explained in commit 906409e's message and diff — read it, don't
+  re-derive it.
+- Delegate=memory pids is correctly live on CT110 today — this is a design
+  fix to what the code does with a subtree that IS correctly delegated, not
+  a "the deploy didn't happen" bug.
+- Not urgent / no live safety exposure: every real call site already falls
+  back to unbounded_plan on OSError, so real runs launch fine today, just
+  silently unbounded — exactly the pre-208 behavior. Correctness over speed.

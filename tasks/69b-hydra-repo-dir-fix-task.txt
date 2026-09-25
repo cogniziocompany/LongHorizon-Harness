@@ -1,0 +1,119 @@
+TASK 69b - Fix HYDRA_REPO_DIR so the hydra-e2e job works on the LINUX runner. Slice 2 of 3.
+BLOCKED ON 69a: do not start until 69a has NAMED the three checkpoints.
+
+REPO / WORKSPACE: cognizioware-qa   BRANCH: fix/hydra-e2e-repo-dir
+
+================================================================================
+KEEP THE EPISODE SMALL - this is why the task was sliced
+================================================================================
+Three previous attempts produced ZERO commits. Measured 2026-09-10: the executor trajectory reached
+13.36 MB and per-request latency climbed to 3m44s until the episode ran out its 3600 s budget. The
+cause is CONTEXT SIZE, not a hard bug. Open the workflow file and the suite file. Do not survey the
+repository. If you are grepping broadly, stop and commit what you have.
+
+================================================================================
+THE DECISION IS ALREADY MADE - IMPLEMENT (a)
+================================================================================
+There is NO correct Linux path to point the variable at. Measured on CT210: no hydra directory
+exists anywhere under /home/runner or /opt, and fake-agent.js is not on the box at all. So
+repointing the variable cannot work.
+
+**IMPLEMENT (a): have the workflow check the repo out itself.**
+`actions/checkout` with `repository: cogniziocompany/cognizioware-hydra` into a known path, then set
+HYDRA_REPO_DIR from `${{ github.workspace }}`. A job that depends on somebody having manually cloned
+a sibling repo onto a runner is precisely the fragility that caused this - the runner moved from
+Windows to CT210 and the assumption died silently.
+
+*** THE TOKEN IS THE RISK AND IT IS NOT YET SETTLED. cognizioware-hydra is a PRIVATE repo
+(visibility=private), so actions/checkout needs a token, and NO qa workflow does a cross-repo
+checkout today - there is no proven-good token to copy from. BEFORE relying on one: state WHICH
+secret you intend to use, and whether it actually exists. Do NOT invent a secret name. Do NOT print
+a token value anywhere - env var NAMES only. ***
+
+IF NO USABLE TOKEN EXISTS: fall back to (c) - make the three dependent checkpoints SKIP WITH A
+STATED REASON, and say plainly that (a) was blocked on the token. A checkpoint that can never pass
+in the environment it runs in is the same defect as a test asserting a field that does not exist: it
+trains people to ignore a red suite. A stated skip is honest; a silent pass is not.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Do NOT lower the 76.92 threshold. The bar is not the problem.
+ - Do NOT delete a checkpoint to make the suite green. Skip with a reason, or fix the path.
+ - FACTORY_REPO_DIR is NOT yours - it is slice 69c. Do not fix it here; do not leave a comment
+   claiming it is done.
+ - No live Hydra calls, no QA backend calls, no deploys. The suite is dispatched by CI.
+ - Plain git. Commit by EXPLICIT PATH. Never git add -A. Check git diff --stat first.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+ - Before declaring completion: git fetch origin && git merge origin/<base>, and report the result.
+
+DONE MEANS: the commits, diff --stat, where HYDRA_REPO_DIR is set and what it is now, which option
+(a or c) you implemented and WHY, the token you named and whether it exists, the resulting score,
+and whether the job passes its bar.
+
+================================================================================
+*** THE TOKEN EXISTS. TAKE OPTION (a). - PAXTON, 2026-09-10 22:25 PT ***
+================================================================================
+A secret named **`HYDRA_REPO_READ_TOKEN`** has been created in `cogniziocompany/cognizioware-qa`.
+**NAME ONLY - the value is not in this file, not in the queue note, and not in any transcript. Read it
+from the secrets context; never echo, log, or commit it.**
+
+This SUPERSEDES the earlier instruction to "verify HYDRA_API_KEY's scope empirically and fall back to
+option (c)". You now have a real credential:
+  * **TAKE OPTION (a).** The three checkpoints - `hydra-device-register`, `hydra-device-session`,
+    `hydra-device-cleanup` - **RUN, they do not skip.**
+  * Do NOT use `HYDRA_API_KEY` for the checkout. It is a service API key, not a git credential; that
+    was the whole reason option (c) existed as a fallback.
+  * Fallback (c) is now the FAILURE path only, not the expected one. If the checkout still fails,
+    report the exact error and skip explicitly with a stated reason - **never weaken the job to
+    manufacture a green.**
+
+*** THIS IS THE FIRST CROSS-REPO CHECKOUT SECRET IN THIS REPO, AND IT CARRIES A RETIREMENT DEBT. ***
+Paxton, 22:25: the earlier audit of 16 existing secrets found **no cross-repo `actions/checkout`
+precedent** - so there is no house pattern to copy and this token establishes one.
+**If `cognizioware-qa` ever moves to a GitHub App or an org-level secret, THIS TOKEN IS THE THING TO
+RETIRE.** Write that into the workflow as a comment beside the secret reference, and into the PR body.
+A first-of-its-kind credential with no retirement note is how long-lived tokens outlive their reason.
+
+WHAT THE PREVIOUS RUN ESTABLISHED - do not re-derive:
+  `HYDRA_REPO_DIR` is a **repository VARIABLE** (`${{ vars.HYDRA_REPO_DIR }}`), NOT a hardcoded path.
+  Read at `.github/workflows/qa-ci.yml:91` inside the `hydra-e2e` job that begins at line 69 - the
+  comment at line 90 documents the sibling-checkout assumption this task exists to remove - and again
+  at `qa-gate.yml:144`. Its value lives in GitHub repo variables, which a run cannot change.
+
+================================================================================
+*** READ THIS FIRST. TWO RUNS HAVE NOW "COMPLETED" THIS TASK AND PRODUCED NOTHING. ***
+    Overseer, 2026-09-11 07:50 PT.
+================================================================================
+Run 1: `20260911T103601Z_0341d093` - manager confirmed completion. Tree: ZERO commits.
+Run 2: `20260911T135747Z_3c1a66e7` - manager confirmed completion. Tree: ZERO commits.
+
+Both times the workspace `cognizioware-qa` was left in the IDENTICAL state:
+
+    branch fix/hydra-e2e-repo-dir @ 68ce620   (unchanged across both runs)
+    git log origin/main..HEAD          -> EMPTY
+    git diff --stat origin/main..HEAD  -> EMPTY
+    untracked: qa-ci.yml.bak, qa-ci.yml.bak2, qa-ci.yml.bak3, qa-gate.yml.bak
+
+**THE `.bak` FILES ARE THE TELL.** Something in the approach edits a workflow by copying it to
+`file.bak`, `file.bak2`, `file.bak3` - and then never commits the result. Three generations of
+backup and zero commits means the work is being done and then abandoned in the working tree.
+
+**WHAT THIS TASK REQUIRES, AND IT IS NOT NEGOTIABLE:**
+ 1. **COMMIT WHAT YOU CHANGE.** `git add <explicit paths>` then `git commit`. Never `git add -A`.
+ 2. **DELETE the `.bak` files** - they are litter from the previous two attempts, not work in
+    progress. Do not treat them as a starting point and do not commit them.
+ 3. **Before you report completion, run `git log origin/main..HEAD` and PASTE THE OUTPUT into your
+    report.** If it is empty, you have not completed the task - say so plainly instead.
+ 4. If you cannot make the change, STOP and explain why. **A truthful "I could not do this" is a
+    better outcome than a third confirmed completion with an empty diff**, which costs a capacity
+    slot and an operator gate every time.
+
+**CONTEXT YOU MAY BE MISSING:** this task edits `.github/workflows/` in `cognizioware-qa` to fix
+HYDRA_REPO_DIR for the hydra-e2e job on the Linux runner. The repo is `cognizioware-qa` even though
+the subject is hydra - that is correct and is stated on line 4; it is not a workspace error.

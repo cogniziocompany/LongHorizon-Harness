@@ -1,0 +1,38 @@
+TASK 185 - pr-gate: one reusable PR workflow for every fleet repo (build + tests + secret scan + impact label),
+with auto-merge for docs-only PRs.
+
+SOURCE: Paxton 2026-09-15/16; plan C:/tmp/PLAN-pr-review-gate-2026-09-15.md (step 1 and 5). Item 3 of the
+"blocked, nobody assigned" list (a green build that ran no tests, pp PR #107) is the concrete trigger; task 183
+does powerplatform first, this task generalises it. Appended after the pp and fleet-plane tasks.
+
+REPO / WORKSPACE: cognizioware-mcp-tools (hosts the reusable workflow); stub PRs in the other seven repos are
+opened BY THIS RUN too (it holds GH_TOKEN): mcp-cognizioware, LongHorizon-Harness, cognizioware-hydra,
+cognizioware-powerplatform (base develop, NEVER main), cognizioware-qa, BMAD_Cognizioware, ptait09-easybutt0n-ai.
+
+MEASURED 2026-09-15: claude-code.yml exists on 4/8 repos and is a comment-triggered reviewer, not a gate.
+mcp-cognizioware/.github/workflows/pr-checks.yml already runs on pull_request (docker build + advisory secret grep)
+- COPY ITS SHAPE. BMAD_Cognizioware and ptait09-easybutt0n-ai have NO workflows at all. mcp-tools reports "no
+checks" on PRs because images build only at merge.
+
+SCOPE
+ 1. `.github/workflows/pr-gate.yml` in cognizioware-mcp-tools with `on: workflow_call` and inputs: build_cmd,
+    test_cmd, secret_scan (default true), docs_paths (glob list). Jobs: build (runs build_cmd), test (runs test_cmd;
+    the badge must mean tests ran - upload the test report as an artifact), secret-scan (gitleaks, BLOCKING, not
+    advisory), classify (paths -> label impact:docs | impact:code | impact:deploy; deploy = litellm-config.yaml,
+    docker-compose*, .github/workflows/**, *.service, svc/**, deployments/**, powerplatform main).
+ 2. Auto-merge: a final job that, when label == impact:docs AND all gate jobs green AND repo allow_auto_merge is
+    true, runs `gh pr merge --auto --squash`. Never on powerplatform main. Never for impact:deploy (label
+    needs-window instead).
+ 3. Eight stubs: `.github/workflows/pr-gate.yml` in each repo, 8-12 lines, `uses: cogniziocompany/
+    cognizioware-mcp-tools/.github/workflows/pr-gate.yml@main` with that repo's real build/test commands read
+    from its README/package.json/csproj (do not invent; if a repo has no tests, say so in the stub and set
+    test_cmd to a command that fails loudly: `echo "no tests defined" && exit 1` is NOT acceptable - use the
+    repo's real runner or open an issue).
+ 4. Docs: docs/pr-gate.md in mcp-tools (how the labels drive merging; how to add a repo).
+
+HARD RULES: each stub PR is impact:deploy by construction (it touches workflows) -> label needs-window; the OVERSEER
+merges them. Push + open the PRs yourself, DO NOT MERGE. No secrets. The reusable file must be on mcp-tools MAIN
+before stubs can resolve it - say so in every stub PR body.
+
+DONE MEANS: pr-gate.yml on a branch of mcp-tools with a passing self-test run (workflow_dispatch on itself); eight
+stub PRs open; docs written; a docs-only test PR on mcp-tools shows the four jobs and the impact:docs label.

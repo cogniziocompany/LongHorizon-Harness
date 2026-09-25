@@ -47,7 +47,9 @@ class WorkspaceBase:
     """A resolved launch base for one workspace."""
 
     workspace: Path
-    mode: str  # "not-a-repo" | "on-default" | "in-place" | "worktree" | "stash"
+    # "not-a-repo" | "on-default" | "in-place" | "worktree" | "stash" |
+    # "continuation" (task 201: explicit per-entry opt-in, workspace untouched)
+    mode: str
     original_branch: str
     default_branch: str
     run_branch: str | None = None
@@ -57,7 +59,15 @@ class WorkspaceBase:
         parts = [f"mode={self.mode}", f"checked-out-branch='{self.original_branch}'"]
         if self.run_branch:
             parts.append(f"run-branch='{self.run_branch}'")
-        parts.append(f"base=origin/{self.default_branch}" if self.default_branch else "base=unresolved")
+        if self.mode == "continuation":
+            # The continuation branch IS the base; nothing was cut or resolved.
+            parts.append("base=continuation-branch-as-is")
+        else:
+            parts.append(
+                f"base=origin/{self.default_branch}"
+                if self.default_branch
+                else "base=unresolved"
+            )
         if self.stashed:
             parts.append("leftover-preserved-in-named-stash")
         return "; ".join(parts)
@@ -175,6 +185,8 @@ def prepare_workspace_base(
     run_label: str,
     base_root: str | Path | None = None,
     probe_open_pr: Callable[[Path, str], str | None] | None = probe_open_pr_gh,
+    continuation: bool = False,
+    requested_branch: str = "",
 ) -> WorkspaceBase:
     """Resolve a launch-safe base for ``workspace``, preserving foreign work.
 
@@ -183,6 +195,15 @@ def prepare_workspace_base(
     Raises :class:`WorkspaceBaseError` when no clean base is resolvable; the
     message always names the checked-out branch and, when known, any
     colliding OPEN PR.
+
+    Task 201 continuation opt-in: when ``continuation`` is set by the queue
+    entry (``branch``/``continue_branch``), the workspace is returned
+    unchanged with mode ``"continuation"`` — no relocation, no stash, and no
+    open-PR refusal.  With ``requested_branch`` named, the entry declares the
+    branch it intends to continue: the guard still does not switch branches
+    (the workspace is used as-is), but a workspace that is not on the named
+    branch is blocked with a retryable error rather than silently launched
+    onto the wrong branch.
     """
 
     original = str(workspace)
@@ -212,6 +233,29 @@ def prepare_workspace_base(
 
     def _prefix(msg: str) -> str:
         return f"checked-out branch '{current}': {msg}"
+
+    if continuation:
+        # Explicit per-entry opt-in (task 201): the queue entry owns this
+        # workspace and the branch it is on.  Return it unchanged — no
+        # relocation, no stash, no open-PR refusal, no fetch.  A named branch
+        # that disagrees with the checked-out one is still a misconfiguration:
+        # block it (retryably) instead of launching onto the wrong branch.
+        if requested_branch and current != requested_branch:
+            raise WorkspaceBaseError(
+                _prefix(
+                    f"continuation entry named branch '{requested_branch}' but the "
+                    f"workspace has '{current}' checked out; refusing to launch "
+                    f"onto the wrong branch — set continue_branch instead, or "
+                    f"check out '{requested_branch}'"
+                )
+            )
+        return WorkspaceBase(
+            workspace=repo,
+            mode="continuation",
+            original_branch=current,
+            default_branch="",
+            run_branch=current,
+        )
 
     try:
         default = _detect_default_branch(repo)
@@ -284,6 +328,19 @@ def prepare_workspace_base(
             sibling = root / f"{repo.name}.run-{run_label}"
     try:
         _git(repo, "worktree", "add", "-b", run_branch, str(sibling), f"refs/remotes/origin/{default}")
+        # Hazard invariant (memory note wsl-worktree-prune-hazard): every
+        # WSL-created run worktree must be locked immediately, or a
+        # `git worktree prune` run from Windows git — which cannot resolve
+        # these paths — deletes the live worktree's admin entry.  A failed
+        # lock is tolerated: it only means the worktree was already locked.
+        _git_soft(
+            repo,
+            "worktree",
+            "lock",
+            str(sibling),
+            "--reason",
+            f"lh-harness run branch {run_branch} (WSL paths; do not prune from Windows)",
+        )
         return WorkspaceBase(
             workspace=Path(os.path.normpath(str(sibling))),
             mode="worktree",
@@ -323,6 +380,8 @@ def resolve_run_base(
     run_label: str,
     base_root: str | Path | None = None,
     probe_open_pr: Callable[[Path, str], str | None] | None = probe_open_pr_gh,
+    continuation: bool = False,
+    requested_branch: str = "",
 ) -> tuple[WorkspaceBase | None, str | None]:
     """Resolve the guard base and the workspace a run must execute in.
 
@@ -337,6 +396,10 @@ def resolve_run_base(
       ``base.workspace`` only when the guard produced a linked worktree, and
       in the requested workspace for every other mode.
 
+    ``continuation``/``requested_branch`` pass straight through to
+    :func:`prepare_workspace_base` (task 201): a queue entry that owns a
+    branch keeps it untouched; a named branch mismatch still blocks.
+
     Raises :class:`WorkspaceBaseError` when no clean base can be resolved; the
     message names the checked-out branch and, when known, any colliding PR.
     """
@@ -348,6 +411,8 @@ def resolve_run_base(
         run_label=run_label,
         base_root=base_root,
         probe_open_pr=probe_open_pr,
+        continuation=continuation,
+        requested_branch=requested_branch,
     )
     effective = str(base.workspace if base.mode == "worktree" else workspace)
     return base, effective

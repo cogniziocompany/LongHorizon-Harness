@@ -1,0 +1,36 @@
+TASK 207 - RECONCILE mcp-tools PR #164 (TASK-160 addy skills pack) WITH MAIN, ONE FILE ONLY
+
+REPO: cogniziocompany/cognizioware-mcp-tools   BRANCH: the EXISTING #164 head (03ae506d). Append only.
+DO NOT open a second PR. DO NOT rebase a pushed branch - merge origin/main INTO the branch.
+
+WHY THIS EXISTS
+On 2026-09-18 18:14 UTC the CT202 deploy-lane hold was lifted (task 122's 4 GiB azure-mcp cap proved
+itself under live E2E load) and three of the four held PRs merged: #163 (e74703f0), #166 (aa5ad096),
+#167 (ef962e03). #164 was the fourth and is now CONFLICTING - mergeable_state=dirty, base c4895555 stale.
+
+THE CONFLICT IS EXACTLY ONE FILE: e2e/suites/25-gateway-skills-mcp.test.js
+Both #166 and #164 rewrote the same constants/header block, with DIFFERENT and BOTH-WANTED intents:
+  - main (after #166, TASK-167): SKILLS_DIR counts skill folders at RUNTIME (never hard-coded, because
+    skills land one PR at a time), and adds LH_PROMPT = 'skills-skill-lh-orchestrator' plus its assertion
+    that the lh-orchestrator doctrine prompt is served.
+  - #164 branch (TASK-160): SKILLS_TREE counts at runtime too, but filters /^addy-/ directories so the
+    25 VENDORED third-party skills (addyosmani/agent-skills, MIT, pinned in skills/_addy-references/
+    UPSTREAM.md) are NOT counted against the first-party skill count; returns -1 to soft-skip when the
+    tree is missing on a checkout.
+REQUIRED RESOLUTION - KEEP BOTH BEHAVIOURS, delete neither:
+  1. Count skill folders at runtime (no constant literal count).
+  2. EXCLUDE /^addy-/ folders from the FIRST-PARTY count, and assert the vendored count separately.
+  3. KEEP the lh-orchestrator prompt assertion from #166 intact - do not drop or skip it.
+  4. Keep the existing soft-skip semantics (missing tree / no LITELLM_MASTER_KEY -> record skip, not fail).
+The other 47 files of #164 are vendored skill content and did NOT conflict - do not touch them.
+
+STEPS
+ 1. git fetch origin; git checkout the #164 head; git merge origin/main (expect ONE conflicted file).
+ 2. Resolve 25-gateway-skills-mcp.test.js per the four rules above.
+ 3. node --check (or the repo's test runner) on that suite; it must parse and its soft-skip path must work
+    without a live gateway.
+ 4. Commit by explicit path, push to the SAME branch, and STOP. Read back that PR #164 reports
+    mergeable=MERGEABLE. MERGING IS THE OVERSEER'S - never merge, and never post an @claude comment.
+
+HAZARD: merging #164 fires the CT202 deploy lane (paths e2e/** and infrastructure/**), which runs a full
+prod deploy. That is the overseer's call in a window, not this run's.

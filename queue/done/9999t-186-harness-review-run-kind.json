@@ -1,0 +1,16 @@
+{
+  "name": "9999t-186-harness-review-run-kind",
+  "task_file": "C:/tmp/harness-review-run-kind-task.txt",
+  "task_source": "task_file",
+  "workspace": "LongHorizon-Harness",
+  "max_rounds": 8,
+  "trio": "kimi",
+  "note": "*** RENUMBERED 179 -> 186 on 2026-09-16: the overseer's own tick queued a different task 179 in the same window; 186 is this one (PR-review-gate plan). *** || Queued 2026-09-16 by session [fe2679] on Paxton's go (PR-review-gate plan, C:/tmp/PLAN-pr-review-gate-2026-09-15.md; decisions: Hydra hosts the App endpoint, gateway trio reviews, docs-only auto-merge, existing Claude/Copilot apps as the only fallback after two harness failures). Appended after pp and fleet-plane tasks. run_kind=review: single reviewer role from auditor_agent, read-only checkout by sha, review.json verdict pass|fail|cannot_review, gateway trio (kimi-k3 -> nemotron -> ornith when synthetic=DOWN). Never posts to GitHub itself (180 does). || STATE = PR, established 2026-09-20 16:27 PT by the interactive overseer [5321285c] in the same triage. The run ended without a disposition, but its branch feat/task-186-review-runs is on origin at 6274f6c with LongHorizon-Harness PR #23 STILL OPEN. It needs review and a merge decision, NOT a relaunch. || INCOMPLETE BY ITS OWN RUN'S ACCOUNT - disposition 2026-09-20 20:24 PT [5321285c]: LongHorizon-Harness PR #23 (feat/task-186-review-runs) is CONFLICTING/DIRTY and its run said plainly 'Task 186 is not done' - the run ended incomplete, no audit was produced and no executor deliverable was accepted. So the PR is a partial branch, not a merge candidate. Finish-or-close is a decision for a follow-up task, and the branch is ALSO the one parked in the CT110 LongHorizon-Harness workspace, which is why entry 203 kept being refused.",
+  "run_id": "20260917T170354Z_9b39315f",
+  "roles_bound": {
+    "manager": "nemotron-3-super:synthetic-anthropic",
+    "executor": "kimi-k3:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-17T17:03:54.357012+00:00"
+}

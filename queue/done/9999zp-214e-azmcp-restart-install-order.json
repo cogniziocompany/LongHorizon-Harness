@@ -1,0 +1,16 @@
+{
+ "name": "9999zp-214e-azmcp-restart-install-order",
+ "task_file": "C:/tmp/azmcp-restart-install-order-task.txt",
+ "task_source": "task_file",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 5,
+ "trio": "kimi",
+ "note": "Queued 2026-09-20 09:20 PT by SCHEDULED TICK #976 [longhorizon-harness overseer]. 214d (PR #182, merged 4b0f8acc7) still did not land its deliverable: read CT202 directly after deploy run 35521649779 finished all-6-green - no azure-mcp-supervised-restart.sh, no /etc/cron.d/azure-mcp-restart. ROOT CAUSE (read from the merged file + live job log 106107637491): `install_supervised_restart()` sits AFTER `main()` in the `if __name__==\"__main__\":` block, and `main()` calls `sys.exit(1)` on every deploy because the Portainer stack-update API returns a permanent 500 (\"compose build operation failed: unable to prepare context: path .../gateway-guides-mcp not found\") - this is the SAME failure the workflow itself labels expected/non-fatal (\"Portainer sync failed (expected - it cannot build this stack)\"). SystemExit from sys.exit(1) skips the next top-level statement, so install_supervised_restart() has never executed on CT202, not once, since PR #182 merged. Fix is ordering/control-flow only (reorder or try/finally), not the sync allowlist (already correct) and not Portainer. Prod-landing rule: all-Synthetic trio required, verify roles_bound after launch. Push+PR only, no merge. Task 214 stays MERGED (not LIVE/VERIFIED) until this lands and CT202 read-back shows both the script file and the cron.d line. STATUS UPDATE 2026-09-20 11:23 PT tick #997: PR #183 merged 609c1254 (tick #995), deploy 35528199461 all-6-green, CT202 read back directly - script present+0755, cron.d line present, container running StartedAt 2026-09-20T18:19:31Z restarting=false. TASK 214 CHAIN VERIFIED AND CLOSED.",
+ "run_id": "20260920T162151Z_926f9473",
+ "roles_bound": {
+  "manager": "kimi-k3:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-20T16:21:51.372303+00:00"
+}

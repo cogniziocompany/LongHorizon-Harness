@@ -1,0 +1,8 @@
+{
+ "name": "05h2-qa-webux-gate-defects",
+ "task_file": "C:/tmp/qa-webux-gate-defects-task.txt",
+ "workspace": "/home/harness/work/cognizioware-qa",
+ "max_rounds": 4,
+ "trio": "kimi",
+ "run_id": "20260908T045002Z_ef02a6b1"
+}

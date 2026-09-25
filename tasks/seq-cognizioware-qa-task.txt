@@ -1,0 +1,261 @@
+TASK 139 - Ship cognizioware-qa logs to the prod Seq server (seq.easybutt0n.ai): backend runtime
+logs AND QA gate outcomes from BOTH CI lanes.
+
+REPO / WORKSPACE: cognizioware-qa
+Source: Paxton 2026-09-10, session [d7a039] (d7a0391e-355f-432d-8ee2-b0a9e878c03c), plan mode.
+
+*** THIS IS THE THIRD SEQ TASK AND THEY DO NOT OVERLAP. Task 135 ships cognizioware-powerplatform
+prod backend logs; task 137 ships ops-control-center + Node MCP services from cognizioware-mcp-tools.
+THIS one is cognizioware-qa only. Same destination, three different senders. Do not "helpfully"
+touch the other two repos. ***
+
+================================================================================
+CONTEXT - measured during exploration, do not re-derive
+================================================================================
+cognizioware-qa has NO centralized log sink. Everything is ephemeral:
+  - packages/backend uses pino ^10.3.1 as a bare pino({level}) in config/logger.ts - JSON to stdout
+    only. In prod that means logs live solely in `docker compose logs backend` on pve151 and die
+    with the container.
+  - packages/runner (27 console.* calls) and the three *-acceptance/ suites (0, 1 and 5 console.*
+    calls) produce output that exists only in a terminal or a GitHub Actions job log, which ages out.
+
+The fleet ALREADY runs a live, known-good Seq at https://seq.easybutt0n.ai (Caddy ->
+http://192.168.21.128:5341 on terranas01), already wired into the LiteLLM gateway as the `seq_mcp`
+MCP server - so anything landing there becomes agent-queryable. Sibling services in
+cognizioware-mcp-tools already use a SEQ_BASE_URL + SEQ_API_KEY pair. Nothing in cognizioware-qa
+references Seq today.
+
+PAXTON'S DECISIONS: a Seq API key ALREADY EXISTS (no key-creation step); scope is backend + runner +
+acceptance suites; suite coverage is OUTCOME-LEVEL via gate-report.mjs; the qa-ci.yml lane is to be
+SOLVED NOW, not deferred.
+
+================================================================================
+WHY OUTCOME-LEVEL AND NOT A PINO RETROFIT - this reasoning is settled, do not redo it
+================================================================================
+The obvious reading of "cover the runner and suites" is to retrofit pino into all four. That is the
+WRONG build, for four measured reasons:
+  - litellm-acceptance and billing-acceptance have ZERO dependencies (node --test); oidc-acceptance
+    has only @playwright/test. pino + pino-seq would be their first dependency ever.
+  - All four are ONE-SHOT processes that exit immediately. pino-seq batches on a timer, so each
+    would need bespoke flush wiring across 5 runner flow scripts, a Playwright reporter and two
+    node:test hooks - seven fragile exit paths, each a silent-log-loss bug.
+  - The suites sit OUTSIDE the npm workspace (root glob is packages/*), so there is no clean shared
+    module.
+  - Their raw stdout is nearly worthless anyway (0 / 1 / 5 console lines). THE SIGNAL IS THE OUTCOMES.
+
+scripts/gate-report.mjs is already the universal choke point: it normalizes ALL FOUR result formats
+(qa-run, playwright, tap, merge); emits target/env/profile/callerSha/score/passed/failed/skipped/
+durationMs/tagCounts and per-check {name,status,tag,message,httpStatus,expected,actual} where `tag`
+is the existing drift / test-debt / real / unclassified classification; already uses global fetch
+(L107) with ZERO dependencies; and is already top-level-await (L279), so `await postToSeq(...)`
+needs NO flush machinery.
+
+================================================================================
+DESIGN - two sinks, because the workloads genuinely differ
+================================================================================
+                  TIER A - backend runtime        TIER B - QA outcomes
+  Covers          packages/backend (long-running) runner + oidc + litellm + billing, both CI lanes
+  Mechanism       pino + pino-seq multistream     fetch -> Seq CLEF, zero deps
+  Application     cognizioware-qa-backend         cognizioware-qa-gate
+  Failure mode    onError -> console.error        try/catch -> ::warning::, never reddens a job
+
+SHARED CONVENTIONS:
+  - Env vars SEQ_BASE_URL, SEQ_API_KEY, SEQ_ENVIRONMENT - matches this repo's own
+    <SERVICE>_BASE_URL/<SERVICE>_API_KEY pairs (N8N_*, LITELLM_*) and the sibling aidev02-app.
+  - ENABLEMENT BY PRESENCE, NOT A FLAG. Blank SEQ_BASE_URL => console only. Local dev and fork PRs
+    degrade to exactly today's behaviour with zero config.
+  - NEVER FAIL THE CALLER. Neither sink may throw, retry-storm, or block shutdown.
+
+================================================================================
+TIER A - backend runtime logs
+================================================================================
+ 1. DEPENDENCY: add pino-seq to packages/backend/package.json. Chosen over
+    @autotelic/pino-seq-transport (stuck at 0.1.0 from 2022, predates pino v10): pino-seq is by
+    Datalust (the Seq vendor), declares peerDependencies {pino: "10.x"} matching the installed
+    pino@^10.3.1, and is TypeScript + ESM native (repo is "type":"module"). VERIFY the version that
+    actually resolves and say which.
+ 2. NEW packages/backend/src/config/seq.ts - a buildLogDestination({serverUrl, apiKey, application,
+    environment}) that returns {destination, flush}:
+      - always push {stream: process.stdout} first;
+      - only if serverUrl is set, createStream({serverUrl, apiKey: apiKey||undefined,
+        additionalProperties:{Application, Environment}, onError: e => console.error(...)}) and push it;
+      - return pino.multistream(streams) plus a flush() that resolves when there is no Seq stream.
+    onError MUST NOT rethrow. A logging path that can throw is worse than no logging.
+ 3. config/env.ts - add SEQ_BASE_URL, SEQ_API_KEY, and
+    SEQ_ENVIRONMENT: process.env.SEQ_ENVIRONMENT ?? 'production' to the getEnv() literal in the
+    existing ?? '' style. (SEQ_ENVIRONMENT future-proofs the planned develop->dev / release->uat /
+    main->prod lanes in design/handoffs/prod-cicd-cutover-expert-handoff.md; the default is correct
+    for today's single target.)
+ 4. config/logger.ts - swap the bare pino({level}) for the factory and export flushLogs. `level`
+    semantics UNCHANGED, so the request middleware, the DB logs in db/client.ts and all 14
+    logger.error(...) sites in routes/qa.routes.ts reach Seq with ZERO call-site edits.
+ 5. index.ts - await flushLogs() in the main().catch() fatal handler before process.exit(1), plus
+    SIGTERM/SIGINT handlers. WITHOUT THIS THE CRASH AND SHUTDOWN LOGS - the ones that matter most -
+    die in an unsent batch.
+ 6. NOISE CONTROL: the request middleware logs EVERY request at info, including /api/health polling.
+    Down-level health-check hits to debug so prod (LOG_LEVEL=info) does not flood Seq.
+ 7. ENV FILES - and read the hazard below before touching prod.env.
+    .env.example gains SEQ_BASE_URL (BLANK) + SEQ_API_KEY + SEQ_ENVIRONMENT with a comment that
+    blank = console-only. docker-compose.yml needs NO change - the backend service already uses
+    env_file: .env, which forwards every key.
+
+*** SECRET HAZARD - THIS OVERRIDES THE SOURCE PLAN. The plan says to paste the real key into
+prod.env. DO NOT. prod.env in this repo is GIT-TRACKED AND ALREADY CONTAINS LIVE PLAINTEXT SECRETS -
+the plan's own "out of scope" section admits it ("rotating the other live secrets committed in
+prod.env"). Adding a fresh key there commits a NEW secret into a history that is already slated for
+a cleanse. So: PLACEHOLDERS ONLY in any tracked file; the real key goes in the PROD HOST .env BY
+HAND. Confirm with `git ls-files prod.env` before you write anything into it, and say what you
+found. Env var NAMES only in every commit, doc and log line. ***
+
+================================================================================
+TIER B - QA outcomes
+================================================================================
+ B1. NEW scripts/lib/seq.mjs - a dependency-free CLEF emitter `postToSeq(events)`:
+     - if SEQ_BASE_URL unset or events empty => silent no-op;
+     - POST to `${url}/api/events/raw?clef`, Content-Type application/vnd.serilog.clef, body is
+       newline-delimited JSON, X-Seq-ApiKey header only when SEQ_API_KEY is set;
+     - AbortSignal.timeout(10_000) so it can NEVER hang a CI job;
+     - non-2xx => console.error('::warning::...'); any throw => caught and warned. NEVER rethrow.
+     CLEF: @t timestamp, @mt message template, @l level (Information is the default and omitted),
+     everything else a top-level property.
+ B2. scripts/gate-report.mjs - after the report is written (~L322), build events and
+     `await postToSeq([...])`. Already top-level-await, so no flush wiring and no exit hooks.
+     - ONE SUMMARY EVENT PER RUN: @mt "QA gate {Target}/{Env} scored {Score}% ({Passed}/{Scored})",
+       level Information when failed===0 else Error. Properties: Application 'cognizioware-qa-gate',
+       Environment (the --env value), Target, Profile, CallerSha, RunId, Score, WeightedScore,
+       Passed, Failed, Skipped, Total, DurationMs, TagCounts, plus GithubRunUrl/GithubRunId from
+       GITHUB_* so every event links back to its job.
+     - ONE EVENT PER FAILED CHECK: level Error, properties CheckName, Tag (drift/test-debt/real/
+       unclassified), Message, HttpStatus, Expected, Actual, Method, plus the same
+       Target/Environment/CallerSha. Passing checks are NOT emitted; gate on SEQ_EMIT_PASSED=1 if
+       ever wanted. THIS IS THE HIGHEST-VALUE PART: it makes the existing classification TRENDABLE -
+       "is drift or real breakage rising, on which target, over which weeks" - which is exactly what
+       the taxonomy in the script header exists to answer and which nothing consumes today.
+ B3. .github/workflows/qa-gate.yml - ENV ONLY. Add SEQ_BASE_URL: ${{ vars.SEQ_BASE_URL }} and
+     SEQ_API_KEY: ${{ secrets.SEQ_API_KEY }} to the step-level env: on the seven existing
+     gate-report.mjs steps (L186, L249, L310, L375, L437, L552, L595), matching the vars.*/secrets.*
+     pattern already used there for QA_API_URL/QA_USER_EMAIL. NO logic changes.
+ B4. .github/workflows/qa-ci.yml - THE 6-HOURLY LANE. This lane calls gate-report.mjs NOWHERE - it
+     only uploads artifacts - so B3 does not cover it. It runs every 6h on cron plus master pushes
+     and hydra-deployed dispatches, which makes it the most valuable recurring signal in the repo.
+     Facts that make this safe and cheap:
+       - hydra-e2e already sets QA_API_URL (L87) - the one thing --source qa-run needs (L107).
+       - oidc-acceptance already produces/uploads oidc-acceptance/results/tier-results.json (L180) -
+         byte-for-byte the --source playwright --file input qa-gate.yml consumes at L251.
+       - oidc-shield produces the same JSON (reporter configured in oidc-acceptance/
+         playwright.config.ts), confirmed by qa-gate.yml's chat-tier2 job reading that path (L310-312).
+       - hydra-e2e / oidc-acceptance / oidc-shield are all gated by workflow_dispatch ||
+         repository_dispatch || schedule || (push && master) (L72, L136, L187) - they NEVER run on
+         pull_request, so adding secrets.SEQ_API_KEY creates NO fork-PR secret exposure. STATE that
+         you re-verified this before adding the secret.
+     Per job:
+       1. hydra-e2e - give the suite step `id: suite`, `set -o pipefail` + `| tee /tmp/hydra.log`,
+          and `continue-on-error: true`; then a "Gate report -> Seq" step that greps the run id out
+          of the log and calls gate-report.mjs --target hydra --env qa --source qa-run --run-id;
+          then a final `if: steps.suite.outcome != 'success' -> exit 1` guard so today's red/green is
+          preserved EXACTLY.
+          TWO DELIBERATE DEVIATIONS from qa-gate.yml: a missing run id is a ::warning:: + exit 0 here
+          (qa-gate ::error::s at L183-184), and the report step is continue-on-error - because this
+          lane is a MONITOR and adding reporting to it must not create a new way for it to go red.
+       2. oidc-acceptance (Tier 1) - add id: suite + continue-on-error to the npm run test:tier1 step
+          (L164-165), then an `if: always()` report step with --target chat --env qa
+          --caller-sha "<sha>-tier1" --source playwright --file oidc-acceptance/results/tier-results.json,
+          then the same fail-if-suite-failed guard.
+          *** working-directory: . IS REQUIRED AND NOT OPTIONAL - the job sets
+          defaults.run.working-directory: oidc-acceptance (L142), and gate-report.mjs resolves BOTH
+          --file and its qa-reports/gate output against process.cwd(). qa-gate.yml sets this override
+          explicitly on its own chat report steps (L247, L309) for exactly this reason. ***
+       3. oidc-shield (Tier 2) - identical to (2) with --caller-sha "<sha>-tier2" and the same
+          working-directory: . override (job default is oidc-acceptance, L192).
+       4. build - UNTOUCHED. Typecheck-only, no QA signal worth shipping.
+     ENVIRONMENT LABEL: these events use --env qa, deliberately distinct from qa-gate's dev/uat/prod
+     so the two lanes never blur together in Seq. Verified safe: gate-report.mjs only requires
+     --target and --env to be non-empty (L48-51); there is no enum to trip over. The lane's own
+     comment (L24) calls this "the persistent QA environment", so `qa` is the honest label - calling
+     it prod would be a lie even though it points at prod-looking URLs.
+
+ ONE-TIME MANUAL SETUP (Paxton or the overseer, NOT the run): repo VARIABLE SEQ_BASE_URL =
+ https://seq.easybutt0n.ai and repo SECRET SEQ_API_KEY = the existing key. Until both exist every new
+ step no-ops silently by the presence rule - so this change is SAFE TO MERGE BEFORE the secret is
+ created. Do not ask for the key and do not print it.
+
+================================================================================
+VERIFICATION - and note which of these you can actually reach
+================================================================================
+ 1. Backend local opt-in: set SEQ_BASE_URL/SEQ_API_KEY in a local .env, npm run dev -w
+    packages/backend, hit /api/health and a /api/qa route. Confirm in Seq (or via the seq_mcp
+    get-events tool) that Application = 'cognizioware-qa-backend' events arrive carrying Application
+    + Environment.
+ 2. Structured errors: force a route failure; confirm logger.error({err},...) renders as a real
+    structured Seq event WITH the exception attached, not a flattened string.
+ 3. GRACEFUL DEGRADATION (MUST-PASS): point SEQ_BASE_URL at an unreachable host - app keeps serving,
+    stdout unaffected, only '[seq] log shipping failed' on stderr. Then UNSET it and confirm
+    behaviour is byte-identical to today. Do this in a THROWAWAY container, never against prod.
+ 4. Flush on exit: SIGTERM the backend; confirm the shutdown line reached Seq.
+ 5. Gate reporter locally (no CI needed): SEQ_BASE_URL=... node scripts/gate-report.mjs --target
+    litellm --env dev --source tap --file <saved tap> -> one summary event plus one event per failed
+    check under Application='cognizioware-qa-gate' with Tag populated. Repeat with
+    --source playwright --file oidc-acceptance/results/tier-results.json to prove BOTH parsers.
+ 6. NEVER REDDENS: repeat 5 with SEQ_BASE_URL at a dead host - the script must still print its
+    score=... line, write its report, and exit 0.
+ 7. qa-ci BEFORE the secret exists: confirm all three jobs stay green and behave exactly as before
+    (proves the no-op path).
+ 8. qa-ci AFTER the secret exists: workflow_dispatch a run; confirm Environment=qa events for
+    Target=hydra and Target=chat land with working GithubRunUrl, AND that a deliberately failing
+    suite still turns the job RED (proves the fail-if-suite-failed guard survived continue-on-error).
+ 9. qa-gate lane: trigger with -f env=dev; confirm events tagged Environment=dev, distinct from qa.
+ 10. Prod backend on pve151 - THIS IS A PROD DEPLOY AND IS NOT YOURS. Deliver the steps; the
+     overseer runs them. Use `docker compose up -d --build`, NOT restart (restart reuses the
+     container and will not re-read .env).
+ READ SEQ TO VERIFY, NOT THE CONTAINER STARTING. Use the LAN admin UI
+ seq-terranas01.lan.easybutt0n.ai (no API key needed). Do NOT rely on the seq_mcp gateway backend if
+ it is still a 0-tool stub - check before depending on it.
+
+================================================================================
+OUT OF SCOPE - deliberate; SAY SO IN THE PR so it is not mistaken for scope creep
+================================================================================
+ - Runner/suite RAW stdout. Tier B ships outcomes, not the runner's 27 progress console.log lines.
+   Its meaningful per-step data already reaches the backend via startRun/addStep/finalizeRun
+   (packages/runner/src/lib/api.ts) and thence Seq. A pino retrofit stays available as an add-on.
+ - Rotating the other live secrets already committed in prod.env - pre-existing, flagged, and per
+   standing decision credential rotation is NOT to be raised as a blocker.
+ - Seq-side dashboards, signals and alerts - the natural next step once data flows.
+ - The qa-gate.yml caller-input gap: nothing stops a caller passing env=dev with a prod base_url.
+   Seq will now make such mismatches VISIBLE (Environment vs the target actually probed), which is a
+   good reason to fix it separately.
+
+================================================================================
+HARD RULES
+================================================================================
+ - NEVER write a secret into a file, fixture, doc, workflow or commit message. Env var NAMES only.
+   Do not put SEQ_API_KEY's value anywhere, and do not add it to a tracked env file.
+ - NEVER the bare gateway /health - it fans a completion out to every configured model, including
+   paid and GPU ones. Use /health/liveliness.
+ - Do NOT edit infrastructure/litellm-config.yaml in any repo - any edit force-recreates the CT202
+   prod router and kills in-flight runs. Nothing here needs it.
+ - Never git add -A; commit by explicit path; check git diff --stat first.
+ - Do NOT merge and do NOT deploy to pve151. Open the PR and STOP.
+
+DONE MEANS: Tier A and Tier B both implemented behind the presence rule; graceful degradation PROVEN
+against a dead Seq for both tiers (the must-pass); qa-ci.yml covered with the red/green behaviour
+preserved and proven; no secret value written anywhere; PR open, not merged.
+
+================================================================================
+*** AMENDMENT 2026-09-14 (Paxton, via the overseer): SEQ INGEST NEEDS NO AUTH. THE KEY ASK IS CLOSED. ***
+================================================================================
+Seq is a DEV environment. No ingest API key will be created, and none is needed. PROVEN by the
+overseer on 2026-09-14: POST /api/events/raw?clef with NO Authorization header returns HTTP 201
+{"MinimumLevelAccepted":null} on BOTH https://seq.easybutt0n.ai and http://192.168.21.128:5341.
+(The /api/events QUERY endpoint returns 401 "Please log in" without a session - that is the UI
+login, not ingest, and is irrelevant to shipping logs.)
+
+THEREFORE:
+  - SEQ_API_KEY / the OTLP auth header is OPTIONAL. Ship with it UNSET. Do not block startup, do not
+    downgrade logging, and do not emit a "configuration incomplete" warning when it is absent.
+  - *** Any guard that refuses to log without SEQ_API_KEY is a BUG - remove it. *** Task 161's run
+    on 2026-09-12 stopped on exactly that guard ("seq logging configuration incomplete; missing
+    environment variables: SEQ_API_KEY"), which is why this amendment exists.
+  - If a key IS present, send it; if not, send nothing. Both paths must be tested.
+  - Verification stays the same and is now unblocked: emit a uniquely-tagged event from the service
+    and confirm it arrives - the overseer can eyeball it in the Seq UI, and the run should assert the
+    201 from the ingest endpoint it actually used.

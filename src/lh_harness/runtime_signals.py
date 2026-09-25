@@ -16,7 +16,12 @@ _DIAGNOSTIC_TOOL_PATTERNS = (re.compile(r"Traceback \(most recent call last\)"),
 # that raises), so only signals that mean the agent runtime itself died count as
 # hard failures.
 _HARD_SIGNAL_PREFIXES = ("AGENT_EXIT=", TURN_FAILED_SIGNAL)
-_HARD_SIGNAL_VALUES = frozenset({"Connection error.", "response.failed"})
+# NO_OUTPUT_STALL is appended by the stalled-episode watchdog
+# (adapters/cli_agent.py): the child produced no output for its whole silent
+# window and was killed.  It is a runtime fault, not task evidence.
+_HARD_SIGNAL_VALUES = frozenset(
+    {"Connection error.", "response.failed", "NO_OUTPUT_STALL"}
+)
 
 
 def detect_runtime_signals(log: str) -> list[dict[str, str]]:

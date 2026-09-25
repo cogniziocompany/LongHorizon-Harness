@@ -1,0 +1,175 @@
+TASK 89 - audit EVERY virtual key and device, and grant each ONLY the tools and models it is allowed
+
+REPO: cogniziocompany/cognizioware-mcp-tools. Workspace on CT110:
+/home/harness/work/cognizioware-mcp-tools.
+
+Paxton, 2026-09-09, alongside the API-key work in task 88: "as you do the key api update, make it
+another queued task, also have it make sure to audit each device or key, and only assign it tools its
+allowed."
+
+## WHY - the current state is one key doing everything
+
+Measured on CT202 from LiteLLM_SpendLogs, 3-hour window: a SINGLE virtual key hash
+ed67aa8efed8d2a0... issued 1,093 Synthetic requests (51,183,416 tokens) AND 231 local requests. One
+credential is carrying the whole harness across every model and every role.
+
+That is the opposite of least privilege, and it has already bitten twice in ways worth remembering:
+
+ - A launch probe was written against LITELLM_MASTER_KEY, so every model appeared reachable. Two runs
+   then died instantly with 403 "key not allowed to access model", because the HARNESS key carries an
+   allow-list the master key does not. A probe on the wrong credential proves nothing.
+ - The gateway logged 6,529 "HTTPException in MCP tool call: 403: User not allowed to call this tool"
+   in two hours, all from the langfuse-mcp container - a client repeatedly calling tools its key was
+   never granted. Nobody noticed until the log was read.
+
+Both are the same shape: nobody can currently say which key may call which tool or model.
+
+## SCOPE
+
+1. **ENUMERATE the credentials.** Every LiteLLM virtual key on CT202 (and CT204): its alias, what
+   access groups / model allow-list it carries, which team it belongs to, and when it was last used.
+   Also enumerate the DEVICES/clients that hold one - the MCP containers on CT202, the harness on
+   CT110, the runners on CT210, the workstations, Hydra on corsairai300. **Counts and a table, not
+   adjectives.** Key NAMES and aliases only - NEVER a key value, not even truncated.
+
+2. **ENUMERATE the tools.** The gateway exposes MCP servers and their tools. For each key, determine
+   which tool surface it can actually reach today. Use the per-server tools/list, NOT a bare gateway
+   /health - a bare /health hits every model and costs real money and GPU time.
+
+3. **BUILD THE MATRIX: key x (models, tools), and mark every cell as JUSTIFIED or UNJUSTIFIED.**
+   A cell is justified only if you can point at something that actually uses it. For each UNJUSTIFIED
+   grant, say what it currently permits and what would break if it were removed.
+   **If you cannot determine whether a grant is needed, mark it UNKNOWN and leave it alone** - see the
+   hard rules. Guessing "probably unused" and revoking it is how a working system breaks quietly.
+
+4. **PROPOSE the least-privilege set**, per key: exactly the models and tools its holder needs.
+   Specifically:
+   - the harness roles (see task 88 - it introduces lh-harness-manager / -executor / -auditor keys;
+     coordinate with it rather than duplicating the work),
+   - each MCP container that calls the gateway (langfuse-mcp is a known offender - determine whether
+     it SHOULD have the tool access it was denied, or whether the denial was correct and the client
+     is retrying wrongly),
+   - the QA/e2e runners,
+   - any workstation or device key.
+
+5. **Make drift visible.** PR #119 merged an ops-doctor pattern today (check_disk in ops_doctor.py) and
+   a LiteLLM config-authority drift check. **Follow that pattern** and add a check that reports keys
+   whose grants do not match the intended matrix, rendering on ops.easybutt0n.ai **/overview** where
+   the doctor already renders. **Do NOT add a route** - RULE 2.
+
+## HARD RULES
+
+ - **DO NOT REVOKE OR NARROW ANY GRANT IN THIS TASK.** Produce the matrix and the proposal. Applying
+   it is a separate, explicitly approved step. A key narrowed on a guess takes the fleet down, and the
+   403 history above shows exactly how fast that happens.
+ - Anything you cannot justify AND cannot prove is unused is **UNKNOWN**, not "remove". List UNKNOWNs
+   for Paxton in one consolidated block.
+ - **NEVER print, log, echo or commit a key value** - not in the matrix, not in the PR body, not in a
+   test fixture, not truncated, not hashed-but-reversible. Aliases and env NAMES only.
+ - Do not create new keys with broad access "for testing". If you need a key to test with, say so and
+   stop.
+ - No bare gateway /health probes. Per-server tools/list only.
+ - Never docker compose up for mcp-tools without --env-file mcp-tools.env. No down -v.
+ - Any change to infrastructure/litellm-config.yaml FORCE-RECREATES the prod router - flag it
+   prominently in the PR body so the merge lands in a window with no active runs.
+ - Commit by explicit path; never git add -A. Check git diff --stat before opening the PR.
+ - PR to main, DO NOT MERGE.
+
+## DONE MEANS
+
+A PR against main carrying: a complete enumerated table of every virtual key and every device holding
+one (aliases only), the key x models/tools matrix with each cell marked JUSTIFIED / UNJUSTIFIED /
+UNKNOWN and evidence for each, a least-privilege proposal per key, a verdict on whether the
+langfuse-mcp 403 burst was a missing grant or a correct denial, and a drift check following the
+existing ops_doctor pattern that renders on /overview - with nothing revoked and every UNKNOWN
+surfaced for Paxton in one block.
+
+## PROPOSED ROLE TOOL SETS - measured 2026-09-09 13:10 PT. Start here, do not start from zero.
+
+Paxton: *"using the litellm, come up with an executor, manager and auditor tool set based on its
+guiding principles."*
+
+### The measured surface
+
+The gateway aggregate exposes **973 tools across 37 namespaces = 737,226 bytes of JSON schema**
+(~184,000 tokens if anything ever requested the lot). Cost per namespace is wildly uneven:
+
+| namespace | tools | schema bytes | bytes/tool |
+|---|---|---|---|
+| ruflo | 243 | 90,930 | 374 |
+| langfuse | 87 | 90,852 | 1,044 |
+| pac | 70 | 62,765 | 897 |
+| **n8n** | **39** | **106,531** | **2,732 - worst offender** |
+| telnyx | 36 | 15,807 | 439 |
+| proxmox{ptait01,ptait07,corsairai300,cognizioware01,terranas01} | 31 each (155) | ~28,500 each | ~920 |
+| hydrafleet | 28 | 11,851 | 423 |
+| playwright{,qa1,qa2,qa3} | 23 each (92) | ~18,300 each | ~795 |
+| xrm | 23 | 20,126 | 875 |
+| {htpc01,desk03,ptait09} | 22 each (66) | ~19,140 each | ~870 |
+| ms365 14 / cloudflare 13 / comfyui 12 / stripe 10 / graphify 10 | | 6,042 / 7,488 / 5,518 / 4,410 / 4,033 | |
+| postgres 9 / postgressecondary 9 / kb 7 / kbuat 7 / hydra 7 / puppeteer 7 | | 5,608 / 5,689 / 4,392 / 4,413 / 2,550 / 2,650 | |
+
+**n8n is the single worst line: 4% of the tools, 14% of the bytes.** Exclude it from any role that does
+not orchestrate workflows and you remove 106KB from every request that role makes.
+
+### The guiding principles these sets are derived from
+
+1. **Least privilege** - a role gets only what its JOB needs, not what might be handy.
+2. **The auditor NEVER writes.** Its whole value is independent verification; a writing auditor cannot
+   be trusted to judge its own effects.
+3. **Scope by `mcp_access_groups`, never by server ID** - IDs regenerate on config change and silently
+   turn an ID-scoped key deny-all.
+4. **Never `["*"]`.**
+5. **Every tool schema is re-sent on EVERY call in the round**, so the set size is a recurring cost,
+   not a one-off. Small sets are cheaper AND safer - the two goals align here.
+6. **Scope by WORKSPACE too, not one global set.** A powerplatform task needs `pac` + `xrm`; an
+   mcp-tools task does not. A single union set pays for every namespace on every call.
+
+### Proposed sets - a STARTING POINT to validate, not a decision
+
+**AUDITOR - read-only, smallest possible.** Verifies claims; must never change anything.
+
+    kb (7)  +  kbuat (7)  +  hydra (7, read)  +  postgres (9, read-only queries)
+    ~30 tools, ~17KB
+    EXPLICITLY EXCLUDED: every proxmox namespace, every ssh host namespace, pac, xrm, n8n,
+    telnyx, stripe, cloudflare, playwright. An auditor needs to READ state, never to reach a host.
+    langfuse (87 tools / 90KB) is the open question - it holds the traces an auditor would want, but
+    it is the second-largest namespace. RECOMMEND: a curated subset of langfuse read tools, not all 87.
+
+**MANAGER - plans and decides. Read-mostly; no host control, no deploys.**
+
+    kb (7) + hydrafleet (28, state) + postgres (9) + graphify (10) + hydra (7)
+    ~61 tools, ~28KB
+    EXPLICITLY EXCLUDED: proxmox* (a planner must not hold pct/docker control), ssh host namespaces,
+    n8n (106KB, and orchestration is not planning), playwright, pac/xrm unless the workspace is
+    powerplatform.
+
+**EXECUTOR - does the work. The only role with write tools, and still not host control.**
+
+    base:                kb (7) + postgres (9) + graphify (10)
+    + if powerplatform:  pac (70) + xrm (23)          [+83KB - only for pp workspaces]
+    + if browser work:   playwright (23) ONE LANE ONLY [+18KB - never all four]
+    + if fleet work:     hydrafleet (28)
+    ~26 tools / ~14KB base, ~132 tools / ~106KB fully loaded
+    EXPLICITLY EXCLUDED BY DEFAULT: all five proxmox namespaces (155 tools, ~142KB) and the three
+    ssh host namespaces. Host control belongs to an operator, not to an agent executing a queued task.
+    Grant per-task with a stated reason if a task genuinely needs it.
+
+### What to verify before proposing these as final
+
+ - **Do these sets actually cover what the roles USE?** Cross-check against real usage: the trajectory
+   artifacts (`/api/runs/{id}/rounds/{n}/trajectory/{role}`) record every `tool_use` a role made. Count
+   which tools were ACTUALLY called across a sample of runs, per role. **A set derived from usage beats
+   a set derived from reasoning** - and if a role never called a namespace in 20 runs, that is evidence.
+ - **Beware the current state:** live runs show `mcp_profile=None`, `agent=codex`, and the session step
+   records `mcp_servers: 0` - i.e. runs are presently getting NO MCP tools at all, only the agent's ~27
+   native tools. **So "what they use today" may understate what they need.** Say so if you find it.
+ - The harness ALREADY has a profile mechanism - `/api/meta` -> `mcp_profiles`: `none`, `audit`
+   (read-only: kb, guides/skills, memory, langfuse), `default` (audit + github, youtrack, ssh), `ops`
+   (default + hydra/fleet + proxmox), `full` (**no allow-list header, ALL servers**). And
+   `defaults.roles` already maps manager->`default`, executor->`default`, auditor->`audit`.
+   **EXTEND THAT MECHANISM RATHER THAN INVENTING A PARALLEL ONE**, and reconcile these proposed sets
+   with those profile names.
+ - **`full` deserves scrutiny**: "no gateway allow-list header; all configured servers permitted" means
+   a run on that profile can see all 973 tools / 737KB. Report who can select it and whether anything
+   currently does.

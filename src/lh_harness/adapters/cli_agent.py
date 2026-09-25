@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+import os
 import posixpath
 import re
 import shlex
@@ -12,6 +14,51 @@ from ..environment.base import Environment
 from ..environment.remote_files import write_remote_text
 from ..runtime_signals import detect_runtime_signals
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH, EpisodeBudget, EpisodeResult
+
+# Stalled-episode detection.  The liveness signal is OUTPUT PROGRESS: a working
+# agent CLI streams stream-json records continuously (the 09-16 fleet snapshot
+# shows 76 s completions interleaved with six 3600 s timeouts whose
+# runtime_signals were EMPTY -- the same workspace, the same role), so a
+# hung child is the one that stops emitting entirely.  Wall-clock duration
+# cannot separate "working slowly" from "hung" (both burn the budget); the
+# absence of any stdout/stderr byte for a full silent window can.
+#
+# The silent window is: LH_HARNESS_STALL_SECONDS (ops override) >
+# EpisodeBudget.stall_seconds (per-episode override) > a conservative quarter
+# of the episode budget, floored at 120 s and capped at 900 s.  With the
+# 3600 s executor wall this is 900 s of total silence -- far beyond anything
+# the 76 s completions suggest a healthy backend needs, yet eight times
+# faster than the 3600 s hangs were costing.
+DEFAULT_STALL_SECONDS_CAP = 900.0
+DEFAULT_STALL_SECONDS_FLOOR = 120.0
+NO_OUTPUT_STALL_SIGNAL = "NO_OUTPUT_STALL"
+
+
+def _stall_window(budget: EpisodeBudget) -> float | None:
+    configured = budget.stall_seconds
+    if configured is None:
+        override = os.environ.get("LH_HARNESS_STALL_SECONDS")
+        if override:
+            try:
+                configured = float(override)
+            except ValueError:
+                configured = None
+    if configured is not None:
+        return float(configured) if configured > 0 else None
+    quarter = budget.max_duration_seconds / 4.0
+    return float(min(DEFAULT_STALL_SECONDS_CAP, max(DEFAULT_STALL_SECONDS_FLOOR, quarter)))
+
+
+def _env_supports_stall_watchdog(env: Environment) -> bool:
+    """True when this Environment's exec accepts no_output_stall_seconds."""
+    exec_fn = getattr(env, "exec", None)
+    if exec_fn is None:
+        return False
+    try:
+        params = inspect.signature(exec_fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "no_output_stall_seconds" in params
 
 _SECRET_NAME = r"(?:API[_-]?KEY|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|SECRET|PASSWORD|TOKEN)"
 _SECRET_VALUE = r"(?:'[^']*'|\"[^\"]*\"|\S+)"
@@ -88,12 +135,20 @@ class CommandAgentAdapter:
         command = f"cd {shlex.quote(self.workspace_path)} && {env_assigns}{command_body}"
         # When a live path is given (local runs), the environment mirrors stdout
         # to that file line-by-line so the dashboard shows the trajectory live.
-        result = await env.exec(
-            command,
-            timeout=budget.max_duration_seconds,
-            tee_path=live_trajectory_path,
-        )
+        # The stall watchdog rides the same call when the environment supports
+        # it: the liveness signal is output progress (see _stall_window above),
+        # so a hung episode fails fast with a runtime signal instead of burning
+        # the full budget while producing nothing.
+        stall_window = _stall_window(budget)
+        exec_kwargs: dict[str, object] = {
+            "timeout": budget.max_duration_seconds,
+            "tee_path": live_trajectory_path,
+        }
+        if stall_window is not None and _env_supports_stall_watchdog(env):
+            exec_kwargs["no_output_stall_seconds"] = stall_window
+        result = await env.exec(command, **exec_kwargs)  # type: ignore[arg-type]
         duration_ms = int((time.monotonic() - start) * 1000)
+        stalled = result.termination_reason == "stall"
         if result.termination_reason == "timeout":
             status = "timeout"
         else:
@@ -106,8 +161,29 @@ class CommandAgentAdapter:
             else ""
         )
         runtime_signals = detect_runtime_signals(stdout_log)
+        if stalled:
+            # A stalled episode must carry a hard runtime signal: the 09-16
+            # evidence showed the failure mode as 3600000-ish ms duration with
+            # an EMPTY runtime_signals array.  This label (plus the
+            # termination_reason here) is what downstream classification keys
+            # on, so the hang is visible in the episode metadata even when the
+            # killed CLI produced no output of its own.
+            runtime_signals.append(
+                {
+                    "signal": NO_OUTPUT_STALL_SIGNAL,
+                    "evidence": (
+                        f"no stdout/stderr output for {stall_window:g}s; "
+                        "killed by the stalled-episode watchdog"
+                    ),
+                }
+            )
         if result.termination_reason == "timeout":
             error = f"Episode timed out after {budget.max_duration_seconds}s."
+        elif stalled:
+            error = (
+                f"Episode stalled: no output for {stall_window:g}s "
+                f"(termination_reason=stall)."
+            )
         else:
             error = redact_secrets(result.stderr[-2000:]) if result.exit_code != 0 else None
         return EpisodeResult(
@@ -125,6 +201,7 @@ class CommandAgentAdapter:
                 "trajectory_format": "jsonl",
                 "assistant_visible_output": visible_output,
                 "runtime_signals": runtime_signals,
+                "stall_window_seconds": stall_window,
                 "actions_log_diagnostics_only": bool(
                     self.visible_output_parser is not None and not visible_output
                 ),

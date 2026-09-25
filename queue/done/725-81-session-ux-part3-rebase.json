@@ -1,0 +1,15 @@
+{
+ "name": "725-81-session-ux-part3-rebase",
+ "task_file": "C:/tmp/session-ux-part3-rebase-task.txt",
+ "workspace": "cognizioware-powerplatform",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "note": "Branch IS on origin as of 2026-09-09 11:52 PT: fix/env-access-and-token-refresh @ e28d5460. Fetch it; do NOT ask for patch files (that instruction is superseded).",
+ "run_id": "20260909T224239Z_deef0fa3",
+ "roles_bound": {
+  "manager": "glm-5.2:synthetic-anthropic",
+  "executor": "qwen3.8-nothink",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-09T22:42:39.555471+00:00"
+}

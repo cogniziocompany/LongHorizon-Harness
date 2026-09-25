@@ -1,0 +1,15 @@
+{
+ "name": "67-purge-greg-xrm-name",
+ "task_file": "C:/tmp/purge-greg-xrm-task.txt",
+ "workspace": "cognizioware-powerplatform-evalfix",
+ "max_rounds": 6,
+ "trio": "kimi",
+ "note": "REQUEUE #3 - 2026-09-09 16:05 PT. *** THIS HAS NOW FAILED TWICE WITH THE SAME EXECUTOR: qwen3.8-nothink on the local span. Run 6c0a3e45 (5 rounds zero output) and run 2e58b480 (2 rounds zero output + 2 timeouts). THREE-STRIKES DISCRIMINATOR: the SAME role failing repeatedly is a BACKEND fault, not oversized scope - do not cut scope again. *** ROOT CAUSE IS SYSTEMIC, NOT THIS TASK: 2 of the 6 trios in launch_queue.py put the executor on cognizioware-ollama-span, and the launcher's own comments record that the span 'is effectively a ONE-executor resource while it is also serving the CI eval gate'. So ANY task has roughly a 1-in-3 chance of drawing a local executor that cannot deliver while the span is contended. trio 'kimi' rotates via _SEQ so it is not pinned, and trio 'qwen' is WORSE (all three roles on the span). IF THIS DRAWS A LOCAL EXECUTOR A THIRD TIME, STOP AND FIX THE LAUNCHER TABLE - do not requeue a fourth time. THE EVIDENCE BASE IS COMPLETE AND MUST BE INHERITED, NOT REDONE: the fallback lives at packages/backend/src/config/mcp-servers.ts lines 127-141 (name 'greg-xrm', key greg-xrm@${envKey}, command process.env.GREG_XRM_COMMAND || 'Greg.Xrm.Mcp.AppMaker', plus the smokeTestRequiredTools entry); the gateway branch at lines 111-124 is SEPARATE AND MUST STAY UNTOUCHED; GREG_XRM_COMMAND is declared at exactly two operator-clearable places, prod.env:61 and packages/backend/src/config/env.ts:53, and used at mcp-servers.ts:135. DECISION (b) IS SETTLED: delete the no-gateway fallback outright and replace it with an explicit loud error - do NOT rename it to a stub nobody exercises; the gateway is the only supported path, and a deployment with no gateway configured must fail loudly rather than silently fall through to a third-party entry that no longer exists. The manager-executes workaround was REJECTED and must not be re-proposed - it collapses the role separation that makes the audit worth anything.",
+ "run_id": "20260910T122917Z_528b5811",
+ "roles_bound": {
+  "manager": "ornith-1.5:pool",
+  "executor": "ornith-1.5:pool",
+  "auditor": "ornith-1.5:pool"
+ },
+ "launched_at": "2026-09-10T12:29:17.433353+00:00"
+}

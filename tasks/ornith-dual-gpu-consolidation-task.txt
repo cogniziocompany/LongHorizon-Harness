@@ -1,0 +1,230 @@
+TASK 123 - REPO-SIDE MIRROR for the local-inference consolidation. The LIVE router change is being
+made by the overseer directly (it is a prod-router operation, not a harness-run operation). This task
+brings the repo, the config file and the e2e suite into line with what is live, so the file and the
+database stop disagreeing.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+
+*** Paxton 2026-09-10 06:30 PT, verbatim direction: "If ornith 128k model is doing so well we'll have
+    the current qwen3.8 all version point to it" and "That will simplify the local hardware, create
+    that as queue task and implement asap since the model passed experimental testing" ***
+
+================================================================================
+WHAT IS BEING DONE LIVE (by the overseer) - this task MIRRORS it, does not redo it
+================================================================================
+
+Measured on the live router 2026-09-10 06:2x PT, all four qwen3.8 aliases resolve to the SPAN:
+
+    alias             underlying                 api_base            deployment id
+    qwen3.8           openai/qwen3.8:27b         :11442/v1           7497d8d0
+    qwen3.8-nothink   openai/qwen3.8:27b         :11442/v1           bce8d0d6
+    qwen3.8--128k     ollama_chat/qwen3.8:27b    :11442              7ca8d287
+    qwen3.8--256k     ollama_chat/qwen3.8:27b    :11442              96c159d1
+    ornith-1.5:pool   ollama_chat/ornith-1.5:9b  :11441              9290c2b8
+
+All four are being repointed to **ornith-1.5:9b**, the span is being retired, and a SECOND ornith
+instance is being loaded on :11438 so the pool spans both GPUs - ONE INSTANCE PER GPU, deliberately
+NOT one model split across two cards.
+
+WHY, measured tonight and not assumed:
+  - ornith completes every MANAGER episode it is given: 64,962 / 80,436 / 135,694 / 142,208 /
+    337,910 / 994,159 ms. It closed a full AUDITOR episode at 1,245,582 ms. It closed the first
+    fully-local end-to-end round on this estate.
+  - qwen3.8-nothink has **0 completions in 6 executor episodes** across two unrelated tasks - it was
+    already removed from the launcher's trio table for that.
+  - The span holds **18.6 GB of VRAM across BOTH GPUs** (CUDA_VISIBLE_DEVICES=0,1,
+    OLLAMA_SCHED_SPREAD=1) and **4.5 GB of host RAM**. ptait01 has 43.5 GB total and only ~4.4 GB
+    available, which is why a second ornith could not be added on 2026-09-10 02:04-02:16 - the host
+    OOM-killed llama-server three times. Retiring the span is what creates the headroom.
+  - :11438 is ALREADY configured correctly for this: CUDA_VISIBLE_DEVICES=**0**, NUM_PARALLEL=8,
+    OLLAMA_FLASH_ATTENTION=1, OLLAMA_KV_CACHE_TYPE=q8_0. No container recreate is needed.
+
+================================================================================
+WHAT THIS TASK ACTUALLY DOES - repo only, no live calls
+================================================================================
+
+1. **`infrastructure/litellm-config.yaml`**: make the file agree with the live router.
+   - the four qwen3.8 aliases point at ornith-1.5:9b
+   - the span deployment is removed
+   - a second ornith deployment on :11438 exists alongside the :11441 one
+   - `router_settings.context_window_fallbacks` currently lists `{"qwen3.8": ["qwen3.8--128k",
+     "qwen3.8--256k", ...]}` - those targets now resolve to the same model as their source, which is
+     a pointless self-fallback. Clean it up.
+   *** THIS FILE IS THE PROD-ROUTER HAZARD: any edit FORCE-RECREATES the CT202 router because the
+   deploy job hashes the deployed file. Say so plainly in the PR so the merge is scheduled into a
+   zero-active-runs window. DO NOT merge it yourself. ***
+
+2. **`router_settings` drift already measured** and must not be re-broken: `allowed_fails` is
+   **file=1 but db=50**. The DB row WINS. Do not "fix" the file to 1 and assume it applied - if you
+   change router_settings at all, it must go through `POST /config/update` and be READ BACK.
+
+3. **e2e**: extend the existing ornith suite rather than adding a new one. It must assert that the
+   pool answers from **BOTH** api_bases (:11441 and :11438), not merely that the alias returns 200 -
+   a single-instance pool would pass a naive test. Assert `max_input_tokens` is 131072 on every
+   ornith deployment.
+
+4. **docs**: one short note recording that qwen3.8 is retired locally and why, with the measurements
+   above. Names and aliases only - NO keys, NO tokens.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **DO NOT call the live router's /model/* or /config/* endpoints.** The overseer owns the live
+   change; this task is repo-side. If the file and the live router disagree when you read them,
+   REPORT the difference, do not "fix" the router.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+ - **NEVER the bare gateway `/health`** - it fans a completion out to every configured model,
+   including paid and GPU ones. Use `/health/liveliness` or `/health?model=`.
+ - Never `git add -A`; check `git diff --stat` before committing (this estate has had a PR balloon
+   to hundreds of CRLF phantom files).
+ - The LiteLLM image is DIGEST-PINNED in docker-compose.yml. Do not bump or unpin it.
+ - **No host-level changes on ptait01.** Container/model-level only, and this task should not need
+   even that.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+`infrastructure/litellm-config.yaml` mirrors the live router exactly (four qwen3.8 aliases on
+ornith, span gone, two ornith deployments, self-referential context_window_fallbacks cleaned), the
+e2e suite proves BOTH api_bases serve, a short doc note, all committed on a branch with the PR body
+flagging the force-recreate hazard. Nothing merged, nothing pushed, no live router calls.
+
+
+================================================================================
+ADDENDUM 2026-09-10 06:40 PT - Paxton's full requirement, and what is already true
+================================================================================
+
+Verbatim: "however you can make ornith calls hit both gpus, all ollama cts using same ollama source
+drive and all qwen models will forward to ornith1.5 128k with text and image. Make sure that's on
+the plan."
+
+FOUR REQUIREMENTS, and TWO ARE ALREADY SATISFIED - measured, do not redo them:
+
+R1. ornith calls hit BOTH GPUs.
+    NOT YET. The pair to use is **:11441 (CUDA_VISIBLE_DEVICES=1) + :11438 (CUDA_VISIBLE_DEVICES=0)**.
+    **DO NOT USE :11442** - it is CUDA_VISIBLE_DEVICES=0,1 with OLLAMA_SCHED_SPREAD=1, i.e. it
+    SPLITS ONE MODEL ACROSS BOTH CARDS, which is exactly what Paxton forbade ("DONT SPREAD IT ACROSS
+    GPUS"). One instance per card, two deployments behind the one alias, router load-balances.
+
+R2. All ollama CTs share one ollama source drive.
+    **ALREADY TRUE.** All three daemons bind the SAME docker volume:
+        /var/lib/docker/volumes/cognizioware-ptait01-inference_ollama_cloud_data/_data -> /root/.ollama
+    and `/api/tags` shows **ornith present on all three, 29 models each**. So loading ornith on
+    :11438 needs NO pull, NO extra disk, and no volume work. Nothing to change here.
+
+R3. All qwen models forward to ornith-1.5 at 128K.
+    14 qwen aliases exist; **13 are CONFIG-sourced, 1 is DB**. Eight are local to ptait01:
+        qwen3.8            openai/qwen3.8:27b        :11442/v1   max_input 65536   CONFIG
+        qwen3.8-nothink    openai/qwen3.8:27b        :11442/v1   max_input 65536   CONFIG
+        qwen3.8--128k      ollama_chat/qwen3.8:27b   :11442      max_input 131072  CONFIG  <- PURGE
+        qwen3.8--256k      ollama_chat/qwen3.8:27b   :11442      max_input 262144  CONFIG  <- PURGE
+        qwen3.6            ollama_chat/qwen3.6:27b   :11438      max_input 16384   CONFIG
+        qwen3-coder        openai/qwen3-coder:30b    :11442/v1   max_input 65536   DB
+        qwen3-coder-next:cloud                       :11438      CONFIG
+        qwen3.5:397b-cloud                           :11438      CONFIG
+    **PURGE OUTRIGHT (Paxton 06:35, "they were not validated"): `qwen3.8--128k` and
+    `qwen3.8--256k`.** Note --256k advertised max_input 262144 while the span actually runs
+    num_ctx 65536 - that alias always overstated its window.
+    **NOT IN SCOPE WITHOUT A SEPARATE DECISION:** the six non-ptait01 aliases (corsairai300 :11440
+    and ollama.com), and in particular **`qwen3.5:397b-cloud` - a 397B model.** Repointing a 397B
+    cloud alias at a local 9B is a capability downgrade, not a consolidation. Local hardware is what
+    Paxton asked to simplify. FLAG these, do not silently repoint them.
+
+R4. Text AND image.
+    **ALREADY TRUE on the existing deployment** - `/model/info` shows ornith-1.5:pool with
+    `supports_vision = True` and `supports_function_calling = True`. **Every NEW ornith deployment
+    must carry BOTH flags**, or image requests will route somewhere else and tool calls will be
+    refused. Assert this in the e2e suite, not by eye.
+
+================================================================================
+THE BLOCKER THE OVERSEER HIT, so this task does not repeat it
+================================================================================
+
+`POST /model/update` on a qwen3.8 alias returns:
+    "Can't edit model. Model in config. Store model in db via `/model/new`. to edit."
+The qwen3.8 aliases carry CONFIG-hash ids (64-hex); `ornith-1.5:pool` carries a UUID and is a DB
+model. **Config-sourced deployments cannot be repointed or deleted through the API.** So this whole
+change is a `litellm-config.yaml` edit plus a router recreate - which is precisely why it needs a
+zero-active-runs window, and why this task is repo-side.
+There is also a dependency loop worth stating: the span's 4.5 GB of host RAM cannot be freed until
+qwen3.8 stops pointing at it, and ptait01 has only ~4.4 GB available - so the SECOND ornith instance
+is gated behind the same config change. One recreate does all of it.
+
+
+================================================================================
+*** SCOPE LOCK 2026-09-10 06:45 PT - PAXTON, OVERRIDES EVERYTHING ABOVE ***
+================================================================================
+
+Verbatim, in order: "Nooo not qwen3.5" / "Stop no cloud" / "Only the ones listed".
+
+**IN SCOPE - EXACTLY THESE FOUR ALIASES AND NOTHING ELSE:**
+    qwen3.8            -> repoint to ornith-1.5:9b @ 128K
+    qwen3.8-nothink    -> repoint to ornith-1.5:9b @ 128K
+    qwen3.8--128k      -> **PURGE** (never validated)
+    qwen3.8--256k      -> **PURGE** (never validated)
+
+**EXPLICITLY OUT OF SCOPE - DO NOT TOUCH, DO NOT REPOINT, DO NOT "TIDY":**
+    qwen3.5:27b, qwen3.5:397b-cloud   - Paxton: "Nooo not qwen3.5"
+    qwen3-coder, qwen3-coder-next:cloud
+    qwen3.6
+    **every :cloud alias and everything on ollama.com or corsairai300 :11440** - Paxton: "Stop no cloud"
+The earlier R3 paragraph listing eight local aliases was me widening the scope on my own judgement.
+It is superseded by this block. Four aliases. That is the whole change.
+
+
+================================================================================
+*** PAXTON 2026-09-10 08:2x PT - OPTION (B) CHOSEN: COMBINED. ONE RECREATE, THE LAST ONE. ***
+================================================================================
+
+Verbatim: "combined - qwen3.8 consolidation plus move the model list to DB in the same recreate, so
+it's the last one you ever pay for."
+
+TASK 123 AND TASK 124 NOW LAND TOGETHER. Neither ships alone. The point is to pay the
+router-recreate cost ONCE and never again, so the sequencing matters more than either task's own
+scope:
+
+  PHASE 1 - LIVE, NO RECREATE, NO WINDOW NEEDED.
+    Add DB deployments via `POST /model/new` for everything being kept. This is additive and takes
+    effect immediately - proven 2026-09-10: /model/new took deployments 213 -> 214 and /model/delete
+    took 2 -> 1, both read back, the router never restarted.
+    **Expect a transient double-serve**: while both the config entry and the new DB entry exist for
+    the same `model_name`, the router LOAD-BALANCES ACROSS BOTH. For most aliases both point at the
+    same backend so it is invisible. **For `qwen3.8` and `qwen3.8-nothink` it is NOT** - the config
+    copy points at the span and the DB copy at ornith, so traffic splits roughly 50/50 during the
+    gap. That is acceptable and is actually a useful canary, but it must be SHORT and it must be
+    expected rather than discovered.
+    Read every addition back with `/model/info` and diff field-by-field before moving on.
+
+  PHASE 2 - THE ONE RECREATE. A single `litellm-config.yaml` change carrying ALL of:
+      - the model entries migrated in Phase 1 REMOVED from the file (this is the only way to remove
+        them; the API refuses - "Can't edit model. Model in config.")
+      - `qwen3.8--128k` and `qwen3.8--256k` gone entirely
+      - the span (`:11442`) deployment gone
+      - `router_settings.context_window_fallbacks` cleaned of the purged aliases - **if those
+        entries outlive the aliases, a context overflow on qwen3.8 falls back to a model that no
+        longer exists**
+      - the Slice 6 DEPRECATION BANNER at the top
+    Merge in a zero-active-runs window. **This is the last config-file change anyone should need to
+    make for a model.**
+
+  PHASE 3 - LIVE AGAIN, NO RECREATE.
+    With qwen3.8 no longer pointing at the span, the span is unreferenced -> unload it -> that
+    returns **4.3 GB of private host RAM** (measured RssAnon, not shared page cache) and 18.6 GB of
+    VRAM across both cards. ptait01 then has ~8.1 GB available against the ~7.0 GB a second ornith
+    needs - it fits, with roughly 1 GB of margin, which is why the span MUST be freed first and why
+    this cannot be done before Phase 2.
+    Then load ornith on **:11438 (CUDA_VISIBLE_DEVICES=0)** and add its deployment via `/model/new`
+    so `ornith-1.5:pool` spans both GPUs - one instance per card, NOT one model split across two.
+    Both new deployments must carry `supports_vision: true` AND `supports_function_calling: true`.
+
+  VERIFY AT THE END - and not by a 200:
+    `/model/info` shows no `qwen3.8--128k`, no `qwen3.8--256k`, no `:11442` deployment, and
+    `ornith-1.5:pool` with TWO deployments on :11441 and :11438; then drive real traffic and confirm
+    BOTH api_bases actually serve. A pool of one would pass a naive alias check.
