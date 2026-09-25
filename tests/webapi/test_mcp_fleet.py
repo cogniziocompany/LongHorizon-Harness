@@ -70,6 +70,14 @@ def test_mcp_fleet_tools_manifest(client_fixture: Any = None) -> None:
             "harness_run_status",
             "harness_resolve_gate",
             "harness_list_contentions",
+            # Task 235: read-only overseer-state tools over the migrated
+            # apparatus archive (unprefixed, per the FIX).
+            "get_queue_entry",
+            "list_queue",
+            "get_task_history",
+            "read_ledger",
+            "list_open_asks",
+            "get_handoff",
         }
         enqueue = next(tool for tool in data["tools"] if tool["name"] == "harness_enqueue_task")
         assert "kimi" in enqueue["description"]

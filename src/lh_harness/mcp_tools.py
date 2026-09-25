@@ -105,6 +105,61 @@ raise a warning naming the peers; confirm the sibling tree is not mid-PR on the
 same branch.
 """
 
+# Task 235: read-only overseer-state tools over the migrated apparatus archive
+# (README-OVERSEER-APPARATUS.md). They answer "what is the overseer working on,
+# what did it decide, what is waiting on Paxton" without any fleet-host
+# filesystem read.
+
+_GET_QUEUE_ENTRY_DESCRIPTION = """Return the full task text and notes for one overseer queue record.
+
+Reads the migrated overseer apparatus (task 104b): the queue entry snapshot
+filed at launch (queue/done or queue/blocked) plus the task brief it points
+at (tasks/<name>-task.txt in this repository). Pass the record_name, the
+entry name, or its run_id. The note field carries the overseer's triage and
+block/skip reasons verbatim. Read-only; never touches a fleet host.
+"""
+
+_LIST_QUEUE_DESCRIPTION_OVERSEER = """List the overseer's migrated queue archive with skip reasons.
+
+Returns done and blocked queue records (the pre-cutover overseer queue)
+newest launch first, each carrying its verbatim note - the note is where
+skip and block reasons live. Filter with status (done/blocked/all), a query
+substring, and a limit. Read-only over the in-repo apparatus archive.
+"""
+
+_GET_TASK_HISTORY_DESCRIPTION = """Return every archived run for a task number or name.
+
+Searches the migrated overseer queue archive (queue/done + queue/blocked) by
+task number, name fragment, or run_id, newest first. Each run carries its
+name, workspace, trio, launch time, and a note excerpt; use get_queue_entry
+for the full task text and note. This is how a chat client finds out whether
+task N ever ran and what happened, without reading a fleet filesystem.
+"""
+
+_READ_LEDGER_DESCRIPTION = """Read recent rows from the overseer deployment ledger.
+
+Returns sections from docs/LEDGER.md (one section per overseer tick, newest
+last in the file; this tool returns the newest N by default). Filter with a
+query substring. The ledger is the written record of what the scheduled
+overseer observed and decided, tick by tick, up to the cutover.
+"""
+
+_LIST_OPEN_ASKS_DESCRIPTION = """List rows from the overseer open-asks register.
+
+Returns the table from queue/OPEN-ASKS.md as it stood at export time, one row
+per thing the overseer was genuinely waiting on Paxton to decide. By default
+only rows that are still open are returned; pass include_closed=true to see
+the answered/closed rows too.
+"""
+
+_GET_HANDOFF_DESCRIPTION = """Return an operator handoff written during the overseer era.
+
+Reads docs/handoffs/HANDOFF-*.md from the migrated apparatus archive. With no
+argument the most recent handoff is returned; pass a filename (or unique
+substring) to pick one. Each handoff is a point-in-time statement of fact,
+not a live status - newer handoffs supersede older ones on the same topic.
+"""
+
 
 def _is_ascii_only(value: str) -> bool:
     """Return True if every character in value is ASCII."""
@@ -213,6 +268,73 @@ def tools_manifest() -> list[dict[str, Any]]:
             _LIST_CONTENTIONS_DESCRIPTION,
             {},
         ),
+        _tool_spec(
+            "get_queue_entry",
+            _GET_QUEUE_ENTRY_DESCRIPTION,
+            {
+                "name": _string_param(
+                    "Record name: the record_name file stem, the entry name, or the run_id.",
+                    required=True,
+                ),
+            },
+        ),
+        _tool_spec(
+            "list_queue",
+            _LIST_QUEUE_DESCRIPTION_OVERSEER,
+            {
+                "status": _string_param(
+                    "Filter by archived status: done, blocked, or all (default all).",
+                    required=False,
+                ),
+                "query": _string_param(
+                    "Optional substring match on record name, entry name, run_id, or task_file.",
+                    required=False,
+                ),
+                "limit": _integer_param("Maximum entries to return (1-500).", 100),
+            },
+        ),
+        _tool_spec(
+            "get_task_history",
+            _GET_TASK_HISTORY_DESCRIPTION,
+            {
+                "task": _string_param(
+                    "Task number, name fragment, or run_id to search for.", required=True
+                ),
+                "limit": _integer_param("Maximum runs to return (1-500).", 100),
+            },
+        ),
+        _tool_spec(
+            "read_ledger",
+            _READ_LEDGER_DESCRIPTION,
+            {
+                "limit": _integer_param(
+                    "Maximum ledger rows to return (1-500). Default 20.", 20
+                ),
+                "query": _string_param(
+                    "Optional substring filter on heading or body.", required=False
+                ),
+            },
+        ),
+        _tool_spec(
+            "list_open_asks",
+            _LIST_OPEN_ASKS_DESCRIPTION,
+            {
+                "include_closed": _boolean_param(
+                    "Include closed/answered rows too.", default=False
+                ),
+                "limit": _integer_param("Maximum rows to return (1-500).", 100),
+            },
+        ),
+        _tool_spec(
+            "get_handoff",
+            _GET_HANDOFF_DESCRIPTION,
+            {
+                "name": _string_param(
+                    "Handoff filename or unique substring. Omit for the most recent.",
+                    required=False,
+                ),
+            },
+        ),
     ]
 
 
@@ -225,12 +347,17 @@ def dispatch(
     supervisor: Any,
     auth_token: str | None,
     request_token: str | None,
+    overseer_root: str | None = None,
 ) -> dict[str, Any]:
     """Run one MCP tool call and return a JSON-RPC style result.
 
     ``arguments`` is the tool's input object.  The dispatcher reuses the same
     validation and business logic as the REST routes, so clients get identical
     behavior whether they call via MCP, HTTP, or curl.
+
+    ``overseer_root`` (task 235) is the resolved apparatus archive root; the
+    WebAPI resolves it once at app creation and passes it here so the
+    overseer-state tools share the deployment's archive path.
     """
     # Auth parity with the REST boundary.
     if auth_token is not None and auth_token != (request_token or ""):
@@ -246,7 +373,57 @@ def dispatch(
         return _resolve_gate(arguments, registry=registry, supervisor=supervisor)
     if tool_name == "harness_list_contentions":
         return _list_contentions(runs_root=_runs_root(registry, supervisor))
+    # Task 235: read-only overseer-state tools over the migrated apparatus
+    # archive. They take no store, registry or supervisor - only the archive
+    # root resolved by the WebAPI.
+    overseer_tools = {
+        "get_queue_entry": _overseer_get_queue_entry,
+        "list_queue": _overseer_list_queue,
+        "get_task_history": _overseer_get_task_history,
+        "read_ledger": _overseer_read_ledger,
+        "list_open_asks": _overseer_list_open_asks,
+        "get_handoff": _overseer_get_handoff,
+    }
+    handler = overseer_tools.get(tool_name)
+    if handler is not None:
+        return handler(arguments, overseer_root=overseer_root)
     return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
+
+
+def _overseer_get_queue_entry(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import get_queue_entry
+
+    return get_queue_entry(arguments, overseer_root=overseer_root)
+
+
+def _overseer_list_queue(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import list_queue as handler
+
+    return handler(arguments, overseer_root=overseer_root)
+
+
+def _overseer_get_task_history(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import get_task_history
+
+    return get_task_history(arguments, overseer_root=overseer_root)
+
+
+def _overseer_read_ledger(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import read_ledger
+
+    return read_ledger(arguments, overseer_root=overseer_root)
+
+
+def _overseer_list_open_asks(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import list_open_asks
+
+    return list_open_asks(arguments, overseer_root=overseer_root)
+
+
+def _overseer_get_handoff(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
+    from .overseer_state import get_handoff
+
+    return get_handoff(arguments, overseer_root=overseer_root)
 
 
 def _runs_root(registry: Any, supervisor: Any) -> str | None:
