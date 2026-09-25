@@ -1,0 +1,70 @@
+================================================================================
+TASK 210 — CT204 (uat) NEVER RECEIVES APP-IMAGE REBUILDS FROM THE MCP-TOOLS DEPLOY LANE
+================================================================================
+Workspace: cognizioware-mcp-tools
+Repo: cogniziocompany/cognizioware-mcp-tools
+Follow-up to task 121 (puppeteer-mcp idle-child leak, PR #175, merged c27858f0,
+prod-VERIFIED tick #713). This is a SEPARATE, NEW defect — do not reopen 121.
+
+ROOT CAUSE, MEASURED 2026-09-18 ~15:55 PT (interactive session, on Paxton's
+explicit "run one overseer sweep tick" request), read from the live workflow
+file at .github/workflows/deploy-mcp-tools.yml, not inferred from the rollup:
+
+- Job "Apply LiteLLM config to UAT CT204" (~lines 313-426) is the ONLY thing
+  the deploy pipeline does to CT204. It: pct push's litellm-config.yaml, the
+  hooks/ dir, and docker-compose.yml to the CT, pulls the ONE pinned litellm
+  image, and force-recreates ONLY `litellm-router`
+  (`docker compose ... up -d --no-deps --force-recreate litellm-router`).
+  It NEVER runs `docker compose build` and NEVER touches any other service
+  container (puppeteer-mcp, playwright-mcp, the other ~15 build-context
+  services).
+- The job that actually builds+deploys the custom app images
+  ("Deploy stack (docker compose)", ~lines 956-962, preceded by a build step
+  around 666-926) runs against CT202 PROD ONLY.
+- Net effect: CT204/uat's app-level containers are frozen at whatever image
+  they last had (built manually or at CT204's own provisioning) and NEVER
+  pick up app-code fixes merged to main, only litellm-config/router changes.
+  This is why PR #175 (task 121) fixed CT202 (RestartCount reset to 0, pids
+  flat) but CT204 stayed on the pre-fix image c18040ec13e0, RestartCount
+  climbing (200+), still actively leaking — confirmed by direct read on
+  CT204 at tick #713 (1.38 GiB / 2 GiB, 803 pids, ~9 min post-restart,
+  matching the pre-fix slope).
+- This is a GENERAL gap, not specific to puppeteer-mcp: ANY future app-level
+  fix in this repo will silently never reach uat. Treat puppeteer-mcp as the
+  discovered symptom, the missing build+redeploy step as the actual scope.
+
+DONE MEANS
+- deploy-mcp-tools.yml's CT204 job builds (or pulls a built image for) and
+  recreates the app-level containers on CT204 the same way the CT202 job
+  does — OR an equivalent second lane that does so — so a merge to main
+  updates uat's app containers, not just its litellm-config/router.
+- Verified DIFFERENCE, not assumed: after the change, trigger (or wait for)
+  one deploy and confirm on CT204 (pct exec from ptait07 — CT204 lives on
+  ptait07, NOT ptait01, whose CT204 is a stopped decoy) that puppeteer-mcp's
+  image/Created timestamp changed and RestartCount resets / stays flat, the
+  same class of proof tick #713 used on CT202.
+- mem_limit stays 2g on puppeteer-mcp and playwright-mcp. Do not touch
+  litellm-config.yaml semantics beyond what the existing job already does.
+  Do not remove or weaken the litellm-config sync job.
+- As an EXCEPTION note: this diff touches `.github/workflows/` — the run's
+  scoped GH_TOKEN (push+PR only) REFUSES workflow-file pushes by permission.
+  Commit locally on a branch, then STOP and say the branch needs an overseer
+  push; do not retry the push yourself, and do not ask for a broader token.
+- No host-level changes on ptait01 or ptait07. Container/workflow-file work
+  only. Never `docker compose down -v` (destroys ollama model blobs — not
+  relevant to this CT but keep the habit). Never `git add -A`; commit by
+  explicit path; check `git diff --stat` before committing.
+- Open the PR yourself once the overseer has pushed the branch — no, wait:
+  since the token can't push this branch at all, the overseer pushes AND
+  opens the PR. Say so plainly in your final message instead of attempting
+  gh pr create against a branch that isn't on the remote.
+
+CONTEXT YOU DO NOT NEED TO RE-DERIVE
+- The leak mechanism itself (idle healthcheck spawning an unreaped stdio
+  child, ~36 pids/30s) is SOLVED and fixed in PR #175 — read it, don't
+  re-diagnose it. Your job is the DEPLOY PIPELINE gap, not the leak.
+- CT204 = uat, lives on ptait07 (192.168.21.138), IP 192.168.21.162. The
+  CT204 on ptait01 is a stopped, same-MAC decoy — never start it.
+- The self-healing OOM containment on CT204 (2g cap kills only the
+  container, docker restarts it) means there is NO OUTAGE pressure here —
+  a correct pipeline fix matters more than speed.

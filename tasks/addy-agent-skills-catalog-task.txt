@@ -1,0 +1,167 @@
+TASK 160 - Serve addyosmani/agent-skills from the CT202 gateway skills catalog.
+
+SOURCE: Paxton, 2026-09-11, planning session [2f6fa0]. Queued as given; the hard rules and the
+verification ORDER below are binding.
+
+REPO / WORKSPACE: cognizioware-mcp-tools
+
+================================================================================
+WHAT THIS IS
+================================================================================
+skills.addy.ie = github.com/addyosmani/agent-skills, MIT, pinned at
+**main @ 6ca0cd7db39b41b1c37e26d335c507ee92382c6d (2026-09-08)**.
+25 lifecycle skills (interview-me -> shipping-and-launch, plus the meta skill using-agent-skills),
+7 shared references/*.md checklists, and client-only extras we are NOT shipping.
+
+HOW THE GATEWAY SERVES SKILLS TODAY - VERIFIED 2026-09-11, do not go hunting:
+  - infrastructure/docker/gateway-skills-mcp/ is a PROMPTS-ONLY MCP server.
+  - It bakes skills/<folder>/SKILL.md into the image (Dockerfile L16-19) and rescans on every
+    prompts/list (src/index.ts L56-79).
+  - The folder name becomes the id; clients see skills-skill-<folder> plus skills-index.
+  - Access wiring ALREADY EXISTS: mcp_aliases.skills (litellm-config.yaml L195), the server block at
+    L562, access_groups ["repo-tools","dev-tools"], and the aggregate guard in
+    e2e/suites/25-gateway-skills-mcp.test.js.
+  - *** THERE WERE 4 SKILL FOLDERS WHEN THIS WAS WRITTEN *** (audio-qa, gateway-skill-authoring,
+    litellm-gateway-quickstart, remote-pc). PR #146 (feat/gateway-skill-claude-bridge, opened
+    2026-09-11) adds a 5th, claude-bridge. So the /health target is NOT a fixed 29: it is
+    **(number of in-house skill folders on main at the time you build) + 25**. COUNT the folders
+    with `ls infrastructure/docker/gateway-skills-mcp/skills | grep -v '^_' | wc -l` before the
+    build and assert that number + 25. Every "29" below means this measured total.
+  - The cleanest precedent for adding a skill is commit cc3eee7 (audio-qa), a single SKILL.md.
+
+================================================================================
+DECISIONS ALREADY MADE. DO NOT RE-OPEN THEM.
+================================================================================
+ 1. REUSE gateway_skills_mcp and its existing repo-tools/dev-tools groups. No new MCP server, no new
+    access group, no team or key changes. Anything that already sees skills-* gets the pack.
+    A separate server/group would touch teams, keys and the drift matrix for no isolation gain - the
+    content is public, MIT and secret-free.
+ 2. NAMESPACE every upstream skill as addy-<name>. Avoids collisions with in-house skills now and
+    later (e.g. code-review) and makes the source obvious:
+    skills-skill-addy-test-driven-development.
+ 3. VENDOR at a pinned SHA via a sync script. No submodule, no fetch at build time. Matches the
+    existing vendored-copy convention and keeps builds offline and reproducible.
+ 4. SERVE THE SIDECAR FILES. The shared references/*.md and per-skill extras (e.g.
+    idea-refine/frameworks.md, constraint-driven-development/references/floor-guard.md) are LINKED
+    from SKILL.md bodies. Serving only SKILL.md leaves DEAD LINKS. Hence the server change in step 2.
+ 5. *** EXCLUDE agents/, .claude/commands, hooks/, evals/, scripts/ and idea-refine/scripts/*.sh. ***
+    These are client-harness features, not prompt content, and A SHELL SCRIPT MUST NEVER SHIP INSIDE
+    A PROMPT CATALOG.
+ 6. CREATE the licensing/attribution convention - none exists yet. Step 1 defines it.
+
+================================================================================
+STEP 1 - SYNC SCRIPT  infrastructure/scripts/sync-addy-agent-skills.sh
+================================================================================
+bash, IDEMPOTENT, takes a pinned UPSTREAM_SHA.
+  - Download the tarball of addyosmani/agent-skills@<sha>; copy skills/<n>/** (EXCLUDING scripts/)
+    into infrastructure/docker/gateway-skills-mcp/skills/addy-<n>/.
+  - Copy references/*.md into a shared folder skills/_addy-references/. THE LOADER SKIPS IT BECAUSE
+    IT HAS NO SKILL.md - that is deliberate; do not add one.
+  - Rewrite frontmatter name: to addy-<n>; append metadata.upstream:
+    addyosmani/agent-skills@<sha> and license: MIT.
+    *** NORMALISE any folded (> or |) description: into the plain or continuation form that
+    parseFrontmatter (src/index.ts L38-54) actually reads. *** A folded scalar it cannot parse yields
+    an empty description and a silently useless catalog entry.
+  - Rewrite relative links (../../references/x.md, references/x.md, sibling .md) into the gateway
+    form: prompt skills-skill-addy-<n> (file: <path>), so a model can follow them.
+  - Write skills/_addy-references/LICENSE (upstream MIT text) and UPSTREAM.md (SHA, date, and the
+    list of EXCLUDED paths).
+  - DELETE any addy-* folder no longer upstream - the sync must REMOVE as well as add, or a retired
+    skill lingers forever.
+
+================================================================================
+STEP 2 - SERVER CHANGE  infrastructure/docker/gateway-skills-mcp/src/index.ts  (KEEP IT MINIMAL)
+================================================================================
+  - Add an OPTIONAL file argument to each skill prompt: prompts/get skill-<n> with
+    {file: "frameworks.md"} returns that sidecar .md, resolved inside the skill folder OR
+    _addy-references/.
+  - ONLY .md files are served.
+  - REJECT path traversal with path.resolve plus a prefix check.
+  - Change buildIndex (L81-97) to group by source: in-house skills first, then an
+    "addy/agent-skills (MIT)" section pointing at skill-addy-using-agent-skills as the router.
+  - *** THE EMPTY tools/list HANDLER (L108-110) MUST STAY. *** The comment above it says why: if that
+    call throws -32601, LiteLLM DROPS THE WHOLE SERVER FROM THE AGGREGATE, prompts included (the same
+    trap gateway-guides-mcp hit, fixed in f984215). Removing it silently deletes the entire skills
+    catalog from every client.
+
+================================================================================
+STEP 3 - DOCS
+================================================================================
+  - skills/README.md: add a "Third-party packs" row and a "how to resync" section.
+  - skills/gateway-skill-authoring/SKILL.md: mention the addy- prefix convention and the sync script.
+
+================================================================================
+STEP 4 - TESTS
+================================================================================
+Extend e2e/suites/25-gateway-skills-mcp.test.js to assert:
+  - EXACTLY 25 skills-skill-addy-* prompts on BOTH the per-server path AND the aggregate /mcp/;
+  - skills-skill-addy-interview-me returns a body containing metadata.upstream;
+  - a sidecar fetch works (addy-idea-refine, file: frameworks.md);
+  - a file: ../../x traversal is REJECTED;
+  - the existing secret regex passes on EVERY addy prompt.
+Add an OFFLINE jest check: every addy-* folder's SKILL.md frontmatter name matches its folder, and
+NO .sh files exist anywhere under the skills tree.
+Suite 20 (state: 'empty') needs NO change.
+Then run: graphify update .
+
+================================================================================
+FILES
+================================================================================
+NEW:   infrastructure/scripts/sync-addy-agent-skills.sh
+       infrastructure/docker/gateway-skills-mcp/skills/addy-*/            (25)
+       infrastructure/docker/gateway-skills-mcp/skills/_addy-references/  (7 refs + LICENSE + UPSTREAM.md)
+EDIT:  infrastructure/docker/gateway-skills-mcp/src/index.ts
+       skills/README.md
+       skills/gateway-skill-authoring/SKILL.md
+       e2e/suites/25-gateway-skills-mcp.test.js
+
+*** UNCHANGED ON PURPOSE: infrastructure/litellm-config.yaml, infrastructure/docker-compose.yml,
+teams, keys. ***
+THIS IS LOAD-BEARING: because the yaml is untouched, this change does NOT force-recreate the CT202
+prod router, so the PR needs no zero-run window. If you find yourself editing either file, STOP -
+you have left the plan.
+
+================================================================================
+VERIFICATION - UAT FIRST, AND THIS ORDER IS A HARD RULE
+================================================================================
+ 1. LOCAL: docker build the gateway-skills-mcp image, run it, then
+      - curl /health must list 29 skills;
+      - an MCP prompts/list / prompts/get against localhost:8000/mcp must cover the SIDECAR case AND
+        the TRAVERSAL-REJECTION case.
+ 2. Open a PR on a feature branch. DEPLOY TO THE UAT LANE (CT204 on ptait07) and get the full e2e
+    suite green, including 25, 20 and 22.
+ 3. Only then merge to main; deploy-mcp-tools.yml rebuilds the image on CT202. On PROD confirm:
+      - suite 25 green against /gateway_skills_mcp/mcp AND the aggregate /mcp/;
+      - skills-index shows the addy section.
+ 4. With a repo-tools-scoped key and a dev-tools-scoped key, confirm BOTH see skills-skill-addy-*,
+    and that a key with NEITHER group does not. READ THE PROMPT LIST BACK; do not infer it from the
+    access-group config.
+
+================================================================================
+HARD RULES
+================================================================================
+ - NEVER git add -A - commit by explicit path; git diff --stat before every commit. The upstream
+   tarball drops many files; a blanket add WILL ship excluded content.
+ - No .sh and no non-.md content in the skills tree. ASSERT IT IN A TEST, do not merely avoid it.
+ - Do NOT edit infrastructure/litellm-config.yaml or infrastructure/docker-compose.yml.
+ - DO NOT MERGE. DO NOT DEPLOY TO CT202. Open the PR and STOP; the overseer owns the lane.
+ - Do NOT post an @claude comment - it bills Paxton's personal subscription (task 117).
+ - No secrets anywhere - env var NAMES only.
+ - Vendored content KEEPS its MIT LICENSE and attribution. Do not strip or rewrite the licence text.
+
+================================================================================
+IF THIS RUN LOOPS - SLICING IS PRE-AUTHORISED
+================================================================================
+This is a LARGE task (a sync script, 32 vendored folders, a server change, docs and tests).
+IF IT REACHES THREE ROUNDS WITHOUT A COMMITTED, BUILDING ARTEFACT, CUT IT at these natural seams and
+queue the rest rather than granting more rounds:
+    160a = the sync script + the vendored tree (no server change)
+    160b = the index.ts sidecar/file argument + buildIndex grouping
+    160c = tests + docs + graphify
+A run that hits its round ceiling with the work DONE does not need more rounds - it needs commit,
+push and PR.
+
+DONE MEANS: 29 skills served, 25 of them addy-*; sidecar .md files fetchable and traversal rejected;
+the empty tools/list handler intact; the LICENSE and UPSTREAM.md present; suite 25 green on UAT with
+the new assertions; no .sh anywhere in the skills tree; and litellm-config.yaml and
+docker-compose.yml untouched.

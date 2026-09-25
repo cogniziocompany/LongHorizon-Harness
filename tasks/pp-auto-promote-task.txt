@@ -1,0 +1,179 @@
+TASK 156 - Auto-promote powerplatform changes all the way through to prod.
+
+REPO: `cogniziocompany/cognizioware-powerplatform`. **Base on `origin/develop`, NOT main.**
+Source: Paxton, 2026-09-10 23:00 PT — *"lets auto prompt all changes for powerplatform push all the
+way through to prod"*.
+
+================================================================================
+*** READ THIS BEFORE DESIGNING ANYTHING. THE GATES YOU WOULD BE REMOVING ARE DELIBERATE. ***
+================================================================================
+Powerplatform is **the single revenue-generating live system**. Everything below was verified by the
+overseer by reading the workflow files at 22:00-23:00 PT — do not re-derive it, and do not assume a
+simpler pipeline than the one that exists.
+
+  `ci.yml:6`   push branches `[main, develop, release]`, commented **"develop->dev, release->uat,
+               main->prod"**. `deployments/instances.json` agrees (prod=main, dev=develop, uat=release).
+  LAN rollout  runs only when `vars.LAN_DEPLOY_ENABLED == '1'` (it is), on `[self-hosted, lan-deploy]`.
+  `promote.yml` is **`workflow_dispatch` ONLY**. Inputs: `ref`, `is_production`, `eval_threshold`,
+               weights, `suite`.
+  EVAL GATE    each tier advances only when a WEIGHTED score from two providers is **STRICTLY GREATER
+               THAN** the threshold (default 90). **Exactly 90.00 does NOT pass.** The providers are
+               this repo's `eval-gate.yml` (primary) and the cognizioware-qa CE e2e gate (secondary).
+  PROD EXTRA   GitHub `environment: production` protection rules **plus** an explicit `is_production`
+               operator acknowledgment.
+  AFTER PROD   `promote.yml` **fast-forwards `origin/main` to the promoted sha** (non-FF refused). So
+               **main FOLLOWS prod; it does not feed it.**
+
+*** SO "AUTOMATIC ALL THE WAY TO PROD" MEANS REMOVING A HUMAN ACKNOWLEDGMENT AND AN ENVIRONMENT
+PROTECTION FROM THE REVENUE SYSTEM. *** That is a real trade, not a plumbing change. **Do not
+implement it silently. Present the options below, get Paxton's pick, and record it in the PR.**
+
+================================================================================
+A DEFECT YOU WILL HIT, ALREADY MEASURED - FIX IT AS PART OF THIS
+================================================================================
+`ci.yml` guards prod on `vars.PROD_PROMOTED_SHA` and **exits 1 when it is unset**:
+    "PROD_PROMOTED_SHA is not set. Prod cannot be deployed from push-to-main until promote.yml
+     records a SHA."
+**MEASURED 22:00 PT: `gh variable list` returns only `LAN_DEPLOY_ENABLED`, `QA_ENV_ID_DEV`,
+`QA_ENV_ID_PROD`, `QA_ENV_ID_UAT`. `PROD_PROMOTED_SHA` IS NOT SET.**
+And `promote.yml:638` records that the code writing it was **removed on 2026-09-08** ("Nothing in this
+repo ever read vars.PROD_PROMOTED_SHA"), replaced by GitHub Deployment records — **but the ci.yml
+reader was never removed.** One file retired the variable; the other still hard-requires it.
+Today that only breaks the push-to-main route (prod ships via promote.yml, confirmed by a Deployment
+record on `ref=main` dated 2026-09-09T16:43:49Z). **An automated chain will walk straight into it**,
+so reconcile the two files: either restore the writer, or delete the ci.yml reader and rely on the
+Deployment records. **Say which and why.**
+
+================================================================================
+OPTIONS - RANKED. THE ORCHESTRATOR PICKS; DO NOT CHOOSE ON YOUR OWN AUTHORITY.
+================================================================================
+ **1 (RECOMMENDED) — auto to UAT, prod stays one click.**
+    On a successful `develop` build, automatically dispatch `promote.yml` for the dev->uat leg. Prod
+    keeps `is_production` + environment protection. **Keeps every eval gate, removes the tedium, and
+    leaves a human on the last step into the revenue system.**
+    Cost: prod still needs one deliberate action.
+
+ **2 — fully automatic, gates retained.**
+    Chain dev->uat->prod automatically, but keep the weighted eval threshold on every tier and keep
+    the environment protection as an *auto-approving* reviewer. The eval score becomes the only thing
+    standing between a merge to develop and prod.
+    **Be explicit about what that means: any change that scores >90 reaches prod with no human
+    involved.** If the eval suite has a blind spot, prod inherits it automatically.
+
+ **3 — fully automatic, gates relaxed.** Lower or remove the threshold to reduce friction.
+    **NOT RECOMMENDED, and name why in the PR if chosen:** the gates are the only automated judgment
+    in the chain; removing them turns promotion into an unconditional deploy.
+
+================================================================================
+BUILD NOTES, WHICHEVER OPTION IS CHOSEN
+================================================================================
+ * **Do NOT bypass `promote.yml` by pushing to `main`.** main follows prod by fast-forward; writing to
+   it directly inverts the model and will fight the non-FF refusal.
+ * Trigger the chain from a SUCCESSFUL dev deploy, not from the push itself — otherwise a red build
+   promotes.
+ * **Make it idempotent and non-overlapping.** Two promotions racing to fast-forward main will have
+   one refuse. Use a concurrency group.
+ * **A GREEN ROLLUP CAN CONTAIN A HARD-FAILING TEST.** Read per-job conclusions when deciding to
+   advance, never the summary.
+ * The secondary provider is a cross-repo dispatch into `cognizioware-qa` and is polled via a commit
+   status. **Known broken:** per `cognizioware-qa/README.md:228-233` the `QA_GATE_DISPATCH_TOKEN`
+   lacks the `repo:status` scope, so those polls TIME OUT — the dual-eval gate is not currently
+   functioning. **An automated chain that waits on a status nobody can post will hang on every run.**
+   Verify that token's scope before automating anything that depends on it.
+ * Add a **kill switch**: a repo variable that disables auto-promotion without editing workflows
+   (the `LAN_DEPLOY_ENABLED` pattern already in use).
+ * Env var NAMES only in code and docs; never a token value.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Do NOT merge to `main` to ship. Do NOT disable `environment: production` without Paxton saying so.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat`.
+ - Do NOT post an `@claude` comment — it bills Paxton's personal subscription.
+ - Open the PR and STOP. This changes how prod ships; it does not get merged by the implementer.
+
+DONE MEANS: the chosen option is implemented behind a kill switch with every eval gate intact unless
+Paxton explicitly relaxed one; the `PROD_PROMOTED_SHA` contradiction between `ci.yml` and
+`promote.yml` is reconciled and the choice explained; the `QA_GATE_DISPATCH_TOKEN` scope is verified
+(or the secondary provider is explicitly excluded with evidence); a dry run shows dev->uat advancing
+on a real build; and the PR states plainly which human gate, if any, was removed.
+
+================================================================================
+*** PAXTON'S DECISION 2026-09-10 23:20 PT - THE OPTIONS ABOVE ARE SUPERSEDED. ***
+"AUTO PUSH THROUGH PIPELINE." Fully automatic dev -> uat -> prod. Do not re-present the options.
+================================================================================
+**A PREMISE I GOT WRONG, CORRECTED BY PAXTON:** prod here is NOT a public release cut and is NOT
+accessible via SSO. My "removing a human gate from a customer-facing revenue system" framing was
+overweighted, and the options table was built on it. The real risk is narrower and sharper: an
+automated chain ships whatever the gates approve. **So the gates are the entire safety mechanism**,
+which is why the preconditions below are non-negotiable rather than nice-to-have.
+
+*** THE SAFETY NET DOES NOT CURRENTLY FIRE. MEASURED ON origin/develop, 23:10 PT: ***
+
+    playwright.config.js:6      testMatch: /(librechat-(usermimic|sso)|trms-eval)\.spec\.js/
+                                -> the session-flow specs are EXCLUDED
+    env-to-session.spec.js      test.skip(!DEV_LANE, 'DEV_LANE=true is required')
+                                -> additionally skipped even if included
+    eval-gate.yml:239,255,262   continue-on-error: true  x3
+                                -> "informational", "not yet promoted to a gate"
+
+`promote.yml` DOES compute a genuine verdict (`$final -gt $threshold`, strictly greater, PASS/FAIL).
+**But it is fed by suites that largely do not run and cannot fail.** Wiring auto-promotion on top of
+this ships every change to prod on a green that means "nothing ran."
+
+*** AND THERE IS NO PR REVIEWER IN THIS REPO. *** Measured: only cognizioware-mcp-tools,
+mcp-cognizioware and LongHorizon-Harness carry `.github/workflows/claude-code.yml`.
+**cognizioware-powerplatform does NOT.** So once the chain is automatic, nothing reviews the code on
+its way to prod - not a bot, not a human. **The e2e gates are not merely the main check; they are the
+ONLY check.** State that plainly in the PR. If a reviewer is wanted here, that is task 130's rollout
+pattern, not this task.
+
+================================================================================
+*** SCOPE CUT: THIS TASK OWNS THE CHAIN ONLY. TWO OTHER TASKS OWN THE NET. ***
+================================================================================
+Paxton, 23:20: *"156 must depend on 153, not duplicate it."* Boundary verified by reading both files:
+
+  **TASK 153 owns MAKING THE SPECS EXECUTE** - tagging `@production-ready`, adding them to
+      `testMatch`, the `e2e:prod-ready` script, and the `DEV_LANE` skip. Its lines 49-56 already name
+      every piece. **DO NOT touch `playwright.config.js` or the spec tags here.**
+  **TASK 109 owns MAKING CI GATE** - its PART B, and its own line 110: *"Run informational for an
+      AGREED number of consecutive green runs, then promote to a REQUIRED check. WRITE DOWN THE
+      PROMOTION CRITERION."* **DO NOT flip the `continue-on-error` flags here.** Paxton's 23:20
+      instruction - "change these so the e2e doesn't allow auto pass" - IS that criterion and has
+      been recorded on 109.
+  **THIS TASK (156) owns ONLY** the automatic chain, its kill switch, its concurrency control, and
+      reconciling the two defects below.
+
+**DEPENDENCY CHAIN, and it is not short:  107 -> 109 -> 156,  and  153 -> 156.**
+107 is requeued and active; 109 is blocked behind it. **If 153 and 109 have not landed when you
+start, BUILD THE CHAIN BUT LEAVE IT DISABLED** behind the kill switch, and say plainly in the PR that
+enabling it before the gates fire would auto-ship on a meaningless green. **Do not enable it "to test
+the wiring."**
+
+================================================================================
+TWO CHAIN-BREAKERS THE AUTOMATION MUST HANDLE
+================================================================================
+ * **`vars.PROD_PROMOTED_SHA` is UNSET while `ci.yml` hard-requires it** (exit 1). `promote.yml:638`
+   removed the writer on 2026-09-08 and replaced it with GitHub Deployment records, but nobody
+   removed the ci.yml reader. Harmless today because prod ships via `promote.yml` - fatal to an
+   automated push-to-main path. Reconcile the two files and say which way and why.
+ * **`weight_secondary` must be ZERO until `QA_GATE_DISPATCH_TOKEN` gets `repo:status` scope.** The
+   secondary provider is polled via a commit status that token cannot post
+   (`cognizioware-qa/README.md:228-233`), so the score never arrives. **An automated chain waiting on
+   it hangs on EVERY run.** Either zero the weight and say so, or fix the scope first.
+
+ALSO DECIDE DELIBERATELY, DO NOT DISCOVER LATER: **`SKIP_CREATE=1` is set for the prod tier**
+(`eval-gate.yml:267`), so the prod-tier eval does NOT exercise session creation. Auto-promotion would
+therefore be gated, at the prod step, on a suite that skips the flow users actually hit. Either accept
+that dev/uat coverage is the real evidence and write it down, or change it.
+
+BUILD NOTES: trigger from a SUCCESSFUL dev deploy, never from the push itself, or a red build
+promotes. Use a concurrency group - two promotions racing to fast-forward `main` will have one refuse.
+**Never push to `main` to ship**: `promote.yml` fast-forwards main to the promoted sha, so main
+FOLLOWS prod. Add a kill switch as a repo variable, following the existing `LAN_DEPLOY_ENABLED`
+pattern. A GREEN ROLLUP CAN CONTAIN A HARD-FAILING TEST - read per-job conclusions when deciding to
+advance.
+
+STANDING REQUIREMENT PAXTON ADDED: **new features ship with matching e2e coverage.** In an automatic
+chain a feature merged without a spec widens a blind spot that reaches prod by itself. Authoring that
+coverage is 153/109 scope; this task's PR must state the rule.

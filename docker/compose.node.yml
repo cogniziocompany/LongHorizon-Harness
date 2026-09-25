@@ -34,6 +34,13 @@ services:
       # Web workbench defaults surfaced in /api/meta.
       LH_HARNESS_WEB_DEFAULT_AGENT: ${LH_NODE_AGENT:-claude_code}
       LH_HARNESS_WEB_DEFAULT_MODEL: ${LH_NODE_MODEL:-kimi-k2.7-code:cloud}
+      # Optional fleet telemetry: when LH_HARNESS_FLEET_URL is set, this node
+      # pushes events, heartbeats, round content, and the final report to
+      # fleet-admin over an outbound HTTPS path (no inbound NAT required).
+      LH_HARNESS_FLEET_URL: ${LH_HARNESS_FLEET_URL:-}
+      LH_HARNESS_FLEET_NODE: ${LH_HARNESS_FLEET_NODE:-}
+      LH_HARNESS_FLEET_KEY: ${LH_HARNESS_FLEET_KEY:-}
+      LH_HARNESS_FLEET_LABELS: ${LH_HARNESS_FLEET_LABELS:-}
     volumes:
       - lh-harness-work:/home/harness/work
       - lh-harness-runs:/home/harness/runs

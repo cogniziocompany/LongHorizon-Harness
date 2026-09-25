@@ -1,0 +1,9 @@
+{
+  "name": "0009-56-eval-gate-ct110-deploy",
+  "task_file": "C:/tmp/eval-gate-ct110-deploy-task.txt",
+  "workspace": "LongHorizon-Harness-b",
+  "max_rounds": 12,
+  "trio": "kimi",
+  "run_id": "20260909T020608Z_1319b759",
+  "note": "|| *** CAUSE IDENTIFIED — 2026-09-16 08:56 PT, SCHEDULED TICK #283. Still a stranding (work did not land), but NOT the task-136 fallback cohort. Read from run 20260909T020608Z_1319b759's failure_reason, not inferred: 403 `key not allowed to` — an ALLOW-LIST refusal, not a missing secret; died at round 1/12. This entry is one of the FOUR outliers in the 18-entry undispositioned set; the other 14 share the single missing-`:synthetic-anthropic`-fallback cause and are BLOCKED on task 136. NEXT STEP for this one: the fallback fix will NOT revive it — diagnose its own cause before requeuing."
+}

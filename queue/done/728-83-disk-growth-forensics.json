@@ -1,0 +1,15 @@
+{
+ "name": "727-83-disk-growth-forensics",
+ "task_file": "C:/tmp/disk-growth-forensics-task.txt",
+ "workspace": "cognizioware-mcp-tools-b",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "note": "REQUEUE - 2026-09-09 17:15 PT. Previous run c521618a produced NOTHING in 3 rounds and the cause was NOT scope, so do not cut it. Its own prompt outgrew the model: manager 829,358 chars (~207k tokens), executor 715,695. Rounds 1-2 could not emit a valid route; round 3's executor emitted no readable output - which is what a prompt that size looks like from the inside. Two contributing faults, both now understood: (1) the task-94 defect - role_history_chars is applied TWICE, so history alone can reach 200k chars; (2) the launcher was putting THREE concurrent runs on the local Ollama span, which serves about ONE executor. FIXED IN THE LAUNCHER 17:15: LOCAL_CAP was only enforced inside the Synthetic-down fallback block, so trios 0 and 1 kept seating a local executor in normal mode with nothing capping them; it now rotates to an all-Synthetic trio when the span is full. This requeue should draw a non-local executor. IF IT AGAIN PRODUCES NO EXECUTOR OUTPUT, stop and report - do not requeue a third time. || ORIGINAL: Paxton 2026-09-09: forensic 'why did space grow / is it typical'. READ-ONLY on live hosts. Distinct from task 75 (capacity plan) - do not duplicate.",
+ "run_id": "20260910T001519Z_5772c319",
+ "roles_bound": {
+  "manager": "glm-5.2:synthetic-anthropic",
+  "executor": "nemotron-3-super:synthetic-anthropic",
+  "auditor": "syn:large:vision:synthetic-anthropic"
+ },
+ "launched_at": "2026-09-10T00:15:19.740182+00:00"
+}

@@ -1,0 +1,46 @@
+TASK 176 - Hydra: an `enqueue_task` fleet tool, and the shared-infrastructure interlock (gaps 4.1 and "enqueue").
+
+SOURCE: Paxton's priority-2 handoff gap 4 ("a gate mid-flight must block a router restart. Proposed home: Hydra")
+and audit [fe2679] section M. Ordered after every powerplatform task; the interlock matters after the cutover.
+
+REPO / WORKSPACE: cognizioware-hydra    BASE: origin/main (NOT feat/harness-fleet - that branch's control-plane
+content is ALREADY in main; its only delta is PR #5, which Paxton decided 2026-09-14 to CLOSE as superseded).
+
+================================================================================
+MEASURED 2026-09-14 - the handoff's "orchestration half does not exist" is WRONG; most of it exists
+================================================================================
+ - orchestrator/src/mcp.js mounts /mcp (alias hydra, 7 device tools) and /fleet-mcp (alias hydrafleet, 28 tools,
+   FLEET_TOOLS from L122): list_harness_nodes, install_harness_node, restart_harness_node, list_fleet_runs,
+   create_fleet_run, get_run_snapshot, get_run_deep_link, send_run_instructions, resolve_run_gate, stop_run,
+   resume_run, migrate_run, get_fleet_meta, offload_node, kill_terminal, restart_terminal, rc.status, rc.sessions,
+   rc.exec, get_fleet_capacity, get_run_activity.
+ - orchestrator/src/fleet-scheduler.js consumes the LongHorizon-Harness queue contract (listQueue L62,
+   listAllQueue L69) - "no queue engine" by design. fleet-routes.js L109-115 returns {runs, queue, errors}.
+ - MISSING: an enqueue tool. create_fleet_run -> scheduler.createRun creates a RUN directly, which is the
+   section 3.2 "may never call" path for the chat agent (bypasses capacity, eligibility, one-run-per-tree).
+ - Interlock: none. Nearest is fleet-routes.js L94-95: 409 "node has non-terminal runs" unless force:true, and
+   restart_harness_node's refusal. It keys on RUNS, not GATES, and force bypasses it.
+ - Every mutating fleet route requires a `rationale` (fleet-routes.js L9, L42-47, ...). Keep that.
+
+================================================================================
+SCOPE
+================================================================================
+ 1. FLEET_TOOLS += enqueue_task {node, name, task, workspace, trio, max_rounds, priority, dedup_key, requested_by}
+    -> POST /api/queue on the chosen harness node (LHH contract in docs/queue.md, dedup_key is a BODY field since
+    0de7b2d). Returns {ok, queue_id, node}. Rationale required like every other mutating tool. The chat agent's
+    enqueue path becomes THIS tool; document that create_fleet_run is operator-only.
+ 2. Interlock: a `maintenance` guard in fleet-routes.js used by restart_harness_node, offload_node and any future
+    router/DB restart route: refuse (409, no force override) while ANY harness node reports a pending gate
+    (fleet.harness_gates status=pending, or GET /api/runs status waiting_approval) or a run in `starting`.
+    Add POST /fleet/maintenance {on|off, rationale} the overseer sets during a drain; while on, enqueue_task is
+    accepted but create_fleet_run and node restarts are refused.
+ 3. Surface both on the fleet window: pending gates count and maintenance flag in get_fleet_meta.
+ 4. Tests (orchestrator/tests): enqueue_task hits the harness stub with the right body; interlock refuses with a
+    pending gate and force:true; maintenance flag toggles behaviour.
+ 5. Housekeeping the overseer asked for in task 166 is NOT here: PR #5 close, branch close, PR triage stay in 166.
+
+HARD RULES: deploy is the hydra-ci deploy job on merge to main (self-hosted hydra-host runner) - it restarts the
+orchestrator, so merge only in a window the overseer chooses. Push + PR yourself; DO NOT MERGE.
+
+DONE MEANS: PR open; hydrafleet lists 29 tools including enqueue_task through the gateway (read it back with
+Accept: application/json, text/event-stream - without it the aggregate returns 406); interlock tests green.

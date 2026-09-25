@@ -1,0 +1,16 @@
+{
+  "name": "9999-159-pp105-frontend-build-fix",
+  "task_file": "C:/tmp/pp105-frontend-build-fix-task.txt",
+  "workspace": "/home/harness/work/cognizioware-powerplatform-evalfix",
+  "max_rounds": 6,
+  "trio": "kimi",
+  "note": "CLOSED 2026-09-17 03:41 PT by scheduled tick #396. Run 20260917T064433Z_c4682f89 gated at end of round 5/6 with 5 consecutive failed rounds and ZERO commits (HEAD 260ddb5 == origin, ahead=0); two narrowing injections (#389 cmd-d037b744b9c94e72, #391 cmd-b0d738f97c7049b1) were never acted on. Gate 3bd1905f86e2 resolved -> STOP (read back resolved/stop). The overseer then recovered the run's uncommitted work by hand: staged the 4 tracked src paths BY PATH (SessionList.create-dispatch.test.tsx, SessionWizard.test.tsx, WorkspaceLayout.tsx, WorkspaceLayout.stall-detection.test.tsx), excluded the 3 packages/frontend/dist/ paths, committed 9dfda4c (+273/-161) and pushed to task-101/build-dispatch. VERIFIED from the GitHub API, not from the push output: PR #105 headRefOid == 9dfda4cae1587a00022a9ffc0561b9205a0a7c08, state OPEN, base develop. Still open against the PR and NOT part of this task any more: mergeable=CONFLICTING and the frontend build check. Those are task 192 (9999z4-192-pp105-build-green-and-rebase), queued at the end of the active band. PRIOR NOTE: REQUEUED 2026-09-15 17:49 PT BY SCHEDULED TICK #180 - STRANDED FOR FOUR DAYS. Run 20260911T205727Z_e944e0e2 FAILED 09-11 14:15 PT in ROUND 1, abort_reason=provider_rate_limit (261612 ms) - the same Synthetic 429 the prior note already predicted for this task. PROVIDER FAULT, NOT SCOPE. THE TARGET IS STILL BROKEN, READ LIVE THIS TICK: pp PR #105 (task-101/build-dispatch, 'wire wizard Start button to dispatch build via POST /setup/start') is OPEN, mergeable=MERGEABLE, and its checks read build=FAILURE, image=SKIPPED, deploy=SKIPPED. Last updated 2026-09-10 11:01Z - untouched for five days. Fix t",
+  "task_source": "task_file",
+  "run_id": "20260917T064433Z_c4682f89",
+  "roles_bound": {
+    "manager": "syn:large:vision:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "kimi-k3:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-17T06:44:33.166543+00:00"
+}

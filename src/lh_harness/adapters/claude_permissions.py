@@ -161,6 +161,26 @@ class WorkspaceSnapshot:
 _GIT_METADATA_NOISE = frozenset({".git", ".git/index", ".git/FETCH_HEAD"})
 
 
+def is_git_internal_metadata_path(relative: str) -> bool:
+    """Git-internal bookkeeping that read-only git commands refresh.
+
+    Covers the stat-cache/admin files under ``.git/`` — the index,
+    ``*.lock`` side files, and the whole ``.git/worktrees/<name>/`` admin
+    subtree of linked worktrees, whose ``index``/``HEAD``/``ORIG_HEAD``/
+    ``logs`` entries live in the MAIN repo's git dir but churn when any
+    read-only git command runs inside the linked (audited) workspace.
+    Churn here is git bookkeeping, never an auditor working-file write.
+    History-bearing paths (``.git/objects``, refs, top-level ``.git/HEAD``)
+    are NOT covered, so a forbidden network git operation still trips the
+    guard.
+    """
+    if relative in _GIT_METADATA_NOISE:
+        return True
+    if relative.startswith(".git/") and relative.endswith(".lock"):
+        return True
+    return relative == ".git/worktrees" or relative.startswith(".git/worktrees/")
+
+
 def snapshot_workspace(
     workspace_path: str,
     hidden_paths: tuple[str, ...] | list[str] = (),
@@ -190,10 +210,14 @@ def snapshot_workspace(
                 continue
             try:
                 relative = path.relative_to(root).as_posix()
-                if relative in _GIT_METADATA_NOISE or (
-                    relative.startswith(".git/") and relative.endswith(".lock")
-                ):
-                    if entry.is_dir(follow_symlinks=False):
+                if is_git_internal_metadata_path(relative):
+                    # Keep descending into `.git` itself (objects/refs stay
+                    # tracked) and into `*.lock` dirs as before, but skip the
+                    # `.git/worktrees/` admin subtree entirely.
+                    if entry.is_dir(follow_symlinks=False) and not (
+                        relative == ".git/worktrees"
+                        or relative.startswith(".git/worktrees/")
+                    ):
                         stack.append(path)
                     continue
                 stat = entry.stat(follow_symlinks=False)

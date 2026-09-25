@@ -1,0 +1,62 @@
+TASK 157 - CONTAINMENT: give the LiteLLM router container its own memory cap (cognizioware-mcp-tools).
+
+*** OVERSEER-EXECUTED. NOT FOR A HARNESS RUN. Lives in queue/blocked/ deliberately. ***
+Reason it cannot be a run (CORRECTED 2026-09-15, scheduled tick #183): the first clause used to read
+"CT110 has no gh and no GitHub token (measured, task 149)" and that is **FALSE since 2026-09-14
+16:21 PT** - runs push and open their own PRs now. **THE BLOCK STILL HOLDS on the clauses that did
+not change:** the merge fires the mcp-tools deploy lane which recreates the router on CT202, and the
+merge window needs the same ZERO-ACTIVE-RUNS precondition as task 144. A run still cannot merge and
+cannot count runs.
+
+Queued by Paxton 2026-09-10 ~23:40 PT via session [4c0be38b] after the 22:36 CT202 incident.
+Source of truth: C:/tmp/ct202-memory-handoff.md ("The real fix", item 2).
+
+================================================================================
+WHY (one paragraph, so nobody re-derives it)
+================================================================================
+`docker inspect cognizioware-mcp-tools-litellm` returns memLimit=0. The router has NO container
+cap. When it leaked to 12.7 GB it filled the CT202 cgroup and the kernel killed its SIBLINGS (node
+services behind ops.easybutt0n.ai and fleet.easybutt0n.ai, plus the MCP ssh_exec gateway) instead
+of the offender. 123 prior OOM kills, none visible anywhere. A container cap does not fix the leak
+(that is task 158) - it changes WHO dies: the router restarts in seconds under
+restart=unless-stopped, and the gateway and web surfaces stay up.
+
+================================================================================
+THE CHANGE - one service, two keys
+================================================================================
+In cognizioware-mcp-tools, find the compose file that defines the service whose container is named
+`cognizioware-mcp-tools-litellm` (NOT `...-litellm-router` - that container does not exist).
+Add to THAT service only:
+
+    mem_limit: 6g
+    memswap_limit: 6g
+
+Sizing: fresh process is ~830 MB; idle growth measured ~240 MB/h; loaded growth ~1.5 GB/h. 6 GB
+gives ~3-4 h of loaded headroom before a self-restart and keeps 14 GB of the 20 GB CT cap for the
+siblings. If the overseer has fresher samples that argue for a different number, use them and say
+so in the PR body. Do not go above 8g - above that the sibling-kill failure mode returns.
+
+Do NOT touch infrastructure/litellm-config.yaml (Paxton's standing rule; also force-recreates the
+prod router on its own). Do NOT change restart policy (already unless-stopped). No other files.
+
+================================================================================
+LANDING SEQUENCE
+================================================================================
+1. Branch from main, commit the two lines, push, open PR. Title:
+   "infra: cap litellm container memory (6g) so OOM kills the router, not its siblings".
+   PR body: link the handoff, cite memLimit=0 evidence, the 123-kill counter, and the sizing above.
+   Cross-reference task 158 as the actual leak fix.
+2. Review: the overseer must NOT post the @claude comment (task 117 ban - bills Paxton's
+   subscription). Tell Paxton the PR number; he posts the comment. Wait for claude[bot] verdict.
+   No self-merge of an unreviewed PR (same refusal as 111/149).
+3. Merge ONLY at ACTIVE RUNS = 0, read from GET /api/runs and counted - same precondition, same
+   trap as task 144 (launcher polls every 15 min and will refill the slot). The deploy lane runs
+   `docker compose up -d --remove-orphans`; a changed mem_limit IS a service config change, so
+   compose WILL recreate the router. Every live run loses its model transport for ~40 s. That is
+   acceptable only at zero active. Bundle with the next 144-style window if one is pending.
+4. Read back: `docker inspect cognizioware-mcp-tools-litellm --format '{{.HostConfig.Memory}}'`
+   must equal 6442450944. Router HTTP 200. ops 302 / fleet 200. Record in LEDGER.md.
+5. If the router is OOM-killed under the new cap within 24 h, that is the cap WORKING - log the
+   restart count and hand the growth samples to task 158. Do not raise the cap in response.
+
+RULE 2 applies (hydra writes / fleet reads / ops infra-only). Secrets by name only, never values.

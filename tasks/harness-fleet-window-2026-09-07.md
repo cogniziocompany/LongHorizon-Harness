@@ -109,6 +109,7 @@ Keep the title. Update: Hydra box -> "Hydra fleet MCP (control) · fleet.easybut
 
 - 2026-09-08 06:45 PT: fleet.easybutt0n.ai restored (fleet-admin healthy on CT202 via #100/#102 lanes); ct110 enrolled against it (device key rotated once because the first enrol echoed it; key lives only in /home/harness/.lh-harness-secrets.env as LH_HARNESS_FLEET_KEY with URL/NODE/LABELS). Fleet window view re-vendored from ptait09 #43 as mcp-tools #104 (chain merges after the current lane). Reporter PR #3 rebased on main; release to CT110 in the next quiet window once the ingest routes are live.
 
+- 2026-09-08 (routing, tasks 45/46/44): runs and queue rows will carry `route` once task 49 lands (`route.bound.roles.{manager,executor,auditor}.{model,backend,tier,rationale}`, plus `provisional` and `override`; see the handoff's "Interfaces other tasks read"). Task 45 (window): show the bound model per role and the tier badge, rationale as a tooltip, provisional on pending rows; absent field renders nothing. Task 46 (Hydra, slice 7): render `roles` and `route`; the panel pins one role to a model on a PENDING entry through the queue's route endpoint with a required rationale, and shows a failed entry's `reason` verbatim and a refused entry's tried list. Task 44 (gate): assert route, tier and refusal reason render on both surfaces and that an absent route renders nothing rather than "unknown". Both surfaces feature-detect the field as they do `/api/queue`.
 - 2026-09-08 09:15 PT: with the QA classifier fixed, the #105 lane passed its UAT gate (6/6) but the CT202 deploy failed building the vendored fleet-admin image: the upstream Dockerfile copied migrate.js from the context root while it lives in src/. Fixed in mcp-tools #107 (chain: merge after the #106 lane, deploy, verify view) and upstream ptait09 #44 (merged). Reporter release to CT110 follows once /harness/* routes answer on fleet.easybutt0n.ai.
 
 ### 2026-09-08 03:45 PT — fleet view deploy chain
@@ -133,3 +134,69 @@ Keep the title. Update: Hydra box -> "Hydra fleet MCP (control) · fleet.easybut
 - hydra-ocr-service has been "unhealthy" since deploy: compose healthcheck execs curl in python:3.11-slim → hydra #19 (python urllib probe) chain-merging.
 - RC on Hydra (#17) is deployed with #18; rc-host trust material + rc-migrate + PTAIT09 disable remain operator steps for Paxton.
 - qa #18 (11b): the run's manager refused to sign off because the auditor's own test run wrote into config-baselines; the overseer verified directly on CT110 (52/52 unit, 9/9 gate-report, validate-workflows OK, clean tree, no deletions; the 18 "failures" were Playwright browser tests with no chromium on CT110), pushed the merge, chain merging. Lesson for the task template: auditors must run only the hermetic unit target (`test:unit`), never `npm test` when that maps to Playwright.
+
+### 2026-09-08 09:05 PT — why the fleet window is empty while Hydra's sidebar has data
+Paxton compared the two views. They are the same subject seen from two planes, and they are fed differently:
+- **Hydra (control plane, corsairai300)** *pulls*. CT110 is registered as an external harness node (`/harness/nodes` → ct110, online,
+  hasToken true) and Hydra's fleet routes call the harness API live, so its sidebar shows runs the moment they exist.
+- **Fleet window (report plane, fleet-admin on CT202)** *is pushed to*. Nothing queries the harness; nodes, runs, gates and events only
+  appear when the harness reporter and the device agents post them.
+Verified now: `GET https://fleet.easybutt0n.ai/api/fleet/overview` → `{"nodes":[],"runs":[],"gates":[],"counts":{...0},"issues":[]}`.
+CT110 **is** enrolled (`LH_HARNESS_FLEET_URL/NODE/LABELS/KEY` all present in `/home/harness/.lh-harness-secrets.env`), but the deployed
+harness build has **no fleet reporter module** — `ls /home/harness/release-src/src/lh_harness/` shows nothing fleet-related. So there is no
+producer: enrolment without a reporter is exactly an empty window.
+The reporter is LongHorizon-Harness PR #3 (`feat/fleet-reporter`, run 878831fc): events, heartbeat and round content push. It conflicted with
+everything main gained overnight; the rebase task 05h6b is now **running** (20260908T155915Z_42a8b0c2) in the parallel tree
+`LongHorizon-Harness-b`. Order after it lands: merge → release to CT110 in a quiet window (abort runs → deploy → resume) → the window fills.
+Device rows come from the second producer, ptait09 fleet device emission (merged upstream as #45), which needs the device rollout.
+
+### 2026-09-08 09:10 PT — task 45: hybrid pull so the window shows every harness session (running)
+Paxton's requirement, verbatim intent: *"I should see, the human user and the AI agent, an lh-harness in both fleet and hydra. SAME FLEET."*
+The window stays push-fed (reporter + device agents, untouched) and gains an **additive read-through poller** so it is correct with or without a
+reporter and backfills sessions the reporter never sent:
+- Nodes come from `FLEET_HARNESS_NODES_JSON` (same shape Hydra uses: nodeId, baseUrl, uiBaseUrl, tokenEnv, labels), token read by env name only.
+- The poller is **read-only** against the harness (run list + snapshot for status, round, gates), bounded timeouts, ~20 s default.
+- Rows are upserted into the same tables the push path writes, tagged with origin; **a pushed row is never overwritten by a pulled one**.
+- A node that stops answering is marked degraded with last error/last seen; existing rows are not blanked.
+- Every run row links out to the running lh-harness web UI (`<uiBaseUrl>/runs/<run_id>`), and per-round session ids
+  `<run_id>.<round_tag>.<role>` are shown so a session joins to a trace.
+**Parity contract (tested, and stated in the README so a future change that re-keys or filters rows is recognised as breaking it):** the same node
+id, the same run ids and the same statuses must appear on all four surfaces within one poll interval — the window in a browser, Hydra in a browser,
+the window's read API, and Hydra's fleet MCP tools. Identical strings, no re-keying per surface, so a human and an agent can quote the same id.
+Source repo is ptait09-easybutt0n-ai (fleet-admin's home); the copy in cognizioware-mcp-tools is vendored, so the overseer re-vendors and deploys
+through that lane afterwards, then sets `FLEET_HARNESS_NODES_JSON` and the token env on CT202.
+Run 20260908T160511Z_059e273a, 8 runs now active across 8 working trees.
+
+### 2026-09-08 09:25 PT — the harness task queue must be visible in the web UX
+Paxton: the queue in `docs/queue.md` has to be viewable by a person, not only through the API. That doc already designates the client —
+*"Hydra | Deep links to /api/queue + optional queue panel that POSTs enqueue"* — so the panel goes in Hydra (control plane, may write) and a
+read-only mirror goes in the fleet window (report plane).
+- **Task 46 (Hydra, queued)** gained slice 7: a Queue section under the fleet list showing name, workspace, trio, priority, requested_by, status,
+  the full selectable queue id and timestamps, grouped exactly as `GET /api/queue` groups them, counts in the header; writes are enqueue,
+  re-prioritise and delete, each requiring a rationale like the run controls, errors inline, no optimistic mutation. A waiting entry must explain
+  itself: if its workspace matches a non-terminal run, say so, because that is the commonest reason a queued item looks stuck (it is exactly what
+  head-blocked our own queue this morning).
+- **Task 45 (fleet window, running)** received the same as an injected instruction, read-only: poll `/api/queue` per node in the same cycle, render
+  the section beside the runs, no writes.
+**Live state that both must handle:** the deployed harness build predates the queue API — `GET /api/queue` returns **404** on ct110 today, and the
+node serves **no dashboard at its web root** (404; `_STATIC_DIR` points at `_frontend/web/dist`, which is not in the repo and not on the box). So
+both surfaces feature-detect per node and show one quiet line — "Queue API not available on this node (needs the harness release)" — rather than an
+empty table implying an empty queue. The queue API arrives on ct110 with the harness release that also carries the fleet reporter.
+
+### 2026-09-08 09:35 PT — Paxton's correction: neither surface is redundant, and the planes are
+The expert's aside that Hydra is redundant against the harness's own UI is **rejected**. The confirmed architecture:
+- **fleet.easybutt0n.ai** — every lh-harness run, everywhere. The wallboard.
+- **Hydra** — the **device** fleet and the control plane: terminals, shells, heads on real machines, in real time.
+- **An lh-harness run is an agent that consumes Hydra devices.** It may reach into the device fleet to execute (bash, a head, a terminal).
+**Use case, verbatim:** *"I access hydra, can see all the harness in the right side panel, then if any are using the hydra tools, I should see it
+in the terminal and the heads on the left hand side of the screen."*
+- **Task 46** gained slice 8: a run row on the right shows which head/terminal it drives; the device entry on the left shows which run is driving it;
+  selecting either highlights the other without stealing focus; the cockpit links into the existing terminal for that head. Identifiers unchanged on
+  both sides. Derived only from what the orchestrator already exposes — if the data cannot support the pairing today, the run must say which field
+  would be needed rather than fake it.
+- **Task 16a (MSCE experience layer, queued)** gained the device dimension through all three levels: L1 traces record the device/head/terminal and the
+  Hydra node an exec went through (identical id strings, absent when there was no remote exec); L2 policies keep the device *requirement* and drop the
+  instance ("needs a linux shell head with docker", not "used head 7 on desk03"); L3 environmental cognition holds the fleet itself — which hosts
+  exist, what each can run, and the standing constraints (no host-level change without an explicit go, restart a runner from outside it, some hosts
+  have no IPv6 egress). Redaction still applies; device ids and hostnames are fine, tokens are not. Scope guard: fields and capture only, no Hydra
+  client, no dependency on the device fleet being present.

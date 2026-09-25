@@ -1,0 +1,8 @@
+{
+ "name": "14d-harness-infra-hardening",
+ "task_file": "C:/tmp/harness-infra-hardening-task.txt",
+ "workspace": "/home/harness/work/LongHorizon-Harness",
+ "max_rounds": 8,
+ "trio": "kimi",
+ "run_id": "20260908T140622Z_23ea04dc"
+}

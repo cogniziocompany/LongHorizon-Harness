@@ -1,0 +1,43 @@
+TASK 175 - fleet-admin (fleet.easybutt0n.ai) needs a deploy path in code: compose service, Caddy route, deploy step.
+
+SOURCE: Paxton's priority-2 handoff (the fleet window is live but empty; nothing in a repo describes how it is
+deployed) and audit [fe2679] section M (2026-09-14). Ordered after every powerplatform task.
+
+REPO / WORKSPACE: ptait09-easybutt0n-ai    BASE: origin/easybutt0n-runner-v2 (the shared repo's superset branch;
+task 148 slices use feat/harness-fleet-report as the PINNED SOURCE - coordinate: this task must not repin).
+
+================================================================================
+MEASURED 2026-09-14
+================================================================================
+ - fleet.easybutt0n.ai answers HTTP 200 "Fleet Window", Via: 1.1 Caddy, X-Powered-By: Express (on CT202 per the
+   overseer), GET /api/fleet/nodes -> [] because the harness heartbeat has never succeeded (task 114).
+ - fleet-admin/Dockerfile exists (two-stage, EXPOSE 8787, `node src/migrate.js && node src/server.js`).
+ - NO fleet-admin service in docker-compose.yml (services: cloudflared, open-webui, mcpo, claude-rc).
+ - NO .github/workflows in this repo at all. NO Caddyfile or reverse_proxy anywhere in the repo.
+ - docs/FLEET-V2-ROLLOUT.md L17 and L153 still list "deploy fleet-admin centrally" as TODO.
+ - Env names: FLEET_ADMIN_KEY, FLEET_READ_KEY, FLEET_PORT (8787), FLEET_SIG_HEADER; Postgres schema `fleet`
+   applied by src/migrate.js; socket.io namespace /fleet.
+ - The C# supervisor has no build path either (task 162) - different service, same repo, same root cause:
+   this repo has no CI.
+
+================================================================================
+SCOPE
+================================================================================
+ 1. docker-compose.fleet-admin.yml (or a `fleet-admin` service + profile in the existing compose): image built
+    from fleet-admin/Dockerfile, env from fleet-admin.env (names only, gitignored), Postgres dependency named,
+    healthcheck on GET /api/fleet/nodes with the read key.
+ 2. infrastructure/caddy/fleet.easybutt0n.ai.Caddyfile snippet: reverse_proxy to :8787 with websocket passthrough
+    for /socket.io. Read the LIVE Caddy config on the host first (read-only) and reproduce it; do not invent.
+ 3. Deploy step: scripts/deploy-fleet-admin.sh mirroring cognizioware-hydra's hydra-ci deploy job shape (rsync
+    the service dir to the host path, compose build, compose up -d, health wait, smoke). A GitHub Actions workflow
+    is the second step, only after task 162's supervisor script proves the per-host pattern - do NOT add the
+    first workflow to this repo in this task.
+ 4. docs/FLEET-V2-ROLLOUT.md: replace the two TODO rows with the measured topology and the runbook.
+ 5. Read-back: after the overseer runs the deploy step in a window, fleet.easybutt0n.ai still returns 200 and
+    the container image id matches the build.
+
+HARD RULES: no host mutation by the run - files + docs + PR only; the overseer deploys. Secrets by env NAME only.
+Push + PR yourself; DO NOT MERGE.
+
+DONE MEANS: PR open with compose, Caddy snippet, deploy script and runbook; `docker compose config` validates
+locally; the snippet matches the live Caddy config read from the host.

@@ -1,0 +1,95 @@
+# TASK 193 — reconcile PR ptait09#52 against the NOW-LIVE fleet-admin deploy path
+
+## Why this exists
+Task 175 shipped PR `cogniziocompany/ptait09-easybutt0n-ai#52` (branch
+`feat/fleet-admin-deploy-path`, head `f196f87`, OPEN/MERGEABLE, unreviewed). It was written on the
+premise — true when queued 2026-09-14 — that `fleet.easybutt0n.ai` had no compose service, no
+deploy script and no Caddyfile anywhere in any repo.
+
+**That premise is now FALSE, measured on the live host by scheduled tick #414 (2026-09-17 05:44 PT):**
+
+- `cognizioware-mcp-tools-fleet-admin` is **UP 15 h and healthy** on CT202 (192.168.21.161),
+  container created `2026-09-16T21:52:36Z`.
+- It deploys from the **mcp-tools repo / "Deploy MCP Tools Stack" lane**:
+  compose project `cognizioware-mcp-tools`, config file
+  `/opt/cognizioware-mcp-tools/docker-compose.yml`, build context `./docker/fleet-admin`.
+- The **live** Caddyfile (`/opt/cognizioware-mcp-tools/Caddyfile`, bind-mounted to
+  `/etc/caddy/Caddyfile` in `cognizioware-mcp-tools-caddy`) already carries the vhost, and
+  `https://fleet.easybutt0n.ai/` returns **200**.
+- The live service uses an **external** database: `FLEET_DATABASE_URL` →
+  agent-db `192.168.21.154/ai_easybutt0n`, schema `fleet`. It does **not** run a co-located Postgres.
+
+So PR #52 adds a SECOND, independent deploy path for a service that already has a live one.
+Per LOOP-PROMPT RULE 2 ("check whether one already exists and extend it"), this is duplication and
+the PR must be cut back rather than merged.
+
+## THE SNIPPET IS NOT MERELY UNVERIFIED — IT IS WRONG AND WOULD CAUSE AN OUTAGE
+Task 175's run correctly refused to claim the Caddy gate was met. The overseer then closed it from
+the host. The diff:
+
+LIVE:                                   PR #52:
+  reverse_proxy fleet-admin:8787          reverse_proxy 127.0.0.1:8787 {
+                                              websockets
+                                          }
+
+Measured from INSIDE the `cognizioware-mcp-tools-caddy` container:
+- `http://fleet-admin:8787/api/fleet/nodes` → **200 OK** (X-Powered-By: Express)
+- `http://127.0.0.1:8787/` → **Connection refused**
+- `docker inspect` → `HostPortBindings=map[]`, `ExposedPorts=map[8787/tcp:{}]` — the container
+  uses compose `expose:` and binds **no host port at all**.
+
+Applying PR #52's snippet to the live Caddy would take `fleet.easybutt0n.ai` from **200 to 502**.
+The snippet's own comment block asserts the exact inverse of the truth ("Do not re-introduce a
+`fleet-admin:8787` name upstream — it would proxy to a container that binds loopback only and is
+unreachable by name"). That reasoning is backwards and must be deleted, not softened.
+
+Two further defects the run itself named, both confirmed:
+1. The snippet header claims `read-only capture, 2026-09-18` — a **false** provenance claim, and a
+   future date (it was written 2026-09-17). Delete the claim.
+2. `docs/FLEET-V2-ROLLOUT.md` line 65 mislabels `192.168.21.154` as ct202. It is the **agent-db**
+   host; ct202 is `192.168.21.161`.
+
+## SCOPE — cut back, do not extend. Work on the EXISTING branch and the EXISTING PR #52.
+1. **Delete** `docker-compose.fleet-admin.yml` and `fleet-admin.env.example` from the branch. The
+   live deploy is the mcp-tools compose block; a rival compose that stands up its own
+   `postgres:16-alpine` contradicts the external agent-db the live service actually uses.
+2. **Delete** `scripts/deploy-fleet-admin.sh` for the same reason — the "Deploy MCP Tools Stack"
+   lane already deploys this service. Do not write a second deploy path.
+3. **Replace** `infrastructure/caddy/fleet.easybutt0n.ai.Caddyfile` with the VERBATIM live block
+   below, keeping only a short honest header that says it is a capture of the live ct202 config
+   taken 2026-09-17 by the overseer, and that the file is REFERENCE ONLY — the deployed copy is
+   `/opt/cognizioware-mcp-tools/Caddyfile` in the mcp-tools repo:
+
+```
+fleet.easybutt0n.ai {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_DNS_API_TOKEN}
+		resolvers 1.1.1.1 8.8.8.8
+	}
+	encode gzip
+	reverse_proxy fleet-admin:8787
+}
+```
+
+4. **Rewrite** the `docs/FLEET-V2-ROLLOUT.md` fleet-admin rows to describe the deploy path that is
+   ACTUALLY live (mcp-tools lane → CT202, external agent-db at 192.168.21.154 schema `fleet`,
+   Caddy vhost already serving 200), and fix the line-65 `.154`/ct202 mislabel.
+5. Keep the doc's unrelated rollout-state corrections (the host cutover table) — those are good and
+   independent of the duplication.
+
+## DONE MEANS
+- PR #52 still OPEN (never merged — merging is the overseer's), head advanced, diff shrunk to
+  docs + one reference Caddyfile.
+- `git grep -n '127.0.0.1:8787'` on the branch returns **nothing**.
+- `git grep -n '2026-09-18'` on the branch returns **nothing**.
+- No `docker-compose.fleet-admin.yml`, no `scripts/deploy-fleet-admin.sh`, no
+  `fleet-admin.env.example` on the branch.
+- No `.github/workflows` added. No repin of `feat/harness-fleet-report`. No host mutation — the
+  live capture is already done and is quoted above; do NOT touch CT202.
+- Push to the SAME branch `feat/fleet-admin-deploy-path` so PR #52 updates. Open no new PR. STOP
+  after pushing.
+
+## CONSTRAINTS
+- You hold `GH_TOKEN`: push and update the PR yourself. Do not ask the overseer to push.
+- Do NOT invoke `@claude` for review, on any repo, for any reason.
+- Base stays `origin/easybutt0n-runner-v2`.

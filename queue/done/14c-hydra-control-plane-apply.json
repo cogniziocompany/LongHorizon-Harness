@@ -1,0 +1,8 @@
+{
+ "name": "14c-hydra-control-plane-apply",
+ "task_file": "C:/tmp/hydra-control-plane-apply-task.txt",
+ "workspace": "/home/harness/work/cognizioware-hydra-rsi",
+ "max_rounds": 10,
+ "trio": "kimi",
+ "run_id": "20260908T110712Z_92ad3327"
+}

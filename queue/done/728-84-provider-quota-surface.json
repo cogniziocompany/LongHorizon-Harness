@@ -1,0 +1,15 @@
+{
+  "name": "728-84-provider-quota-surface",
+  "task_file": "C:/tmp/provider-quota-surface-task.txt",
+  "workspace": "cognizioware-mcp-tools",
+  "max_rounds": 10,
+  "trio": "kimi",
+  "note": "DISPOSITIONED 2026-09-16 08:40 PT, SCHEDULED TICK #282 - Do NOT requeue. STATE IS MERGED, not stranded. Run 20260910T073903Z_54635f7d reads failed, which is why eight consecutive stranding scans re-flagged it, but the deliverable shipped: mcp-tools PR #135 'feat(ops): surface Synthetic and Ollama provider quota on the admin-centres page' (head task-84, base main) reads state=MERGED from the GitHub API this tick. The LEDGER's own 09-10 row already said '84 provider-quota-surface - FAILED, but the work was done: PUSHED -> PR #135'; this tick closes the loop by reading the PR back as MERGED. Residual toward VERIFIED: nobody has confirmed the quota panel RENDERS for an operator on ops.easybutt0n.ai/admin-centres (a merge is not a render) - that residual belongs to a verification pass, not to a relaunch of this run. || PRIOR NOTE: Paxton 2026-09-09: surface Synthetic + Ollama quota on ops admin-centres. EXTEND that page, no new route. Synthetic /quotas returned 404 on every token-auth path tried; synthetic.new/quotas needs a browser session. Resolve or use a labelled estimate. ADDENDUM: iframe is BLOCKED (x-frame-options SAMEORIGIN on synthetic.new) - baseline is a link-out; server-side session fetch is Option B and must NOT be given credentials. ADDENDUM 2: links+instructions ALREADY SHIPPED in PR #123 - do not redo. This task = quota rows w/ thresholds, masked credential form (Path 1), Playwright agentic path (Path 2), e2e for BOTH. Never give it a live credential; ship empty and OFF.",
+  "run_id": "20260910T073903Z_54635f7d",
+  "roles_bound": {
+    "manager": "glm-5.2:synthetic-anthropic",
+    "executor": "nemotron-3-super:synthetic-anthropic",
+    "auditor": "syn:large:vision:synthetic-anthropic"
+  },
+  "launched_at": "2026-09-10T07:39:03.477708+00:00"
+}

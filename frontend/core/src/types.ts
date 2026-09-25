@@ -72,6 +72,20 @@ export interface RoundView {
   final_response_status?: Record<string, unknown>;
 }
 
+export type ContentionTier = 'same_repo' | 'same_repo_same_branch' | 'shared_git_dir' | 'same_tree';
+
+export interface ContentionPeer {
+  run_id: string;
+  workspace: string;
+  branch?: string | null;
+}
+
+export interface WorkspaceContention {
+  contention_id: string;
+  severity: ContentionTier;
+  peers: ContentionPeer[];
+}
+
 export interface RunSummary {
   id: string;
   task: string;
@@ -84,6 +98,7 @@ export interface RunSummary {
   workspace?: string;
   max_rounds?: number;
   prompt_language?: 'en' | 'zh';
+  contention?: WorkspaceContention;
 }
 
 export interface Snapshot {

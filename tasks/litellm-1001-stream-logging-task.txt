@@ -1,0 +1,255 @@
+TASK 151 - LiteLLM v1.100.1 + PR #38998 backport: stop losing every streamed call.
+
+*** OVERSEER-EXECUTED / WINDOWED. NOT A NORMAL HARNESS RUN. IN queue/blocked/ DELIBERATELY. ***
+It recreates the CT202 PROD router, needs prod credentials, and requires a drained fleet. A harness
+run is never given credentials and must never restart the router it is itself routing through.
+
+Source: Paxton, 2026-09-10, plan from session [f335d2] (f335d257-57e6-51d4-9413-1883e98107af).
+
+================================================================================
+THE PREMISE - VERIFIED BY THE OVERSEER ON THE LIVE PROD ROUTER, 2026-09-10 21:05 PT
+================================================================================
+Measured on CT202 (**ptait01**, `pct config 202` -> `ip=192.168.21.161/24`; the container is named
+`cognizioware-ops-it-services-uat-copy`, which is MISLEADING - the address is authoritative, and an
+earlier probe was nearly dismissed as a decoy because of that name):
+
+    POST requests, last 30m : 3,128      _on_deferred_native_stream_complete errors: 342
+    POST requests, last 6h  : 36,125     _on_deferred_native_stream_complete errors: 5,389
+    "cannot pickle" errors, last 6h: 1,591
+    router image: c8756e7b9a61  (the v1.100.0 pin)
+
+**342 errors against 3,128 live POSTs matches the plan's claimed ~346/30min.** The zero-traffic
+explanation was ruled out explicitly: there WAS traffic. The premise is real, not inferred.
+
+*** AND THERE ARE TWO DEFECTS RUNNING AT ONCE, NOT ONE. *** The 1,591 `cannot pickle` errors are
+TASK 82's separate bug (`deepcopy` of a request object holding a live client `RLock`, via
+`spend_log_error_logger.py`). This task fixes the ARITY bug (#40345). **Fixing this one will NOT
+make task 82 go away**, and if spend rows are still missing afterwards, that is why. Do not report
+task 82 as resolved by this upgrade.
+
+THE BUG: on v1.100.0 every streamed `/v1/messages` call bridged to a non-Anthropic provider hits
+`TypeError: _on_deferred_native_stream_complete() takes 1 positional argument but 2 were given` at
+stream end - the harness's whole `:synthetic-anthropic` path and the ornith local lane. The call is
+logged as FAILED with ~0 completion tokens and $0, and the client receives a 500 error event
+APPENDED AFTER `message_stop`.
+TRIGGER: the file guardrails `hide-secrets` (G3) and `output-moderation` are both `post_call` +
+`default_on`, which arms the native deferred hook; the Anthropic bridge then calls it with 2 args.
+There are no guardrail rows in the DB.
+UPSTREAM: BerriAI/litellm#40345. Fix PRs #38998 (+26/-5) and #39647 are **NOT MERGED**. No release
+fixes it - v1.100.1 is v1.100.0 plus a router OOM fix; 1.102.0 is reported affected.
+
+================================================================================
+*** THIS DELIBERATELY OVERRIDES A STANDING INSTRUCTION - SAY SO IN THE PR. ***
+================================================================================
+Task 82's text says, verbatim: **"Do NOT bump the pinned digest as part of this task - report the
+candidate version and what changed. Digest pinning is a standing rule."**
+Paxton decided on 2026-09-10 to bump it anyway, to v1.100.1 plus the backport. That is a deliberate
+supersession, not an oversight. **Record it in the PR body and in the LEDGER row**, so nobody later
+reads the bump as a violation of the pinning rule.
+
+================================================================================
+APPROACH - PATCH AS A BIND-MOUNTED FILE, NOT A CUSTOM IMAGE
+================================================================================
+The image stays `ghcr.io/berriai/litellm@sha256:<v1.100.1>` so three things keep working: the CI
+digest grep and pull (`deploy-mcp-tools.yml:410,919`, `deploy-mcp-tools.ps1:329`), the version check
+in `e2e/suites/01-litellm-health.test.js`, and the upgrade runbook.
+The patched file lives in `infrastructure/docker/litellm/hooks/`, **which both lanes already sync**
+(`deploy-mcp-tools.yml:399-406`, `736-743`) - VERIFIED: that directory exists on origin/main and
+already holds `cache_namespacer.py` and `thinking_normalizer.py`. **No workflow edit is needed.**
+
+VERIFIED FACTS (overseer, 21:05 PT):
+  * current pin `c8756e7b9a61` = v1.100.0, referenced in exactly FOUR places on origin/main:
+        infrastructure/docker-compose.yml:34
+        infrastructure/azure/aca-vai02-config.yaml:353
+        infrastructure/README.md:71
+        docs/config-authority.md:18
+  * v1.100.1 digest per the plan: `sha256:a3715fa7ad8387941ab697259bd2881d68931657247a41984f90fae6d11c62bf`
+    -> **RE-VERIFY THIS DIGEST YOURSELF before writing it into the compose file.**
+  * `e2e/suites/01-litellm-health.test.js` scans UP TO 20 LINES ABOVE the `image:` line for the
+    FIRST `vX.Y.Z` match. **So the version comment nearest `image:` must read v1.100.1**, or the
+    test asserts the wrong version. This is a real trap - the existing comment block above that line
+    mentions 1.93.0 AND v1.100.0.
+  * The Prisma schema is identical between 1.100.0 and 1.100.1, so the runbook's migration-diff step
+    is a no-op. **Record that it was checked; do not skip the check.**
+
+================================================================================
+STEPS
+================================================================================
+0. MEMORY. Write `litellm-deferred-stream-logging-bug.md` (type `project`) covering #40345, the
+   trigger, the measured numbers above, the patched-file approach and **when to remove it** (once an
+   upstream release contains #38998 or #39647), and that the 51 DB price rows set 2026-09-10 via
+   `PATCH /model/{id}/update` are live and the DB overrides the YAML. Add the MEMORY.md line.
+
+1. BRANCH VIA A WORKTREE - the checkout holds an uncommitted pricing change AND someone else's edit
+   to `design docs/handoff-docs/ornith-db-owned-local-lane.md`. **Touch neither.**
+       git worktree add ../cognizioware-mcp-tools-litellm-1001 -b fix/litellm-1.100.1-deferred-stream origin/main
+
+2. CODE (in the worktree):
+   a. New `infrastructure/docker/litellm/hooks/litellm_v1_100_1_common_request_processing.py`, taken
+      verbatim from `https://raw.githubusercontent.com/BerriAI/litellm/v1.100.1/litellm/proxy/common_request_processing.py`,
+      **record its sha256**, then apply the single #38998 hunk at the native closure (~line 2401):
+        1 arg + coroutine -> enqueue on `GLOBAL_LOGGING_WORKER`
+        2 args -> `await _as_success_dispatcher(<captured logging_obj>).dispatch_success_handlers(
+                   assembled_response, cache_hit=..., start_time=None, end_time=None,
+                   prefer_async_handlers=True)`
+        anything else -> log an error and drop
+      Header comment: source tag, upstream sha256, #40345/#38998 links, and "delete this file and its
+      mount when upgrading past a release containing #38998/#39647".
+   b. `infrastructure/docker-compose.yml` litellm-router: image -> v1.100.1 digest; comment nearest
+      `image:` says v1.100.1 (see the test trap above); add the read-only volume mounting the patched
+      file over `/app/.venv/lib/python3.13/site-packages/litellm/proxy/common_request_processing.py`.
+   c. Update the other three digest references. `aca-vai02-config.yaml` gets the digest only (no bind
+      mount there) - note that limitation in the file.
+   d. Fix the doc error in `design docs/mcp-placeholder-services-audit-and-plan.md` SS13.1: CT204's
+      host is ptait07 (192.168.21.138), NOT .110. **CONFIRMED by the overseer: ptait07 holds CT204 at
+      192.168.21.162; ptait01 (192.168.21.110) holds CT202 at .161.**
+   e. `python -m py_compile` the patched file; diff against upstream = EXACTLY ONE HUNK;
+      `docker compose config` parses.
+
+3. PRE-FLIGHT (read-only + backups): follow the `mcp-gateway-ops` skill upgrade procedure
+   (`.claude/skills/mcp-gateway-ops/SKILL.md:298-388`) on CT204 and CT202 - `pct snapshot` plus
+   `pg_dump -Fc` to `/var/backups/litellm-pre-upgrade.dump`. Run
+   `infrastructure/scripts/litellm-team-audit.sh` on both with `mcp-tools.env` sourced; **exit 0 is
+   REQUIRED** - exit 2 means restore with `litellm-team-restore.sh` FIRST (the CLAUDE.md pre-upgrade
+   gate). Record the baseline error count and the spend success/failure split.
+
+4. UAT FIRST (CT204 on ptait07, MANUAL - CI only recreates UAT when `litellm-config.yaml` changes,
+   `deploy-mcp-tools.yml:419-420`). Push the file and compose by hand, `docker pull` the digest, then
+   `docker compose --env-file mcp-tools.env up -d --no-deps --force-recreate litellm-router`.
+   **Never a bare `docker compose up` for mcp-tools - always `--env-file mcp-tools.env`.**
+   Verify 1-5 below against http://192.168.21.162:4000. **STOP IF ANY CHECK FAILS.**
+
+5. DRAIN, THEN PROD.
+   *** THE DRAIN MECHANISM NOW EXISTS: `C:/tmp/queue/DRAIN`. *** Task 147 built and PROVED it at
+   20:35 PT (log line `DRAIN flag set - launching nothing (active=N)`). The overseer arms it; the
+   plan's "ask the overseer to pause the launcher" is satisfied by that flag. **Do NOT edit
+   `C:/tmp/launch_queue.py` yourself.**
+   Wait for a COUNTED zero: `running + waiting_approval == 0` from `GET /api/runs`. Count, do not
+   infer - the overseer got this wrong twice on 2026-09-10.
+   Then open the PR; merging to main triggers `deploy-mcp-tools.yml` (E2E gate -> UAT sync ->
+   cognizioware-qa UAT gate -> CT202 deploy). Hooks sync at 736-743 delivers the patched file BEFORE
+   the prod `compose up -d` recreate at ~958-964. Watch through `qa-verify-prod` and `smoke-test`,
+   **reading the per-job conclusions, not the rollup** - a green rollup can contain a hard-failing
+   test. Then verify against CT202 and tell the overseer to clear the flag.
+
+================================================================================
+VERIFICATION
+================================================================================
+ 1. `01-litellm-health` passes, AND
+    `docker exec ... python -c "import litellm.proxy.common_request_processing as m, hashlib; print(hashlib.sha256(open(m.__file__,'rb').read()).hexdigest())"`
+    equals the patched file's sha256. **That hash equality is the only proof the mount took** - a
+    running container is not proof it kept your file.
+ 2. Streaming probe: `POST /v1/messages` with `stream: true` on `glm-4.7-flash:synthetic-anthropic`
+    plus one on `general-chat`. No `error` event after `message_stop`; a new `LiteLLM_SpendLogs` row
+    with `status='success'`, completion_tokens > 0 AND **spend > 0**.
+ 3. ZERO `_on_deferred_native_stream_complete` errors over 15 minutes of LIVE traffic - and record
+    the POST count in the same window, because zero errors with zero traffic proves nothing. The
+    baseline is 342 per 30 min at 3,128 POSTs.
+ 4. Runbook post-upgrade checks: no prisma errors; `/key/list`, `/team/list`, `/health/readiness`
+    all 200; MCP aggregate >= 45 tools; team audit exit 0; `RUN_LIVE_REGRESSION=1 npm run test:teams`
+    5/5. **NEVER the bare gateway `/health`** - it fans a completion out to every configured model.
+ 5. `npx jest --testPathPattern='13-litellm-model-inference' -t 'Phase 0'`,
+    `npm run test:litellm-models`, and suites 36 and 39 from `e2e/`.
+ 6. Prod only, one hour after resume: `LiteLLM_DailyUserSpend` success share well above 1%, and
+    Synthetic `spend` > 0. **Expect `cannot pickle` errors to CONTINUE** - that is task 82.
+
+================================================================================
+ROLLBACK
+================================================================================
+Revert compose `image:` to `sha256:c8756e7b9a61...`, remove the volume line, `--force-recreate
+litellm-router`, and revert the PR on main so the next deploy does not re-apply it. **The schema is
+unchanged, so no `pg_restore` is needed.** If only the patch misbehaves (e.g. double logging), remove
+JUST the volume line and keep v1.100.1.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Do NOT edit `infrastructure/litellm-config.yaml` - any edit force-recreates the prod router on its
+   own schedule, which would collide with this windowed change.
+ - Do NOT edit `C:/tmp/launch_queue.py`. The overseer owns the DRAIN flag.
+ - Do NOT merge outside a counted zero-active window. Do NOT post an `@claude` comment (it bills
+   Paxton's personal subscription).
+ - No secrets in code, docs, fixtures or commit messages - env var NAMES only.
+ - Never `git add -A`; commit by explicit path; `git diff --stat` first.
+ - The pricing PR stays PARKED. The 51 DB price rows are live and stay.
+
+DONE MEANS: the in-container file hash equals the patched file's hash; a streamed call produces a
+success row with spend > 0 and no trailing error event; zero arity errors over 15 minutes of
+MEASURED live traffic; the digest bump is recorded as a deliberate supersession of task 82's pinning
+instruction; and task 82's `cannot pickle` defect is explicitly reported as STILL OPEN.
+
+================================================================================
+*** PAXTON 2026-09-10 21:55 PT: THIS RUNS INSIDE THE SAME DRAIN WINDOW AS TASK 144. ***
+================================================================================
+Do NOT schedule a separate window. Task 147 produces one drained fleet and both tasks use it.
+
+YOUR POSITION IN THE ORDER IS **FOURTH**:
+    1. drain (147)   2. merge PR #140   3. merge hydra #26   4. **THIS TASK**   5. pg_repack
+
+WHY THAT PLACE, and both reasons bind:
+  * Steps 2 and 3 restart containers. Doing this upgrade before them would mean recreating the router
+    twice for no reason and re-testing against a moving target.
+  * **pg_repack MUST come after you.** Your upgrade recreates the router, and a router restart during
+    a repack interrupts the table swap at the one moment interrupting is unsafe.
+
+*** YOUR IMAGE PULL IS PART OF THE REPACK'S RISK BUDGET. *** Pulling the v1.100.1 image consumes disk
+on CT202, where the repack margin was already only ~8 G (34 G free vs a 26 G table). **After your pull
+completes, re-measure free space and report the number** - the repack step decides go/no-go on it. If
+your pull leaves too little room, the repack is dropped, not squeezed.
+
+================================================================================
+*** UPDATE 2026-09-10 22:15 PT - TWO CORRECTIONS TO THIS TASK, BOTH VERIFIED ON THE LIVE ROUTER.
+Source: session [8c54cf]; re-measured independently by the overseer. ***
+================================================================================
+**1. THE "cannot pickle WILL CONTINUE" CAVEAT ABOVE IS RETIRED. CARRY TASK 82's FIX IN THIS PR.**
+This task previously said the 1,591 `cannot pickle` errors are task 82's separate LiteLLM bug and
+would survive the upgrade. **That was wrong.** They are OUR OWN HOOK:
+    cache_namespacer.py:127  `data = deepcopy(data)`   (import at line 35)
+    6h: "cannot pickle" 1,772  vs  cache_namespacer.py tracebacks 1,774   -> 1:1, same event
+The request dict carries `litellm_logging_obj`, which holds a `threading.RLock`; `deepcopy` cannot
+pickle it. The hook fails open - no calls lost - but affected requests are **never tenant-namespaced**,
+which is a **cross-tenant response-cache isolation gap**. That is a security issue.
+    ADD TO THIS PR: shallow `dict(data)` + copy only the cache sub-dict; drop the `deepcopy` import;
+    add a test with a real `threading.RLock()` to the EXISTING
+    `infrastructure/docker/litellm/hooks/tests/` directory, asserting the namespace is set, no warning
+    is logged, and the caller's dict is unmutated.
+    **It needs NO digest change** - it rides this PR only so both fixes share one UAT pass and one
+    drain window. Task 82's own file now carries the full detail.
+    ADD TO VERIFICATION: **zero `cache_namespacer failed` lines** over the 15-minute live window, and
+    a keyed request producing a namespace-prefixed Redis key.
+
+**2. THE "342 ERRORS / 3,128 POSTs" FIGURE IN THIS FILE IS WRONG ON BOTH SIDES. DO NOT QUOTE IT.**
+Re-measured over 30 minutes on prod:
+        POST /v1/messages   191
+        POST /mcp         3,170          <- 94% of all POSTs, and UNAFFECTED by this bug
+        all POST          3,361
+        arity errors        760
+So the original denominator was overwhelmingly MCP traffic that this bug cannot touch, **and the
+errors are not 1:1 with requests - they run roughly FOUR per `/v1/messages` call.**
+    CONSEQUENCE FOR YOUR VERIFICATION: when you record "zero arity errors over 15 minutes of live
+    traffic", **record the `/v1/messages` POST count, NOT the total POST count.** A total-POST
+    denominator makes the bug look ~17x rarer than it is and would let a quiet `/v1/messages` window
+    masquerade as a fix.
+    UAT CT204 shows 0 of these errors on the SAME digest purely because it receives no traffic of this
+    shape - so a clean UAT run is NOT evidence the bug is fixed. Only prod traffic proves it.
+
+================================================================================
+*** DIGEST CORRECTED 2026-09-10 22:20 PT - THE ONE IN THIS FILE IS WRONG. DO NOT USE IT. ***
+================================================================================
+This task carried `sha256:a3715fa7ad8387941ab697259bd2881d68931657247a41984f90fae6d11c62bf` for
+v1.100.1, with an instruction to re-verify it. **The overseer re-verified it and it does not exist.**
+`docker manifest inspect ghcr.io/berriai/litellm:v1.100.1` from CT202:
+
+    mediaType: application/vnd.oci.image.index.v1+json
+      linux/amd64      sha256:d85c0b36e2fdd64719e7fc2692431cd5aee0814925e96c2892d1491b13189c23
+      linux/arm64      sha256:9b3c5a90347054cb25e8a4f834c09a6f21e7313438f5438ced959b7d08bbdb45
+      unknown/unknown  sha256:b30cfa592b0659afb2d089c0aaceab0e84b8db99697902574a6e09b8379d4673
+      unknown/unknown  sha256:3afd57eb888a0f9be42b69584287495320d090ca6f1ac25991ef9308fafeaaee
+    grep -c a3715fa7  ->  0      (it appears NOWHERE in the index)
+
+*** USE THE linux/amd64 MANIFEST DIGEST: `sha256:d85c0b36e2fdd64719e7fc2692431cd5aee0814925e96c2892d1491b13189c23` ***
+CT202 is linux/amd64. Pin the PLATFORM manifest, not the index digest - the existing v1.100.0 pin
+(`c8756e7b9a61...`) follows the same convention, so matching it keeps the CI digest grep and the
+runbook working.
+**RE-VERIFY IT YOURSELF ANYWAY before writing it into compose.** That instruction is what caught this
+one; do not drop it just because a digest is now supplied.

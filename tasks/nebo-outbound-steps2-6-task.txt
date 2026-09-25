@@ -1,0 +1,201 @@
+TASK 190 - Nebo Outbound, STEPS 2-6 (continuation of task 100).
+
+THIS TASK IS THE REMAINDER OF TASK 100, CUT OUT OF IT BY THE OVERSEER ON 2026-09-17 (tick #386).
+Task 100's run 20260917T044204Z_9c4f19f2 was narrowed to LAND STEP 1 ONLY (verify commit c99320a,
+resolve the staged workflow JSON, account for pre-existing test failures, push and open its PR).
+Steps 2-6 below are yours. DO NOT START until task 100's PR is open - the branch is shared.
+
+REPO: cogniziocompany/cognizioware-nebo, branch `feat/nebo-outbound` (task 100's branch).
+Workspace on CT110: /home/harness/work/cognizioware-nebo.
+
+STOP GATE A BINDS ABSOLUTELY, INHERITED FROM TASK 100 AND NOT NEGOTIABLE:
+DRY_RUN stays true for the entire run. Nothing is ever sent to a real recipient. Step 7 (the live
+send) is PAXTON'S, never a run's.
+
+NO .env CREDENTIALS EXIST on CT110 for nebo, so the live read-only Dataverse proof and the G2
+header proof are DEFERRED, not chased. Report them as unavailable in the PR.
+
+BUDGETS, MEASURED ON TASK 100 - THESE ARE WHY IT GATED THREE TIMES:
+- The AUDITOR episode budget is 300 s, ONE SIXTH of the executor's 1800 s. Never ask the auditor
+  for a whole-repo or whole-diff audit. ONE closed question per round, answerable in under 300 s.
+- An executor round that produces 16 MiB of output has looped instead of committing. Keep each
+  subtask to one file or one command and COMMIT durable progress as soon as it is verified.
+
+WHEN THE WORK IS DONE: `git push` and `gh pr create` YOURSELF with the scoped GH_TOKEN, then STOP.
+NEVER MERGE - merging is the overseer's.
+
+--- STEPS 2-6, COPIED VERBATIM FROM TASK 100'S SPEC ---
+
+
+STEP 2 - `packages/outbound`: the action engine (new workspace package)
+ - `actions.js`: a templated action = `{campaignId, campaignActivityId, templateId, listId,
+   offering:'powerplatform', persona, status: draft|approved|running|paused, dailyCap, approvedBy,
+   approvedAt}`. Persisted as the Dynamics `campaign` record (`description` holds the JSON config,
+   `statuscode` mirrors status). Local mirror in `STATE_FILE` for fast reads.
+ - `draft.js`: `draftTemplate({offering, persona, listId, sampleLead})` calls LiteLLM
+   (`LITELLM_BASE_URL`, `LITELLM_API_KEY`, model from `librechat.yaml` default) with
+   `assembleCopyConstraints` injected, runs `findForbiddenPhrases`, returns
+   `{subject, html, violations}`. **NEVER writes.**
+ - `runner.js`: `runOnce(action)` -> members MINUS alreadySent MINUS donotemail -> up to `dailyCap`
+   -> `sendTemplatedEmail` each -> per-lead results. `previewRun(action)` does the same WITHOUT
+   sending (renders first 3 via `InstantiateTemplate`, creates no email).
+ - `gate.js`: reuse the decision shape from `server.js` (`kind:'gate'`, `context:{actionId}`).
+   **`status` may only move to `approved|running` via an answered, approved gate** - same rule as
+   `set_campaign_status`.
+
+STEP 3 - `services/worker`: the poll loop
+ - `services/worker/index.mjs`: every `OUTBOUND_POLL_SECONDS` (default 900), for each `running`
+   action, `runOnce`. Results to stdout + `STATE_FILE.runs[]`; the Dynamics email records ARE the
+   audit trail. Respects DRY_RUN.
+ - Dockerfile + compose service `outbound-worker`, `restart: unless-stopped`, shares the
+   `orchestrator_state` volume.
+
+STEP 4 - Orchestrator MCP tools (EXTEND `mcp-servers/campaign-orchestrator-mcp/server.js`)
+ Add, all via `@nebo/outbound`: `list_marketing_lists`, `preview_list_members(listId)`,
+ `draft_email_template`, `save_email_template`, `create_outbound_action`, `preview_outbound_run`,
+ `request_outbound_approval` (raises the gate), `start_outbound_action`, `pause_outbound_action`,
+ `get_outbound_status`. One paragraph on these in the LibreChat agent system prompt
+ (`deployments/librechat/README.md`).
+ **EXTEND the existing server - do not add a second MCP server** (RULE 2, no duplicate surfaces).
+
+STEP 5 - `services/outbound-admin`: the /outbound page
+ - Node + express, server-rendered HTML (htmx or plain forms, **no SPA build**). Port 3030, mounted
+   at `/outbound` (`app.use('/outbound', router)`; all links relative). Trusts `X-Forwarded-Email`
+   from oauth2-proxy for `approvedBy`.
+ - Pages:
+     `/outbound` - marketing lists table (name, member count, last used) + active actions with
+        status / last run / sent count
+     `/outbound/lists/:id` - live member table (60s cache): name, email, company, subject, created,
+        already-sent badge
+     `/outbound/actions/new?list=:id` - "Draft with AI", then editable subject + HTML body textarea
+        (the same textarea is what gets saved), forbidden-phrase result, Save as template
+     `/outbound/actions/:id` - rendered preview for 3 sample leads, recipient count,
+        **Approve & send first batch**, **Turn on autonomous**, **Pause**, run log
+ - Compose: `outbound-admin` (expose 3030) + `outbound-oauth2-proxy`
+   (`quay.io/oauth2-proxy/oauth2-proxy`, provider `oidc`, same `OPENID_CLIENT_ID/SECRET/ISSUER`,
+   `--reverse-proxy`, `--proxy-prefix=/outbound/oauth2`, `--upstream=http://outbound-admin:3030`,
+   `--pass-user-headers`, `--email-domain=cognizio.company`).
+ - `deployments/caddy/nebo.Caddyfile`: `handle_path`/`route /outbound*` ->
+   `reverse_proxy 127.0.0.1:4180`.
+
+STEP 6 - config, docs, tests
+ - `env.template`: add `OUTBOUND_FROM_EMAIL=ai-dev01@cognizio.company`,
+   `OUTBOUND_DEFAULT_LIST_ID=2bb6de0a-9aac-f111-aaac-000d3a5c0dfb`, `OUTBOUND_POLL_SECONDS=900`,
+   `OUTBOUND_DAILY_CAP=50`, `OUTBOUND_ADMIN_PORT=3030`, `OUTBOUND_PUBLIC_PATH=/outbound`.
+   **NAMES in env.template, never values.**
+ - `docs/HANDOFF.md`: new dated section, including G2 closed. `CLAUDE.md`: one line noting the
+   /outbound exception and that Dynamics is the store for outbound actions.
+ - `npm test` stays green; add `e2e/outbound.test.mjs` covering **runner idempotency, the daily
+   cap, the gate rule, and dry-run**.
+
+================================================================================
+VERIFICATION
+================================================================================
+
+ - Unit: `npm test` - the 41 existing tests plus the new outbound tests, all green.
+ - Live READ-ONLY: a small script hitting `listLeadMarketingLists()` and
+   `listMembers(OUTBOUND_DEFAULT_LIST_ID)` prints the expected leads. Reads are safe; do them.
+ - Gateway: after the `.mcp.json` header fix,
+   `xrm-dataverse_view_get_list_by_table_schema_name lead` returns views instead of the header
+   error. That is the G2 proof.
+ - **IDEMPOTENCY, PROVEN IN DRY-RUN:** run `previewRun` twice against the same list and show the
+   second pass yields ZERO sends. Do not settle for reasoning about `alreadySent` - exercise it.
+ - Send verification is PAXTON'S (STOP GATE A): with DRY_RUN=false he sends to ONE test lead,
+   confirms `GET /emails?$filter=...` shows `statecode 1 / statuscode 3 (Sent)` and that it appears
+   in ai-dev01's Sent Items, then re-runs to confirm zero duplicates.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **DRY_RUN=true for the whole run. Never send a real email. Never set DRY_RUN=false.**
+ - **Never grant a Dataverse privilege, never edit the Entra app registration, never provision an
+   LXC.** Report what is needed (STOP GATE B).
+ - Dataverse credentials go in `.env` ONLY. **Never commit a secret; never print a key value.**
+   Report the `.mcp.json.bak` / `.codex/config.toml` finding by FILE and FACT.
+ - **No new custom Dynamics entities.** OOTB only.
+ - **No n8n.** In-repo worker only.
+ - Extend `campaign-orchestrator-mcp`; do not create a second orchestrator (RULE 2).
+ - `donotemail` and `statecode ne 0` filters are mandatory and must be covered by a test.
+ - Commit by EXPLICIT PATH; never `git add -A`; clone/check with autocrlf=false; check
+   `git diff --stat` before the PR.
+ - PR to `main`. **DO NOT MERGE.**
+
+================================================================================
+DONE MEANS
+================================================================================
+
+A PR against main implementing Steps 1-6: the Dataverse client and outbound mappings with
+fake-fetch tests proving DRY_RUN blocks every write; the action engine with the gate rule enforced;
+the worker; the ten orchestrator tools added to the EXISTING MCP server; the `/outbound` admin page
+with its oauth2-proxy sidecar and Caddy route; env/doc updates with names only. Plus: a live
+read-only proof that the target list's members resolve, a dry-run preview run executed TWICE
+showing zero sends on the second pass, the G2 header fix documented, the `.mcp.json.bak` /
+`.codex/config.toml` credential exposure reported with whether either was ever committed, and a
+plain statement of which STOP GATE B items (1-4) remain outstanding for Paxton.
+
+**Not deployed, nothing sent, awaiting Paxton.**
+
+
+================================================================================
+=== CORRECTION APPENDED BY SCHEDULED TICK #298, 2026-09-16 11:58 PT - READ THIS
+=== LAST; IT OVERRIDES ANYTHING ABOVE THAT CONTRADICTS IT.
+================================================================================
+
+WHY THIS IS IN THE TASK FILE: the queue entry's `note` field is NEVER sent to you.
+Verified this tick by reading the launcher - the string `note` does not appear in
+launch_queue.py at all; you receive ONLY this file. Anything earlier ticks put in the
+note was invisible to you. Nothing below is new scope.
+
+1. PUSH AND OPEN THE PR YOURSELF, THEN STOP. Commit by explicit path, check
+   `git diff --stat` first, never `git add -A`, then `git push` and `gh pr create`.
+   Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14 16:21 PT, so do
+   NOT ask for a GitHub credential and do not ask the overseer to push for you.
+   Do NOT merge - merging stays the overseer's.
+   EXCEPTION: if your diff touches `.github/workflows/`, the scoped token refuses
+   workflow-file pushes by permission. Commit, then STOP and say the branch needs an
+   overseer push; do not retry.
+
+2. STOP GATE A IS UNCHANGED AND ABSOLUTE: DRY_RUN stays true. No real email to a real
+   lead, ever. Nothing in this correction relaxes that.
+
+3. WHY YOUR PREDECESSOR DIED - a PROVIDER fault, not a task fault, and NOT a reason to
+   cut scope. Run 20260916T183449Z_cc37a3d6 failed 2026-09-16 11:47 PT, exit 1, with:
+     429 "You've exceeded your subscription rate limits" on
+     syn:large:vision:synthetic-anthropic, plus
+     "No fallback model group found for original model_group=...:synthetic-anthropic"
+   That second line is a KNOWN router defect (task 136 is fixing it): every one of the
+   ~22 fallback entries on the live router targets a ':cloud' group, and ZERO
+   ':synthetic-anthropic' groups have any fallback, so a provider blip kills the run
+   outright instead of degrading. You are the FIFTH run lost to this.
+   If you hit a 402 or 429, that is the provider. Do not narrow the task in response.
+
+
+================================================================================
+AMENDMENT 2026-09-17 16:30 PT (interactive overseer [5321285c]) - TWO PROVEN DEFECTS ALREADY ON THIS BRANCH
+================================================================================
+These were found by reviewing task 100's PR #1 (cogniziocompany/cognizioware-nebo#1, head c99320a, still
+open and unmerged). They were injected into run 20260917T183603Z_90fda74e at 12:25 PT, but that run was
+KILLED at round 3 (exit -15) before acting on them: the branch is still at c99320a and PR #1 is unchanged.
+So whichever run next touches feat/nebo-outbound owns them. Fix them, push to the SAME PR #1, and say so.
+
+DEFECT 1 - CORRECTNESS. packages/data-model/dataverse-client.js, function encodeValue(): IT ENCODES
+NOTHING. Its character class matches only the SAFE characters (letters, digits, - _ ~ ! ' ( ) * , and
+whitespace) and the callback returns each match UNCHANGED, so every unsafe character passes straight
+through - the exact opposite of the comment above it, which claims "Everything else is percent-encoded".
+Measured by running the function: 'a&b=c#d' returned 'a&b=c#d', and 'x%20y' returned 'x%20y'. Any $filter
+or $select value containing &, #, + or % therefore corrupts the OData query string or injects extra query
+options.
+  FIX: encode the VALUE properly (encodeURIComponent, then selectively restore the OData-safe set if you
+  want filters readable in logs) while keeping the OPTION KEYS ($filter, $select, $expand) verbatim - the
+  key-casing point in that comment is CORRECT and must survive, because URLSearchParams lowercases them to
+  %24filter and Dataverse then silently returns the wrong rows. Add a unit test whose filter value
+  contains &, #, +, % and a space.
+
+DEFECT 2 - HYGIENE. e2e/outbound-map.test.mjs contains TWO LITERAL NUL BYTES, at byte offsets 3636
+(line 82) and 17148 (line 417), both used as composite-key separators inside template literals. Git
+therefore classifies the file as BINARY: `gh pr diff` prints "Binary files differ" and that test can never
+be reviewed in a diff, now or in future. The file is otherwise clean UTF-8 - 18,200 bytes, 437 LF, zero
+CR, so the CRLF discipline held.
+  FIX: write the separator as the two-character escape backslash-zero, or a printable sentinel such as
+  '::'. Confirm with `git diff --stat` that the file reports line counts rather than "Bin".

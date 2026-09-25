@@ -1,0 +1,41 @@
+TASK 187 - Hydra: receive GitHub pull_request events, run the harness review, post the verdict, fall back to the
+existing Claude/Copilot apps only when the harness cannot review.
+
+SOURCE: Paxton 2026-09-15/16: App endpoint on the Hydra orchestrator; fallback = the GitHub Apps ALREADY wired to
+his subscriptions (claude App installed org-wide; Copilot), no new API key. Plan C:/tmp/PLAN-pr-review-gate-2026-09-15.md
+steps 2, 4, 6. App creation handoff: C:/tmp/HANDOFF-github-app-lh-reviewer-2026-09-15.md (Paxton creates and
+installs the App and drops GITHUB_APP_ID / GITHUB_APP_INSTALLATION_ID / GITHUB_APP_PRIVATE_KEY_PATH /
+GITHUB_WEBHOOK_SECRET into Hydra's host .env - names only in the repo). ALTERNATIVE Paxton raised: an ORG WEBHOOK +
+the existing fine-grained PAT `lh-harness-ct110` (needs Commit statuses RW added) posting commit STATUSES instead of
+Check Runs. Support BOTH: App auth when GITHUB_APP_ID is set, PAT + statuses otherwise; say which is active in
+get_fleet_meta.
+
+REPO / WORKSPACE: cognizioware-hydra    BASE: origin/main   DEPENDS ON: 179 (review run contract), 176 (enqueue_task;
+until it lands use create_fleet_run with caller hydra and a rationale).
+
+SCOPE
+ 1. orchestrator/src/github-webhook.js: POST /github/webhook; verify X-Hub-Signature-256 with GITHUB_WEBHOOK_SECRET
+    (constant-time compare); accept pull_request opened/synchronize/reopened and check_suite rerequested; ignore
+    drafts and bots' own PRs unless label review:force. Idempotency key = <repo>#<pr>@<head_sha>; a duplicate
+    delivery returns 200 and does nothing.
+ 2. On accept: enqueue a review run on the harness node that owns that repo's workspace ({kind:"review", repo,
+    pr_number, head_sha, base_ref}); post a pending Check Run `harness-review` (or a pending status when on PAT).
+ 3. Poll GET /api/runs/<id>/review; on verdict post the Check Run conclusion (success/failure/neutral for
+    cannot_review) with the summary + findings as annotations (statuses: description only); label review:pass /
+    review:fail / review:fallback.
+ 4. FALLBACK (Paxton): only after TWO cannot_review verdicts for the same head_sha: post ONE comment `@claude review
+    this PR` FROM THE APP identity (the existing claude-code.yml path; task 188 makes the workflow accept the App's
+    author association), label review:fallback, and if no review appears within 30 min, `gh api` request
+    `copilot-pull-request-reviewer[bot]` as a reviewer. Count fallbacks in get_fleet_meta so subscription spend is
+    visible. NEVER post @claude from a personal identity; NEVER on the first failure.
+ 5. cloudflared: add the `/github/webhook` route to hydra.cognizioware.com (docker-compose.yml ingress) - the
+    orchestrator restarts on deploy; the overseer chooses the window.
+ 6. Tests (orchestrator/tests): signature verify (good/bad/replayed), idempotent delivery, pending->conclusion flow
+    against a harness stub, fallback fires only on the second cannot_review, PAT mode posts a status not a check.
+
+HARD RULES: rationale on every mutating call; secrets by env NAME; push + open the PR yourself; DO NOT MERGE
+(merge = hydra-ci deploy = orchestrator restart; check no gate is mid-flight first - task 176's interlock later).
+
+DONE MEANS: PR open; a fixture delivery produces pending -> success on a stub harness; two forced cannot_review
+verdicts produce exactly one @claude comment from the App and one Copilot request; get_fleet_meta shows the mode
+and the fallback count.

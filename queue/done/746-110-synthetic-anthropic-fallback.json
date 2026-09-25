@@ -1,0 +1,15 @@
+{
+ "name": "synthetic-anthropic-fallback",
+ "task_file": "C:/tmp/synthetic-anthropic-fallback-task.txt",
+ "workspace": "/home/harness/work/cognizioware-mcp-tools",
+ "max_rounds": 10,
+ "trio": "kimi",
+ "note": "THE #1 RECURRING FLEET KILLER, still unfixed. Every model group the harness actually requests (:synthetic-anthropic) has NO fallbacks entry - the whole fallback map is defined for :cloud aliases, and the Anthropic route split renamed the models without updating it. Measured 2026-09-09 20:00-20:07 PT: FIVE runs died in seven minutes (89 with a 402 'Insufficient quota and token balance', then 101/105/85/94 with 429s) and every one carried 'No fallback model group found for original model_group=nemotron-3-super:synthetic-anthropic'. Same defect that killed 19 of 24 runs earlier the same day. PR #37 does NOT fix it - checked, it predates the route split and mentions synthetic-anthropic zero times. TWO HAZARDS: (1) router_settings is DB-SHADOWED, the DB row WINS over the YAML - nine merged alias edits were measured DEAD on the live router, so POST /config/update then READ THE ROW BACK AND DIFF; a 200 is not proof, it silently discarded a key twice. (2) ANY edit to infrastructure/litellm-config.yaml FORCE-RECREATES the CT202 PROD router because the deploy job hashes the deployed file - merge only with zero active runs and no gate mid-flight. Do NOT add local qwen3.8 as an EXECUTOR fallback: measured tonight the local executor hit the 1800s episode timeout on 5 of 7 rounds on task 82, so a local floor there converts a rate limit into a queueing collapse; manager/auditor only if proposed at all. Never the bare gateway /health. Do NOT push or open a PR - commit and stop, and say explicitly that merging recreates the prod router so the overseer picks the window. ALSO FOLDED IN 2026-09-09 20:16 PT - a SECOND verified defect in the SAME file, bundled deliberately so the prod router is recreated ONCE not twice: enable_pre_call_checks sits at line 107 under litellm_settings, but LiteLLM reads it from router_settings, so context_window_fallbacks has NEVER pre-routed and oversized prompts have been hitting the small local backend first. From an unread PR #41 review comment, verified against main. Structure measured so the run need not hunt for it: router_settings at 292, fallbacks key ALREADY EXISTS at 311 (extend it, do not add a second), context_window_fallbacks at 372; line 360 records a deliberate decision to keep :pool fallbacks Ollama-family only with NO paid providers - respect that when choosing targets.",
+ "run_id": "20260910T192412Z_bfbc7e1a",
+ "roles_bound": {
+  "manager": "ornith-1.5:pool",
+  "executor": "ornith-1.5:pool",
+  "auditor": "ornith-1.5:pool"
+ },
+ "launched_at": "2026-09-10T19:24:12.940998+00:00"
+}

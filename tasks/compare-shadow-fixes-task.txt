@@ -1,0 +1,52 @@
+TASK 222 - compare_shadow.py reports 0% agreement on data where the launchers actually agree
+
+This tool produces evidence item 1 and item 3 for cutover task 168's 7-day shadow window (started
+2026-09-23 00:19 PT, ends ~2026-09-30 00:19 PT). REPRODUCED 2026-09-23 00:29 PT on the real window data, not
+inferred: PC log slice from "20:56 shadow-filed 9999zv-221-queue-database-url-dropped" with
+--pc-date 2026-09-22, a --queue-names map built from the PC log's own "shadow-filed" lines, and
+CT110's runs/queue/shadow.jsonl (16 records). Output: `entries=5 phantom=1 missed=3 shadow-only=1
+agreement=0/5`. Hand-checked against the raw records, the true picture is 2 of 2 observable
+entries AGREE and there is no genuine disagreement. At day 7 this tool would fail promotion for
+tooling reasons alone.
+
+DEFECT 1 (the big one) - judged on the shadow's LATEST decision, which is always post-launch.
+  For entry 221 the shadow recorded `queue.shadow_launch` at 03:57:16Z (would_run_at), the PC
+  launched run 20260923T035722Z_d1d74675 at 03:57:22Z, and every later shadow pass recorded
+  `queue.shadow_skip` "workspace ... has active run 20260923T035722Z_d1d74675" - i.e. occupied by
+  the PC's run OF THIS SAME ENTRY. The tool takes the latest record (a skip) and scores "missed".
+  Same for 218 (shadow_launch 07:19:53Z, PC run 24b4a1ad at 07:19:54Z, then self-occupancy skips).
+  FIX: compare the PC decision against the shadow's latest decision AT OR BEFORE the PC's launch
+  time (within the cycle); and classify a skip whose occupying run_id equals the run the PC
+  launched for this entry as `self-occupied` (neither agree nor missed), never as `missed`.
+  Entry 217-clawdtalk shows the residual race: the PC launched before the shadow's first pass, so
+  the shadow only ever saw self-occupancy. Classify that as `unobserved-race`, reported separately,
+  and state how evidence item 3 should treat it.
+
+DEFECT 2 - the documented --queue-names source does not survive.
+  The shadow record carries queue_id and workspace but no entry name; without a map the tool keys
+  shadow rows by workspace basename, so NOTHING joins (first run: agreement 0/139, every PC entry
+  "pc-only", shadow rows named "LongHorizon-Harness" / "cognizioware-mcp-tools"). The docstring says
+  to build the map from runs_root/queue/q-*.json, but the PC launcher DELETEs each API entry at
+  launch (its log says "shadow-retired" on the same minute), so those files are gone. The durable
+  source is the PC log's own `shadow-filed <name>.json <queue_id>` lines. FIX: derive the map from
+  the PC log by default; keep --queue-names as an override.
+
+DEFECT 3 - the PC log carries HH:MM only; --pc-date must be exact for the FIRST line or every
+  timestamp shifts (first run put 09-22 events on 09-30, +7 days, breaking the 900 s cycle window).
+  FIX: either derive dates from an anchor the log itself carries (preferred: have launch_queue.py
+  print a full ISO date line at startup and at each midnight roll - that is a PC-side change, state
+  it as a recommendation in the PR body, do NOT edit C:/tmp/launch_queue.py), or add --since so an
+  operator slices by a known dated line instead of hand-trimming the file.
+
+DEFECT 4 (minor) - deliberate probes score as phantoms. Overseer/tick probes use a workspace that
+  does not exist (e.g. `__tick1558-workspace-does-not-exist__`). Report them in their own bucket
+  (e.g. workspace names wrapped in double underscores) so they never count against item 2.
+
+DELIVERABLES (branch + PR to main; never merge yourself; no @claude review):
+ 1. Fix defects 1-4 in scripts/compare_shadow.py.
+ 2. A test fixture reproducing EXACTLY the three real cases above (221 agree-then-self-occupied,
+    218 same, 217 unobserved race) plus one genuine disagreement and one probe; assert the verdicts.
+ 3. Print, per verdict bucket, what it means for evidence items 1-3 so the day-7 report is
+    readable without this task text.
+CONSTRAINTS: env NAMES only; never `git add -A`; PR only; do NOT touch the deployed CT110 tree,
+its config.toml, or C:/tmp/launch_queue.py.

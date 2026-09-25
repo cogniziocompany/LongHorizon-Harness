@@ -1,0 +1,46 @@
+TASK 197 - Slice 182c ONLY: migrate the overseer's C:/tmp files into the fleet.* tables that 182a already shipped.
+
+WHY THIS IS A SEPARATE, SMALLER TASK
+Run 20260917T135926Z_c8e4a4c5 delivered 182a and 182b and then exhausted its 8-round budget with 182c/182d
+untouched. It was STOPPED, not granted rounds: re-deriving finished work burns context and produces nothing.
+This slice is 182c and NOTHING ELSE. 182d (tick + artifact route) is queued separately AFTER this lands.
+
+WHAT ALREADY EXISTS - DO NOT REBUILD IT, DO NOT RE-AUDIT IT
+Repo cogniziocompany/ptait09-easybutt0n-ai. Verified by the overseer on CT110 at tick #450, not taken on report:
+ - 182a schema + API: branch feat/overseer-schema-api-182a, commits d15a5d5 + e2d4375, OPEN as PR #54
+   (base easybutt0n-runner-v2). Six tables incl. fleet.task_state; seven /api/overseer/* routes; 44/44 tests pass.
+ - 182b UI: branch feat/overseer-ui-182b, commit 3f5be96, OPEN as PR #55 (base feat/overseer-schema-api-182a).
+Branch this slice off feat/overseer-schema-api-182a (it holds the schema you are migrating into). The stack is
+182b -> 182a -> easybutt0n-runner-v2 -> main; do not attempt to re-base it onto main and do not merge anything.
+
+THE ELEVEN-STATE QUESTION IS ANSWERED - DO NOT GATE ON IT AGAIN
+The previous run burned its last round asking this because it could not read C:/tmp/queue/LOOP-PROMPT.md from
+PTAIT09. The canonical chain is:
+  QUEUED -> RUNNING -> GATED -> BRANCHED -> PUSHED -> PR -> REVIEWED -> MERGED -> LANE -> LIVE -> VERIFIED
+plus exactly four legal off-path states: HELD, BLOCKED, FAILED, SUPERSEDED.
+COMMITTED and DONE are NOT states (COMMITTED is BRANCHED; DONE is MERGED/LANE/LIVE/VERIFIED).
+BRANCHED = committed locally only. PUSHED = the branch is on the remote.
+The CHECK constraint already in fleet-admin/schema.sql (task_state, ~line 296) matches this list EXACTLY and is
+CORRECT AS WRITTEN. Acceptance constraint 6 is SATISFIED. Change nothing about it.
+
+SCOPE - one script, one PR
+scripts/migrate-overseer-files.mjs, one-shot, idempotent by key, run from PTAIT09:
+ - C:/tmp/queue/*.json + blocked/ + done/ -> fleet.task_state. State derived: band = QUEUED, blocked/ = BLOCKED,
+   done/ WITH a run_id = whatever GET /api/runs REPORTS for that run id, NEVER assumed. Note: done/ is filed AT
+   LAUNCH, so it is an upper bound, not proof of completion - a failed run in done/ migrates as FAILED.
+ - C:/tmp/queue/LEDGER.md -> ledger rows, split on the "### TICK" / "- <date> PT -" markers.
+ - C:/tmp/queue/OPEN-ASKS.md -> asks (open table rows = open; "Answered" + struck headings = answered, with the
+   answer text as the first message).
+ - C:/tmp/HANDOFF-*.md -> handoffs.
+Dry-run FIRST and print counts; then insert; then READ THE COUNTS BACK and assert they equal the file counts.
+A 200 from the API is not proof a row landed - select it back.
+
+HARD RULES
+ - Redact per task 92's CREDENTIAL-SAFETY rules before any insert. Env NAMES only, never values.
+ - Additive only: files stay in place. Rename to .migrated-<date> ONLY after read-back counts match.
+ - RULE 2 - no second copy of the queue: read run state via the harness API, never by re-implementing the queue.
+ - Do not deploy (that is task 175's path) and do not edit LOOP-PROMPT.md.
+ - You hold a GH_TOKEN. Push the branch and open the PR YOURSELF, then STOP. Never merge.
+
+DONE MEANS: a dry-run prints counts; a real run inserts them; re-running inserts ZERO duplicates (idempotent by
+key, proven by running it twice and comparing counts); the fleet.task_state rows use only the fifteen states above.

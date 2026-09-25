@@ -518,6 +518,8 @@ For example `20250907T120000Z_abcd1234.round_001.cli_executor`. The same value i
 
 Deploy note for node operators: place the gateway key in `/home/harness/.lh-harness-secrets.env` on the node host (CT110/WSL), not in project files. After the harness node reads it, `GET /api/meta` will report `mcp_gateway_configured: true` and the available profiles. If you proxy through LiteLLM, add `X-LH-Session` to a server's `extra_headers` so the gateway forwards it to the upstream.
 
+Changes to `/home/harness/.lh-harness-secrets.env` (including the `LH_HARNESS_FLEET_*` variables) only take effect after a service restart — systemd reads `EnvironmentFile` once at process start.
+
 ### Dashboard commands
 
 ```bash
@@ -536,6 +538,22 @@ lh-harness web --workspace-root .               # Serve the workbench for anothe
 | `--host` / `--port` | Bind address (default: `127.0.0.1:8799`); `--port 0` lets the OS pick |
 | `--auth-token` | Bearer token, required for any non-loopback `--host` (also `LH_HARNESS_WEB_TOKEN`) |
 | `--no-open` | Do not open the URL in a browser |
+
+##### Fleet reporting environment
+
+Used by `lh-harness web` and the node Docker image to stream telemetry to
+`fleet.easybutt0n.ai` over an outbound HTTPS path.  All are optional; when
+`LH_HARNESS_FLEET_URL` is unset the reporter is not started.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LH_HARNESS_FLEET_URL` | *(none)* | Fleet-admin origin (e.g. `https://fleet.easybutt0n.ai`). |
+| `LH_HARNESS_FLEET_KEY` | *(none)* | Per-host HMAC key for signing POST bodies. |
+| `LH_HARNESS_FLEET_NODE` | `socket.gethostname()` | Node identity reported as `X-Fleet-Host`. |
+| `LH_HARNESS_FLEET_LABELS` | *(none)* | `kind=ct110,repo=...` style labels. |
+
+See [docs/fleet-reporting.md](docs/fleet-reporting.md) for what is pushed,
+endpoint paths, the 8 MB round-content cap, and the privacy note.
 
 ### Common CLI options
 

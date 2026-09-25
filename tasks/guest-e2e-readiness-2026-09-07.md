@@ -110,3 +110,40 @@ AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET and BILLING_API_URL (http://192.168.21.1
 - GUEST_TEST_ENVIRONMENT_ID recorded in the lane env for the e2e suites.
 - UAT is now at parity with dev for guest access; the click-through can be exercised on https://powerplatform-uat… once the release
   fast-forward carries the current develop head. PR #96 (tier-aware seeding) still merges so the next tier is one command.
+
+### 2026-09-08 08:45 PT — why the guest meter shows no events (root-caused, proven against the dev sandbox)
+Paxton asked why the "Cognizioware guest tokens (observation only, TEST)" meter is empty. Three separate reasons, verified:
+1. **The service sends Stripe a meter ID where Stripe expects an event name.** `UsageEventsController.RecordGuestMeterAsync` builds a
+   `GuestStripeMeterEvent` with `MeterId: _settings.GuestMeterId`; `GuestStripeWriter` passes that as the first argument of
+   `RecordBillingMeterEventAsync`, and `StripeService` assigns that argument to `fields["event_name"]`. Dev had
+   `Stripe__GuestMeterId=mtr_test_61VMDVxi…`. Proof against acct_1TsqbjQVmqxwMkjo (mcp-cognizioware-dev sandbox):
+   `event_name=mtr_test_61VMDVxi…` → `invalid_request_error "No active meter found for event name …"`;
+   `event_name=cognizioware_guest_tokens` with a customer from that account → **accepted**, event visible on the meter.
+   The account's four active meters are cognizioware_guest_tokens, sms_segments, task_tokens, voice_seconds — one meter per event name.
+2. **Both guest switches are off** in dev and uat (`Billing__GuestChargingEnabled=false`, `Billing__GuestExecutionEnabled=false`), so nothing
+   generates guest usage yet. Operator flips these, not a task.
+3. **The UAT sandbox is a different Stripe account** (key …WZlf, its own product/price/meter `mtr_test_61VMDmus…`) from dev (…rh0W), so the
+   UAT dashboard is empty simply because nothing has run against it. That split is correct, not a bug.
+Also found: the powerplatform dev lane's `STRIPE_TEST_CUSTOMER_ID=cus_TPFW7YS21tEYUs` does not exist in the dev billing Stripe account
+(customers there are `cus_Utwk…`), so usage pinned to it fails with "No such customer" — the ensure-customer endpoint should supply the id.
+**Actions:** stopgap applied to the dev and uat lane env (`Stripe__GuestMeterId=cognizioware_guest_tokens`, backups `.env.bak-guestmeter-*`)
+so events flow as soon as the switches flip; task 05h5b queued at the front to do it properly (a real `GuestMeterEventName` setting, the usage
+kind carried in the payload, a startup guard that refuses an `mtr_`-shaped value, tests, docs).
+
+### 2026-09-08 08:50 PT — guest usage PROVEN end to end on dev (and a lane trap found)
+After the meter-name stopgap and turning `Billing__GuestExecutionEnabled=true` (charging deliberately left false), a guest-channel usage event
+posted to `/api/v1/usage/events` produced the expected writer line — *"Recording observation-only guest meter event: meter=cognizioware_guest_tokens
+price=price_1UCpYb… product=prod_VDG4R7… customer=cus_Utwk… quantity=2000"* — and the Stripe guest meter moved to **2001** (1 manual probe + 2000 from
+the service) while `task_tokens` stayed at 1000. The observation path is correct once the event name is right.
+**Trap found (I caused it, then fixed it):** a plain `docker compose up -d --no-deps app` on a lane silently rolled the dev billing lane back to an
+image from 2026-07-14 (44c4ccc, 42 commits behind develop, predating the guest meter code). `deployments/tier/docker-compose.yml` resolves
+`APP_IMAGE_TAG` from the lane `.env`, which still pinned the July tag, while `rollout.sh` passes the tag inline and never persists it. Prod's compose
+requires the tag explicitly; dev and uat do not. Fixed on the box by pinning `sha-32a365e` and recreating; slice 6 of task 05h5b makes it structural.
+**Usage contract for the afternoon session:** correlation_id, attempt_id, tenant_id, customer_id and a positive total_tokens are all required
+(snake_case), Authorization carries the Lindy webhook secret, and principal_id/channel/source_event_id mark it as guest.
+
+## Progress 2026-09-08 (overseer)
+
+- **CI compose validation was failing every PR in `mcp-cognizioware`.** The guest-meter branch deliberately made the lane compose require `APP_IMAGE_TAG` — so a bare `docker compose up -d` fails loudly instead of silently redeploying a stale pinned image, which is what rolled the dev box back to a July image earlier — and removed the variable from `env.dev.example`. The CI "Validate lane compose" step copies that example and runs `docker compose config`, so it broke on the requirement it was meant to enforce. Fixed on the branch by giving the structural check a throwaway tag; build and all 376 hermetic tests were already passing.
+- **Cloudflare Pages is red on `develop` itself**, not just on PRs #90 and #91, so it is pre-existing and does not gate either of them. Worth its own fix; it is the only red check left on #91.
+- PR #91 (guest kill switches in the admin UI) is green apart from that pre-existing Pages check. PR #90 (guest meter events keyed by event name, carrying the usage kind) is re-running after the CI fix.

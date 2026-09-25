@@ -1,0 +1,154 @@
+TASK 110 - the harness's own model aliases have NO fallback entry. A provider blip kills every run
+outright instead of degrading. This has now wiped the fleet twice.
+
+REPO: cogniziocompany/cognizioware-mcp-tools (infrastructure/litellm-config.yaml + the live router).
+
+================================================================================
+THE EVIDENCE - two mass-kill events, same root cause
+================================================================================
+
+2026-09-09 20:00-20:07 PT: **five runs died inside seven minutes.** Captured from their own
+`failure_reason` fields:
+
+    89  qa            20:00:45  402  Insufficient quota and token balance
+    101 pp-evalfix    20:05:47  429  exceeded your subscription rate limits
+    105 mcp-tools-c   20:05:47  429
+    85  mcp-tools-b   20:05:47  429
+    94  LHH           20:06:58  429
+
+Every single one carried the SAME second sentence:
+
+    No fallback model group found for original model_group=nemotron-3-super:synthetic-anthropic
+
+And the fallback map it then printed is defined ENTIRELY for `:cloud` aliases:
+
+    {'minimax-m2.7:cloud': ['glm-5.3-flash:cloud','kimi-k2.6:cloud']},
+    {'nemotron-3-super:cloud': ['glm-5.3-flash:cloud','kimi-k2.6:cloud']},
+    {'kimi-k2.6:cloud': ['glm-5.3-flash:cloud']}, ... etc
+
+**There is not one entry for any `:synthetic-anthropic` model group** - and `:synthetic-anthropic` is
+what the harness actually requests, because the Anthropic-route split renamed every model the agents
+use. The fallback map was never updated to match the rename.
+
+This is the SAME defect that killed **19 of 24 runs on 2026-09-09** earlier in the day. It was
+diagnosed then as "one missing fallback" and the aliases in use were never given entries. It is still
+unfixed and it has now cost a second full fleet.
+
+**PR #37 does NOT fix this** - checked. It is from 2026-07-10, predates the route split, and mentions
+`synthetic-anthropic` **zero times**. Do not rebase or revive it for this; it is a 40,000-line PR full
+of `graphify-out/` and comfyui dumps and belongs to task 97's disposition review.
+
+================================================================================
+WHAT TO DO
+================================================================================
+
+1. **ENUMERATE the model groups the harness actually requests.** Do not guess from the config. Read
+   them from the live router (`/v1/models` or the `LiteLLM_Config` `router_settings` row) AND from the
+   launcher's trio definitions. Report the list with counts. The three seen tonight are
+   `glm-5.2:synthetic-anthropic`, `kimi-k3:synthetic-anthropic`, `nemotron-3-super:synthetic-anthropic`,
+   plus `syn:large:vision:synthetic-anthropic` - **but confirm the full set rather than trusting those four.**
+
+2. **Add a `fallbacks` entry for EVERY `:synthetic-anthropic` group**, targeting the `:cloud` tier that
+   already has working chains. The point is graceful degradation: when Synthetic is exhausted a run
+   should move to another provider, not die at round zero.
+
+3. **Add `context_window_fallbacks` for the same groups** if the existing `:cloud` entries have them -
+   match the pattern already there, do not invent a new one.
+
+4. **Prove it degrades.** The test is NOT "the config parses". Force the condition and show a request
+   for a `:synthetic-anthropic` group succeeding via its fallback while Synthetic is refusing. If you
+   cannot force it safely, say so and state exactly what would prove it - do not claim it works.
+
+================================================================================
+THE EXACT STRUCTURE - measured on main 2026-09-09 20:16 PT, so you do not have to find it
+================================================================================
+
+    line  67   litellm_settings:
+    line 107     enable_pre_call_checks: true      <-- IN THE WRONG SECTION. See item 5 below.
+    line 292   router_settings:
+    line 311     fallbacks:                        <-- ADD THE :synthetic-anthropic ENTRIES HERE.
+                                                       The key ALREADY EXISTS - extend it, do not
+                                                       create a second one.
+    line 352     # OCR: glm-ocr unavailable -> kimi-k2.6:cloud (then default_fallbacks)
+    line 360     # 2026-09-09 (G1): explicit :pool fallbacks - Ollama-family only, no paid providers
+    line 371     # (a COMMENT mentioning enable_pre_call_checks, not the setting itself)
+    line 372     context_window_fallbacks:         <-- and the context entries HERE.
+
+Note line 360: a previous change deliberately kept the `:pool` fallbacks to the Ollama family with
+**no paid providers**. Respect that intent when choosing targets - do not quietly route a degraded
+run onto a paid provider.
+
+================================================================================
+ITEM 5 - FOLDED IN DELIBERATELY: enable_pre_call_checks is in the wrong section
+================================================================================
+
+**This is a SECOND verified defect in the SAME file, and it is folded into this task ON PURPOSE so the
+production router is recreated ONCE rather than twice.** Editing that file force-recreates CT202, so
+two separate PRs would mean two prod recreates for two one-line fixes.
+
+It came from an unread review comment on PR #41 (chatgpt-codex-connector, P2, "Move pre-call checks
+into router_settings"), verified by the overseer against main:
+
+    LiteLLM reads `enable_pre_call_checks` from `router_settings`, NOT from `litellm_settings`.
+    It currently sits at line 107 under `litellm_settings`.
+
+**Consequence: `context_window_fallbacks` has never actually pre-routed.** Oversized prompts have been
+going to the small local backend first and failing there, instead of being routed to a larger-context
+model before the call. That is a live, silent defect and it has been in place the whole time.
+
+DO: move it into `router_settings` (near line 292-311). Keep the explanatory comment with it. Do NOT
+change its value - `true` is correct, it is only in the wrong place.
+
+**VERIFY IT THE SAME WAY AS THE FALLBACKS**: `router_settings` is DB-shadowed, so moving it in the YAML
+may change nothing on the live router until the DB row is updated and read back.
+
+================================================================================
+TWO HAZARDS THAT MAKE THIS A CAREFUL CHANGE, NOT A QUICK ONE
+================================================================================
+
+**A. `router_settings` IS DB-SHADOWED. A YAML EDIT ALONE MAY CHANGE NOTHING.**
+Five config sections live in Postgres (`general_settings`, `guardrails`, `litellm_settings`,
+`mcp_servers`, `router_settings`) and **the DB row WINS over the file.** Measured 2026-09-09: nine
+merged alias edits were DEAD on the live router. So: change the YAML for the repo record, then
+`POST /config/update`, then **READ THE ROW BACK AND DIFF IT.** A 200 from that endpoint is not proof -
+it returned 200 twice while silently discarding a key.
+
+**B. ANY edit to `infrastructure/litellm-config.yaml` FORCE-RECREATES THE CT202 PRODUCTION ROUTER.**
+The deploy job hashes the DEPLOYED file's content, so even a comment-only change triggers it. **Merge
+only in a window with zero active harness runs**, and confirm no QA gate or promotion is mid-flight
+first. Restarting the router mid-promotion has already poisoned one.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - Cheap probes only: `/health/liveliness` or `/health/readiness`. **NEVER the bare gateway `/health`** -
+   it hits every model including paid and GPU ones, which is the last thing this estate needs today.
+ - Do NOT "fix" this by adding local `qwen3.8` as a fallback target for the EXECUTOR. Measured tonight:
+   the local executor hit the 1800s episode timeout on FIVE of seven rounds on task 82. A local floor
+   for the two light roles (manager, auditor) is defensible; for the executor it converts a rate limit
+   into a queueing collapse. If you propose a local floor, propose it ONLY for manager/auditor and say
+   why.
+ - Do NOT change any key, rate limit or spend setting. This is routing only.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat`.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+   INCLUDE an explicit note that merging it recreates the prod router so the overseer picks the
+   window.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+The enumerated list of `:synthetic-anthropic` groups actually in use; a fallback entry for each,
+mirroring the existing `:cloud` chains; the YAML change committed; a clear statement of whether the
+live DB row was updated and read back, or why that step is being left to the merge window; and either
+a demonstration that a request degrades via fallback, or a precise statement of what would prove it.
+
+**If you can only deliver the enumeration and the config change without a live proof, that is still a
+good outcome** - say which is which. An unproven claim that fallbacks work would be worse than none,
+because the next outage would be met with false confidence.

@@ -1,0 +1,130 @@
+TASK 117 - the open-PR backlog has grown to 25 across six repos and NOT ONE has a review decision.
+Produce the cross-repo inventory and triage that nobody currently has. REPORT-ONLY: no merges.
+
+*** Paxton 2026-09-09 23:20 PT asked for this directly, after the overseer reported the backlog:
+    "after you get this local 128k model, create this task for it: 25 open PRs, none with a review
+     decision." ***
+
+REPO / WORKSPACE: cognizioware-mcp-tools (the inventory document lands here under docs/).
+The triage READS all six repos via `gh`; it WRITES only in this one.
+
+================================================================================
+THE MEASUREMENT THAT PROMPTED THIS - read 2026-09-09 23:14 PT, do not re-derive the counts
+================================================================================
+
+`gh pr list --state open --json number,title,isDraft,reviewDecision` across six repos:
+
+    cognizioware-mcp-tools    12 open   #122 #120 #112 #55 #41 #40 + 6 more
+    mcp-cognizioware           5 open   #61 #34 #33 #32 #31
+    cognizioware-hydra         5 open   #26 #25 #24 #23 #5
+    LongHorizon-Harness        3 open   #10 #8 #7
+    cognizioware-powerplatform 0 open
+    cognizioware-qa            0 open
+                              25 total, and reviewDecision is EMPTY on every single one.
+
+"No review decision" is NOT the same as "needs a reviewer". Some already carry findings and are
+waiting on FIXES; some are superseded; some are deliberately gated. Nobody has ever written that
+distinction down, which is why the number keeps growing and nothing drains. **That distinction is
+the deliverable.**
+
+================================================================================
+WHAT TO PRODUCE
+================================================================================
+
+`docs/pr-backlog-triage-2026-09-09.md` - one row per open PR, every field evidenced by something
+read, with this classification in a column called VERDICT:
+
+  READY        - green checks, no unaddressed findings, no gate. Safe to review then merge.
+  NEEDS-FIX    - carries review findings that are NOT yet addressed. Name the findings and say
+                 whether the PR author has responded. This is the class that looks like "unreviewed"
+                 but is actually "reviewed and ignored".
+  SUPERSEDED   - its change already landed another way, or a newer PR replaces it. Recommend CLOSE
+                 and say what replaced it.
+  GATED        - deliberately held. Name the gate and the task number holding it.
+  STALE        - no activity for >7 days AND conflicts with its base, or targets a branch that moved.
+  UNKNOWN      - you could not determine it. Say why. An honest UNKNOWN beats a guessed READY.
+
+For EVERY row also record: base branch, mergeable state, CI conclusion (and whether checks even ran
+- `gh pr checks` on mcp-tools reports "no checks reported" because images build only AT MERGE TIME),
+behind-by count, and the age in days.
+
+================================================================================
+WHAT IS ALREADY OWNED BY ANOTHER TASK - do NOT duplicate, just cite the owner
+================================================================================
+
+Check the queue before proposing work. These are already assigned:
+ - **mcp-tools #36 and the eight superseded PRs** -> TASK 97 (pr-reconciliation) holds the
+   authorisation to merge #36 and close the eight. Mark them GATED/owned by 97. Do not act.
+ - **mcp-tools #55 suite-number collisions** -> TASK 106 (e2e-suite-collisions). Suites
+   20/23/26/29/30/31/36 are each duplicated. Mark it owned by 106.
+ - **hydra #26** (adds the PR reviewer to hydra) -> TASK 116, and Paxton explicitly directed that it
+   go through the BMAD spec process before it is merged, which is itself gated behind TASK 111.
+   Mark GATED. Do NOT recommend merging it.
+ - **hydra #24, #23, #5** -> these carry SERIOUS posted findings already (see below). They are
+   NEEDS-FIX, and the fixes are gated behind the same BMAD flow in TASK 116.
+ - **the reviewer workflow itself** -> TASK 87 (copilot-pr-review-infra-mcp), very low priority.
+ - **mcp-cognizioware repo backlog** -> TASK 102, very low priority, and it carries a CONCURRENCY
+   STOP GATE because another agent is actively iterating promote-billing.
+
+The findings already posted by the overseer, so you can classify them without re-reviewing:
+ - hydra #24 - six P1s. Production writes go to the WRONG HOST (a dev box) while reporting success;
+   and key verification never tests the SUBMITTED key, so an invalid key "verifies" and the rotation
+   flow then revokes the good one.
+ - hydra #23 - the scheduled overseer-ingest records success having ingested nothing (false green).
+ - hydra #5 - device-token revocation silently REVERSES on restart, because the env seed re-adds the
+   revoked id.
+ - LongHorizon-Harness #7 - workspace reservation defect.
+
+================================================================================
+THE PART THAT NEEDS A RECOMMENDATION, NOT A LIST
+================================================================================
+
+End the document with a section called **DRAIN ORDER** - the sequence you would actually work, with
+reasoning. Specifically answer:
+
+ 1. Which PRs can be closed outright? A closed PR is backlog genuinely removed, and it is the
+    cheapest win available. Name each and why.
+ 2. Which are READY and merely need the reviewer invoked? **Count them.** This matters because since
+    mcp-tools PR #131 the reviewer authenticates with a SUBSCRIPTION OAuth token, so every review
+    invocation bills PAXTON'S PERSONAL CLAUDE QUOTA. A 25-PR burst is a real cost, not a free
+    action. Your job is to tell him the smallest set worth spending it on.
+ 3. Which are effectively abandoned and should be closed rather than fixed?
+ 4. Is any OPEN PR a merge HAZARD that should be flagged now? Specifically: does any touch
+    `infrastructure/litellm-config.yaml`? Any edit to that file FORCE-RECREATES the CT202 production
+    router (the deploy job hashes the deployed file, so even a comment-only change triggers it), so
+    it can only be merged in a window with zero active harness runs. #120 ("retire qwen3.5 local
+    tags and qwen3.6") and #41 ("qwen3.6 local model") both look like config edits - CHECK, and flag
+    every one you find, because merging one unaware is how the prod router gets recreated mid-run.
+
+================================================================================
+HARD RULES
+================================================================================
+
+ - **DO NOT MERGE ANYTHING. DO NOT CLOSE ANYTHING.** This task produces the map; the overseer and
+   Paxton act on it. An unreviewed merge is a state the pipeline is not supposed to have.
+ - **DO NOT post `@claude` comments to invoke the reviewer.** That spends Paxton's subscription
+   quota. Recommending which PRs deserve it is the deliverable; spending it is not yours to do.
+ - **NEVER use `delete_repo`.** Never force-push. Never rewrite another PR's branch.
+ - A live harness run OWNS its branch - never touch a branch that has a run on it.
+ - Never `git add -A`; commit by explicit path; check `git diff --stat` before committing.
+ - Windows CRLF hazard: this estate has had a PR balloon to hundreds of phantom-changed files.
+   Check `git diff --stat` and stop if it shows files you did not edit.
+ - PUSH AND OPEN THE PR YOURSELF: commit by explicit path, check `git diff --stat`, then `git push`
+   and `gh pr create`, and STOP. Your run holds a scoped GH_TOKEN (push + PR only) since 2026-09-14
+   16:21 PT, so do not ask for a GitHub credential. Do NOT merge - merging is the overseer's.
+   (This REPLACES the retired 'do not push / the overseer opens the PR' rule.)
+   EXCEPTION - if your diff touches `.github/workflows/`, the scoped token REFUSES workflow-file
+   pushes by permission. Commit, then STOP and say the branch needs an overseer push; do not retry.
+
+================================================================================
+DONE MEANS
+================================================================================
+
+`docs/pr-backlog-triage-2026-09-09.md` committed on a branch, containing all 25 open PRs classified
+with evidence, every already-owned PR cited to its owning task rather than re-planned, a DRAIN ORDER
+with reasoning, an explicit count of how many reviewer invocations you are recommending Paxton pay
+for, and every litellm-config.yaml-touching PR flagged as a prod-router-recreate hazard. Nothing
+merged, nothing closed, no reviewer invoked.
+
+
+[2026-09-15 06:53 PT tick #103 [906eb4]] Run 20260915T102609Z_4f935d79 ENDED at its completion gate after verification: mcp-tools PR #152 (base main, 70e973b4, 1 file +263) is the sole deliverable. No further run needed; the PR awaits review/merge by the overseer.

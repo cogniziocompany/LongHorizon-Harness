@@ -1,0 +1,14 @@
+TASK 219 - Wire the Postgres queue store into the web service behind [queue] backend (LongHorizon-Harness)
+
+Measured 2026-09-22 04:24 PT on origin/main: src/lh_harness/webapi/server.py:881 constructs QueueStore(runs_root, queue_config) unconditionally. queue.py:87 _select_queue_store(runs_root, project) already implements the choice (file default; backend="postgres" + queue.database_url -> PgQueueStore) but its only callers are tests/webapi/test_pg_queue.py. Result: setting [queue] backend = "postgres" in .lh-harness/config.toml is read by load_run_defaults and then IGNORED, so cutover task 168 cannot proceed by configuration. PR #35 (task 173 shadow mode) does not add the call either.
+
+Deliverables (branch + PR to main, never merge yourself, no @claude review):
+1. In create_app (server.py ~867-884): select the store via _select_queue_store(runs_root, project) using the same project config already loaded there; keep the file store as the default and byte-for-byte today's behaviour when [queue] has no backend key. A bad backend must fail loudly at startup, not fall back silently.
+2. Make Launcher and every queue_store consumer in server.py accept the PgQueueStore interface (same method set as QueueStore; counts/list/get/create/delete/set_priority/read_shadow_records if PR #35 has landed - rebase onto main at PR time).
+3. Tests: create_app with backend=file (unchanged), backend=postgres with a fake DSN asserting PgQueueStore is chosen (mock the connection), and backend=bogus raising at startup.
+4. docs/queue.md: the [queue] keys, LH_HARNESS_DB_PASSWORD from the environment (name only), migrations 001/002 must exist first.
+Constraints: env NAMES only; never git add -A; PR only; do not touch the deployed CT110 tree.
+
+
+## STATUS (overseer tick #1459, 2026-09-22 07:19 PDT)
+PR: branch feat/task-219-pg-queue-wiring @ e0f47b8 pushed by the run; LHH PR #39 -> main open, MERGEABLE, unreviewed. Awaiting r5 audit and task-117 review before merge.

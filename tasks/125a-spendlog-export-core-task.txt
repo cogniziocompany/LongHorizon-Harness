@@ -1,0 +1,120 @@
+TASK 125a - ONE bounded export-verify-delete cycle. Manual. No schedule, no audit surface.
+
+*** SLICE 1 OF 3. Task 125 was sliced 2026-09-10 22:35 PT because its run bb12da51 ran FIVE HOURS
+without finishing. Unsliced task 69 failed three times at 3600s; sliced, 69a finished in 8 minutes.
+Same medicine. ***
+
+REPO / WORKSPACE: cognizioware-mcp-tools.
+Slices: **125a = the data path (this)**, 125b = the audit entry, 125c = the schedule.
+**DO NOT build a scheduler. DO NOT touch the ops audit surface. Those are 125b and 125c.**
+
+================================================================================
+DO EXACTLY ONE CYCLE, BY HAND, OVER ONE BOUNDED CHUNK
+================================================================================
+Not the 18 GB backlog. **ONE chunk** - bound it by row count (e.g. 50,000) or by a single day, oldest
+first. Getting one chunk provably right is the whole job; 125c does the repeat and the drain.
+
+TARGETS - verified, do not go hunting:
+    SOURCE  CT202 (**ptait01**, `pct config 202` -> ip=192.168.21.161/24; the container is named
+            `cognizioware-ops-it-services-uat-copy`, which is MISLEADING - the address is
+            authoritative). Postgres container `cognizioware-mcp-tools-postgres`, **role `litellm_user`,
+            database `litellm_mcp_tools`** - CORRECTED 2026-09-11: an earlier draft said database
+            `litellm` and a role `llmproxy`; NEITHER EXISTS and psql fails with
+            `FATAL: role "llmproxy" does not exist`. Values read from the container's own
+            POSTGRES_USER / POSTGRES_DB. Do not take credentials from a task file - read them live,
+            table `"LiteLLM_SpendLogs"` (QUOTED - case-sensitive).
+    DEST    terranas01 = **192.168.21.128**,
+            **`/Volume2/usbdrive/cognizioware-mcp-gateway/spendlogs/`** - CORRECTED 2026-09-11 by
+            Paxton ("Ur path off... /Volume2/usbdrive/..."). The overseer created that directory
+            and PROVED it writable (write -> read back -> checksum -> remove). Owner prax211,
+            mode drwxrwx---, 7.2 TB free.
+            *** THE OLD PATH `/Volume2/cognizioware-mcp-gateway/spendlogs/` STILL HOLDS 5.5 GB OF
+            EARLIER EXPORTS AND WAS NOT MOVED. *** Those files cover 2026-07, 2026-08, 09_01to05,
+            09_05to07, 09_07 and 09_08_precutoff. **Do NOT re-export that history** - it is already
+            archived. Your job is the bounded RECURRING cycle from the cutoff forward. The two
+            paths are on DIFFERENT filesystems (dev 52 vs 53), so any future consolidation is a
+            real copy, not a rename.
+            **SSH is port 9222 as `prax211`** - NOT root, NOT port 22 (its sshd AllowUsers blocks
+            root, and sudo needs a password).
+            *** terranas01 has NO SFTP SUBSYSTEM: `scp` FAILS. Stream over ssh instead. *** And
+            scp's port flag is `-P`, not `-p`.
+
+================================================================================
+THE ORDER IS THE SAFETY DESIGN. DO NOT REARRANGE IT.
+================================================================================
+ 1. **PICK AN EXPLICIT CUTOFF** - a literal timestamp, e.g. `"startTime" < now() - interval '48 hours'`.
+    Never "everything": recent rows are what an operator debugging a live incident needs. Record it.
+ 2. **EXPORT FIRST** to a compressed temp file on CT202. **Record the exact row count.**
+ 3. **TRANSFER** to the destination path above.
+ 4. *** VERIFY ON THE DESTINATION. *** Re-read the file ON TERRANAS01 and confirm BOTH a checksum
+    match AND the row count. **A successful scp/ssh exit code is NOT proof the bytes are readable at
+    the far end.** If verification fails: STOP. DELETE NOTHING. Report FAILED.
+ 5. **ONLY THEN DELETE**, bounded by **the same predicate used for the export** - not a fresh
+    `now()`, or you delete rows written between steps 2 and 5 that were never exported.
+ 6. **RECLAIM: do nothing but observe.** `DELETE` returns no space to the filesystem. Plain autovacuum
+    marks pages reusable so Postgres REFILLS them - that is what keeps the table flat once the stock
+    is drained. Record `n_dead_tup` from `pg_stat_user_tables` before and after and say whether
+    autovacuum is keeping up.
+    *** NEVER `VACUUM FULL`. *** It takes an ACCESS EXCLUSIVE lock on a table the live gateway writes
+    to on every request. The one-time reclaim of the existing stock is `pg_repack` in an attended
+    window and is NOT yours.
+
+================================================================================
+REPORT (plain text - the audit SURFACE is 125b's job, not yours)
+================================================================================
+cutoff used; rows exported; rows deleted (**these must match, or say loudly that they did not**);
+bytes written; destination path and filename; CT202 disk used/total/percent BEFORE and AFTER; table
+size before and after; `n_dead_tup` before and after.
+
+================================================================================
+HARD RULES
+================================================================================
+ - **This deletes production data.** Export-verify-then-delete, in that order, always. If any step is
+   uncertain, delete nothing and report FAILED.
+ - **The export file contains full request/response bodies and IS SENSITIVE.** Say where it lands and
+   who can read it. No secrets in the script, the filename, or the report - env var NAMES only.
+ - Do NOT edit `infrastructure/litellm-config.yaml` - any edit force-recreates the CT202 prod router.
+ - No bare `docker compose up` for mcp-tools - always `--env-file mcp-tools.env`. Never
+   `docker compose down -v`.
+ - Do not reconfigure terranas01; Paxton manages it. Write into the destination path only.
+ - Never `git add -A`; commit by explicit path. Do NOT merge. Do NOT post an `@claude` comment.
+
+DONE MEANS: one chunk exported, transferred, **verified at the destination by checksum AND row
+count**, and only then deleted by the same predicate - with every number above recorded, and
+`VACUUM FULL` never run.
+
+================================================================================
+*** RE-SCOPED 2026-09-11 09:28 PT AFTER RUN 11f36a4c STOPPED AT ITS OWN GATE. READ THIS FIRST. ***
+================================================================================
+Run 20260911T160009Z_11f36a4c reached round 2 and stopped to ask, correctly, because the harness
+environment HAS NO WAY TO DO THIS TASK AS ORIGINALLY WRITTEN:
+
+    "no pct/docker socket to exec the CT202 Postgres container, and terranas01 has no
+     non-password SSH path. Nothing on CT202 has been touched, and per the hard rule I must
+     delete nothing until every step is provably executable."
+
+**THAT WAS THE RIGHT CALL AND THE RUN IS NOT AT FAULT.** It touched nothing and refused to delete.
+The FIRST option it offered - provision pct/docker access and an SSH key to the run - was REFUSED:
+**A HARNESS RUN IS NEVER GIVEN CREDENTIALS IN THIS FLEET. That is a standing rule, not a gap.**
+
+**THE SPLIT, AND IT IS THE WHOLE POINT OF THIS SLICE NOW:**
+ - **YOU (the run) BUILD AND PROVE THE SCRIPT.** Committed, reviewable, dry-runnable. It must read
+   EVERY credential from environment variables at execution time - env var NAMES in the code, never
+   values, never a literal host credential. It must have a `--dry-run` that prints the exact cutoff
+   timestamp, the exact SELECT predicate and the exact DELETE predicate it WOULD use, and exits
+   without connecting to anything.
+ - **THE OVERSEER EXECUTES THE PRIVILEGED CYCLE** against CT202 and terranas01 and reports the
+   numbers back into this file.
+
+**DO NOT try to reach CT202 or terranas01. Do not ask for access again - the answer is no, and a
+second gate on the same question burns a round for nothing.** If a step cannot be proven without
+live access, say so IN THE SCRIPT as a documented precondition and move on.
+
+EVERYTHING ELSE IN THIS FILE STILL BINDS - above all the ORDER: cutoff -> export -> transfer ->
+VERIFY AT DESTINATION (checksum AND row count) -> delete by the SAME predicate -> observe
+n_dead_tup. Never VACUUM FULL. The order is the safety design and re-scoping does not relax it.
+
+DONE MEANS (revised): a committed, dry-run-proven script whose predicates are identical between the
+export and the delete, every credential taken from a named env var, and a short runbook telling the
+overseer exactly what to run and what numbers to record. **No live export, transfer or delete is
+yours to perform.**

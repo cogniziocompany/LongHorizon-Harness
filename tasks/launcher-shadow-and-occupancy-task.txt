@@ -1,0 +1,52 @@
+[STATUS 2026-09-21 22:15 PDT, tick #1357] RUN ENDED. Delivered on PR #35 (LongHorizon-Harness, head 4ead320, base main). Residual: trio-family comparison evidence cannot come from the PC launch_queue.log (no trio names); accepted as documented. Not merged; deploy is a CT110 restart in a zero-active window.
+
+TASK 173 - CT110 launcher: shadow (observe) mode, dirty-tree occupancy, and a cross-process lease
+(cutover Step 2 + gap 1.9 + the 2026-09-14 workspace-collision finding).
+
+SOURCE: docs/handoffs/orchestrator-migration-2026-09-08.md section 5 Step 2 and section 6 decommission criteria;
+Paxton's priority-2 handoff; audit [fe2679] section M. GATED ON TASK 172 (same files). Ordered after every
+powerplatform task.
+
+REPO / WORKSPACE: LongHorizon-Harness    BASE: origin/main, rebased on task 172's branch if unmerged.
+COLLIDES WITH task 48 / PR #8 (launcher.py, mcp_tools.py, server.py) - rebase on it, do not duplicate.
+
+================================================================================
+MEASURED 2026-09-14
+================================================================================
+ - No shadow/dry-run/observe anywhere in launcher.py (grep on origin/main and the worktree).
+ - Occupancy check _check_eligibility L223-242 compares normalised workspace PATH STRINGS against ACTIVE runs
+   only. A dirty tree with no live run is fully eligible. Three collisions on 2026-09-14 alone (LEDGER L20824):
+   a run started on top of another task's uncommitted work.
+ - Serialisation is in-process only (self._launch_lock, L78). Two API processes on one runs_root can both pass.
+ - _run_pass launches at most one entry per pass (L129-146).
+
+================================================================================
+SCOPE
+================================================================================
+ 1. `[queue] observe = true|false` (config.py, default false). When true, _run_pass computes the FULL decision
+    (eligibility, capacity, key health, trio resolve) and then, INSTEAD of _launch (short-circuit immediately
+    before L298, never inside the eligibility gate), emits `queue.shadow_launch` {queue_id, trio, roles, workspace,
+    would_run_at} or `queue.shadow_skip` {queue_id, reason}. The entry stays pending. Nothing else changes, so
+    flipping observe off is the promotion and needs no code.
+ 2. Shadow log: append each shadow decision as one JSON line to runs_root/queue/shadow.jsonl (rotated daily), and
+    expose GET /api/queue/shadow?since= for the fleet window and the comparison script.
+ 3. Comparison tool: scripts/compare_shadow.py reads shadow.jsonl and the PC launcher's launch_queue.log (copied
+    in by the overseer) and reports agreement per entry: same launch decision within one cycle (900 s), same trio
+    family, phantom (shadow said launch, PC did not), missed (PC launched, shadow skipped), with reasons. This is
+    the promotion evidence #1-#3 in section 6 of the migration doc.
+ 4. Occupancy: a workspace counts as OCCUPIED when any of: an active run owns it (today); `git status --porcelain`
+    is non-empty; the checked-out branch has no upstream and carries commits not on origin/main. Skip reason names
+    which. Add `[queue] occupancy_ignore_dirty = false` so the overseer can override per environment.
+ 5. Lease: runs_root/queue/.lease written with {pid, host, ts} via O_EXCL, refreshed each pass, considered stale
+    after 3 missed intervals; a second launcher process that cannot take the lease logs and idles. This is gap
+    4.2 "single-orchestrator guarantee" at the file-store level; 134 mirrors it as a row lock.
+ 6. Liveness: the fleet heartbeat (server.py L674-679 already sends real queue_len) gains launcher_tick_at and
+    lease_holder so the fleet window can show the launcher is alive (gap "orchestrator liveness signal").
+ 7. Tests: observe mode never calls create_run; shadow events carry the decision; dirty-tree and upstream-less
+    cases are skipped with the right reason; lease refused to a second instance; stale lease reclaimed.
+
+HARD RULES: shadow mode must be safe to deploy while the PC launcher is authoritative - it launches NOTHING.
+Deploying it is a CT110 restart = overseer, zero-active window. Push + PR yourself; DO NOT MERGE.
+
+DONE MEANS: PR open; `observe=true` proven in a local run to emit shadow events and start no run; compare script
+produces the agreement table from two sample logs; occupancy and lease tests green.

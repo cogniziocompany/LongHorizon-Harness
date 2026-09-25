@@ -29,6 +29,13 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     python3 /usr/local/bin/lh-node-materialize-config --config-file "$CONFIG_FILE"
 fi
 
+# Fleet reporting is configured entirely from the environment.  When unset,
+# the web server starts without the reporter and behaves as before.
+export LH_HARNESS_FLEET_URL="${LH_HARNESS_FLEET_URL:-}"
+export LH_HARNESS_FLEET_NODE="${LH_HARNESS_FLEET_NODE:-}"
+export LH_HARNESS_FLEET_KEY="${LH_HARNESS_FLEET_KEY:-}"
+export LH_HARNESS_FLEET_LABELS="${LH_HARNESS_FLEET_LABELS:-}"
+
 exec lh-harness web \
     --host 0.0.0.0 \
     --port "$PORT" \
