@@ -36,6 +36,7 @@ from .types import (
     HarnessConfig,
 )
 from .utils.agent_cli import probe_agent_cli
+from .workspace_guard import WORKSPACE_BASE_MODES
 from .supervisor.control_bus import (
     _append_jsonl as _append_jsonl_nofollow,
     _atomic_bytes_write,
@@ -108,6 +109,117 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescrip
         if action.default is None or action.default == [] or action.nargs == 0:
             return action.help
         return super()._get_help_string(action)
+
+
+class _CliArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that remembers the real error text before dying.
+
+    Task 252: a supervisor-built worker argv argparse rejects dies with exit 2
+    before any run state exists, so the queue showed the bare "run failed"
+    instead of the actual cause.  ``_write_argparse_failure`` turns the
+    remembered message into the run's durable ``report.json``; the standard
+    stderr output and exit code are unchanged.
+    """
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        self._last_error_message = message  # type: ignore[attr-defined]
+        super().error(message)
+
+
+def _flag(prefix: str, suffix: str) -> str:
+    return f"--{prefix.replace('_', '-')}-{suffix}"
+
+
+def _argv_value(argv: list[str], flag: str) -> str | None:
+    """Read one ``--flag=value`` / ``--flag value`` value out of raw argv.
+
+    Only used on the argparse-death path, where nothing has been parsed yet;
+    the supervisor (and every sane caller) passes ``--flag=value``, so the
+    ``--flag value`` spelling is handled for completeness.  The first
+    occurrence wins, matching argparse's own left-to-right resolution.
+    """
+    prefix = f"{flag}="
+    for index, token in enumerate(argv):
+        if token.startswith(prefix):
+            return token[len(prefix):]
+        if token == flag and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
+def _log_dir_for_argv(argv: list[str], run_defaults: dict[str, object]) -> Path | None:
+    """Derive the run's log directory from raw argv before argparse succeeded.
+
+    Mirrors ``_run_command``'s resolution: an explicit ``--log-dir`` wins,
+    otherwise ``<runs-root>/<run-id>/lh_harness``.  ``None`` means the log
+    directory cannot be attached to anything — a run id that argparse never
+    accepted does not exist as a reservation, so there is nothing to report.
+    """
+    log_dir = _argv_value(argv, "--log-dir")
+    if log_dir:
+        return Path(log_dir).expanduser().resolve()
+    run_id = _argv_value(argv, "--run-id")
+    if not run_id:
+        return None
+    if (
+        not run_id
+        or run_id in {".", ".."}
+        or "/" in run_id
+        or "\\" in run_id
+        or "\x00" in run_id
+    ):
+        return None
+    runs_root = (
+        _argv_value(argv, "--runs-root")
+        or run_defaults.get("runs_root")
+        or _DEFAULT_RUNS_ROOT
+    )
+    return Path(str(runs_root)).expanduser().resolve() / run_id / "lh_harness"
+
+
+def _write_argparse_failure(
+    argv: list[str],
+    message: str,
+    run_defaults: dict[str, object],
+) -> None:
+    """Persist report.json when the ``run`` CLI dies on argparse (task 252).
+
+    Measured run 20260925T053514Z_78483494: the worker exited 2 on
+    ``--workspace-base-mode: invalid choice: 'not-a-repo'`` and wrote nothing,
+    so the queue showed "run failed" with no cause.  This mirrors
+    ``_write_bootstrap_failure``'s report schema so the dashboard and the
+    supervisor's crash reconciliation read it like any other failed worker:
+    the real argparse message lands in ``error``, which
+    ``_terminal_status_for_exit`` promotes to the queue's failure reason.
+    Never overwrites an existing report — a run id argparse rejected may name
+    an older reservation, and that run's report is its own truth.
+    """
+    log_dir = _log_dir_for_argv(argv, run_defaults)
+    if log_dir is None:
+        return
+    report = {
+        "schema_version": 2,
+        "status": "failed",
+        "task": _argv_value(argv, "--task") or "",
+        "completion_satisfied": False,
+        "completion_authority": "manager_with_role_auditors",
+        "rounds_run": 0,
+        "max_rounds": run_defaults.get("max_rounds"),
+        "abort_reason": "argparse_failure",
+        "error": message,
+        "exception_type": "SystemExit",
+    }
+    encoded = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+    root = log_dir
+    role_dir = root / "role_orchestration"
+    for target in (root / "report.json", role_dir / "report.json"):
+        try:
+            if target.exists():
+                continue
+            _ensure_dir_nofollow(target.parent)
+            _atomic_bytes_write(target, encoded.encode("utf-8"))
+        except OSError:
+            continue
 
 
 def _flag(prefix: str, suffix: str) -> str:
@@ -401,7 +513,7 @@ def main(argv: list[str] | None = None) -> int:
     def run_default(name: str, fallback=None):
         return run_defaults.get(name, fallback)
 
-    parser = argparse.ArgumentParser(
+    parser = _CliArgumentParser(
         prog="lh-harness",
         description=f"LongHorizon-Harness {__version__}",
         epilog=_EPILOG,
@@ -517,16 +629,12 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument(
         "--workspace-base-mode",
         default=None,
-        choices=(
-            "on-default",
-            "in-place",
-            "worktree",
-            "stash",
-            "continuation",
-        ),
+        choices=WORKSPACE_BASE_MODES,
         help="Internal: the mode the prelaunch workspace guard chose for this run "
         "(task 201); recorded in the round-zero workspace record. Set by the "
-        "supervisor for queue-triggered launches.",
+        "supervisor for queue-triggered launches. 'not-a-repo' (task 252) is a "
+        "legitimate non-git workspace: the worker runs in place with no branch "
+        "work — no default-branch lookup, no branch cut, no push.",
     )
     run_parser.add_argument(
         "--prompt-language",
@@ -748,7 +856,20 @@ def main(argv: list[str] | None = None) -> int:
 
     add_command("check-update", "Check PyPI for a newer LongHorizon-Harness release")
 
-    args = parser.parse_args(raw_argv)
+    try:
+        args = parser.parse_args(raw_argv)
+    except SystemExit:
+        # Task 252: a worker whose argv argparse rejects died before any run
+        # state existed, so the queue showed "run failed" with no cause.  The
+        # subparser (not the top-level parser) holds the message for options
+        # parsed under ``run``.  Exit code and stderr output are unchanged.
+        message = (
+            getattr(run_parser, "_last_error_message", None)
+            or getattr(parser, "_last_error_message", None)
+        )
+        if raw_argv[:1] == ["run"] and message:
+            _write_argparse_failure(raw_argv, message, run_defaults)
+        raise
     if args.command == "run":
         if config_error is not None:
             parser.error(str(config_error))

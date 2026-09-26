@@ -777,6 +777,26 @@ class ControlBus:
         with self._locked():
             self._atomic_json_write(self.owner_path, owner)
 
+    def update_owner(
+        self,
+        update: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Atomically read, transform, and replace the owner record.
+
+        Same transaction discipline as :meth:`update_status`: the merge runs
+        under the run's cross-process control lock so a concurrent writer
+        cannot lose the update.
+        """
+
+        with self._locked():
+            current = _read_json_file(self.owner_path)
+            updated = update(current)
+            if not isinstance(updated, dict):
+                raise TypeError("owner update must return a dictionary")
+            if updated != current:
+                self._atomic_json_write(self.owner_path, updated)
+            return updated
+
     def read_owner(self) -> dict[str, Any]:
         return _read_json_file(self.owner_path)
 

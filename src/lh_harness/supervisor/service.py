@@ -28,6 +28,7 @@ from typing import Any
 from .control_bus import (
     ControlBus,
     RevisionConflict,
+    _append_jsonl,
     _atomic_bytes_write,
     _atomic_exclusive_write,
     _ensure_dir_fd_nofollow,
@@ -48,6 +49,7 @@ from .lifecycle import (
 )
 from ..agent_registry import normalise_reasoning_effort, supports_reasoning_effort
 from .. import worker_isolation
+from ..workspace_park import park_workspace
 from ..types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
@@ -1138,6 +1140,151 @@ class RunSupervisor:
         payload = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
         _atomic_bytes_write(path, payload)
 
+    def _record_park_event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        """Append one ``workspace.parked`` event to the run's role events log."""
+
+        try:
+            logs = self._run_logs_dir(run_id)
+            role_dir = logs / "role_orchestration"
+            role_dir.mkdir(parents=True, exist_ok=True)
+            record = {
+                "schema_version": 2,
+                "event_id": f"{run_id}:park-{time.time():.6f}",
+                "type": event_type,
+                "ts": time.time(),
+                "run_id": run_id,
+                "payload": payload,
+            }
+            _append_jsonl(role_dir / "events.jsonl", record)
+        except (OSError, ValueError, RuntimeError):
+            # Parking itself has already happened (or safely not happened);
+            # a read-only or replaced run directory must not turn the park
+            # into a crash.
+            logger.exception("park event recording failed for run %s", run_id)
+
+    def _record_park_report(self, run_id: str, report_payload: dict[str, Any]) -> None:
+        """Persist the park summary (backup ref, stash) beside the run report."""
+
+        try:
+            logs = self._run_logs_dir(run_id)
+            _ensure_dir_nofollow(logs)
+            self._write_private_atomic_json(logs / "park.json", report_payload)
+        except (OSError, ValueError, RuntimeError):
+            logger.exception("park report recording failed for run %s", run_id)
+
+    def _record_park_service_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Append one ``workspace.parked`` event to the queue service event log.
+
+        Same durable stream and record shape the launcher uses for
+        ``queue.launched``/``queue.skipped`` (``<runs_root>/queue/
+        service_events.jsonl``), so the overseer and fleet see the park through
+        the real queue event mechanism.
+        """
+
+        record = {
+            "schema_version": 2,
+            "event_id": f"queue-{time.time():.6f}",
+            "type": event_type,
+            "ts": time.time(),
+            "payload": payload,
+        }
+        try:
+            queue_dir = self.runs_root / "queue"
+            queue_dir.mkdir(parents=True, exist_ok=True)
+            path = queue_dir / "service_events.jsonl"
+            line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+        except OSError:
+            logger.exception("park service-event recording failed for run event %s", event_type)
+
+    def _park_workspace(self, run_id: str) -> dict[str, Any] | None:
+        """Park the run's workspace now that the run is terminal.
+
+        Fires exactly once per terminal transition: the park result is recorded
+        durably (``park.json``) and a second terminal observation of the same
+        generation is a no-op.  Failures are recorded and logged, never raised
+        into the poller.
+        """
+
+        try:
+            bus = self._bus(run_id)
+            owner = bus.read_owner()
+            status = bus.read_status()
+        except (ValueError, OSError, RuntimeError):
+            logger.exception("park: cannot read run state for %s", run_id)
+            return None
+        if not owner:
+            return None
+        # Idempotency: a previous epoch's park must not be reused after a
+        # resume reopens the run.
+        epoch = resume_epoch(status) or resume_epoch(owner)
+        park_marker = str(owner.get("parked_epoch") or "")
+        if park_marker and int(park_marker or 0) >= epoch:
+            return None
+        workspace = str(owner.get("workspace") or "")
+        if not workspace:
+            return None
+        try:
+            result = park_workspace(
+                run_id,
+                workspace,
+                owner=owner,
+                record_event=lambda event_type, payload: (
+                    self._record_park_event(run_id, event_type, payload),
+                    self._record_park_service_event(event_type, payload),
+                ),
+                record_report=lambda report_payload: self._record_park_report(run_id, report_payload),
+            )
+        except Exception:
+            logger.exception("park failed unexpectedly for run %s", run_id)
+            return None
+        # Durable one-shot marker, scoped by resume generation so a resumed
+        # run parks again when it later reaches a terminal state.
+        try:
+            self._bus(run_id).update_owner(lambda value: {**value, "parked_epoch": str(epoch)})
+        except Exception:
+            logger.exception("park marker write failed for run %s", run_id)
+        if result.get("parked"):
+            logger.info(
+                "workspace parked for run %s: from=%s to=origin/%s backup_ref=%s stash=%s",
+                run_id,
+                result.get("from_branch"),
+                result.get("default_branch"),
+                result.get("backup_ref") or "-",
+                result.get("stash") or "-",
+            )
+        else:
+            logger.warning(
+                "workspace park incomplete for run %s: %s",
+                run_id,
+                result.get("error") or "unknown reason",
+            )
+        return result
+
+    def _maybe_park_terminal_workspace(self, run_id: str, status: dict[str, Any]) -> None:
+        """Park the workspace when ``status`` names a terminal lifecycle.
+
+        The four endings named by TASK 260 — end_of_round stop, cancelled,
+        done (``completed``), failed — all canonicalize into
+        :data:`TERMINAL_STATUSES`, which this single gate observes.  The
+        durable ``parked_epoch`` owner marker inside :meth:`_park_workspace`
+        makes a repeated terminal observation of the same run generation a
+        no-op, so park fires exactly once per terminal transition.
+        """
+
+        if not is_terminal_status(status.get("status")):
+            return
+        try:
+            self._park_workspace(run_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("park gate failed unexpectedly for run %s", run_id)
+
     def _replay_pending_lifecycle(
         self,
         run_id: str,
@@ -1519,11 +1666,17 @@ class RunSupervisor:
                 if field in owner:
                     item[field] = owner[field]
             items.append(item)
+            # TASK 260: parking is triggered by the same poll that observes
+            # the terminal lifecycle, so a run whose workspace must be parked
+            # does not wait for someone to request its status explicitly.
+            self._maybe_park_terminal_workspace(run_dir.name, status)
         return items
 
     def status(self, run_id: str) -> dict[str, Any]:
         self._assert_run_scope(run_id)
-        return self._refresh(run_id)
+        status = self._refresh(run_id)
+        self._maybe_park_terminal_workspace(run_id, status)
+        return status
 
     def owner(self, run_id: str) -> dict[str, Any]:
         self._assert_run_scope(run_id)
@@ -1762,10 +1915,11 @@ class RunSupervisor:
         allow_auditor_write_mcp: bool = False,
         youtrack_issue_id: str | None = None,
         base_check: str | None = None,
-        # Task 201: the launcher records which mode the workspace guard chose
-        # ("on-default" / "in-place" / "worktree" / "stash" / "continuation").
-        # Only create_run (queue-triggered launches) supplies these; other
-        # call sites default to None and the record simply omits them.
+        # Task 201 + 252: the launcher records which mode the workspace guard
+        # chose (WORKSPACE_BASE_MODES in workspace_guard — the shared tuple
+        # the run parser's choices are validated against).  Only create_run
+        # (queue-triggered launches) supplies these; other call sites default
+        # to None and the record simply omits them.
         workspace_base_mode: str | None = None,
         workspace_base_summary: str | None = None,
         _recover_reservation: bool = False,
@@ -2266,7 +2420,10 @@ class RunSupervisor:
                     "finished_at": status.get("finished_at") or time.time(),
                 }
                 bus.write_owner(owner)
-            return status
+        # Park after the lock block: the git operations below must not hold the
+        # supervisor's shared lifecycle lock (TASK 260).
+        self._maybe_park_terminal_workspace(run_id, status)
+        return status
 
     def _resolve_workspace(self, workspace: str | Path | None) -> Path:
         """Resolve and enforce the supervisor workspace boundary."""

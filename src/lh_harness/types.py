@@ -132,11 +132,13 @@ class HarnessConfig:
     harness_dir: str = DEFAULT_HARNESS_DIR
     log_dir: str = DEFAULT_LOG_DIR
     runs_root: str = DEFAULT_STATE_ROOT
-    # Task 201: the mode the prelaunch workspace guard chose for this run
-    # ("on-default" / "in-place" / "worktree" / "stash" / "continuation"), set
-    # by the supervisor from the launcher's resolved base and surfaced in the
-    # round-zero record.  None means the launch was not queue-triggered (or the
-    # running harness predates the guard), and the record omits it.
+    # Task 201 + 252: the mode the prelaunch workspace guard chose for this
+    # run ("not-a-repo" / "on-default" / "in-place" / "worktree" / "stash" /
+    # "continuation"), set by the supervisor from the launcher's resolved base
+    # and surfaced in the round-zero record.  None means the launch was not
+    # queue-triggered (or the running harness predates the guard), and the
+    # record omits it.  'not-a-repo' is a legitimate non-git workspace: the
+    # worker runs in place with no branch work at all.
     workspace_base_mode: str | None = None
     auditor_output_chars: int = 24_000
     role_verified_context_chars: int = 60_000
