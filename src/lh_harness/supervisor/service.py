@@ -1752,10 +1752,11 @@ class RunSupervisor:
         allow_auditor_write_mcp: bool = False,
         youtrack_issue_id: str | None = None,
         base_check: str | None = None,
-        # Task 201: the launcher records which mode the workspace guard chose
-        # ("on-default" / "in-place" / "worktree" / "stash" / "continuation").
-        # Only create_run (queue-triggered launches) supplies these; other
-        # call sites default to None and the record simply omits them.
+        # Task 201 + 252: the launcher records which mode the workspace guard
+        # chose (WORKSPACE_BASE_MODES in workspace_guard — the shared tuple
+        # the run parser's choices are validated against).  Only create_run
+        # (queue-triggered launches) supplies these; other call sites default
+        # to None and the record simply omits them.
         workspace_base_mode: str | None = None,
         workspace_base_summary: str | None = None,
         _recover_reservation: bool = False,

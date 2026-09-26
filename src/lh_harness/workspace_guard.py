@@ -37,6 +37,28 @@ _GIT_TIMEOUT = 90
 _GH_TIMEOUT = 30
 _MAX_MESSAGE = 4_000
 
+# Every mode ``prepare_workspace_base`` can return.  Task 252: this tuple is
+# the single source of truth shared by the supervisor (``manager`` records the
+# round-zero mode list and the ``lh-harness run`` argparse choices derive
+# from it indirectly through the supervisor's forwarding), so a new mode
+# added to the guard cannot again drift out of the worker CLI's accepted
+# choices — the round-trip test imports it and compares it against the
+# argparse choices in ``cli``.
+#
+# ``not-a-repo`` semantics (task 252, measured run 20260925T053514Z_78483494):
+# the workspace is a legitimate non-git directory (chat-test scratch,
+# docs-only trees).  The worker runs in place with no branch work at all —
+# no default-branch lookup, no branch cut, no checkout, no stash, no push.
+# The workspace is handed over exactly as found.
+WORKSPACE_BASE_MODES = (
+    "not-a-repo",
+    "on-default",
+    "in-place",
+    "worktree",
+    "stash",
+    "continuation",
+)
+
 
 class WorkspaceBaseError(RuntimeError):
     """No clean default-branch base could be resolved; the launch must fail."""
@@ -47,8 +69,9 @@ class WorkspaceBase:
     """A resolved launch base for one workspace."""
 
     workspace: Path
-    # "not-a-repo" | "on-default" | "in-place" | "worktree" | "stash" |
-    # "continuation" (task 201: explicit per-entry opt-in, workspace untouched)
+    # One of WORKSPACE_BASE_MODES: "not-a-repo" | "on-default" | "in-place" |
+    # "worktree" | "stash" | "continuation" (task 201: explicit per-entry
+    # opt-in, workspace untouched)
     mode: str
     original_branch: str
     default_branch: str
