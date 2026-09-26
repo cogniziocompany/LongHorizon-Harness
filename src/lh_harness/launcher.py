@@ -31,7 +31,12 @@ from .queue import (
     read_lease,
 )
 from .supervisor.lifecycle import ACTIVE_STATUSES, canonical_lifecycle_status
-from .workspace_guard import WorkspaceBaseError, prepare_workspace_base, probe_open_pr_gh
+from .workspace_guard import (
+    WorkspaceBaseError,
+    prepare_workspace_base,
+    probe_open_pr_gh,
+    resolve_run_base,
+)
 from .workspace_identity import resolve_many
 
 # ``httpx`` is already a transitive dependency of FastAPI/TestClient, but the
@@ -903,6 +908,8 @@ class Launcher:
         # 96563c4c under PR #154).  A non-default checked-out branch must not
         # be used as-is; the run gets a base cut fresh from origin's default,
         # and another task's uncommitted/unpushed work is never destroyed.
+        # The same guard helper serves POST /api/runs, so every create-run
+        # call site resolves the launch base identically.
         #
         # Continuation opt-in (task 201): an entry with ``branch`` or
         # ``continue_branch`` set is a continuation task that owns the branch
@@ -911,7 +918,7 @@ class Launcher:
         # default (neither set) keeps the guard's full protection.
         continuation = bool(getattr(entry, "branch", "") or getattr(entry, "continue_branch", False))
         try:
-            base = prepare_workspace_base(
+            base, workspace = resolve_run_base(
                 entry.workspace,
                 run_label=f"{entry.trio}-{uuid.uuid4().hex[:8]}",
                 base_root=getattr(self.supervisor, "workspace_root", None),
@@ -942,7 +949,7 @@ class Launcher:
                 updated.last_checked_at = _now()
                 self.queue_store.update(updated)
             return False
-        workspace = str(base.workspace if base.mode == "worktree" else entry.workspace)
+        workspace = str(workspace)
         try:
             created = self.supervisor.create_run(
                 task=entry.task,
