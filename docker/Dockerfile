@@ -40,6 +40,8 @@ RUN pip install /opt/lh-harness-src
 
 COPY --chown=harness:harness docker/entrypoint.sh /usr/local/bin/lh-node-entrypoint
 RUN chmod +x /usr/local/bin/lh-node-entrypoint
+COPY --chown=harness:harness docker/materialize_node_config.py /usr/local/bin/lh-node-materialize-config
+RUN chmod +x /usr/local/bin/lh-node-materialize-config
 
 USER harness
 WORKDIR /home/harness
