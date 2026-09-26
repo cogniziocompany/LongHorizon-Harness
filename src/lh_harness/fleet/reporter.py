@@ -237,6 +237,7 @@ class FleetReporter:
         active: int,
         cap: int,
         queue_len: int = 0,
+        review_verdicts: dict[str, int] | None = None,
         launcher_tick_at: float | None = None,
         lease_holder: dict[str, Any] | None = None,
     ) -> None:
@@ -315,6 +316,9 @@ class FleetReporter:
             ],
             "capacity": {"active": active, "cap": cap},
             "queueLen": queue_len,
+            # Review-run verdict counts only; findings/blocking bodies never
+            # leave the run's own review.json.
+            "reviewVerdicts": dict(review_verdicts or {}),
             # Launcher liveness (task 173, scope 6): the lease's last refresh
             # and its holder.  Both are None when no lease exists, which is the
             # fleet window's "no launcher" signal -- so the block is always
@@ -357,15 +361,39 @@ class FleetReporter:
         callback: Callable[
             [],
             tuple[list[dict[str, Any]], int, int, int]
-            | tuple[list[dict[str, Any]], int, int, int, float | None, dict[str, Any] | None],
+            | tuple[list[dict[str, Any]], int, int, int, dict[str, int] | None]
+            | tuple[
+                list[dict[str, Any]],
+                int,
+                int,
+                int,
+                float | None,
+                dict[str, Any] | None,
+            ]
+            | tuple[
+                list[dict[str, Any]],
+                int,
+                int,
+                int,
+                dict[str, int] | None,
+                float | None,
+                dict[str, Any] | None,
+            ],
         ],
     ) -> None:
         """Register a callback that produces heartbeat data every 30 s.
 
-        The callback must return ``(runs, active, cap, queue_len)`` or, when
-        the node exposes a launcher lease, the extended
-        ``(runs, active, cap, queue_len, launcher_tick_at, lease_holder)``.  It
-        is invoked on the reporter daemon thread; keep it fast and
+        The callback may return any of:
+
+        - ``(runs, active, cap, queue_len)``
+        - ``(runs, active, cap, queue_len, review_verdicts)`` — a count
+          mapping ``{"pass": 2, "fail": 1, "cannot_review": 0}`` (task 186)
+        - ``(runs, active, cap, queue_len, launcher_tick_at, lease_holder)``
+          — a node exposing a launcher lease (task 173)
+        - ``(runs, active, cap, queue_len, review_verdicts,
+          launcher_tick_at, lease_holder)`` — both extensions together
+
+        It is invoked on the reporter daemon thread; keep it fast and
         exception-free.
         """
         if not self._enabled:
@@ -433,16 +461,35 @@ class FleetReporter:
                 ):
                     try:
                         result = self._heartbeat_callback()
-                        if len(result) == 6:
-                            runs, active, cap, queue_len, launcher_tick_at, lease_holder = result
-                            self.queue_heartbeat(
+                        # 4: base heartbeat; 5: + review_verdicts (task 186);
+                        # 6: + launcher liveness (task 173); 7: both extras.
+                        if len(result) == 7:
+                            (
                                 runs, active, cap, queue_len,
-                                launcher_tick_at=launcher_tick_at,
-                                lease_holder=lease_holder,
-                            )
+                                review_verdicts,
+                                launcher_tick_at, lease_holder,
+                            ) = result
+                        elif len(result) == 6:
+                            (
+                                runs, active, cap, queue_len,
+                                launcher_tick_at, lease_holder,
+                            ) = result
+                            review_verdicts = None
+                        elif len(result) == 5:
+                            runs, active, cap, queue_len, review_verdicts = result
+                            launcher_tick_at = None
+                            lease_holder = None
                         else:
                             runs, active, cap, queue_len = result
-                            self.queue_heartbeat(runs, active, cap, queue_len)
+                            review_verdicts = None
+                            launcher_tick_at = None
+                            lease_holder = None
+                        self.queue_heartbeat(
+                            runs, active, cap, queue_len,
+                            review_verdicts=review_verdicts,
+                            launcher_tick_at=launcher_tick_at,
+                            lease_holder=lease_holder,
+                        )
                     except Exception:
                         logger.exception("fleet reporter heartbeat callback failed")
                     self._last_heartbeat = now

@@ -125,30 +125,30 @@ def test_heartbeat_reports_real_queue_depth(tmp_path: Path) -> None:
     store = app.state.queue_store
     heartbeat = _registered_heartbeat()
 
-    _, _, _, queue_len, _, _ = heartbeat()
+    _, _, _, queue_len, _review_verdicts, _, _ = heartbeat()
     assert queue_len == 0  # empty queue
 
     first = store.create(_payload())
-    _, _, _, queue_len, _, _ = heartbeat()
+    _, _, _, queue_len, _review_verdicts, _, _ = heartbeat()
     assert queue_len == 1  # one pending entry
 
     second = store.create(_payload())
-    _, _, _, queue_len, _, _ = heartbeat()
+    _, _, _, queue_len, _review_verdicts, _, _ = heartbeat()
     assert queue_len == 2  # two non-terminal entries
 
     # Launching one moves it pending -> launched; it is still non-terminal, so
     # the backlog the orchestrator owns is unchanged.
     store.mark_launched(second.queue_id, "run-1")
-    _, _, _, queue_len, _, _ = heartbeat()
+    _, _, _, queue_len, _review_verdicts, _, _ = heartbeat()
     assert queue_len == 2
 
     # Reaching a terminal state removes the entry from the live backlog.
     store.mark_done(second.queue_id)
-    _, _, _, queue_len, _, _ = heartbeat()
+    _, _, _, queue_len, _review_verdicts, _, _ = heartbeat()
     assert queue_len == 1
 
     store.mark_failed(first.queue_id, "boom")
-    _, _, _, queue_len, _, _ = heartbeat()
+    _, _, _, queue_len, _review_verdicts, _, _ = heartbeat()
     assert queue_len == 0
 
 
@@ -164,7 +164,7 @@ def test_heartbeat_queue_len_matches_counts(tmp_path: Path) -> None:
 
     counts = store.counts()
     expected = counts["pending"] + counts["launched"]
-    _, _, _, queue_len, _, _ = heartbeat()
+    _, _, _, queue_len, _review_verdicts, _, _ = heartbeat()
     assert queue_len == expected == 3
 
 
@@ -187,8 +187,12 @@ def test_heartbeat_queue_len_reaches_fleet_payload(tmp_path: Path) -> None:
         lambda endpoint, payload, gzip_body=True: posted.append((endpoint, payload))
     )
 
-    runs, active, cap, queue_len, launcher_tick_at, lease_holder = _registered_heartbeat()()
-    reporter.queue_heartbeat(runs, active, cap, queue_len, launcher_tick_at, lease_holder)
+    runs, active, cap, queue_len, _review_verdicts, launcher_tick_at, lease_holder = (
+        _registered_heartbeat()()
+    )
+    reporter.queue_heartbeat(
+        runs, active, cap, queue_len, _review_verdicts, launcher_tick_at, lease_holder
+    )
 
     assert posted, "a heartbeat should have been posted"
     endpoint, body = posted[-1]
@@ -215,5 +219,7 @@ def test_heartbeat_ignores_queue_when_store_absent(tmp_path: Path) -> None:
     _maybe_start_fleet_reporter(app.state.registry, None, queue_store=None)
     reporter = get_reporter()
     assert reporter._heartbeat_callback is not None
-    _, _, _, queue_len, _, _ = reporter._heartbeat_callback()
+    _, _, _, queue_len, review_verdicts, _, _ = reporter._heartbeat_callback()
     assert queue_len == 0
+    # A node with no runs reports no review verdict counts.
+    assert review_verdicts == {}
