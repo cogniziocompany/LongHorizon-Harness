@@ -879,6 +879,8 @@ def main(argv: list[str] | None = None) -> int:
         # expects a value on `args`.
         if not hasattr(args, "allow_auditor_write_mcp"):
             args.allow_auditor_write_mcp = bool(run_defaults.get("allow_auditor_write_mcp", False))
+        if not hasattr(args, "experience"):
+            args.experience = bool(run_defaults.get("experience", False))
         if PROJECT_CONFIG_PATH.is_file():
             print(f"Using config: {PROJECT_CONFIG_PATH.resolve()}")
         return _run_command(args)
@@ -1838,6 +1840,7 @@ def _run_command(args: argparse.Namespace) -> int:
         runs_root=args.runs_root,
         workspace_base_mode=getattr(args, "workspace_base_mode", None),
         prompt_language=args.prompt_language,
+        experience=bool(getattr(args, "experience", False)),
         **context_cap_defaults,
     )
     # Override character limits with CLI arguments if provided
