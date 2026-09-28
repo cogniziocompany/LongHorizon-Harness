@@ -32,9 +32,20 @@
 # launch unbounded with a log line saying so (see
 # worker_isolation.unbounded_plan).
 #
-# Secrets are injected through the unit's EnvironmentFile, which must stay out
-# of git (read them on the host with ``systemctl show lh-harness -p
+# Secrets are injected through the unit's EnvironmentFile below, which must
+# stay out of git (read them on the host with ``systemctl show lh-harness -p
 # Environment``); the worker env strips LH_HARNESS_WEB_TOKEN itself.
+#
+# The live unit's inline `Environment=LH_HARNESS_WEB_TOKEN=<value>` line
+# (readable via `systemctl cat` / the unit file itself; task 262 audit,
+# 2026-09-28 fleet check) was the leak task 272 hardens: this shipped
+# template carries the EnvironmentFile reference ONLY — no non-secret
+# Environment= line was added here so the template stays byte-faithful to
+# its audited baseline, and no secret-bearing Environment=NAME=value may
+# ever be re-added (tests/test_unit_template_secret_hardening.py and
+# scripts/deploy/secret_scan.sh both enforce it).  Any non-secret settings
+# the live unit carries inline (endpoint + default model/agent topology)
+# stay host-side and are NOT part of this template.
 
 [Unit]
 Description=LongHorizon-Harness service (run supervisor + web API)
