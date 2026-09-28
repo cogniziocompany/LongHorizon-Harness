@@ -567,6 +567,22 @@ the independent audit, and Eq. 2 value backfill.  Enable with
 byte-identical to a build without the layer.  See
 [docs/experience-layer.md](docs/experience-layer.md) for what is captured, the
 value formula, redaction, and what Phase 1 deliberately excludes.
+##### Seq logging environment
+
+Ship Python logging records (including FastAPI/uvicorn logs from
+`lh-harness web`) to Seq over the raw CLEF ingestion API.  All are optional;
+when `SEQ_URL` is unset the handler is not attached.  `SEQ_API_KEY` is only
+optional metadata: the dev Seq server accepts unauthenticated ingest, so an
+unset key still ships events.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SEQ_URL` | *(none)* | Seq server origin (e.g. `https://seq.easybutt0n.ai`). Unset = disabled. |
+| `SEQ_API_KEY` | *(none)* | Seq ingestion API key sent as the `X-Seq-ApiKey` header. Optional — sent when present, omitted when not. |
+| `SEQ_MIN_LEVEL` | `INFO` | Minimum Python logging level shipped to Seq. |
+
+See [docs/seq-logging.md](docs/seq-logging.md) for the CLEF event shape,
+level mapping, and how to query and alert in Seq.
 
 ### Common CLI options
 

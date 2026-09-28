@@ -37,6 +37,28 @@ _GIT_TIMEOUT = 90
 _GH_TIMEOUT = 30
 _MAX_MESSAGE = 4_000
 
+# Every mode ``prepare_workspace_base`` can return.  Task 252: this tuple is
+# the single source of truth shared by the supervisor (``manager`` records the
+# round-zero mode list and the ``lh-harness run`` argparse choices derive
+# from it indirectly through the supervisor's forwarding), so a new mode
+# added to the guard cannot again drift out of the worker CLI's accepted
+# choices — the round-trip test imports it and compares it against the
+# argparse choices in ``cli``.
+#
+# ``not-a-repo`` semantics (task 252, measured run 20260925T053514Z_78483494):
+# the workspace is a legitimate non-git directory (chat-test scratch,
+# docs-only trees).  The worker runs in place with no branch work at all —
+# no default-branch lookup, no branch cut, no checkout, no stash, no push.
+# The workspace is handed over exactly as found.
+WORKSPACE_BASE_MODES = (
+    "not-a-repo",
+    "on-default",
+    "in-place",
+    "worktree",
+    "stash",
+    "continuation",
+)
+
 
 class WorkspaceBaseError(RuntimeError):
     """No clean default-branch base could be resolved; the launch must fail."""
@@ -47,8 +69,9 @@ class WorkspaceBase:
     """A resolved launch base for one workspace."""
 
     workspace: Path
-    # "not-a-repo" | "on-default" | "in-place" | "worktree" | "stash" |
-    # "continuation" (task 201: explicit per-entry opt-in, workspace untouched)
+    # One of WORKSPACE_BASE_MODES: "not-a-repo" | "on-default" | "in-place" |
+    # "worktree" | "stash" | "continuation" (task 201: explicit per-entry
+    # opt-in, workspace untouched)
     mode: str
     original_branch: str
     default_branch: str
@@ -212,7 +235,12 @@ def prepare_workspace_base(
         repo = (Path(base_root) if base_root else Path.cwd()) / repo
     repo = Path(os.path.normpath(str(repo)))
 
-    is_repo = (repo / ".git").exists() or _git_soft(repo, "rev-parse", "--git-dir") is not None
+    # ".git" exists in every checkout form (repo dir, linked-worktree file,
+    # submodule file), so when it is absent the workspace is not a git repo
+    # and the guard must pass through without ever touching subprocess — a
+    # caller whose ``subprocess`` is stubbed (supervisor API tests) must get
+    # the same launchable base, not a tooling error.
+    is_repo = (repo / ".git").exists()
     if not repo.is_dir() or not is_repo:
         # Not a git checkout (e.g. a fresh workspace root): nothing to guard.
         return WorkspaceBase(
@@ -367,3 +395,47 @@ def prepare_workspace_base(
         run_branch=run_branch,
         stashed=True,
     )
+
+
+def resolve_run_base(
+    workspace: str | Path | None,
+    *,
+    run_label: str,
+    base_root: str | Path | None = None,
+    probe_open_pr: Callable[[Path, str], str | None] | None = probe_open_pr_gh,
+    continuation: bool = False,
+    requested_branch: str = "",
+) -> tuple[WorkspaceBase | None, str | None]:
+    """Resolve the guard base and the workspace a run must execute in.
+
+    The one guard helper shared by the ``supervisor.create_run`` call sites
+    (the queue ``Launcher`` and ``POST /api/runs``) so neither grows a second
+    copy of the try/prepare/worktree-selection logic:
+
+    * ``workspace=None`` (no explicit workspace in the request) skips the
+      guard and returns ``(None, None)`` — the supervisor then uses its
+      configured workspace root, exactly as before the guard existed.
+    * otherwise the guard resolves a launch-safe base and the run executes in
+      ``base.workspace`` only when the guard produced a linked worktree, and
+      in the requested workspace for every other mode.
+
+    ``continuation``/``requested_branch`` pass straight through to
+    :func:`prepare_workspace_base` (task 201): a queue entry that owns a
+    branch keeps it untouched; a named branch mismatch still blocks.
+
+    Raises :class:`WorkspaceBaseError` when no clean base can be resolved; the
+    message names the checked-out branch and, when known, any colliding PR.
+    """
+
+    if workspace is None or not str(workspace).strip():
+        return None, None
+    base = prepare_workspace_base(
+        workspace,
+        run_label=run_label,
+        base_root=base_root,
+        probe_open_pr=probe_open_pr,
+        continuation=continuation,
+        requested_branch=requested_branch,
+    )
+    effective = str(base.workspace if base.mode == "worktree" else workspace)
+    return base, effective

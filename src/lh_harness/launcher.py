@@ -30,8 +30,13 @@ from .queue import (
     queue_config_from_config,
     read_lease,
 )
-from .supervisor.lifecycle import ACTIVE_STATUSES, canonical_lifecycle_status
-from .workspace_guard import WorkspaceBaseError, prepare_workspace_base, probe_open_pr_gh
+from .supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
+from .workspace_guard import (
+    WorkspaceBaseError,
+    prepare_workspace_base,
+    probe_open_pr_gh,
+    resolve_run_base,
+)
 from .workspace_identity import resolve_many
 
 # ``httpx`` is already a transitive dependency of FastAPI/TestClient, but the
@@ -565,6 +570,12 @@ class Launcher:
         # Signal 3 — the launcher_stalled flag read by /api/meta; no code
         # needed here beyond the state flip above (stall_fired property).
 
+    def _entry_is_launched(self, queue_id: str) -> bool:
+        """Return True if the entry was promoted to launched by _launch."""
+
+        entry = self.queue_store.get(queue_id)
+        return entry is not None and entry.status == "launched"
+
     def _update_launched_entries(
         self, active: dict[str, dict[str, Any]]
     ) -> None:
@@ -687,6 +698,16 @@ class Launcher:
         if capacities.get(entry.trio, 0) <= 0:
             return f"{entry.trio} at capacity"
         entry_workspace = _normalize_workspace(entry.workspace)
+        # Use the shared supervisor reservation primitive so queue launches
+        # race-safely with POST /api/runs. A reservation takes priority over the
+        # historical active-run scan because a worker may be in the brief
+        # creating/starting reservation window before it appears in list_run_items.
+        if getattr(self.supervisor, "workspace_is_reserved", None) is not None:
+            try:
+                if self.supervisor.workspace_is_reserved(entry.workspace):
+                    return f"workspace {entry.workspace} is reserved for a launch"
+            except Exception:
+                pass
         for run_id, info in active.items():
             owner = info.get("owner", {})
             workspace = _normalize_workspace(owner.get("workspace", ""))
@@ -903,6 +924,8 @@ class Launcher:
         # 96563c4c under PR #154).  A non-default checked-out branch must not
         # be used as-is; the run gets a base cut fresh from origin's default,
         # and another task's uncommitted/unpushed work is never destroyed.
+        # The same guard helper serves POST /api/runs, so every create-run
+        # call site resolves the launch base identically.
         #
         # Continuation opt-in (task 201): an entry with ``branch`` or
         # ``continue_branch`` set is a continuation task that owns the branch
@@ -911,7 +934,7 @@ class Launcher:
         # default (neither set) keeps the guard's full protection.
         continuation = bool(getattr(entry, "branch", "") or getattr(entry, "continue_branch", False))
         try:
-            base = prepare_workspace_base(
+            base, workspace = resolve_run_base(
                 entry.workspace,
                 run_label=f"{entry.trio}-{uuid.uuid4().hex[:8]}",
                 base_root=getattr(self.supervisor, "workspace_root", None),
@@ -942,7 +965,7 @@ class Launcher:
                 updated.last_checked_at = _now()
                 self.queue_store.update(updated)
             return False
-        workspace = str(base.workspace if base.mode == "worktree" else entry.workspace)
+        workspace = str(workspace)
         try:
             created = self.supervisor.create_run(
                 task=entry.task,
@@ -984,6 +1007,28 @@ class Launcher:
                 self._handle_retry(updated, failure_reason)
             return False
         launched = self.queue_store.mark_launched(entry.queue_id, run_id)
+        # Confirm the worker is durable before consuming capacity. A create_run
+        # that raised after the idempotency write but before a pid is promoted
+        # should not be treated as a successful launch.
+        if launched is not None:
+            status = self.supervisor.status(run_id)
+            lifecycle = canonical_lifecycle_status(status.get("status"))
+            if lifecycle not in ACTIVE_STATUSES and lifecycle != "starting":
+                # Roll back to pending so a later tick can retry after the
+                # failure reason is surfaced.
+                self.queue_store.record_skip(
+                    entry.queue_id,
+                    f"worker exited before launch confirmed: {status.get('status') or 'unknown'}",
+                )
+                # record_skip only appends a reason while status is pending.
+                # If the mark_launched already changed status, force it back.
+                reverted = self.queue_store.get(entry.queue_id)
+                if reverted is not None and reverted.status != "pending":
+                    reverted.status = "pending"
+                    reverted.run_id = None
+                    reverted.launched_at = None
+                    self.queue_store.update(reverted)
+                return False
         self._emit_run_event(
             run_id,
             "queue.launched",
