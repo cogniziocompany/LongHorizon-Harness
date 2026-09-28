@@ -291,6 +291,40 @@ def test_launcher_fails_entry_when_create_run_raises(tmp_path: Path) -> None:
     assert "launch failed" in (updated.reason or "")
 
 
+def test_launcher_skips_non_read_only_auditor_profile_without_burning_attempt(tmp_path: Path) -> None:
+    # Task 234 (CT110, 2026-09-23): an auditor role bound to a non-read-only
+    # MCP profile must be refused before any attempt is consumed.  The original
+    # burn path let the refusal escape into ``create_run`` and then
+    # ``mark_failed``, leaving the entry terminal with a failed attempt.  The
+    # new pre-burn path records a skip reason, leaves status pending, and
+    # never calls the supervisor.
+    root, store, supervisor = _fixture(tmp_path)
+    config = default_queue_config()
+    config["trios"]["kimi"] = {"agent": "claude_code", "model": "kimi-k3", "mcp_profile": "default"}
+    launcher = Launcher(supervisor, store, queue_config=config)
+    entry = store.create(_base_entry(trio="kimi"))
+    initial_attempt = entry.attempt
+
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "pending"
+    assert updated.attempt == initial_attempt
+    assert updated.reason is None
+    assert any("roles.auditor.mcp_profile" in reason and "not read-only" in reason for reason in updated.skip_reasons)
+    assert not supervisor.created
+
+    # A second tick sees the same profile and records another skip; the entry
+    # still does not burn an attempt or become failed.
+    asyncio.run(launcher.tick())
+    twice = store.get(entry.queue_id)
+    assert twice is not None
+    assert twice.attempt == initial_attempt
+    assert twice.status == "pending"
+    assert sum("roles.auditor.mcp_profile" in reason for reason in twice.skip_reasons) == 2
+
+
 def test_launcher_no_double_launch_across_ticks(tmp_path: Path) -> None:
     """A second tick must not launch into a workspace that got an active run between ticks.
 
@@ -329,10 +363,13 @@ def test_launcher_no_double_launch_across_ticks(tmp_path: Path) -> None:
 def test_launch_role_configs_omit_unset_and_keep_auditor_read_only(tmp_path: Path) -> None:
     # Cutover 168 (2026-09-23): an unset model/profile was passed as the string
     # "None" and every worker died on its reservation check; a trio-wide
-    # profile also landed on the auditor, which must stay read-only.
+    # profile also landed on the auditor, which must stay read-only.  Task 234:
+    # a read-only trio profile ("audit") launches, and the launched specs stay
+    # stripped of mcp_profile either way — a non-read-only trio profile is now
+    # refused pre-burn (see the skip test above), never sent to the worker.
     _root, store, supervisor = _fixture(tmp_path)
     config = default_queue_config()
-    config["trios"]["kimi"] = {"agent": "claude_code", "model": "kimi-k3", "mcp_profile": "default"}
+    config["trios"]["kimi"] = {"agent": "claude_code", "model": "kimi-k3", "mcp_profile": "audit"}
     launcher = Launcher(supervisor, store, queue_config=config)
     entry = store.create(_base_entry(trio="kimi"))
 
@@ -360,3 +397,57 @@ def test_launch_role_configs_without_model_or_profile(tmp_path: Path) -> None:
 
     roles = supervisor.created[-1]["owner"]["role_configs"]
     assert all(spec == {"agent": "claude_code"} for spec in roles.values())
+
+
+def test_auditor_read_only_violation_matches_service_refusal() -> None:
+    # Task 234: the helper must return exactly the ValueError text the
+    # supervisor raises inside ``_normalise_role_configs``, so the recorded
+    # skip reason is the same clear refusal an operator would have seen from
+    # the burned attempt.
+    from lh_harness.supervisor.service import _normalise_role_configs, auditor_read_only_violation
+
+    specs = {"auditor": {"agent": "claude_code", "model": "m1", "mcp_profile": "default"}}
+    expected: str | None = None
+    with pytest.raises(ValueError) as raised:
+        _normalise_role_configs(specs, agent="claude_code", model="m1")
+    expected = str(raised.value)
+
+    refusal = auditor_read_only_violation(specs, agent="claude_code", model="m1")
+    assert refusal == expected
+    assert refusal is not None
+    assert "roles.auditor.mcp_profile 'default'" in refusal
+    assert "not read-only" in refusal
+
+
+def test_auditor_read_only_violation_accepts_read_only_and_unset_profiles() -> None:
+    from lh_harness.supervisor.service import auditor_read_only_violation
+
+    # The built-in read-only profile is accepted.
+    read_only = {"auditor": {"agent": "claude_code", "model": "m1", "mcp_profile": "audit"}}
+    assert auditor_read_only_violation(read_only, agent="claude_code", model="m1") is None
+    # An auditor spec without any profile falls back to the built-in default,
+    # which is read-only.
+    unset = {"auditor": {"agent": "claude_code", "model": "m1"}}
+    assert auditor_read_only_violation(unset, agent="claude_code", model="m1") is None
+    # Unrelated validation failures are left to create_run's own handling.
+    assert auditor_read_only_violation({"auditor": {"agent": "nope", "model": "m1"}}, agent="claude_code", model="m1") is None
+
+
+def test_launcher_skips_unknown_profile_with_read_only_requirement(tmp_path: Path) -> None:
+    # An explicit auditor profile that is not read-only is refused on the
+    # pre-burn path even when it arrives through a trio-level override; the
+    # run-wide ``mcp_profile`` is NOT sent to create_run (cutover 168), so the
+    # launched specs stay stripped and the reservation check still passes.
+    _root, store, supervisor = _fixture(tmp_path)
+    config = default_queue_config()
+    config["trios"]["kimi"] = {"agent": "claude_code", "model": "kimi-k3", "mcp_profile": "none"}
+    launcher = Launcher(supervisor, store, queue_config=config)
+    entry = store.create(_base_entry(trio="kimi"))
+
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "launched"
+    owner = supervisor.created[-1]["owner"]
+    assert all(spec == {"agent": "claude_code", "model": "kimi-k3"} for spec in owner["role_configs"].values())

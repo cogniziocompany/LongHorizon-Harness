@@ -343,6 +343,91 @@ def test_supervised_worker_claims_pre_popen_reservation(monkeypatch, tmp_path: P
     assert claimed["state"] == "running"
 
 
+def test_supervised_reservation_role_mismatch_reports_expected_and_actual(tmp_path: Path) -> None:
+    """Task 234 D2: the mismatch error prints both role configurations."""
+
+    root = tmp_path / "runs"
+    run_dir = root / "reserved"
+    (run_dir / "control").mkdir(parents=True)
+    owner = {
+        "run_id": "reserved",
+        "pid": os.getpid(),
+        "task": "cutover",
+        "agent": "codex",
+        "model": "gpt-5.6-sol",
+        "max_rounds": 2,
+        "role_configs": {
+            "executor": {"agent": "codex", "model": "gpt-5.6-sol"},
+            "auditor": {"agent": "codex", "model": "gpt-5.6-sol-stale"},
+        },
+        "state": "creating",
+    }
+    (run_dir / "control" / "owner.json").write_text(json.dumps(owner), encoding="utf-8")
+    (run_dir / "control" / "status.json").write_text(
+        json.dumps({"run_id": "reserved", "status": "creating"}), encoding="utf-8"
+    )
+
+    actual = {
+        "executor": {"agent": "codex", "model": "gpt-5.6-sol"},
+        "auditor": {"agent": "codex", "model": "gpt-5.6-sol-live"},
+    }
+    with pytest.raises(ValueError) as excinfo:
+        _adopt_supervised_run_dir(
+            root,
+            "reserved",
+            task="cutover",
+            agent="codex",
+            model="gpt-5.6-sol",
+            workspace=None,
+            max_rounds=2,
+            role_configs=actual,
+        )
+    message = str(excinfo.value)
+    assert "does not match its reservation" in message
+    assert "expected/reservation-stored" in message
+    assert "actual/recomputed" in message
+    # The stored (expected) side shows the stale model…
+    assert "auditor{agent='codex', model='gpt-5.6-sol-stale'}" in message
+    # …and the recomputed (actual) side shows the live one.
+    assert "auditor{agent='codex', model='gpt-5.6-sol-live'}" in message
+
+
+def test_supervised_reservation_role_mismatch_handles_missing_side(tmp_path: Path) -> None:
+    """A reservation without role_configs renders as ``none`` on the expected side."""
+
+    root = tmp_path / "runs"
+    run_dir = root / "reserved"
+    (run_dir / "control").mkdir(parents=True)
+    owner = {
+        "run_id": "reserved",
+        "pid": os.getpid(),
+        "task": "cutover",
+        "agent": "codex",
+        "model": None,
+        "max_rounds": 2,
+        "state": "creating",
+    }
+    (run_dir / "control" / "owner.json").write_text(json.dumps(owner), encoding="utf-8")
+    (run_dir / "control" / "status.json").write_text(
+        json.dumps({"run_id": "reserved", "status": "creating"}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        _adopt_supervised_run_dir(
+            root,
+            "reserved",
+            task="cutover",
+            agent="codex",
+            model=None,
+            workspace=None,
+            max_rounds=2,
+            role_configs={"executor": {"agent": "codex", "model": "gpt-5.6-sol"}},
+        )
+    message = str(excinfo.value)
+    assert "expected/reservation-stored: none;" in message
+    assert "executor{agent='codex', model='gpt-5.6-sol'}" in message
+
+
 def test_supervised_task_reference_is_bound_to_reserved_run(tmp_path: Path) -> None:
     run_dir = tmp_path / "runs" / "reserved"
     task_path = run_dir / "tmp" / "task.md"
