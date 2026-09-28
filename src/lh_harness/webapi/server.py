@@ -15,9 +15,10 @@ import os
 import re
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -46,7 +47,7 @@ from . import mcp_jsonrpc as mcp_protocol
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
-from ..supervisor.control_bus import CommandConflict, RevisionConflict
+from ..supervisor.control_bus import CommandConflict, RevisionConflict, _append_jsonl
 from ..fleet import get_reporter
 from ..queue import (
     PgQueueStore,
@@ -58,6 +59,7 @@ from ..queue import (
     _select_queue_store,
 )
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
+from ..workspace_guard import WorkspaceBaseError, probe_open_pr_gh, resolve_run_base
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
@@ -84,6 +86,7 @@ _WEB_DEFAULT_AUDITOR_MODEL = (
 )
 from .protocol import build_meta
 from .snapshot import _provenance, build_run_summary, build_snapshot
+from .experience_routes import register_experience_api
 
 # Vite builds directly into this directory, so a source checkout and an
 # installed wheel resolve the same path.  It is absent until the frontend is
@@ -476,6 +479,25 @@ class StateRegistry:
             }
         ]
 
+    def run_items_cheap(self) -> list[dict[str, Any]]:
+        """Cheap run enumeration for the ``/api/runs`` list projection.
+
+        The supervisor path reads each run's small durable control records
+        only (no per-run deep boundary validation, no report/task reads, no
+        lifecycle reconciliation).  Without a supervisor the registry falls
+        back to the dashboard scan, which is only worth using for a handful of
+        embedded runs.
+        """
+
+        if self.supervisor is not None and hasattr(self.supervisor, "list_run_summaries"):
+            return self.supervisor.list_run_summaries()
+        items = self.base_state.list_runs()
+        if items:
+            return items
+        if self.runs_root is not None:
+            return []
+        return self.run_items()
+
 
 def _safe_run_id(run_id: str) -> bool:
     return (
@@ -627,6 +649,40 @@ def _public_owner(owner: dict[str, Any]) -> dict[str, Any]:
 
 def _event_tailer(state: DashboardState, run_id: str) -> EventTailer:
     return EventTailer(state.role_dir / "events.jsonl", run_id=run_id)
+
+
+def _emit_run_created_event(
+    supervisor: Any,
+    run_id: str,
+    base: "WorkspaceBase",
+    workspace: str | None,
+) -> None:
+    """Record the guard's base decision in the run's own event ledger.
+
+    Same provenance contract as the queue Launcher's ``queue.launched`` event:
+    the run-created event carries ``workspace_base`` (``base.summary()``) so
+    operators can see which mode the launch used (on-default / in-place /
+    worktree / stash) and which foreign branch was left untouched.
+    """
+
+    try:
+        role_dir = supervisor._run_logs_dir(run_id) / "role_orchestration"
+        record = {
+            "schema_version": 2,
+            "event_id": f"{run_id}:run-created-{time.time():.6f}",
+            "type": "run.created",
+            "ts": time.time(),
+            "run_id": run_id,
+            "payload": {
+                "workspace": workspace,
+                "workspace_base": base.summary(),
+            },
+        }
+        _append_jsonl(role_dir / "events.jsonl", record)
+    except Exception:
+        # The guard decision is already durable in the owner record; a failed
+        # provenance append must never fail the run creation itself.
+        pass
 
 
 def _snapshot_for(registry: StateRegistry, state: DashboardState, run_id: str) -> dict[str, Any]:
@@ -820,6 +876,30 @@ def _stream_projection_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
 _HEAVY_SNAPSHOT_FIELDS = frozenset({"rounds", "events", "legacy"})
 
 
+def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
+    """Project one cheap run item into the ``fields=summary`` response row.
+
+    The projection deliberately omits ``task``/``task_summary`` and every
+    other per-run-large field; ``round`` is included only when the run's
+    durable state already carried one, because deriving it otherwise would
+    require a per-run rounds/events read, which is exactly the cost this path
+    exists to avoid.
+    """
+
+    row: dict[str, Any] = {
+        "id": str(item.get("id") or ""),
+        "status": str(item.get("status") or "unknown"),
+        "updated_at": item.get("mtime", 0.0),
+        "workspace": str(item.get("workspace") or ""),
+    }
+    for field in ("agent", "model", "max_rounds", "prompt_language"):
+        if field in item:
+            row[field] = item[field]
+    if isinstance(item.get("round"), int) and not isinstance(item.get("round"), bool):
+        row["round"] = item["round"]
+    return row
+
+
 def _summary_from_full(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Return a lightweight snapshot for run list switching.
 
@@ -943,10 +1023,15 @@ def create_app(
     auth_token: str | None = None,
     allowed_origins: set[str] | list[str] | tuple[str, ...] | None = None,
     bind_host: str = "127.0.0.1",
+    probe_open_pr: "Callable[[Path, str], str | None] | None" = probe_open_pr_gh,
     caller_configs: dict[str, dict[str, Any]] | None = None,
 ) -> FastAPI:
     """Create an API app over a live shared state or a historical runs root.
 
+    ``probe_open_pr`` follows the same default-on contract as the queue
+    Launcher (task 195 deliverable 3): production POST /api/runs probes origin
+    for a colliding OPEN PR with no flag or config.  Pass ``None`` only to
+    disable the probe explicitly (tests and offline runs).
     ``supervisor`` accepts the real :class:`RunSupervisor` or any stand-in
     exposing the same surface (tests pass an in-memory fake so the launcher
     the app builds can be driven without spawning workers).
@@ -1066,7 +1151,9 @@ def create_app(
             queue_store = QueueStore(runs_root, queue_config)
     launcher: Launcher | None = None
     if supervisor is not None and queue_store is not None:
-        launcher = Launcher(supervisor, queue_store, queue_config=queue_config)
+        launcher = Launcher(
+            supervisor, queue_store, queue_config=queue_config, probe_open_pr=probe_open_pr
+        )
 
     # Task 235: the overseer-state tools read the migrated apparatus archive
     # (tasks/, queue/done, queue/blocked, docs/) from this checkout. Resolve
@@ -1151,6 +1238,10 @@ def create_app(
         if not request.url.path.startswith("/api/runs/") or not request.url.path.endswith("/snapshot"):
             response.headers.setdefault("Cache-Control", "no-store")
         return response
+
+    # Read-only MSCE experience levels (L1/L2/L3) for the fleet surfaces.
+    # Registration adds no auth surface: the middleware above guards /api/*.
+    register_experience_api(app, registry, runs_root=registry.runs_root)
 
     @app.get("/api/meta")
     def meta(request: Request) -> dict[str, Any]:
@@ -1570,10 +1661,48 @@ def create_app(
         return {"ok": True, "available": False, "contentions": []}
 
     @app.get("/api/runs")
-    def runs() -> dict[str, Any]:
+    def runs(
+        fields: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """List runs.  Default projection is unchanged and full; opt-in to cheap.
+
+        Query parameters:
+            fields=summary  - omit large per-run fields (``task``, ``task_summary``,
+                              provenance blob, etc.) and return only ``id``,
+                              ``status``, ``workspace``, ``updated_at`` and
+                              ``round``.
+            status=x,y,z    - comma-list filter; only runs whose lifecycle status is
+                              exactly one of the given values are returned.
+
+        The cheap path is O(runs) with only small bounded reads per run and no
+        deep boundary validation, report/owner re-reads, or per-row state
+        construction.  Status values are read from durable ``status.json``/owner
+        records.  They can therefore be stale by the configured cache window
+        (currently 5 seconds) when the supervisor is not actively refreshing
+        the run.  This is acceptable for gate detection, which only needs a
+        recent snapshot, not a live process poll.  Existing callers that pass no
+        parameters receive the same full projection they always have.
+        """
+
+        summary_mode = bool(fields and fields.strip().lower() == "summary")
+        status_filter: set[str] | None = None
+        if status:
+            status_filter = {s.strip() for s in status.split(",") if s.strip()}
+
+        if summary_mode:
+            # Cheap path: avoid per-run boundary validation and state_for churn.
+            items = registry.run_items_cheap()
+            if status_filter:
+                items = [item for item in items if str(item.get("status") or "") in status_filter]
+            result = [_build_summary_projection(item) for item in items]
+            return {"runs": result}
+
         result: list[dict[str, Any]] = []
         contentions = _load_contentions(runs_root)
         for item in registry.run_items():
+            if status_filter and str(item.get("status") or "") not in status_filter:
+                continue
             item_run_id = str(item.get("id") or "")
             summary = build_run_summary(item, state=registry.state_for(item_run_id))
             result.append(_annotate_contention(summary, contentions))
@@ -1648,12 +1777,27 @@ def create_app(
                 raise ValueError("prompt_language must be en or zh")
             mcp_profile = _body_text(body.get("mcp_profile"), field="mcp_profile", max_chars=64) or None
             youtrack_issue_id = _body_text(body.get("youtrack_issue_id"), field="youtrack_issue_id", max_chars=64) or None
+            # Workspace branch guard: identical semantics to the queue
+            # Launcher's launch path (task 195 / task 200).  A non-default
+            # checked-out branch must not be used as-is; the run gets a base
+            # cut fresh from origin's default, and another task's
+            # uncommitted/unpushed work is never destroyed.  A refused base
+            # fails loudly as 409 before any run row is created.
+            try:
+                base, guarded_workspace = resolve_run_base(
+                    workspace,
+                    run_label=uuid.uuid4().hex[:8],
+                    base_root=getattr(supervisor, "workspace_root", None),
+                    probe_open_pr=probe_open_pr,
+                )
+            except WorkspaceBaseError as exc:
+                raise HTTPException(status_code=409, detail=f"workspace base refused: {exc}") from exc
             created = supervisor.create_run(
                 task=task,
                 agent=agent,
                 model=model,
                 role_configs=role_configs,
-                workspace=workspace,
+                workspace=guarded_workspace,
                 max_rounds=max_rounds,
                 prompt_language=prompt_language,
                 run_id=run_id_value,
@@ -1662,10 +1806,17 @@ def create_app(
                 youtrack_issue_id=youtrack_issue_id,
                 idempotency_key=_bounded_command_id(request.headers.get("Idempotency-Key")),
             )
+            if base is not None:
+                run_id = str(created.get("id") or "")
+                if run_id:
+                    _emit_run_created_event(supervisor, run_id, base, guarded_workspace)
         except IdempotencyConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (TypeError, ValueError, OSError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            detail = str(exc)
+            if isinstance(exc, ValueError) and "reserved by another launch" in detail:
+                raise HTTPException(status_code=409, detail=detail) from exc
+            raise HTTPException(status_code=400, detail=detail) from exc
         if isinstance(created.get("owner"), dict):
             created = {**created, "owner": _public_owner(created["owner"])}
         return {"ok": True, "run": created}
@@ -2063,7 +2214,36 @@ def create_app(
         mode = _body_text(body.get("mode", "continue"), field="mode", max_chars=16) or "continue"
         if mode not in {"continue", "retry"}:
             raise HTTPException(status_code=422, detail="mode must be continue or retry")
+        # Cancelled runs may only be resumed after the operator explicitly
+        # acknowledges the cancellation reason.  The acknowledgement is supplied as
+        # a short operator note so it can be recorded in the run history.
+        cancel_reason_ack = _body_text(
+            body.get("cancelReasonAck") or body.get("cancel_reason_ack"),
+            field="cancelReasonAck",
+            max_chars=10_000,
+        )
         try:
+            run_status = canonical_lifecycle_status(supervisor.status(run_id).get("status"))
+            if run_status == "cancelled":
+                if not cancel_reason_ack:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="cancelled run requires a cancelReasonAck note to resume",
+                    )
+                try:
+                    bus = supervisor._bus(run_id)
+                    bus.append(
+                        "resume",
+                        {
+                            "mode": mode,
+                            "cancel_reason_ack": cancel_reason_ack,
+                            "acknowledged_at": time.time(),
+                        },
+                        created_by="web",
+                        command_id="resume-cancel-ack",
+                    )
+                except Exception:
+                    pass
             created = supervisor.resume(
                 run_id,
                 mode=mode,

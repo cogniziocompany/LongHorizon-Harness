@@ -76,6 +76,7 @@ class FakeSupervisor:
     def __init__(self, runs_root: Path) -> None:
         self.runs_root = runs_root
         self.workspace_root = runs_root.parent / "workspaces"
+        self._statuses: dict[str, dict[str, Any]] = {}
         self.created: list[dict[str, Any]] = []
 
     def list_run_items(self) -> list[dict[str, Any]]:
@@ -85,10 +86,15 @@ class FakeSupervisor:
         return {}
 
     def status(self, run_id: str) -> dict[str, Any]:
-        return {"status": "idle", "run_id": run_id}
+        return self._statuses.get(run_id, {"status": "idle", "run_id": run_id})
 
     def create_run(self, **kwargs: Any) -> dict[str, Any]:
-        result = {"id": f"run-{len(self.created) + 1}", **kwargs}
+        run_id = f"run-{len(self.created) + 1}"
+        result = {"id": run_id, **kwargs}
+        # A real supervisor writes "creating" immediately after the idempotency
+        # record; keep the fake consistent with the launcher hardening check that
+        # rolls back launches that never reach an active/starting lifecycle.
+        self._statuses[run_id] = {"status": "creating", "run_id": run_id}
         self.created.append(result)
         return result
 

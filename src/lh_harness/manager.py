@@ -62,6 +62,7 @@ from .supervisor.control_bus import (
     _ensure_dir_nofollow,
     _open_nofollow,
 )
+from .workspace_guard import WORKSPACE_BASE_MODES
 from .auditor_agent import (
     VISIBLE_OUTPUT_KEYS,
     compact_auditor_report_text,
@@ -1025,6 +1026,48 @@ async def _run_impl(
         post_report(config.runs_root, config.log_dir)
     except Exception:
         logger.exception("fleet report hook failed; dropping telemetry")
+    # MSCE experience layer (Phase 1): persist valued L1 traces beside the
+    # ledger once the final report is durably written. Never-fatal by
+    # contract: gated off by default (off runs stay byte-identical), local
+    # files only (no network, no LLM call), and any capture failure is
+    # recorded as a non-fatal event rather than affecting the finished run.
+    try:
+        from .experience.capture import (
+            experience_enabled,
+            persist_run_experience,
+            run_dir_for_log_dir,
+        )
+
+        if experience_enabled(config):
+            capture_result = persist_run_experience(
+                rounds=rounds,
+                report=final,
+                config=config,
+                run_dir=run_dir_for_log_dir(log_dir),
+            )
+            _append_event(
+                events_path,
+                "experience_captured",
+                {
+                    "run_id": capture_result.run_id,
+                    "rounds_captured": capture_result.rounds_captured,
+                    "records_written": capture_result.written,
+                    "skipped_duplicates": capture_result.skipped_duplicates,
+                    "dropped": capture_result.dropped,
+                    "terminal_reward": capture_result.terminal_reward,
+                    "reward_reason": capture_result.reward_reason,
+                },
+            )
+    except Exception as exc:  # experience capture must never fail a run
+        logger.exception("experience capture failed; run report unaffected")
+        try:
+            _append_event(
+                events_path,
+                "experience_capture_failed",
+                {"error": type(exc).__name__},
+            )
+        except Exception:
+            logger.debug("experience_capture_failed event append failed", exc_info=True)
     emit(
         "run_done",
         status=final["status"],
@@ -2385,6 +2428,27 @@ def _managed_round_from_dict(payload: dict[str, Any]) -> ManagedRound:
     )
 
 
+def _round_checkpoint_path(role_dir: Path, round_index: int) -> Path:
+    """Return the local per-round checkpoint path used to resume a round."""
+    return role_dir / "rounds" / f"round_{round_index:03d}" / "checkpoint.json"
+
+
+def _round_checkpoint(record: ManagedRound) -> dict[str, Any]:
+    """Build an independently verifiable checkpoint for one recorded round.
+
+    The checkpoint contains the same durable fields as the rounds.jsonl ledger
+    plus a content hash so resume/continuation can detect a torn write.
+    """
+
+    payload = asdict(record)
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload["schema_version"] = 1
+    payload["checkpoint_kind"] = "managed_round"
+    payload["recorded_at"] = time.time()
+    payload["fingerprint"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return payload
+
+
 async def _record_round(
     env: Environment,
     config: HarnessConfig,
@@ -2398,6 +2462,12 @@ async def _record_round(
     rounds_jsonl = role_dir / "rounds.jsonl"
     _append_jsonl_nofollow(rounds_jsonl, asdict(record))
     await _write_remote_round_text(env, config, record.round_index, "round.json", payload)
+    # Write an independently verifiable per-round checkpoint that resume and
+    # continuation paths can load and validate without re-reading the ledger.
+    checkpoint = _round_checkpoint(record)
+    checkpoint_path = _round_checkpoint_path(role_dir, record.round_index)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_local(checkpoint_path, json.dumps(checkpoint, ensure_ascii=False, indent=2))
     _append_event(events_path, "managed_round_recorded", asdict(record))
     # Push the complete round content (artifacts + trajectories) to fleet-admin
     # when configured.  This is intentionally best-effort and must never delay
@@ -2518,13 +2588,10 @@ def _round_zero_open_prs(branch: str, timeout: float = 10.0) -> list[dict[str, A
     ]
 
 
-_WORKSPACE_BASE_MODES = (
-    "on-default",
-    "in-place",
-    "worktree",
-    "stash",
-    "continuation",
-)
+# Task 252: derived from the guard's shared constant instead of a hand-copy,
+# so a mode the launcher can emit can never fall outside the round-zero
+# record's known set again (the incident run died exactly on such a drift).
+_WORKSPACE_BASE_MODES = WORKSPACE_BASE_MODES
 
 
 def _workspace_round_zero_record(
@@ -2542,7 +2609,8 @@ def _workspace_round_zero_record(
     gate, block, or otherwise alter a launch.
 
     Task 201: ``workspace_base_mode`` names the mode the prelaunch guard
-    chose ("on-default" / "in-place" / "worktree" / "stash" / "continuation")
+    chose ("not-a-repo" / "on-default" / "in-place" / "worktree" / "stash" /
+    "continuation")
     so a later reader can tell whether the run was relocated.  It is supplied
     by the supervisor (queue-triggered launches) and omitted — not guessed —
     when unknown.

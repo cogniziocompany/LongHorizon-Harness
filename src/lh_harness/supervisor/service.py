@@ -28,7 +28,9 @@ from typing import Any
 from .control_bus import (
     ControlBus,
     RevisionConflict,
+    _append_jsonl,
     _atomic_bytes_write,
+    _atomic_exclusive_write,
     _ensure_dir_fd_nofollow,
     _ensure_dir_nofollow,
     _open_nofollow,
@@ -47,6 +49,7 @@ from .lifecycle import (
 )
 from ..agent_registry import normalise_reasoning_effort, supports_reasoning_effort
 from .. import worker_isolation
+from ..workspace_park import park_workspace
 from ..types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
@@ -55,7 +58,17 @@ from ..types import (
     DEFAULT_MAX_ROUNDS,
     MAX_ROUNDS,
 )
-from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
+from ..utils.run_boundary import (
+    CANONICAL_LOG_DIR,
+    LEGACY_LOG_DIR,
+    OSWORLD_COMPAT_LOG_DIR,
+    _MAX_RUN_ID_CHARS,
+    safe_run_control,
+    safe_run_dir,
+    safe_run_logs,
+    safe_run_role,
+    safe_run_rounds,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -484,6 +497,42 @@ def _read_json(path: Path) -> dict[str, Any]:
     return _read_json_file(path, max_bytes=8 * 1024 * 1024)
 
 
+def _run_component_name(value: str) -> str | None:
+    """Validate one run-directory component without touching the filesystem.
+
+    Mirrors the lexical half of ``run_boundary.safe_run_dir``; the symlink/
+    existence half is already handled by ``os.scandir`` in the caller.
+    """
+
+    if (
+        not value
+        or len(value) > _MAX_RUN_ID_CHARS
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+    ):
+        return None
+    return value
+
+
+def _summary_logs_dir(run_dir: Path) -> Path:
+    """Best-effort log directory name for a summary row (never deep-validated).
+
+    The full path stays on ``list_run_items``/``state_for``; summaries only
+    need a stable pointer for filtering by prefix.
+    """
+
+    for name in (CANONICAL_LOG_DIR, OSWORLD_COMPAT_LOG_DIR, LEGACY_LOG_DIR):
+        candidate = run_dir / name
+        try:
+            if candidate.is_dir():
+                return candidate
+        except OSError:
+            continue
+    return run_dir / CANONICAL_LOG_DIR
+
+
 def _pending_approval(path: Path) -> bool:
     latest: dict[str, dict[str, Any]] = {}
     try:
@@ -621,6 +670,15 @@ def _merge_lifecycle_status(
 
 
 RESUME_MODES = ("continue", "retry")
+
+# Per-workspace launch reservation. A reservation is a lightweight file that
+# proves this supervisor process is about to create a run in a workspace. It is
+# deliberately outside the run directory so queue launcher and POST /api/runs
+# can race-check a workspace without knowing a run id yet. The file is keyed by
+# the supervisor PID and a monotonic timestamp; stale files from crashed
+# supervisors are ignored by callers that also verify process liveness.
+_WORKSPACE_RESERVATION_DIR = ".workspace-reservations"
+_WORKSPACE_RESERVATION_STALE_SECONDS = 60.0
 
 # A reopened run keeps its identity and history but must not inherit the
 # previous generation's outcome, live process identity, or one-shot idempotency
@@ -1128,6 +1186,151 @@ class RunSupervisor:
         payload = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
         _atomic_bytes_write(path, payload)
 
+    def _record_park_event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        """Append one ``workspace.parked`` event to the run's role events log."""
+
+        try:
+            logs = self._run_logs_dir(run_id)
+            role_dir = logs / "role_orchestration"
+            role_dir.mkdir(parents=True, exist_ok=True)
+            record = {
+                "schema_version": 2,
+                "event_id": f"{run_id}:park-{time.time():.6f}",
+                "type": event_type,
+                "ts": time.time(),
+                "run_id": run_id,
+                "payload": payload,
+            }
+            _append_jsonl(role_dir / "events.jsonl", record)
+        except (OSError, ValueError, RuntimeError):
+            # Parking itself has already happened (or safely not happened);
+            # a read-only or replaced run directory must not turn the park
+            # into a crash.
+            logger.exception("park event recording failed for run %s", run_id)
+
+    def _record_park_report(self, run_id: str, report_payload: dict[str, Any]) -> None:
+        """Persist the park summary (backup ref, stash) beside the run report."""
+
+        try:
+            logs = self._run_logs_dir(run_id)
+            _ensure_dir_nofollow(logs)
+            self._write_private_atomic_json(logs / "park.json", report_payload)
+        except (OSError, ValueError, RuntimeError):
+            logger.exception("park report recording failed for run %s", run_id)
+
+    def _record_park_service_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Append one ``workspace.parked`` event to the queue service event log.
+
+        Same durable stream and record shape the launcher uses for
+        ``queue.launched``/``queue.skipped`` (``<runs_root>/queue/
+        service_events.jsonl``), so the overseer and fleet see the park through
+        the real queue event mechanism.
+        """
+
+        record = {
+            "schema_version": 2,
+            "event_id": f"queue-{time.time():.6f}",
+            "type": event_type,
+            "ts": time.time(),
+            "payload": payload,
+        }
+        try:
+            queue_dir = self.runs_root / "queue"
+            queue_dir.mkdir(parents=True, exist_ok=True)
+            path = queue_dir / "service_events.jsonl"
+            line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+        except OSError:
+            logger.exception("park service-event recording failed for run event %s", event_type)
+
+    def _park_workspace(self, run_id: str) -> dict[str, Any] | None:
+        """Park the run's workspace now that the run is terminal.
+
+        Fires exactly once per terminal transition: the park result is recorded
+        durably (``park.json``) and a second terminal observation of the same
+        generation is a no-op.  Failures are recorded and logged, never raised
+        into the poller.
+        """
+
+        try:
+            bus = self._bus(run_id)
+            owner = bus.read_owner()
+            status = bus.read_status()
+        except (ValueError, OSError, RuntimeError):
+            logger.exception("park: cannot read run state for %s", run_id)
+            return None
+        if not owner:
+            return None
+        # Idempotency: a previous epoch's park must not be reused after a
+        # resume reopens the run.
+        epoch = resume_epoch(status) or resume_epoch(owner)
+        park_marker = str(owner.get("parked_epoch") or "")
+        if park_marker and int(park_marker or 0) >= epoch:
+            return None
+        workspace = str(owner.get("workspace") or "")
+        if not workspace:
+            return None
+        try:
+            result = park_workspace(
+                run_id,
+                workspace,
+                owner=owner,
+                record_event=lambda event_type, payload: (
+                    self._record_park_event(run_id, event_type, payload),
+                    self._record_park_service_event(event_type, payload),
+                ),
+                record_report=lambda report_payload: self._record_park_report(run_id, report_payload),
+            )
+        except Exception:
+            logger.exception("park failed unexpectedly for run %s", run_id)
+            return None
+        # Durable one-shot marker, scoped by resume generation so a resumed
+        # run parks again when it later reaches a terminal state.
+        try:
+            self._bus(run_id).update_owner(lambda value: {**value, "parked_epoch": str(epoch)})
+        except Exception:
+            logger.exception("park marker write failed for run %s", run_id)
+        if result.get("parked"):
+            logger.info(
+                "workspace parked for run %s: from=%s to=origin/%s backup_ref=%s stash=%s",
+                run_id,
+                result.get("from_branch"),
+                result.get("default_branch"),
+                result.get("backup_ref") or "-",
+                result.get("stash") or "-",
+            )
+        else:
+            logger.warning(
+                "workspace park incomplete for run %s: %s",
+                run_id,
+                result.get("error") or "unknown reason",
+            )
+        return result
+
+    def _maybe_park_terminal_workspace(self, run_id: str, status: dict[str, Any]) -> None:
+        """Park the workspace when ``status`` names a terminal lifecycle.
+
+        The four endings named by TASK 260 — end_of_round stop, cancelled,
+        done (``completed``), failed — all canonicalize into
+        :data:`TERMINAL_STATUSES`, which this single gate observes.  The
+        durable ``parked_epoch`` owner marker inside :meth:`_park_workspace`
+        makes a repeated terminal observation of the same run generation a
+        no-op, so park fires exactly once per terminal transition.
+        """
+
+        if not is_terminal_status(status.get("status")):
+            return
+        try:
+            self._park_workspace(run_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("park gate failed unexpectedly for run %s", run_id)
+
     def _replay_pending_lifecycle(
         self,
         run_id: str,
@@ -1434,6 +1637,69 @@ class RunSupervisor:
                 )
             return status
 
+    def list_run_summaries(self, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+        """Enumerate runs cheaply, without per-run deep boundary validation.
+
+        ``GET /api/runs?fields=summary`` answers gate detection (overseer
+        sweeps poll ``waiting_approval``/``running``/``starting``) and must
+        stay O(runs) with a couple of small bounded reads per run — never the
+        full ``safe_run_*`` boundary walk that ``list_run_items`` performs for
+        every run on every request.  Status is the durable ``status.json``
+        projection; the lifecycle-reconciliation replay stays on the full
+        path.  See the list-endpoint staleness note in ``webapi/server.py``.
+        """
+
+        items: list[dict[str, Any]] = []
+        try:
+            if not self.runs_root.is_dir():
+                return items
+        except OSError:
+            return items
+        try:
+            entries = list(os.scandir(self.runs_root))
+        except OSError:
+            return items
+        if self.attached_only:
+            if not self.attached_run_id:
+                return items
+            entries = [entry for entry in entries if entry.name == self.attached_run_id]
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            run_id = entry.name
+            if _run_component_name(run_id) is None:
+                continue
+            try:
+                mtime = float(entry.stat().st_mtime)
+            except OSError:
+                continue
+            control_dir = Path(entry.path) / "control"
+            status = _read_json_file(control_dir / "status.json")
+            owner = _read_json_file(control_dir / "owner.json")
+            if not status and not owner:
+                # No durable control metadata at all: not a managed run this
+                # API has ever seen.  Cheap enumeration is a supervisor
+                # surface, so skip unmanaged/historical directories the same
+                # way ``list_run_items`` skips boundary failures.
+                continue
+            status_name = str(status.get("status") or owner.get("status") or "idle")
+            if statuses is not None and status_name not in statuses:
+                continue
+            items.append(
+                {
+                    "id": run_id,
+                    "status": status_name,
+                    "mtime": mtime,
+                    "workspace": str(owner.get("workspace") or ""),
+                    "max_rounds": owner.get("max_rounds"),
+                    "agent": owner.get("agent"),
+                    "model": owner.get("model"),
+                    "log_dir": str(_summary_logs_dir(Path(entry.path))),
+                }
+            )
+        items.sort(key=lambda item: item["mtime"], reverse=True)
+        return items
+
     def list_run_items(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         try:
@@ -1498,7 +1764,7 @@ class RunSupervisor:
             item = {
                 "id": run_dir.name,
                 "task": task,
-                "status": str(status.get("status") or report.get("status") or "idle"),
+                "status": str(status.get("status") or report.get("status") or "unknown"),
                 "mtime": mtime,
                 "log_dir": str(logs),
             }
@@ -1509,11 +1775,17 @@ class RunSupervisor:
                 if field in owner:
                     item[field] = owner[field]
             items.append(item)
+            # TASK 260: parking is triggered by the same poll that observes
+            # the terminal lifecycle, so a run whose workspace must be parked
+            # does not wait for someone to request its status explicitly.
+            self._maybe_park_terminal_workspace(run_dir.name, status)
         return items
 
     def status(self, run_id: str) -> dict[str, Any]:
         self._assert_run_scope(run_id)
-        return self._refresh(run_id)
+        status = self._refresh(run_id)
+        self._maybe_park_terminal_workspace(run_id, status)
+        return status
 
     def owner(self, run_id: str) -> dict[str, Any]:
         self._assert_run_scope(run_id)
@@ -1752,10 +2024,11 @@ class RunSupervisor:
         allow_auditor_write_mcp: bool = False,
         youtrack_issue_id: str | None = None,
         base_check: str | None = None,
-        # Task 201: the launcher records which mode the workspace guard chose
-        # ("on-default" / "in-place" / "worktree" / "stash" / "continuation").
-        # Only create_run (queue-triggered launches) supplies these; other
-        # call sites default to None and the record simply omits them.
+        # Task 201 + 252: the launcher records which mode the workspace guard
+        # chose (WORKSPACE_BASE_MODES in workspace_guard — the shared tuple
+        # the run parser's choices are validated against).  Only create_run
+        # (queue-triggered launches) supplies these; other call sites default
+        # to None and the record simply omits them.
         workspace_base_mode: str | None = None,
         workspace_base_summary: str | None = None,
         _recover_reservation: bool = False,
@@ -1793,7 +2066,54 @@ class RunSupervisor:
         )
         run_id = run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
         run_dir = self._run_dir(run_id)
-        workspace_path = self._resolve_workspace(workspace)
+        with self.reserve_workspace(workspace) as workspace_path:
+            return self._create_run_once_reserved(
+                task=task,
+                agent=agent,
+                model=model,
+                role_configs=role_configs,
+                resolved_role_configs=resolved_role_configs,
+                workspace_path=workspace_path,
+                max_rounds=max_rounds,
+                prompt_language=prompt_language,
+                run_id=run_id,
+                run_dir=run_dir,
+                reasoning_effort=reasoning_effort,
+                mcp_profile=mcp_profile,
+                base_check=base_check,
+                workspace_base_mode=workspace_base_mode,
+                workspace_base_summary=workspace_base_summary,
+                youtrack_issue_id=youtrack_issue_id,
+                _recover_reservation=_recover_reservation,
+                _idempotency_fingerprint=_idempotency_fingerprint,
+            )
+
+    def _create_run_once_reserved(
+        self,
+        *,
+        task: str,
+        agent: str,
+        model: str | None,
+        role_configs: dict[str, dict[str, str | None]] | None,
+        resolved_role_configs: dict[str, dict[str, str]],
+        workspace_path: Path,
+        max_rounds: int,
+        prompt_language: str,
+        run_id: str,
+        run_dir: Path,
+        reasoning_effort: str | None,
+        mcp_profile: str | None,
+        base_check: str | None,
+        # Task 201: the launcher records which mode the workspace guard chose
+        # ("on-default" / "in-place" / "worktree" / "stash" / "continuation").
+        # Only create_run (queue-triggered launches) supplies these; other
+        # call sites default to None and the record simply omits them.
+        workspace_base_mode: str | None = None,
+        workspace_base_summary: str | None = None,
+        youtrack_issue_id: str | None = None,
+        _recover_reservation: bool,
+        _idempotency_fingerprint: str | None,
+    ) -> dict[str, Any]:
         workspace_path.mkdir(parents=True, exist_ok=True)
         # Re-resolve after mkdir: a pre-existing symlink or a concurrently
         # introduced symlink must not redirect the worker outside the boundary.
@@ -2209,7 +2529,10 @@ class RunSupervisor:
                     "finished_at": status.get("finished_at") or time.time(),
                 }
                 bus.write_owner(owner)
-            return status
+        # Park after the lock block: the git operations below must not hold the
+        # supervisor's shared lifecycle lock (TASK 260).
+        self._maybe_park_terminal_workspace(run_id, status)
+        return status
 
     def _resolve_workspace(self, workspace: str | Path | None) -> Path:
         """Resolve and enforce the supervisor workspace boundary."""
@@ -2230,6 +2553,113 @@ class RunSupervisor:
         except ValueError:
             raise ValueError(f"workspace must be inside configured workspace root: {root}") from None
         return resolved
+
+    def _workspace_reservation_path(self, workspace_path: Path) -> Path:
+        """Return the per-workspace reservation marker path under the runs root."""
+
+        workspace_path = Path(workspace_path)
+        # Reservations are stored under the runs root. The workspace itself lives
+        # under workspace_root, which may be a sibling of runs_root. Hash the
+        # absolute workspace path so the marker is unique and stable regardless of
+        # whether workspace_root overlaps runs_root.
+        try:
+            relative = workspace_path.resolve(strict=False).relative_to(self.workspace_root)
+        except (OSError, RuntimeError, ValueError):
+            relative = workspace_path.resolve(strict=False)
+        workspace_hash = hashlib.sha256(str(relative).encode("utf-8")).hexdigest()[:32]
+        return self.runs_root / _WORKSPACE_RESERVATION_DIR / f"{workspace_hash}.reservation.json"
+
+    @contextmanager
+    def reserve_workspace(self, workspace: str | Path | None = None):
+        """Atomically reserve a workspace for a single launch transaction.
+
+        The reservation file is written with an exclusive tempfile/rename under
+        the anchored no-follow helpers used by the control bus. It records the
+        supervisor PID and a timestamp. Callers (queue launcher eligibility,
+        POST /api/runs) must hold this reservation before launching a worker so
+        two launch paths cannot claim the same workspace.
+
+        Raises ValueError if the workspace is already reserved by a live process.
+        """
+
+        workspace_path = self._resolve_workspace(workspace)
+        reservation_path = self._workspace_reservation_path(workspace_path)
+        _ensure_dir_nofollow(reservation_path.parent)
+        now = time.time()
+        self_pid = os.getpid()
+
+        def _is_stale(payload: dict[str, Any]) -> bool:
+            try:
+                pid = int(payload.get("pid", 0) or 0)
+                ts = float(payload.get("ts", 0) or 0)
+            except (TypeError, ValueError):
+                return True
+            if pid <= 0 or pid == self_pid:
+                return True
+            if now - ts > _WORKSPACE_RESERVATION_STALE_SECONDS:
+                return True
+            # A crashed supervisor's PID may be reused; the start identity makes
+            # the reservation durable enough for launch races without requiring
+            # a cross-process lease.
+            identity = str(payload.get("pid_start_identity") or "")
+            current_identity = _pid_start_identity(pid)
+            if current_identity and identity and current_identity != identity:
+                return True
+            return False
+
+        # Create the reservation exclusively.  We first attempt an atomic
+        # exclusive-create; if another live supervisor holds the reservation we
+        # fail closed.  A stale reservation is overwritten so crashed launchers
+        # do not block a workspace forever.
+        payload = {
+            "pid": self_pid,
+            "ts": now,
+            "workspace": str(workspace_path),
+            "pid_start_identity": _pid_start_identity(self_pid),
+        }
+        data = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        try:
+            _atomic_exclusive_write(reservation_path, data)
+        except FileExistsError:
+            existing = _read_json(reservation_path)
+            if not _is_stale(existing):
+                other_pid = int(existing.get("pid", 0) or 0)
+                raise ValueError(f"workspace is reserved by another launch: {workspace_path} (pid {other_pid})")
+            # Stale reservation: overwrite it. We still use atomic write to
+            # avoid tearing the file for concurrent readers of this supervisor.
+            _atomic_bytes_write(reservation_path, data)
+        try:
+            yield workspace_path
+        finally:
+            try:
+                reservation_path.unlink()
+            except (OSError, FileNotFoundError):
+                pass
+
+    def workspace_is_reserved(self, workspace: str | Path | None = None) -> bool:
+        """Return True if the workspace is currently reserved by another live supervisor."""
+
+        workspace_path = self._resolve_workspace(workspace)
+        reservation_path = self._workspace_reservation_path(workspace_path)
+        try:
+            payload = _read_json(reservation_path)
+        except (OSError, ValueError):
+            return False
+        self_pid = os.getpid()
+        try:
+            pid = int(payload.get("pid", 0) or 0)
+            ts = float(payload.get("ts", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0 or pid == self_pid:
+            return False
+        if time.time() - ts > _WORKSPACE_RESERVATION_STALE_SECONDS:
+            return False
+        identity = str(payload.get("pid_start_identity") or "")
+        current_identity = _pid_start_identity(pid)
+        if current_identity and identity and current_identity != identity:
+            return False
+        return True
 
     def _signal(self, run_id: str, sig: signal.Signals, *, kind: str) -> dict[str, Any]:
         if self.attached_only and run_id != self.attached_run_id:
@@ -2623,6 +3053,18 @@ class RunSupervisor:
                 raise ValueError("cannot resume an active run")
             if not is_terminal_status(current.get("status")):
                 raise ValueError(f"run is not resumable from status {current.get('status') or 'unknown'}")
+            # Migration/successor creation must wait until the predecessor run has
+            # reached a terminal lifecycle status.  ``report.json`` is the audit
+            # outcome and can be satisfied before the supervisor has observed the
+            # process exit, so require the supervisor's own status decision too.
+            supervisor_status = canonical_lifecycle_status(current.get("status"), default="unknown")
+            report_status = canonical_lifecycle_status(
+                (_read_json(logs / "report.json") or {}).get("status"), default=""
+            )
+            if supervisor_status not in TERMINAL_STATUSES:
+                raise ValueError(
+                    f"predecessor worker has not reached a terminal status: {supervisor_status}"
+                )
             owner = self.owner(run_id)
             report = _read_json(logs / "report.json")
             # The owner record is written before the worker starts and is
@@ -2634,7 +3076,11 @@ class RunSupervisor:
             if not task.strip():
                 raise ValueError("cannot resume a run without a saved task")
             workspace = str(owner.get("workspace") or self.workspace_root)
+            # Before continuing in place, validate the latest round checkpoint.
+            # A missing or tampered checkpoint is a fail-closed condition: the
+            # worker would otherwise rebuild its state from an untrusted ledger.
             if mode == "continue":
+                self._validate_latest_round_checkpoint(run_id, run_dir)
                 return self._continue_run_in_place(
                     run_id,
                     run_dir=run_dir,
@@ -2718,15 +3164,20 @@ class RunSupervisor:
         )
         max_rounds = _resume_round_budget(owner, extra_rounds)
         workspace_path = self._resolve_workspace(workspace)
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        workspace_path = self._resolve_workspace(str(workspace_path))
-        if (
-            safe_run_logs(self.runs_root, run_dir, allow_missing=True) is None
-            or safe_run_control(self.runs_root, run_dir, allow_missing=True) is None
-        ):
-            raise ValueError("run reservation path is outside its run boundary")
-        self._run_logs_dir(run_id)
-        task_path = run_dir / "tmp" / "task.md"
+        # In-place resume reuses the same workspace; another launch cannot be
+        # using it because the run is terminal. Still take a brief reservation
+        # so the launcher does not race to create a successor in the same
+        # directory before this resume transaction completes.
+        with self.reserve_workspace(workspace_path):
+            workspace_path.mkdir(parents=True, exist_ok=True)
+            workspace_path = self._resolve_workspace(str(workspace_path))
+            if (
+                safe_run_logs(self.runs_root, run_dir, allow_missing=True) is None
+                or safe_run_control(self.runs_root, run_dir, allow_missing=True) is None
+            ):
+                raise ValueError("run reservation path is outside its run boundary")
+            self._run_logs_dir(run_id)
+            task_path = run_dir / "tmp" / "task.md"
         self._write_task_file(task_path, task)
         bus = ControlBus(run_dir)
         command = self._worker_command(
@@ -2787,6 +3238,68 @@ class RunSupervisor:
             workspace_path=workspace_path,
             task=task,
         )
+
+    def _validate_latest_round_checkpoint(self, run_id: str, run_dir: Path) -> None:
+        """Load the latest round checkpoint and verify its fingerprint.
+
+        The checkpoint is written by ``_record_round`` with a SHA-256 fingerprint
+        over the canonical round record.  On resume/continuation we recompute the
+        hash over the same canonical fields and fail closed if the file is missing,
+        malformed, or tampered.
+        """
+
+        logs = self._run_logs_dir(run_id)
+        role_dir = safe_run_role(self.runs_root, run_dir, allow_missing=True)
+        if role_dir is None:
+            raise ValueError("run role path is outside its run boundary")
+        rounds_dir = role_dir / "rounds"
+        if not rounds_dir.is_dir():
+            # A run with no recorded rounds has nothing to validate; the worker
+            # will start from the saved task.
+            return
+        candidates: list[tuple[int, Path]] = []
+        try:
+            for entry in rounds_dir.iterdir():
+                if not entry.is_dir():
+                    continue
+                suffix = entry.name.removeprefix("round_")
+                if suffix == entry.name or not suffix.isdecimal():
+                    continue
+                checkpoint_path = entry / "checkpoint.json"
+                if checkpoint_path.is_file():
+                    candidates.append((int(suffix), checkpoint_path))
+        except OSError as exc:
+            raise ValueError(f"cannot read rounds directory for checkpoint validation: {exc}") from exc
+        if not candidates:
+            return
+        candidates.sort(key=lambda item: item[0])
+        _, latest_path = candidates[-1]
+        try:
+            checkpoint = _read_json(latest_path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"latest round checkpoint is unreadable: {exc}") from exc
+        if not isinstance(checkpoint, dict):
+            raise ValueError("latest round checkpoint is malformed")
+        stored_fingerprint = str(checkpoint.get("fingerprint") or "")
+        if not stored_fingerprint:
+            raise ValueError("latest round checkpoint has no fingerprint")
+        # Recompute the fingerprint over the canonical round record fields.
+        canonical_record = {
+            key: value
+            for key, value in checkpoint.items()
+            if key not in {"schema_version", "checkpoint_kind", "recorded_at", "fingerprint"}
+        }
+        canonical = json.dumps(
+            canonical_record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        computed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        if computed != stored_fingerprint:
+            raise ValueError(
+                "latest round checkpoint fingerprint mismatch: checkpoint may be tampered or torn"
+            )
 
     def command_receipt(self, run_id: str, command_id: str) -> dict[str, Any] | None:
         return self._bus(run_id).receipt_for(command_id)
