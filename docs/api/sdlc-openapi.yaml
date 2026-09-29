@@ -1,0 +1,1055 @@
+openapi: 3.1.0
+info:
+  title: Delivery record store (sdlc) API
+  version: 0.1.0
+  summary: Write and read APIs for the delivery record store (task 288 design spec)
+  description: |-
+    Contract for the delivery record store defined by
+    docs/design/sdlc-record-store.md and the plan in
+    docs/handoffs/PLAN-delivery-record-store-2026-09-29.md (task 288).
+
+    Two services, each extending an API that already exists; writes happen in
+    one place only:
+
+    * **Write and capture API** — LongHorizon-Harness on CT110 (FastAPI,
+      `src/lh_harness/webapi/server.py`). The FastAPI routes publish this
+      specification at `/openapi.json`. The same operations are also exposed
+      as MCP tools (`hydrafleet-*`) beside the six read tools in
+      `src/lh_harness/overseer_state.py`.
+    * **Read API** — fleet-admin (Express, `src/server.js`, router
+      `buildSdlcRouter()` in `src/sdlc.js`, mounted at `/api/sdlc`, GET only,
+      behind the existing read key). Handlers follow the `guarded()` /
+      `relay()` wrappers and the 502/503/404 behaviour of `src/overseer.js`.
+
+    Both sides authenticate with a bearer token (the harness web API token on
+    the write side; the existing fleet-admin read key on the read side).
+    Secret values never appear in payloads: redacted bodies carry
+    `[REDACTED:<kind>]` placeholders, and files that are themselves secrets
+    are represented by name, size and hash only.
+servers:
+  - url: https://lh-harness.ct110
+    description: >-
+      Write and capture API — LongHorizon-Harness webapi process on CT110
+      (base URL placeholder; the deployed value is the service's own address
+      and is not recorded in this file)
+  - url: https://fleet.easybutt0n.ai
+    description: >-
+      Read API — fleet-admin (serves the Overseer and Ship Plane pages; the
+      sdlc router is mounted GET-only behind the existing read key)
+tags:
+  - name: write
+    description: Write and capture API (LongHorizon-Harness on CT110)
+  - name: read
+    description: Read API (fleet-admin, GET only)
+paths:
+  /api/sdlc/tasks:
+    post:
+      tags: [write]
+      summary: Create or update a task record
+      description: >-
+        Upsert by (task_number, slug): task numbers are reused across the
+        history, so the natural pair disambiguated by slug is the match key;
+        the surrogate task_uid is the identity returned. A body whose
+        task_number is omitted records an unmapped early id (e.g. `05h3b`).
+      operationId: upsertTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskWrite'
+      responses:
+        '200':
+          description: Existing task updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '201':
+          description: Task created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    get:
+      tags: [read]
+      summary: Task list with current stage
+      operationId: listTasks
+      parameters:
+        - name: stage
+          in: query
+          schema:
+            $ref: '#/components/schemas/LifecycleStage'
+        - name: repo
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          description: Free-text filter over title and slug
+          schema:
+            type: string
+        - name: from
+          in: query
+          description: Created-at lower bound (RFC 3339)
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: Created-at upper bound (RFC 3339)
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Page of tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tasks, total]
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Task'
+                  total:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/sdlc/tasks/{task_uid}:
+    get:
+      tags: [read]
+      summary: One task — stages, links, documents
+      operationId: getTask
+      parameters:
+        - name: task_uid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The task with its current stage, links and document list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Task'
+                  - type: object
+                    properties:
+                      stage_events:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/StageEvent'
+                      links:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Link'
+                      artifacts:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Artifact'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/sdlc/tasks/{task_uid}/stages:
+    post:
+      tags: [write]
+      summary: Record a stage reached, with its evidence reference
+      description: >-
+        Appends a stage event and advances the task's current-stage
+        projection. evidence_ref carries the proof of the stage (run id, PR
+        number, merge commit, report.json path); the earliest imported events
+        may reference loose records rather than typed links.
+      operationId: recordStage
+      parameters:
+        - name: task_uid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stage, occurred_at]
+              properties:
+                stage:
+                  $ref: '#/components/schemas/LifecycleStage'
+                evidence_ref:
+                  type: string
+                  maxLength: 1024
+                occurred_at:
+                  type: string
+                  format: date-time
+      responses:
+        '201':
+          description: Stage event recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StageEvent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/sdlc/tasks/{task_uid}/timeline:
+    get:
+      tags: [read]
+      summary: Stage events and ledger rows in time order
+      operationId: taskTimeline
+      parameters:
+        - name: task_uid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Interleaved, time-ordered stage events and ledger rows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries]
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      required: [kind, occurred_at]
+                      properties:
+                        kind:
+                          type: string
+                          enum: [stage_event, ledger_row]
+                        occurred_at:
+                          type: string
+                          format: date-time
+                        stage_event:
+                          $ref: '#/components/schemas/StageEvent'
+                        ledger_row:
+                          $ref: '#/components/schemas/LedgerRow'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/sdlc/artifacts:
+    post:
+      tags: [write]
+      summary: Store a document version (body, kind, links)
+      description: >-
+        Stores the body content-addressed (sha256): a body seen before is not
+        stored twice; the call records an artifact_version copy pointing at
+        the blob. Bodies must already be redacted — matched secret values
+        replaced by `[REDACTED:<kind>]`; files that are themselves secrets
+        are not accepted as bodies (register them through the import bundle's
+        name/size/hash records instead).
+      operationId: storeArtifact
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, body, original_path]
+              properties:
+                task_uid:
+                  type: string
+                  format: uuid
+                kind:
+                  $ref: '#/components/schemas/ArtifactKind'
+                title:
+                  type: string
+                logical_path:
+                  type: string
+                  maxLength: 4096
+                body:
+                  type: string
+                  description: UTF-8 text body, post-redaction
+                written_at:
+                  type: string
+                  format: date-time
+                original_path:
+                  type: string
+                  maxLength: 4096
+                backup_suffix:
+                  type: string
+                  maxLength: 64
+                links:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/LinkWrite'
+      responses:
+        '201':
+          description: Artifact version stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [artifact_id, version_id, blob_sha256, deduplicated]
+                properties:
+                  artifact_id:
+                    type: string
+                    format: uuid
+                  version_id:
+                    type: string
+                    format: uuid
+                  blob_sha256:
+                    type: string
+                    pattern: '^[0-9a-f]{64}$'
+                  deduplicated:
+                    type: boolean
+                    description: true when the body already existed under this sha256
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/sdlc/artifacts/{id}:
+    get:
+      tags: [read]
+      summary: A document
+      operationId: getArtifact
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The artifact, its latest body, and a version count
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Artifact'
+                  - type: object
+                    properties:
+                      body:
+                        type: string
+                        description: Latest version's UTF-8 body (post-redaction)
+                      blob_sha256:
+                        type: string
+                      version_count:
+                        type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/sdlc/artifacts/{id}/versions:
+    get:
+      tags: [read]
+      summary: A document's version history
+      operationId: artifactVersions
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Every recorded copy of the artifact, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [versions]
+                properties:
+                  versions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ArtifactVersion'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/sdlc/artifacts/{id}/diff:
+    get:
+      tags: [read]
+      summary: Difference between two versions
+      operationId: artifactDiff
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          required: true
+          description: version_id of the older version
+          schema:
+            type: string
+            format: uuid
+        - name: to
+          in: query
+          required: true
+          description: version_id of the newer version
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Unified diff between the two version bodies
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [from, to, diff]
+                properties:
+                  from:
+                    type: string
+                    format: uuid
+                  to:
+                    type: string
+                    format: uuid
+                  diff:
+                    type: string
+                    description: Unified diff text
+            text/plain:
+              schema:
+                type: string
+                description: Unified diff text
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/sdlc/links:
+    post:
+      tags: [write]
+      summary: Join a task to a run, queue id, PR, commit or session
+      description: >-
+        Idempotent on (task_uid, kind, target): re-recording an existing join
+        returns the existing link. Queue-event records stay in the `harness`
+        schema of `lh_harness` and are reached through `kind = 'queue'`
+        links, never copied.
+      operationId: createLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LinkWrite'
+      responses:
+        '200':
+          description: Link already existed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Link'
+        '201':
+          description: Link created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Link'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/overseer/ledger:
+    post:
+      tags: [write]
+      summary: Append a ledger row
+      description: >-
+        The write path the plan adds beside the six read-only overseer archive
+        tools. Keyed by (session_ref, tick_number, occurred_at) because tick
+        numbers restarted at 1 after the 2026-09-23 cutover. Bodies must
+        already be redacted.
+      operationId: appendLedgerRow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_ref, tick_number, occurred_at]
+              properties:
+                session_ref:
+                  type: string
+                  maxLength: 16
+                  example: f14d17
+                tick_number:
+                  type: integer
+                occurred_at:
+                  type: string
+                  format: date-time
+                section:
+                  type: string
+                  maxLength: 128
+                body:
+                  type: string
+      responses:
+        '201':
+          description: Ledger row appended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerRow'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: A row with this (session_ref, tick_number, occurred_at) already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/overseer/open-asks:
+    post:
+      tags: [write]
+      summary: Create or update an open ask
+      description: >-
+        Upsert by ask_id (create when omitted). A state change appends to the
+        row's state_history rather than overwriting.
+      operationId: upsertOpenAsk
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                ask_id:
+                  type: string
+                  format: uuid
+                task_uid:
+                  type: string
+                  format: uuid
+                asked_by:
+                  type: string
+                question:
+                  type: string
+                state:
+                  type: string
+                  example: open
+                answer:
+                  type: string
+                occurred_at:
+                  type: string
+                  format: date-time
+      responses:
+        '200':
+          description: Existing ask updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAsk'
+        '201':
+          description: Ask created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAsk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/sdlc/import:
+    post:
+      tags: [write]
+      summary: Load an exported bundle (used by the backfill)
+      description: >-
+        Accepts an export bundle laid out per docs/design/sdlc-record-store.md
+        §5: a JSONL manifest (one line per artifact version), the
+        redaction report, the name/size/hash-only records for files that are
+        themselves secrets, and the content-addressed blobs. The load runs
+        inside one import_batch so every imported row is traceable and the
+        whole batch is reversible.
+      operationId: importBundle
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [manifest]
+              properties:
+                manifest:
+                  type: string
+                  format: binary
+                  description: manifest.jsonl — one JSON object per artifact version
+                redaction_report:
+                  type: string
+                  format: binary
+                  description: redaction-report.jsonl — {path, kind, count} per redacted file
+                secrets_by_name:
+                  type: string
+                  format: binary
+                  description: secrets-by-name.jsonl — name/size/sha256 only, no bodies
+                blobs:
+                  type: array
+                  description: Content-addressed body files, named by sha256
+                  items:
+                    type: string
+                    format: binary
+            encoding:
+              manifest:
+                contentType: application/x-ndjson
+              redaction_report:
+                contentType: application/x-ndjson
+              secrets_by_name:
+                contentType: application/x-ndjson
+              blobs:
+                contentType: application/octet-stream
+      responses:
+        '202':
+          description: Bundle accepted; an import_batch row opened
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportBatch'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/sdlc/search:
+    get:
+      tags: [read]
+      summary: Search documents — keyword from Postgres, semantic from qdrant
+      operationId: search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [keyword, semantic]
+            default: keyword
+        - name: task_uid
+          in: query
+          description: Payload filter for semantic mode (qdrant sdlc_documents)
+          schema:
+            type: string
+            format: uuid
+        - name: kind
+          in: query
+          schema:
+            $ref: '#/components/schemas/ArtifactKind'
+        - name: stage
+          in: query
+          schema:
+            $ref: '#/components/schemas/LifecycleStage'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Ranked hits with the artifact and task they belong to
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hits]
+                properties:
+                  hits:
+                    type: array
+                    items:
+                      type: object
+                      required: [artifact_id, score, snippet]
+                      properties:
+                        artifact_id:
+                          type: string
+                          format: uuid
+                        task_uid:
+                          type: string
+                          format: uuid
+                        version_id:
+                          type: string
+                          format: uuid
+                        score:
+                          type: number
+                        snippet:
+                          type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/sdlc/stats:
+    get:
+      tags: [read]
+      summary: Counts by stage, repo and month
+      operationId: stats
+      responses:
+        '200':
+          description: Aggregate counts over the sdlc schema
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  by_stage:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                  by_repo:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                  by_month:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                    description: Keys are YYYY-MM
+                  totals:
+                    type: object
+                    properties:
+                      tasks:
+                        type: integer
+                      artifacts:
+                        type: integer
+                      blobs:
+                        type: integer
+                      ledger_rows:
+                        type: integer
+                      open_asks:
+                        type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Write side: the LongHorizon-Harness web API bearer token. Read side:
+        the existing fleet-admin read key. Token values never appear in this
+        repository.
+  schemas:
+    LifecycleStage:
+      type: string
+      description: >-
+        The ledger's own ladder: QUEUED → RUNNING → GATED → BRANCHED → PUSHED
+        → PR → REVIEWED → MERGED → LANE → LIVE → VERIFIED on the main path;
+        HELD, BLOCKED, FAILED, SUPERSEDED off it.
+      enum:
+        - QUEUED
+        - RUNNING
+        - GATED
+        - BRANCHED
+        - PUSHED
+        - PR
+        - REVIEWED
+        - MERGED
+        - LANE
+        - LIVE
+        - VERIFIED
+        - HELD
+        - BLOCKED
+        - FAILED
+        - SUPERSEDED
+    ArtifactKind:
+      type: string
+      enum: [spec, queue_entry, handoff, plan, runbook, scratch, patch, evidence, run_dump, log, script]
+    LinkKind:
+      type: string
+      enum: [run, queue, pr, commit, gate, session, artifact]
+    TaskWrite:
+      type: object
+      required: [slug]
+      properties:
+        task_number:
+          type: integer
+          description: Nullable — numbers are reused; absent for unmapped early ids
+        slug:
+          type: string
+          maxLength: 256
+        title:
+          type: string
+        repo:
+          type: string
+          maxLength: 256
+        stage:
+          $ref: '#/components/schemas/LifecycleStage'
+        requested_by:
+          type: string
+          maxLength: 256
+    Task:
+      type: object
+      required: [task_uid, slug]
+      properties:
+        task_uid:
+          type: string
+          format: uuid
+        task_number:
+          type: [integer, 'null']
+        slug:
+          type: string
+        title:
+          type: string
+        repo:
+          type: string
+        stage:
+          $ref: '#/components/schemas/LifecycleStage'
+        requested_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    StageEvent:
+      type: object
+      required: [event_id, task_uid, stage, occurred_at]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        task_uid:
+          type: string
+          format: uuid
+        stage:
+          $ref: '#/components/schemas/LifecycleStage'
+        evidence_ref:
+          type: string
+          description: Run id, PR number, merge commit, report path — untyped by design
+        occurred_at:
+          type: string
+          format: date-time
+    Artifact:
+      type: object
+      required: [artifact_id, kind]
+      properties:
+        artifact_id:
+          type: string
+          format: uuid
+        task_uid:
+          type: [string, 'null']
+          format: uuid
+        kind:
+          $ref: '#/components/schemas/ArtifactKind'
+        title:
+          type: string
+        logical_path:
+          type: string
+    ArtifactVersion:
+      type: object
+      required: [version_id, artifact_id, blob_sha256, original_path]
+      properties:
+        version_id:
+          type: string
+          format: uuid
+        artifact_id:
+          type: string
+          format: uuid
+        blob_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        original_path:
+          type: string
+        written_at:
+          type: [string, 'null']
+          format: date-time
+        backup_suffix:
+          type: string
+    LedgerRow:
+      type: object
+      required: [session_ref, tick_number, occurred_at]
+      properties:
+        session_ref:
+          type: string
+          maxLength: 16
+        tick_number:
+          type: integer
+        occurred_at:
+          type: string
+          format: date-time
+        section:
+          type: string
+        body:
+          type: string
+          description: Post-redaction row text ([REDACTED:<kind>] placeholders)
+    OpenAsk:
+      type: object
+      required: [ask_id, question, state]
+      properties:
+        ask_id:
+          type: string
+          format: uuid
+        task_uid:
+          type: [string, 'null']
+          format: uuid
+        asked_by:
+          type: string
+        question:
+          type: string
+        state:
+          type: string
+        state_history:
+          type: array
+          items:
+            type: object
+            required: [state, at]
+            properties:
+              state:
+                type: string
+              at:
+                type: string
+                format: date-time
+        asked_at:
+          type: [string, 'null']
+          format: date-time
+        answered_at:
+          type: [string, 'null']
+          format: date-time
+        answer:
+          type: [string, 'null']
+    LinkWrite:
+      type: object
+      required: [task_uid, kind, target]
+      properties:
+        task_uid:
+          type: string
+          format: uuid
+        kind:
+          $ref: '#/components/schemas/LinkKind'
+        target:
+          type: string
+          maxLength: 1024
+          description: Run id, queue id (q-<hex>), PR number, commit sha, gate id or session ref
+        artifact_id:
+          type: string
+          format: uuid
+          description: Typed reference when kind is 'artifact'
+    Link:
+      allOf:
+        - $ref: '#/components/schemas/LinkWrite'
+        - type: object
+          required: [link_id]
+          properties:
+            link_id:
+              type: string
+              format: uuid
+            created_at:
+              type: string
+              format: date-time
+    ImportBatch:
+      type: object
+      required: [batch_id, source_host, started_at]
+      properties:
+        batch_id:
+          type: string
+          format: uuid
+        source_host:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+        counts:
+          type: object
+          description: Per-kind row counts
+          additionalProperties:
+            type: integer
+        redaction_report:
+          type: object
+          description: File/kind/count rollup — never a secret value
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        code:
+          type: integer
+        detail:
+          type: string
+  responses:
+    BadRequest:
+      description: Invalid request body or parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid bearer token / read key
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Referenced task, artifact or version does not exist
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    BadGateway:
+      description: >-
+        Read side only: the upstream dependency (Postgres agent-db or qdrant)
+        was unreachable — mirrors the `guarded()` behaviour of src/overseer.js
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: >-
+        Read side only: a required upstream is not configured — mirrors the
+        503 behaviour of src/overseer.js
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+security:
+  - bearerAuth: []
