@@ -28,7 +28,7 @@ SCOPE
     author association), label review:fallback, and if no review appears within 30 min, `gh api` request
     `copilot-pull-request-reviewer[bot]` as a reviewer. Count fallbacks in get_fleet_meta so subscription spend is
     visible. NEVER post @claude from a personal identity; NEVER on the first failure.
- 5. cloudflared: add the `/github/webhook` route to hydra.cognizioware.com (docker-compose.yml ingress) - the
+ 5. cloudflared: add the `/github/webhook` route to hydra.easybutt0n.ai (docker-compose.yml ingress) - the
     orchestrator restarts on deploy; the overseer chooses the window.
  6. Tests (orchestrator/tests): signature verify (good/bad/replayed), idempotent delivery, pending->conclusion flow
     against a harness stub, fallback fires only on the second cannot_review, PAT mode posts a status not a check.
