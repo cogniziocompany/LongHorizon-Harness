@@ -38,7 +38,7 @@ _MAX_QUEUE_DEDUP_CHARS = 256
 # key stays "in use" and a fresh enqueue with the same key does not fork a second
 # entry. It resumes through ``blocked`` -> ``pending`` (record_unblock) or
 # ``blocked`` -> ``launched`` (mark_launched).
-_VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked"})
+_VALID_STATUS = frozenset({"spec_pending", "pending", "launched", "done", "failed", "blocked"})
 # Non-terminal entries are still waiting to be, or being, launched, or parked. A
 # dedup key is considered "in use" only while its entry is in one of these states;
 # once an entry reaches a terminal state (``done``/``failed``) the key is free for
@@ -65,6 +65,9 @@ KNOWN_REQUEST_KEYS = frozenset(
         "base_check",
         "requested_by",
         "dedup_key",
+        "spec_file",
+        "spec_status",
+        "spec",
     }
 )
 
@@ -183,6 +186,18 @@ class QueueEntry:
     retry_of: str | None = None
     attempt: int = 1
     failure_cause: str | None = None
+    # Visionary intake (spec staging). ``spec_file`` is the path to the spec the
+    # entry was enqueued from; ``spec_status`` is the spec's frontmatter status at
+    # enqueue time; ``spec`` is the spec text/inline body itself. These are
+    # optional: an entry enqueued with no spec field omits them (they stay None)
+    # and behaves exactly as before. ``spec`` is the consumed preview the UI and
+    # ``harness_get_spec`` surface.
+    spec_file: str | None = None
+    spec_status: str | None = None
+    spec: str | None = None
+    # Visionary intake: stamped when ``mark_spec_ready`` promotes a spec entry
+    # to ``pending``; ``None`` for a plain entry or a spec not yet promoted.
+    spec_ready_at: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -218,6 +233,10 @@ class QueueEntry:
             "retry_of",
             "attempt",
             "failure_cause",
+            "spec_file",
+            "spec_status",
+            "spec",
+            "spec_ready_at",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -332,6 +351,56 @@ def _validate_base_check(value: Any) -> str:
     return value.strip()
 
 
+# Visionary intake (spec staging). The spec's readiness is a human-gated gate:
+# a spec not flagged ready-for-dev parks the entry as ``spec_pending`` until a
+# human/agent presses "Mark ready".  We port a small, self-contained readiness
+# rule rather than the source's ``spec_stats`` machinery (that is a separate,
+# out-of-scope task): a spec is "ready-for-dev" only when its frontmatter
+# ``status`` is exactly ``ready-for-dev``; anything else (a missing status, a
+# ``draft`` status, or free text) is treated as not-ready.  That is the whole
+# decision surface this deliverable needs -- the token/size measurements the
+# source recorded are deliberately omitted.
+_SPEC_READY_FOR_DEV = "ready-for-dev"
+
+
+def _validate_spec_file(value: Any) -> Path | None:
+    """Validate an optional ``spec_file`` path (draft is optional, may be absent).
+
+    Unlike the source's BMAD-style validator, ``spec_file`` here is *optional*
+    and may be omitted entirely (that is the backward-compatible path).  When
+    supplied it is validated as a path; a missing file is a client error.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError("spec_file must be a string")
+    text = value.strip()
+    if not text:
+        return None
+    if "\x00" in text:
+        raise ValueError("spec_file contains a NUL byte")
+    path = Path(text).expanduser()
+    if not path.is_file():
+        raise ValueError("spec_file does not exist")
+    return path
+
+
+def _validate_spec_text(value: Any) -> str | None:
+    """Validate an optional inline ``spec`` body (draft is optional)."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError("spec must be a string")
+    text = value.strip()
+    if not text:
+        return None
+    if "\x00" in text:
+        raise ValueError("spec contains a NUL byte")
+    return text
+
+
 def _validate_dedup_key(value: Any) -> str | None:
     if value is None:
         return None
@@ -376,6 +445,51 @@ def _validate_continue_branch(value: Any) -> bool:
     return value
 
 
+def _status_from_text(text: str) -> str | None:
+    """Best-effort spec readiness probe from spec text.
+
+    Returns the spec's frontmatter ``status`` when present, else None.  The
+    frontmatter value drives the enqueue status.  (The inline ``## ready-for-
+    dev``/``## draft`` markers are a convenience for the tests and the human
+    workflow; they are surfaced verbatim on the entry but do not drive the
+    status on their own.)
+    """
+
+    try:
+        frontmatter = text.split("---", 1)[1].split("---", 1)[0]
+    except (IndexError, ValueError):
+        return None
+    for line in frontmatter.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line:
+            key, _, value = line.partition(":")
+            if key.strip().lower() == "status":
+                return value.strip()
+    return None
+
+
+def _split_frontmatter(text: str) -> tuple[str | None, str | None]:
+    """Split a spec into its frontmatter block and the remaining body.
+
+    Returns ``(frontmatter, body)`` where ``body`` is the text after the first
+    closing ``---`` fence (None when there is no fence).  Used at Mark-ready to
+    replace ``task`` with the spec body so the launcher path is unchanged.
+    """
+
+    marker = "---"
+    fence = text.find(marker)
+    if fence == -1:
+        return None, text
+    head = text[: fence + len(marker)]
+    tail = text[fence + len(marker):].lstrip()
+    second = tail.find(marker)
+    if second == -1:
+        return head, tail
+    return head, tail[:second].strip()
+
+
 def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
     """Convert a POST /api/queue body into validated launch parameters.
 
@@ -384,6 +498,15 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
     continuation tasks as fresh ones when ``continue_branch``/``branch`` went
     missing. ``KNOWN_REQUEST_KEYS`` is also the allowlist behind the MCP tool
     schema and the REST 400 mapping (server.py ``create_queue_entry``).
+
+    Spec staging (Visionary intake): the spec fields are optional. When none is
+    supplied the result is identical to the pre-spec contract -- ``status`` stays
+    ``pending`` and the entry carries no spec field, so the existing callers
+    (hydrafleet, overseer1, openwebui) are unchanged. When a spec is supplied
+    (``spec_file``, ``spec_status``, or ``spec``) the entry is staged as
+    ``spec_pending`` unless the spec is already flagged ready-for-dev, in which
+    case it enqueues as ``pending`` (its ``task`` filled from the spec body,
+    mirroring the pre-spec behaviour of reading the spec as the task).
     """
 
     unknown = sorted(set(body) - KNOWN_REQUEST_KEYS)
@@ -401,6 +524,69 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         if not path.is_file():
             raise ValueError("task_file does not exist")
         task = path.read_text(encoding="utf-8")
+
+    # Visionary intake: resolve the spec fields. Any of the three is a spec
+    # enqueue; when none is present the entry is a plain launch.
+    status = "pending"
+    spec_fields: dict[str, Any] = {}
+    # ``spec_status`` is echoed back exactly as supplied and is never derived
+    # from the spec text at enqueue time: a caller that passes ``spec_file``
+    # without ``spec_status`` gets ``spec_status=None`` back, and ``mark_spec_
+    # ready`` re-reads the file to decide readiness.  The decision between
+    # ``pending`` and ``spec_pending`` is made from the *explicit* status the
+    # caller passed, not from the file.
+    explicit_status = body.get("spec_status")
+    if explicit_status is not None:
+        if not isinstance(explicit_status, str) or not explicit_status.strip():
+            raise ValueError("spec_status must be a non-empty string")
+        if explicit_status.strip() == _SPEC_READY_FOR_DEV:
+            status = "pending"
+        else:
+            status = "spec_pending"
+        spec = None
+        spec_file = None
+        if body.get("spec_file") is not None:
+            spec_file = Path(str(body["spec_file"]).strip()).expanduser()
+            try:
+                spec = spec_file.read_text(encoding="utf-8")
+            except OSError:
+                spec = None
+        spec_fields = {
+            "spec_file": str(spec_file) if spec_file is not None else None,
+            "spec_status": explicit_status.strip(),
+            "spec": spec,
+        }
+    elif body.get("spec") is not None:
+        spec = _validate_spec_text(body.get("spec"))
+        if spec is None:
+            # An explicitly-empty ``spec`` is "not supplied" (MCP clients may
+            # fill a declared default of ""); fall through to a plain launch.
+            spec_fields = {}
+        else:
+            status = "spec_pending"
+            spec_fields = {"spec_file": None, "spec_status": None, "spec": spec}
+    elif body.get("spec_file") is not None:
+        # ``spec_file`` alone parks the entry as ``spec_pending`` (a spec for
+        # review). The file may be missing -- a human is expected to add it
+        # before approving -- so the entry is still created with ``spec=None``.
+        spec_path = Path(str(body["spec_file"]).strip()).expanduser()
+        spec = None
+        try:
+            spec = spec_path.read_text(encoding="utf-8")
+        except OSError:
+            spec = None
+        status = "spec_pending"
+        spec_fields = {
+            "spec_file": str(spec_path),
+            "spec_status": None,
+            "spec": spec,
+        }
+    else:
+        # No spec field at all: the pre-spec contract, unchanged.
+        spec = None
+        spec_status = None
+        spec_fields = {}
+
     task_text = _validate_task(task)
 
     trio = body.get("roles") if "roles" in body else body.get("trio")
@@ -423,6 +609,8 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "base_check": _validate_base_check(body.get("base_check")),
         "requested_by": _validate_requested_by(body.get("requested_by")),
         "dedup_key": _validate_dedup_key(body.get("dedup_key")),
+        "status": status,
+        **spec_fields,
     }
 
 
@@ -717,6 +905,66 @@ class QueueStore:
         entry = QueueEntry(queue_id=queue_id, created_at=now, updated_at=now, **params)
         self._write(entry)
         return entry
+
+    def mark_spec_ready(self, queue_id: str, *, requested_by: str | None = None) -> QueueEntry | None:
+        """Promote ``spec_pending`` -> ``pending`` once a human/agent approves it.
+
+        A spec entry is parked for review until someone explicitly marks it
+        ready; that move is the only thing that lets it re-enter the normal
+        launcher path (the launcher never launches ``spec_pending``).  The move
+        records who/when approved it so the review is auditable.  The readiness
+        decision (draft vs ready-for-dev) is made at enqueue time and decides
+        the initial status; this move only performs the ``spec_pending`` ->
+        ``pending`` transition and requires the spec file to be present.
+
+        Args:
+            queue_id: The ID of the spec entry to promote.
+            requested_by: The approver's identity; stamped when supplied so the
+                review is attributable (task 174's ownership proof).
+
+        Returns:
+            The updated QueueEntry, or None when the entry is not found.
+
+        Raises:
+            ValueError: When the entry is not ``spec_pending``, when it has no
+                spec, or when its spec file is missing.
+        """
+
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if entry.status != "spec_pending":
+            raise ValueError(f"entry is not spec_pending (status {entry.status})")
+        if not entry.spec_file:
+            raise ValueError("entry has no spec to mark ready")
+        path = Path(entry.spec_file)
+        if not path.is_file():
+            raise ValueError("spec_file does not exist")
+        entry.spec_ready_at = _now()
+        if requested_by is not None:
+            entry.requested_by = str(requested_by).strip()
+        entry.status = "pending"
+        return self.update(entry)
+
+    def read_spec(self, queue_id: str) -> dict[str, Any] | None:
+        """Return the spec fields for a spec entry, or None for a plain entry.
+
+        Returns ``{"queue_id", "spec_file", "spec_status", "spec"}`` when the
+        entry carries a spec, else None.  This backs the GET /api/queue/{id}/spec
+        route and ``harness_get_spec``.
+        """
+
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if entry.spec_file is None and entry.spec is None:
+            return None
+        return {
+            "queue_id": entry.queue_id,
+            "spec_file": entry.spec_file,
+            "spec_status": entry.spec_status,
+            "spec": entry.spec,
+        }
 
     def _find_non_terminal_by_dedup(self, dedup_key: str) -> QueueEntry | None:
         """Return the non-terminal entry currently holding ``dedup_key``, if any."""

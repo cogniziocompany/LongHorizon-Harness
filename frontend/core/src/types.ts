@@ -154,3 +154,38 @@ export interface ArtifactList {
   round_index: number;
   artifacts: string[];
 }
+
+/** One durable task waiting to be launched by the service (Visionary intake). */
+export interface QueueEntry {
+  queue_id: string;
+  name: string;
+  task: string;
+  workspace: string;
+  max_rounds: number;
+  trio: string;
+  priority: number;
+  requested_by: string;
+  branch: string;
+  continue_branch: boolean;
+  base_check: string;
+  status: string;
+  run_id: string | null;
+  reason: string | null;
+  skip_reasons: string[];
+  created_at: number;
+  updated_at: number;
+  launched_at: number | null;
+  last_checked_at: number | null;
+  dedup_key: string | null;
+  retry_of: string | null;
+  attempt: number;
+  failure_cause: string | null;
+  /** Visionary intake: the spec file the entry was enqueued from. */
+  spec_file: string | null;
+  /** Visionary intake: the spec's frontmatter status captured at enqueue time. */
+  spec_status: string | null;
+  /** Visionary intake: the spec text/inline body itself (the consumed preview). */
+  spec: string | null;
+  /** Visionary intake: stamped when ``mark_spec_ready`` promotes a spec entry. */
+  spec_ready_at: number | null;
+}

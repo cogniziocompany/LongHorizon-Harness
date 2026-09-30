@@ -67,6 +67,8 @@ def test_mcp_fleet_tools_manifest(client_fixture: Any = None) -> None:
         assert names == {
             "harness_enqueue_task",
             "harness_list_queue",
+            "harness_get_spec",
+            "harness_mark_spec_ready",
             "harness_run_status",
             "harness_resolve_gate",
             "harness_list_contentions",
