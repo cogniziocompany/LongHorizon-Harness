@@ -408,7 +408,7 @@ def _is_no_blocking_acceptance(text: str) -> bool:
 
 
 def _parse_status_control_header(text: str) -> str | None:
-    lines = _first_nonempty_lines(text, 1)
+    lines = _control_header_lines(text)[:1]
     if not lines:
         return None
     match = _STATUS_CONTROL_LINE_RE.match(lines[0])
@@ -423,7 +423,7 @@ def _parse_status_control_header(text: str) -> str | None:
 
 
 def _parse_integrity_control_header(text: str) -> str | None:
-    lines = _first_nonempty_lines(text, 2)
+    lines = _control_header_lines(text)[:2]
     if len(lines) < 2:
         return None
     match = _INTEGRITY_CONTROL_LINE_RE.match(lines[1])
@@ -433,7 +433,7 @@ def _parse_integrity_control_header(text: str) -> str | None:
 
 
 def _parse_contract_audit_control_header(text: str) -> str | None:
-    lines = _first_nonempty_lines(text, 3)
+    lines = _control_header_lines(text)[:3]
     if len(lines) < 3:
         return None
     match = _CONTRACT_AUDIT_CONTROL_LINE_RE.match(lines[2])
@@ -706,6 +706,25 @@ def _first_nonempty_lines(text: str, count: int) -> list[str]:
         if len(lines) >= count:
             break
     return lines
+
+
+_CONTROL_SCAN_LINES = 8
+
+
+def _normalize_control_line(line: str) -> str:
+    # Local models wrap labels and values in markdown (**Status:** complete, `clean`).
+    # Only * and ` are stripped: underscores are part of values such as needs_revision.
+    return re.sub(r"[*`]", "", line).strip()
+
+
+def _control_header_lines(text: str) -> list[str]:
+    """The three control lines. Normally the first three non-empty lines; tolerate up to
+    _CONTROL_SCAN_LINES - 3 preamble lines (e.g. "Here is my audit.") before the Status line."""
+    lines = [_normalize_control_line(item) for item in _first_nonempty_lines(text, _CONTROL_SCAN_LINES)]
+    for index, line in enumerate(lines):
+        if _STATUS_CONTROL_LINE_RE.match(line):
+            return lines[index : index + 3]
+    return lines[:3]
 
 
 def _strip_heading(line: str) -> str:
