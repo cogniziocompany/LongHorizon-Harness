@@ -1434,13 +1434,24 @@ def create_app(
         entries = queue_store.list()
         # The status set is canonical in queue.py; a "blocked" entry (the PC
         # queue's fifth state) is surfaced as its own group, not a failure.
-        valid_statuses = {"pending", "launched", "done", "failed", "blocked"}
+        # "spec_pending" is the sixth state (Visionary intake): a spec awaiting
+        # a human-gated "Mark ready" approval.  It is surfaced as its own group
+        # and is never counted as a launchable "pending" entry.
+        valid_statuses = {
+            "spec_pending",
+            "pending",
+            "launched",
+            "done",
+            "failed",
+            "blocked",
+        }
         filtered = entries
         if status is not None:
             if status not in valid_statuses:
                 raise HTTPException(status_code=422, detail=f"status must be one of: {', '.join(sorted(valid_statuses))}")
             filtered = [item for item in entries if item.status == status]
         groups: dict[str, list[dict[str, Any]]] = {
+            "spec_pending": [],
             "pending": [],
             "launched": [],
             "done": [],
@@ -1478,6 +1489,40 @@ def create_app(
         removed = queue_store.delete(queue_id)
         if removed is None:
             raise HTTPException(status_code=404, detail="queue entry not found")
+        return {"ok": True, "queue_id": queue_id, "status": "deleted"}
+
+    @app.get("/api/queue/{queue_id}/spec")
+    def get_queue_spec(queue_id: str, request: Request) -> dict[str, Any]:
+        """Return the spec fields for a spec entry (Visionary intake).
+
+        Inherited bearer-token boundary; the entry must carry a spec to return
+        anything.  ``spec_pending`` entries are the usual case.
+        """
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        _scoped_caller(request, "harness_list_queue")
+        data = queue_store.read_spec(queue_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="entry has no spec")
+        return {"ok": True, **data}
+
+    @app.post("/api/queue/{queue_id}/spec")
+    def mark_queue_spec_ready(queue_id: str, body: dict[str, Any] = Body(default_factory=dict), request: Request = None) -> dict[str, Any]:
+        """Promote a ``spec_pending`` entry to ``pending`` (Visionary intake).
+
+        A human/agent approves the spec for launch; this records who/when and
+        re-enters the normal launcher path.  Inherited bearer-token boundary.
+        """
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        _scoped_caller(request, "harness_list_queue")
+        requested_by = body.get("requested_by")
+        if requested_by is not None and not isinstance(requested_by, str):
+            raise HTTPException(status_code=422, detail="requested_by must be a string")
+        updated = queue_store.mark_spec_ready(queue_id, requested_by=str(requested_by).strip() if requested_by else None)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="entry not found")
+        return {"ok": True, "queue_id": queue_id, "status": updated.status}
         return {"ok": True, "queue_id": queue_id, "status": "deleted"}
 
     @app.get("/api/mcp/fleet/tools")

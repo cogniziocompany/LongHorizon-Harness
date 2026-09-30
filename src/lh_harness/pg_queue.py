@@ -49,6 +49,12 @@ _COLUMN_UPDATED_AT = "updated_at"
 _COLUMN_LAUNCHED_AT = "launched_at"
 _COLUMN_LAST_CHECKED_AT = "last_checked_at"
 _COLUMN_DEDUP_KEY = "dedup_key"
+# Visionary intake (spec staging): ``spec_file``/``spec_status``/``spec`` mirror
+# the same three optional QueueEntry fields (queue.py).  They are optional: a
+# plain entry omits them.  The status enum already covers ``spec_pending``.
+_COLUMN_SPEC_FILE = "spec_file"
+_COLUMN_SPEC_STATUS = "spec_status"
+_COLUMN_SPEC = "spec"
 # ``retry_of``/``attempt``/``failure_cause`` stay outside the column set: the
 # requeue feature is out of scope for task 233 and the file store's successor
 # round-trip already matches on the caller-facing fields (branch,
@@ -74,6 +80,9 @@ _QUEUE_COLUMNS = (
     _COLUMN_LAUNCHED_AT,
     _COLUMN_LAST_CHECKED_AT,
     _COLUMN_DEDUP_KEY,
+    _COLUMN_SPEC_FILE,
+    _COLUMN_SPEC_STATUS,
+    _COLUMN_SPEC,
 )
 
 
@@ -238,6 +247,9 @@ class PgQueueStore:
             None,
             None,
             dedup_key,
+            params.get("spec_file"),
+            params.get("spec_status"),
+            params.get("spec"),
         ]
         if dedup_key:
             existing = self._find_non_terminal_by_dedup(dedup_key)
@@ -264,6 +276,63 @@ class PgQueueStore:
                 "skip_reasons": [],
             }
         )
+
+    def mark_spec_ready(self, queue_id: str, *, requested_by: str | None = None) -> QueueEntry | None:
+        """Promote ``spec_pending`` -> ``pending`` once a human/agent approves it.
+
+        Mirrors the file store's contract (see ``QueueStore.mark_spec_ready``):
+        the entry must be ``spec_pending``, carry a spec file, and the spec must
+        now be ``ready-for-dev``.  The move records who/when approved it so the
+        review is auditable, then re-enters the normal launcher path.
+        """
+
+        from .queue import _SPEC_READY_FOR_DEV, _split_frontmatter, _status_from_text, _validate_task
+
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if entry.status != "spec_pending":
+            raise ValueError(f"entry is not spec_pending (status {entry.status})")
+        if not entry.spec_file:
+            raise ValueError("entry has no spec to mark ready")
+        path = Path(entry.spec_file)
+        if not path.is_file():
+            raise ValueError("spec_file does not exist")
+        text = path.read_text(encoding="utf-8")
+        status = _status_from_text(text)
+        if status != _SPEC_READY_FOR_DEV:
+            raise ValueError(
+                f"spec status is {status or 'missing'!r}; set frontmatter status: {_SPEC_READY_FOR_DEV}"
+            )
+        _, body = _split_frontmatter(text)
+        if not body:
+            raise ValueError("spec has no body to launch")
+        entry.task = _validate_task(body)
+        entry.spec_status = status
+        entry.spec = body
+        entry.spec_ready_at = time.time()
+        if requested_by is not None:
+            entry.requested_by = str(requested_by).strip()
+        entry.status = "pending"
+        return self.update(entry)
+
+    def read_spec(self, queue_id: str) -> dict[str, Any] | None:
+        """Return the spec fields for a spec entry, or None for a plain entry.
+
+        Mirrors the file store's ``read_spec``.
+        """
+
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if entry.spec_file is None and entry.spec is None:
+            return None
+        return {
+            "queue_id": entry.queue_id,
+            "spec_file": entry.spec_file,
+            "spec_status": entry.spec_status,
+            "spec": entry.spec,
+        }
 
     def _find_non_terminal_by_dedup(self, dedup_key: str) -> QueueEntry | None:
         """Return the non-terminal entry currently holding ``dedup_key``, if any.
@@ -370,6 +439,9 @@ class PgQueueStore:
             entry.launched_at,
             entry.last_checked_at,
             entry.dedup_key,
+            entry.spec_file,
+            entry.spec_status,
+            entry.spec,
         ]
         try:
             with self._txn() as txn:
@@ -575,6 +647,9 @@ class PgQueueStore:
                     successor.launched_at,
                     successor.last_checked_at,
                     successor.dedup_key,
+                    None,
+                    None,
+                    None,
                 ]
                 txn.execute(
                     "INSERT INTO harness.queue (" + ", ".join(_QUEUE_COLUMNS) + ") VALUES (" + ", ".join(["%s"] * len(_QUEUE_COLUMNS)) + ")",
