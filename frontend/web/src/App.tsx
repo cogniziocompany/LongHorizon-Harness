@@ -75,7 +75,22 @@ import { uiText, useUiLanguage, type UiLanguage } from './i18n';
 type DetailsTab = 'artifacts' | 'trajectory' | 'events';
 type MessageKind = 'user' | 'plan' | 'assistant' | 'verification' | 'final' | 'live';
 
+// Deep links (hydra's get_run_deep_link) open /runs/<id> or /runs/<id>/gates/<approvalId>.
+const RUN_PATH = /^\/runs\/([^/]+)/;
+
+function runIdFromPath(): string {
+  const match = RUN_PATH.exec(window.location.pathname);
+  if (!match) return '';
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return '';
+  }
+}
+
 function readRunId(): string {
+  const fromPath = runIdFromPath();
+  if (fromPath) return fromPath;
   try {
     return window.localStorage.getItem('lh-run-id') || '';
   } catch {
@@ -84,6 +99,11 @@ function readRunId(): string {
 }
 
 function rememberRunId(value: string): void {
+  // Keep the address bar on the selected run so it can be copied and shared.
+  const path = value ? `/runs/${encodeURIComponent(value)}` : '/';
+  if (window.location.pathname !== path) {
+    window.history.replaceState(null, '', path + window.location.search + window.location.hash);
+  }
   try {
     if (value) window.localStorage.setItem('lh-run-id', value);
     else window.localStorage.removeItem('lh-run-id');

@@ -22,7 +22,7 @@ from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 
@@ -2295,6 +2295,16 @@ def create_app(
         # which browsers reject for module scripts when nosniff is enabled.
         for suffix, media_type in _DASHBOARD_MIME_TYPES.items():
             mimetypes.add_type(media_type, suffix)
+        index_html = _STATIC_DIR / "index.html"
+
+        # Run deep links (/runs/<id>, /runs/<id>/gates/<approvalId>, built by hydra's
+        # get_run_deep_link) are Workbench pages: serve the app shell, which opens the
+        # run named in the path.  Registered before the static mount so it wins.
+        @app.get("/runs/{run_id}", include_in_schema=False)
+        @app.get("/runs/{run_id}/{rest:path}", include_in_schema=False)
+        def _run_page(run_id: str, rest: str = "") -> FileResponse:
+            return FileResponse(index_html, media_type="text/html")
+
         app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="dashboard-static")
     return app
 

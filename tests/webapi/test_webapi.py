@@ -279,6 +279,24 @@ def test_dashboard_javascript_asset_has_valid_mime_type_on_bad_platform_mapping(
     assert response.headers["x-content-type-options"] == "nosniff"
 
 
+def test_run_deep_links_serve_the_workbench_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    static_dir = tmp_path / "dist"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text('<div id="root"></div>', encoding="utf-8")
+    monkeypatch.setattr("lh_harness.webapi.server._STATIC_DIR", static_dir)
+    client = TestClient(create_app(state=DashboardState(tmp_path / "logs")))
+
+    for path in ("/runs/20260930T222550Z_4db9e297", "/runs/run-1/gates/appr-1"):
+        page = client.get(path)
+        assert page.status_code == 200, path
+        assert page.headers["content-type"].startswith("text/html")
+        assert '<div id="root"></div>' in page.text
+    # The JSON API is untouched by the page route.
+    assert client.get("/api/runs/does-not-exist/snapshot").status_code == 404
+
+
 @pytest.mark.skipif(
     not _STATIC_DIR.is_dir(),
     reason="web bundle not built; run `npm run build --prefix frontend/web`",
