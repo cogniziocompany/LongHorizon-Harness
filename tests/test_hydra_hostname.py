@@ -11,7 +11,11 @@ import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-OLD_HOST = "hydra.cognizioware.com"
+# The needle is assembled from fragments on purpose: the contiguous literal
+# must never appear in tracked files outside docs/handoffs/, and this guard
+# file is part of that set — a hardcoded needle would make the test fail on
+# its own source.
+OLD_HOST = "hydra." + "cognizioware" + ".com"
 NEW_HOST = "hydra.easybutt0n.ai"
 
 
