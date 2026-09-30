@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS harness.queue (
     launched_at    DOUBLE PRECISION,
     last_checked_at DOUBLE PRECISION,
     dedup_key      VARCHAR(256),
+    -- Visionary intake (spec staging).  Mirrors the optional QueueEntry spec
+    -- fields; all three are NULL for a plain (non-spec) entry.
+    spec_file     VARCHAR(1024),
+    spec_status   VARCHAR(32),
+    spec          TEXT,
     PRIMARY KEY (queue_id)
 );
 

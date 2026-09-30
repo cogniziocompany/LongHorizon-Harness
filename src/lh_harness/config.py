@@ -67,6 +67,8 @@ _MCP_TOOL_NAMES = frozenset(
     {
         "harness_enqueue_task",
         "harness_list_queue",
+        "harness_get_spec",
+        "harness_mark_spec_ready",
         "harness_run_status",
         "harness_resolve_gate",
         "harness_list_contentions",

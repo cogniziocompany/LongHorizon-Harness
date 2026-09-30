@@ -97,7 +97,26 @@ Rules:
 _LIST_QUEUE_DESCRIPTION = """List harness queue entries and their statuses.
 
 Returns pending, launched, done, and failed entries with counts and skip
-reasons. Hydra and chat clients can use this to show the current backlog.
+reasons. A spec_pending entry (Visionary intake) is parked for a human-gated
+"Mark ready" approval and is not launched or counted against capacity until a
+human/agent promotes it. Hydra and chat clients can use this to show the
+current backlog.
+"""
+
+_GET_SPEC_DESCRIPTION = """Return the spec fields for a Visionary-intake entry.
+
+Reads the spec (path, status, and text) for the entry identified by queue_id.
+Use it to preview a spec_pending entry before approving it. queue_id is the
+queue id returned by harness_enqueue_task or harness_list_queue.
+"""
+
+_MARK_SPEC_READY_DESCRIPTION = """Approve a spec_pending entry for launch.
+
+Promotes a spec_pending entry (Visionary intake) to pending so the launcher
+can run it. The spec must now be ready-for-dev: the spec file's frontmatter
+status must be exactly "ready-for-dev". The approval records who and when,
+then re-enters the normal launcher path. queue_id is the queue id returned by
+harness_enqueue_task or harness_list_queue.
 """
 
 _RUN_STATUS_DESCRIPTION = """Return the current status of a harness run.
@@ -274,7 +293,23 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
             "harness_list_queue",
             _LIST_QUEUE_DESCRIPTION,
             {
-                "status": _string_param("Filter by status: pending, launched, done, failed.", required=False),
+                "status": _string_param(
+                    "Filter by status: spec_pending, pending, launched, done, failed.", required=False
+                ),
+            },
+        ),
+        _tool_spec(
+            "harness_get_spec",
+            _GET_SPEC_DESCRIPTION,
+            {
+                "queue_id": _string_param("Queue entry whose spec to read.", required=True),
+            },
+        ),
+        _tool_spec(
+            "harness_mark_spec_ready",
+            _MARK_SPEC_READY_DESCRIPTION,
+            {
+                "queue_id": _string_param("Queue entry whose spec is now ready-for-dev.", required=True),
             },
         ),
         _tool_spec(
@@ -441,6 +476,10 @@ def dispatch(
             return _enqueue(arguments, queue_store=queue_store, caller=None)
         if tool_name == "harness_list_queue":
             return _list_queue(arguments, queue_store=queue_store)
+        if tool_name == "harness_get_spec":
+            return _get_spec(arguments, queue_store=queue_store)
+        if tool_name == "harness_mark_spec_ready":
+            return _mark_spec_ready(arguments, queue_store=queue_store)
         if tool_name == "harness_run_status":
             return _run_status(arguments, registry=registry, supervisor=supervisor)
         if tool_name == "harness_resolve_gate":
@@ -480,6 +519,10 @@ def dispatch(
         )
     if tool_name == "harness_list_queue":
         return _list_queue(arguments, queue_store=queue_store)
+    if tool_name == "harness_get_spec":
+        return _get_spec(arguments, queue_store=queue_store)
+    if tool_name == "harness_mark_spec_ready":
+        return _mark_spec_ready(arguments, queue_store=queue_store)
     if tool_name == "harness_run_status":
         return _run_status(arguments, registry=registry, supervisor=supervisor)
     if tool_name == "harness_resolve_gate":
@@ -659,6 +702,26 @@ def _list_queue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any
     if contentions:
         result["contentions"] = contentions
     return result
+
+
+def _get_spec(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any]:
+    if queue_store is None:
+        return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
+    queue_id = _bounded(arguments.get("queue_id"), field="queue_id", max_chars=128, required=True)
+    data = queue_store.read_spec(queue_id)
+    if data is None:
+        return {"ok": False, "error": "queue entry has no spec", "code": 404}
+    return {"ok": True, **data}
+
+
+def _mark_spec_ready(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any]:
+    if queue_store is None:
+        return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
+    queue_id = _bounded(arguments.get("queue_id"), field="queue_id", max_chars=128, required=True)
+    entry = queue_store.mark_spec_ready(queue_id)
+    if entry is None:
+        return {"ok": False, "error": "queue entry not found", "code": 404}
+    return {"ok": True, "queue_id": queue_id, "status": entry.status}
 
 
 def _run_status(arguments: dict[str, Any], *, registry: Any, supervisor: Any) -> dict[str, Any]:

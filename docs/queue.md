@@ -256,6 +256,10 @@ visible to any caller with the bearer token through `GET /api/queue`.
 | `launched_at` | `float \| None` | `None` | epoch seconds; set at launch | Store, via `mark_launched` (`queue.py:438`) |
 | `last_checked_at` | `float \| None` | `None` | epoch seconds; stamped when the launcher evaluates the entry | Launcher (`launcher.py:206`, `:350`, `:365`) — never set by the store or the API |
 | `dedup_key` | `str \| None` | `None` | see *Idempotent enqueue* below | Caller, at enqueue |
+| `spec_file` | `str \| None` | `None` | path to the spec the entry was enqueued from (Visionary intake); validated at enqueue, never caller-supplied as a path | Store, at `create` when `spec_file` is enqueued |
+| `spec_status` | `str \| None` | `None` | the spec's frontmatter status at enqueue time (Visionary intake) | Store, at `create` when `spec_status` is enqueued |
+| `spec` | `str \| None` | `None` | the spec text/inline body (Visionary intake) | Store, at `create` when `spec` is enqueued |
+| `spec_ready_at` | `float \| None` | `None` | epoch seconds when a spec entry was promoted to `pending` via `mark_spec_ready` (Visionary intake) | Store, via `mark_spec_ready` |
 | `retry_of` | `str \| None` | `None` | queue_id of the failed entry this is a retry of | Store, via `requeue` |
 | `attempt` | `int` | `1` | attempt number (1 for original entry) | Store, via `requeue` |
 | `failure_cause` | `str \| None` | `None` | cause of failure that triggered retry | Store, via `mark_failed` / `requeue` |
@@ -327,6 +331,59 @@ single-orchestrator guarantee against that window is the **launcher lease**
 proposed as **new work** in the migration plan (§4; explicitly `NEW WORK`, and
 it collides with task 48). The guarantee today is "harmless via idempotency"
 (this commit), not "impossible via lease."
+
+## Visionary intake (spec staging)
+
+A spec written in the cognizioware repo is enqueued through the **existing**
+enqueue path — `POST /api/queue` → `QueueStore.create` — and lands as
+`spec_pending`. It is never launched or counted against capacity until a human
+or agent approves it.
+
+### Status
+
+`spec_pending` is a new entry status added to `_VALID_STATUS`
+(`queue.py:28`) and ordered **before** `pending`:
+
+```
+spec_pending, pending, launched, done, failed, blocked
+```
+
+An entry in `spec_pending` is parked for review: the launcher's eligibility gate
+(`launcher.py:487`) skips it because it is not `pending`, so it is never
+launched and never counted against capacity. A plain `pending` entry is the
+only thing the launcher promotes.
+
+### Enqueue behavior
+
+Any of the three optional spec fields — `spec_file`, `spec_status`, or `spec`
+— marks the enqueue as spec-bearing:
+
+- **No spec field at all** → the entry enqueues as `pending` exactly as before.
+  The pre-spec callers (hydrafleet, overseer1, openwebui) are unchanged: the
+  result set is identical and no spec field is persisted.
+- **`spec_status="draft"` (or any status other than `ready-for-dev`)** → the
+  entry lands as `spec_pending` with `spec_status` recorded.
+- **`spec_status="ready-for-dev"`** → the entry enqueues as `pending` (its
+  `task` is filled from the spec body) — the spec was already approved.
+- **`spec_file`** (a path to the spec) → read and parsed at enqueue time; the
+  entry is `spec_pending` unless the spec's frontmatter status is
+  `ready-for-dev`.
+- **`spec`** (inline spec text) → the entry is `spec_pending` unless the inline
+  status is `ready-for-dev`.
+
+A spec is "ready-for-dev" only when its frontmatter `status` is exactly
+`ready-for-dev`; a missing status, a `draft` status, or free text is treated as
+not-ready. The token/size measurements a predecessor design recorded are
+deliberately omitted — readiness is a human-gated gate, not a capacity
+measurement.
+
+### Mark ready
+
+`mark_spec_ready(queue_id)` (store method; `POST /api/queue/{id}/spec` and the
+`harness_mark_spec_ready` MCP tool) promotes `spec_pending` → `pending` and
+records who/when (`spec_ready_at`, and the approver's `requested_by`). The move
+only succeeds when the spec is now `ready-for-dev`; otherwise it raises
+`ValueError`. After the promotion the normal launcher path is unchanged.
 
 ## Enqueue and result behavior
 

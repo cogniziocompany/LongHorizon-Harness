@@ -486,6 +486,9 @@ class Launcher:
         # must not count toward it.
         eligible_seen = False
         for entry in entries:
+            # spec_pending entries are human-gated: the launcher never launches
+            # them and never counts them against capacity.  Only a plain,
+            # review-approved `pending` entry is eligible here.
             if entry.status != "pending":
                 continue
             if launched:
