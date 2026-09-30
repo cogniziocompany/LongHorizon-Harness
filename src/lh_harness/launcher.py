@@ -128,6 +128,12 @@ class Launcher:
         capacities = self._remaining_capacity(active)
         launched = False
         for entry in entries:
+            if entry.status == "spec_pending":
+                # Spec staging gate: the spec is still a draft. Record why so
+                # GET /api/queue shows it; never launch from a draft spec.
+                if not entry.skip_reasons or entry.skip_reasons[-1] != "spec not ready":
+                    self._skip(entry, "spec not ready")
+                continue
             if entry.status != "pending":
                 continue
             if launched:

@@ -600,6 +600,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Maximum characters for role history (default: 100000)",
     )
+    run_parser.add_argument(
+        "--task-text-warn-chars",
+        type=_positive_int,
+        default=None,
+        help="Task text size above which a warning is emitted (default: 8000)",
+    )
 
     run_parser.add_argument(
         "--dashboard",
@@ -1677,7 +1683,12 @@ def _run_command(args: argparse.Namespace) -> int:
     except ProjectConfigError:
         cap_run_defaults = {}
     context_cap_defaults: dict[str, int] = {}
-    for cap_name in ("auditor_output_chars", "role_verified_context_chars", "role_history_chars"):
+    for cap_name in (
+        "auditor_output_chars",
+        "role_verified_context_chars",
+        "role_history_chars",
+        "task_text_warn_chars",
+    ):
         raw_cap = cap_run_defaults.get(cap_name)
         if raw_cap is None:
             continue
@@ -1711,6 +1722,8 @@ def _run_command(args: argparse.Namespace) -> int:
         config.role_verified_context_chars = args.role_verified_context_chars
     if args.role_history_chars is not None:
         config.role_history_chars = args.role_history_chars
+    if args.task_text_warn_chars is not None:
+        config.task_text_warn_chars = args.task_text_warn_chars
     env = _build_env(args.env, tmp_dir=str(run_dir / "tmp"))
 
     # The dashboard starts before agent creation so startup status is visible.

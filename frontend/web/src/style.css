@@ -569,3 +569,35 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .codex-workbench .ui-language-switch button:hover { color: #4d5351; background: #eceeed; }
 .codex-workbench .ui-language-switch button.active { color: #27614f; background: #fff; box-shadow: 0 1px 3px rgba(30, 34, 32, .12); }
 .codex-workbench .ui-language-switch button:focus-visible { outline: 2px solid rgba(47, 111, 91, .35); outline-offset: 1px; }
+
+/* Queue panel (sidebar) and spec preview dialog. */
+.queue-panel { display: flex; flex-direction: column; min-height: 0; margin-top: 18px; }
+.queue-range { padding: 0 10px 6px; color: #a0a1a3; font-size: 9px; }
+.queue-muted { color: #a0a1a3; }
+.queue-error { color: #a74e4e; overflow-wrap: anywhere; }
+.queue-list { display: grid; gap: 6px; max-height: 32vh; overflow-y: auto; }
+.queue-group-title { display: flex; justify-content: space-between; padding: 4px 10px 2px; color: #8d8f92; font-size: 9px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
+.queue-group-title span { color: #b0b1b3; font-weight: 500; }
+.queue-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; width: 100%; padding: 7px 9px; border: 0; border-radius: 7px; color: #525457; background: transparent; text-align: left; cursor: pointer; }
+.queue-row:hover, .queue-row.selected { color: #26282b; background: #eef0f0; }
+.queue-copy { min-width: 0; display: grid; gap: 2px; }
+.queue-copy strong { overflow: hidden; font-size: 11px; font-weight: 500; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+.queue-copy small { overflow: hidden; color: #8d8f92; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.queue-badge { padding: 2px 5px; border: 1px solid #d7d8da; border-radius: 5px; color: #7c7e81; background: #fff; font-size: 8px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase; white-space: nowrap; }
+.queue-badge.phase-active { border-color: #dfb23d; color: #bd8500; background: #fffbef; }
+.queue-badge.phase-done { border-color: #9bc3b0; color: #3f8d73; background: #f2faf6; }
+.queue-badge.phase-failed { border-color: #e1a0a0; color: #c85a5a; background: #fff7f7; }
+.queue-badge.phase-waiting { border-color: #e1c18e; color: #a16f20; background: #fff9ef; }
+.queue-size { display: inline-flex; align-items: center; gap: 4px; color: #8d8f92; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.queue-size em { padding: 1px 4px; border-radius: 4px; color: #7c7e81; background: #f0f1f2; font-style: normal; font-size: 8px; }
+.queue-size-flagged { color: #b85f2e; }
+.queue-size-flagged svg { color: #c85a5a; }
+.queue-dialog { width: min(720px, 100%); max-height: 88vh; display: flex; flex-direction: column; }
+.queue-dialog-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 12px 0 8px; color: #75787b; font-size: 11px; }
+.queue-dialog-meta > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-notice { width: auto; margin: 0 0 10px; }
+.queue-spec-body { min-height: 0; flex: 1; overflow: auto; border: 1px solid #e7e7e8; border-radius: 8px; background: #fafafa; }
+.queue-spec-body pre { margin: 0; padding: 12px; color: #3c3e40; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.queue-spec-body .auth-dialog-copy { margin: 12px; }
+.queue-dialog-status { flex: 1; overflow: hidden; color: #a0a1a3; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.auth-dialog-actions button:disabled { opacity: .5; cursor: not-allowed; }

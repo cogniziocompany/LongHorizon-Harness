@@ -42,6 +42,21 @@ Returns pending, launched, done, and failed entries with counts and skip
 reasons. Hydra and chat clients can use this to show the current backlog.
 """
 
+_GET_SPEC_DESCRIPTION = """Read a queue entry's staged spec.
+
+Returns the spec body, frontmatter, its measured size (chars, estimated
+tokens), and whether it falls inside the expected size range learned from
+previously finished specs. Entries created with spec_file start as
+spec_pending and are not launched until the spec is marked ready.
+"""
+
+_MARK_SPEC_READY_DESCRIPTION = """Promote a spec_pending entry to pending.
+
+The spec file's frontmatter must say status: ready-for-dev. The spec body
+replaces the entry's task text and its size is recorded into the expected
+range. Returns 409-style errors when the spec is still a draft.
+"""
+
 _RUN_STATUS_DESCRIPTION = """Return the current status of a harness run.
 
 Use the run_id returned by harness_enqueue_task / harness_list_queue.
@@ -107,7 +122,21 @@ def tools_manifest() -> list[dict[str, Any]]:
             "harness_list_queue",
             _LIST_QUEUE_DESCRIPTION,
             {
-                "status": _string_param("Filter by status: pending, launched, done, failed.", required=False),
+                "status": _string_param("Filter by status: spec_pending, pending, launched, done, failed.", required=False),
+            },
+        ),
+        _tool_spec(
+            "harness_get_spec",
+            _GET_SPEC_DESCRIPTION,
+            {
+                "queue_id": _string_param("Queue entry whose spec to read.", required=True),
+            },
+        ),
+        _tool_spec(
+            "harness_mark_spec_ready",
+            _MARK_SPEC_READY_DESCRIPTION,
+            {
+                "queue_id": _string_param("Queue entry whose spec is now ready-for-dev.", required=True),
             },
         ),
         _tool_spec(
@@ -155,6 +184,10 @@ def dispatch(
         return _enqueue(arguments, queue_store=queue_store)
     if tool_name == "harness_list_queue":
         return _list_queue(arguments, queue_store=queue_store)
+    if tool_name == "harness_get_spec":
+        return _get_spec(arguments, queue_store=queue_store)
+    if tool_name == "harness_mark_spec_ready":
+        return _mark_spec_ready(arguments, queue_store=queue_store)
     if tool_name == "harness_run_status":
         return _run_status(arguments, registry=registry, supervisor=supervisor)
     if tool_name == "harness_resolve_gate":
@@ -203,14 +236,48 @@ def _list_queue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any
         return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
     status = _bounded(arguments.get("status"), field="status", max_chars=32) or None
     entries = queue_store.list()
-    valid_statuses = {"pending", "launched", "done", "failed"}
+    from .queue import VALID_STATUSES
+
     filtered = entries
-    if status is not None and status in valid_statuses:
+    if status is not None and status in VALID_STATUSES:
         filtered = [item for item in entries if item.status == status]
     return {
         "ok": True,
         "entries": [item.to_dict() for item in filtered],
         "counts": queue_store.counts(),
+        "spec_stats": queue_store.spec_stats().public(),
+    }
+
+
+def _get_spec(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any]:
+    if queue_store is None:
+        return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
+    queue_id = _bounded(arguments.get("queue_id"), field="queue_id", max_chars=128, required=True)
+    try:
+        result = queue_store.read_spec(queue_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "code": 409}
+    if result is None:
+        return {"ok": False, "error": "queue entry not found", "code": 404}
+    return {"ok": True, **result}
+
+
+def _mark_spec_ready(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any]:
+    if queue_store is None:
+        return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
+    queue_id = _bounded(arguments.get("queue_id"), field="queue_id", max_chars=128, required=True)
+    try:
+        entry = queue_store.mark_spec_ready(queue_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "code": 409}
+    if entry is None:
+        return {"ok": False, "error": "queue entry not found", "code": 404}
+    return {
+        "ok": True,
+        "queue_id": queue_id,
+        "status": entry.status,
+        "spec_tokens_est": entry.spec_tokens_est,
+        "spec_range_state": entry.spec_range_state,
     }
 
 

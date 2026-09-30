@@ -136,3 +136,55 @@ def test_role_prompts_distinguish_workspace_from_run_records() -> None:
     assert "not require every subtask to create a file" in auditor
     assert "Private Dashboard trajectory images" in auditor
     assert ".longhorizon-evidence" not in auditor
+
+
+@pytest.mark.parametrize("language", ["en", "zh"])
+def test_manager_prompt_history_sections_share_one_budget(language: str) -> None:
+    """Auditor reports and harness feedback must not each spend the full budget."""
+    from lh_harness.role_prompts import (
+        format_harness_feedback_context,
+        format_verified_intermediate_context,
+    )
+
+    max_history_chars = 12_000
+    rounds = [
+        ManagedRound(
+            round_index=i,
+            next_step=MANAGER_NEXT_CLI,
+            plan_text=f"plan {i} " + ("p" * 400),
+            auditor_report=f"AUDIT-{i:02d}-START " + (f"a{i}" * 2000) + f" AUDIT-{i:02d}-END",
+            harness_feedback=f"FEEDBACK-{i:02d} " + (f"f{i}" * 1500),
+        )
+        for i in range(1, 11)
+    ]
+    prompt = build_role_manager_prompt(
+        task="do the thing",
+        rounds=rounds,
+        round_index=11,
+        round_budget=20,
+        language=language,
+        max_history_chars=max_history_chars,
+    )
+
+    # Recompute the sections with the same split the builder uses and confirm
+    # they are what landed in the prompt, then bound their combined size.
+    feedback_share = max_history_chars // 4
+    auditor_section = format_verified_intermediate_context(
+        rounds, max_chars=max_history_chars - feedback_share, language=language
+    )
+    feedback_section = format_harness_feedback_context(rounds, max_chars=feedback_share)
+    assert auditor_section in prompt
+    assert feedback_section in prompt
+    # _clip_preserve inserts a short "...[truncated N chars...]..." marker per
+    # section; allow that as formatting slack.
+    slack = 2 * 80
+    assert len(auditor_section) + len(feedback_section) <= max_history_chars + slack
+    # The old behaviour handed the full budget to both sections.
+    assert len(auditor_section) + len(feedback_section) < 2 * max_history_chars - slack
+    # Feedback is the minor share; auditor rejection reasons get the majority.
+    assert len(feedback_section) <= feedback_share + 80
+    assert len(auditor_section) > len(feedback_section)
+    # The newest auditor report survives truncation (tail is preserved).
+    # (Only the report body is asserted: the section header sits in the
+    # head+tail truncation gap when the newest section exceeds the tail share.)
+    assert "AUDIT-10-END" in prompt

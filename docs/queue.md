@@ -252,3 +252,52 @@ starts only when `LH_HARNESS_FLEET_URL` is set (`server.py:645`); with the env
 var unset the web server behaves exactly as before. (This is the queue-depth
 half of the liveness signal, delivered in commit `3efb79bd`; the launcher
 last-tick half is deferred to the migration plan §4 as new work.)
+
+## Spec staging (added 2026-09-10)
+
+A queued task no longer has to be launched from raw prose. An entry created
+with `spec_file` (absolute server path to a BMAD-style spec written from
+`templates/task-spec.md`) enters the queue as **`spec_pending`** and is never
+launched until the spec's frontmatter says `status: ready-for-dev`.
+
+Statuses are now `spec_pending → pending → launched → done | failed`. All
+three status lists (`queue.VALID_STATUSES`, the API `groups`, and the store's
+accepted set) derive from one tuple, so a new status cannot vanish from the API.
+
+### Entry fields
+
+| field | meaning |
+|---|---|
+| `spec_file` | path of the spec the task launches from |
+| `spec_status` | `draft` or `ready-for-dev`, read from the spec frontmatter |
+| `spec_chars`, `spec_tokens_est`, `spec_exact` | measured size; `exact` is true only when an Anthropic token count was available, otherwise chars/4 |
+| `spec_measured_at` | last measurement time; the spec is re-measured lazily when its mtime advances |
+| `spec_range_state` | `in_range`, `below`, `above`, or `unestablished` against the learned range |
+
+### Expected-size range
+
+There is **no fixed token budget**. Every spec that is marked ready records
+its `tokens_est` into `<runs_root>/queue/spec_stats.json`; after each one the
+range is recomputed as `median ± k × 1.4826 × MAD` over the last `window`
+samples, and is only "established" once `min_samples` are present. Configure
+under `[queue.spec_stats]` (`window = 50`, `min_samples = 5`, `k = 3.0`).
+A spec outside the range is flagged in `GET /api/queue` and in the Web UI
+queue panel; it is never blocked.
+
+### Routes
+
+| route | purpose |
+|---|---|
+| `GET /api/queue` | now includes `groups.spec_pending` and a top-level `spec_stats` |
+| `GET /api/queue/{id}/spec` | spec body, frontmatter, measurement, range state, current stats |
+| `POST /api/queue/{id}/spec` | mark ready: verifies `status: ready-for-dev`, replaces `task` with the spec body, records the size, promotes to `pending`; `409` when still a draft |
+| `GET /api/queue/spec_stats` | current range |
+| `POST /api/queue/spec_stats/record` | `{key, tokens_est}` from an external queue (the live file queue's `stage_specs.py`) so both queues share one distribution |
+
+MCP mirrors: `harness_get_spec`, `harness_mark_spec_ready`.
+
+The launcher records the skip reason `spec not ready` once per `spec_pending`
+entry so the API shows why it is waiting.
+
+For the live file queue (`C:\tmp\queue`), see
+`docs/handoffs/spec-staging-2026-09-10.md`.

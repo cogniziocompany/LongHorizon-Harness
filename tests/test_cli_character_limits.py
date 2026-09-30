@@ -104,6 +104,18 @@ class TestCapResolutionOrder(unittest.TestCase):
                 config = HarnessConfig()
         self.assertEqual(config.role_history_chars, 100_000)
 
+    def test_task_text_warn_chars_default_and_env_override(self):
+        with env_set(LH_HARNESS_TASK_TEXT_WARN_CHARS=None):
+            self.assertEqual(HarnessConfig().task_text_warn_chars, 8_000)
+        with env_set(LH_HARNESS_TASK_TEXT_WARN_CHARS="12000"):
+            self.assertEqual(HarnessConfig().task_text_warn_chars, 12_000)
+
+    def test_task_text_warn_chars_invalid_env_warns_and_keeps_default(self):
+        with env_set(LH_HARNESS_TASK_TEXT_WARN_CHARS="not_a_number"):
+            with self.assertWarns(RuntimeWarning):
+                config = HarnessConfig()
+        self.assertEqual(config.task_text_warn_chars, 8_000)
+
 
 class TestCLIFlagsExist(unittest.TestCase):
     """The flags must be reachable through the real CLI surface.
@@ -134,6 +146,7 @@ class TestCLIFlagsExist(unittest.TestCase):
             "--auditor-output-chars",
             "--role-verified-context-chars",
             "--role-history-chars",
+            "--task-text-warn-chars",
         ):
             self.assertIn(flag, help_text, f"{flag} is missing from `run --help`")
 

@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import spec_stats as _spec_stats
 from .supervisor.control_bus import _atomic_bytes_write
 from .types import DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 
@@ -25,11 +26,15 @@ _MAX_QUEUE_ID_CHARS = 128
 _MAX_QUEUE_TASK_CHARS = 100_000
 _MAX_QUEUE_REASON_CHARS = 4_000
 _MAX_QUEUE_DEDUP_CHARS = 256
-_VALID_STATUS = frozenset({"pending", "launched", "done", "failed"})
+# ``spec_pending``: the entry has a spec file that is still a draft. The
+# launcher never launches it; ``mark_spec_ready`` promotes it to ``pending``
+# once the spec's frontmatter says ``status: ready-for-dev``.
+_VALID_STATUS = frozenset({"spec_pending", "pending", "launched", "done", "failed"})
+VALID_STATUSES: tuple[str, ...] = ("spec_pending", "pending", "launched", "done", "failed")
 # Non-terminal entries are still waiting to be, or being, launched. A dedup key
 # is considered "in use" only while its entry is in one of these states; once an
 # entry reaches ``done``/``failed`` the key is free for a fresh (retry) entry.
-_NON_TERMINAL_STATUS = frozenset({"pending", "launched"})
+_NON_TERMINAL_STATUS = frozenset({"spec_pending", "pending", "launched"})
 _VALID_TRIOS = frozenset({"kimi", "qwen"})
 
 
@@ -77,6 +82,15 @@ class QueueEntry:
     launched_at: float | None = None
     last_checked_at: float | None = None
     dedup_key: str | None = None
+    # Spec staging. ``spec_file`` is the BMAD-style spec the task is launched
+    # from; its size is measured, never capped (see ``spec_stats``).
+    spec_file: str | None = None
+    spec_status: str | None = None
+    spec_chars: int | None = None
+    spec_tokens_est: int | None = None
+    spec_exact: bool = False
+    spec_measured_at: float | None = None
+    spec_range_state: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -107,6 +121,13 @@ class QueueEntry:
             "launched_at",
             "last_checked_at",
             "dedup_key",
+            "spec_file",
+            "spec_status",
+            "spec_chars",
+            "spec_tokens_est",
+            "spec_exact",
+            "spec_measured_at",
+            "spec_range_state",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -225,8 +246,31 @@ def _validate_dedup_key(value: Any) -> str | None:
     return text
 
 
+def _validate_spec_file(value: Any) -> Path | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError("spec_file must be a string")
+    text = value.strip()
+    if not text:
+        return None
+    if "\x00" in text:
+        raise ValueError("spec_file contains a NUL byte")
+    path = Path(text).expanduser()
+    if not path.is_file():
+        raise ValueError("spec_file does not exist")
+    return path
+
+
 def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
-    """Convert a POST /api/queue body into validated launch parameters."""
+    """Convert a POST /api/queue body into validated launch parameters.
+
+    ``spec_file`` adds the spec-staging stage: the entry is created as
+    ``spec_pending`` (unless the spec is already ``ready-for-dev``), its size is
+    measured, and ``task`` may be omitted because the spec body becomes the task
+    at ``mark_spec_ready`` time. ``task``/``task_file`` alongside ``spec_file``
+    is allowed and kept as the original prose until the spec replaces it.
+    """
 
     task = body.get("task")
     task_file = body.get("task_file")
@@ -237,6 +281,31 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         if not path.is_file():
             raise ValueError("task_file does not exist")
         task = path.read_text(encoding="utf-8")
+
+    spec_path = _validate_spec_file(body.get("spec_file"))
+    spec_fields: dict[str, Any] = {}
+    status = "pending"
+    if spec_path is not None:
+        spec_text = spec_path.read_text(encoding="utf-8")
+        spec_status = _spec_stats.spec_status_from_text(spec_text) or _spec_stats.SPEC_STATUS_DRAFT
+        measure = _spec_stats.measure_text(spec_text)
+        _, spec_body = _spec_stats.parse_frontmatter(spec_text)
+        if spec_status == _spec_stats.SPEC_STATUS_READY:
+            task = spec_body
+        elif task is None:
+            # Placeholder until the spec is ready; never launched in this state.
+            task = spec_body
+            status = "spec_pending"
+        else:
+            status = "spec_pending"
+        spec_fields = {
+            "spec_file": str(spec_path),
+            "spec_status": spec_status,
+            "spec_chars": measure.chars,
+            "spec_tokens_est": measure.tokens_est,
+            "spec_exact": measure.exact,
+            "spec_measured_at": measure.measured_at,
+        }
     task_text = _validate_task(task)
 
     trio = body.get("roles") if "roles" in body else body.get("trio")
@@ -250,6 +319,8 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "base_check": _validate_base_check(body.get("base_check")),
         "requested_by": _validate_requested_by(body.get("requested_by")),
         "dedup_key": _validate_dedup_key(body.get("dedup_key")),
+        "status": status,
+        **spec_fields,
     }
 
 
@@ -302,7 +373,11 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["key_health_url"] = capacity["key_health_url"]
     if isinstance(capacity.get("poll_seconds"), (int, float)):
         normalized_capacity["poll_seconds"] = max(1.0, float(capacity["poll_seconds"]))
-    return {"trios": normalized_trios, "capacity": normalized_capacity}
+    return {
+        "trios": normalized_trios,
+        "capacity": normalized_capacity,
+        "spec_stats": _spec_stats.spec_stats_config_from_config(config),
+    }
 
 
 def default_queue_config() -> dict[str, Any]:
@@ -312,9 +387,111 @@ def default_queue_config() -> dict[str, Any]:
 class QueueStore:
     """Atomic file-backed store for queue entries below a runs root."""
 
-    def __init__(self, runs_root: str | Path) -> None:
+    def __init__(self, runs_root: str | Path, *, spec_stats_config: dict[str, Any] | None = None) -> None:
         self.runs_root = Path(runs_root).expanduser().resolve()
         self._root = _queue_dir(self.runs_root)
+        self.spec_stats_config = dict(spec_stats_config or _spec_stats.DEFAULT_SPEC_STATS_CONFIG)
+
+    # -- spec staging -----------------------------------------------------
+
+    @property
+    def spec_stats_path(self) -> Path:
+        return self._root / _spec_stats.SPEC_STATS_FILENAME
+
+    def spec_stats(self) -> _spec_stats.SpecStats:
+        return _spec_stats.load_stats(self.spec_stats_path)
+
+    def record_spec_finished(self, key: str, tokens_est: int) -> _spec_stats.SpecStats:
+        return _spec_stats.record_finished(
+            self.spec_stats_path, key, tokens_est, config=self.spec_stats_config
+        )
+
+    def measure_spec(self, queue_id: str, *, force: bool = False) -> QueueEntry | None:
+        """Re-measure an entry's spec when the file changed since last measure."""
+
+        entry = self.get(queue_id)
+        if entry is None or not entry.spec_file:
+            return entry
+        path = Path(entry.spec_file)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return entry
+        if not force and entry.spec_measured_at is not None and mtime <= entry.spec_measured_at:
+            return entry
+        text = path.read_text(encoding="utf-8")
+        measure = _spec_stats.measure_text(text)
+        entry.spec_status = _spec_stats.spec_status_from_text(text) or _spec_stats.SPEC_STATUS_DRAFT
+        entry.spec_chars = measure.chars
+        entry.spec_tokens_est = measure.tokens_est
+        entry.spec_exact = measure.exact
+        entry.spec_measured_at = measure.measured_at
+        entry.spec_range_state = _spec_stats.classify(measure.tokens_est, self.spec_stats())
+        return self.update(entry)
+
+    def read_spec(self, queue_id: str) -> dict[str, Any] | None:
+        """Return the spec body, frontmatter, measurement, and current stats."""
+
+        entry = self.measure_spec(queue_id)
+        if entry is None:
+            return None
+        if not entry.spec_file:
+            raise ValueError("entry has no spec_file")
+        try:
+            text = Path(entry.spec_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"spec_file unreadable: {exc}") from exc
+        frontmatter, body = _spec_stats.parse_frontmatter(text)
+        stats = self.spec_stats()
+        return {
+            "queue_id": entry.queue_id,
+            "spec_file": entry.spec_file,
+            "frontmatter": frontmatter,
+            "body": body,
+            "chars": entry.spec_chars,
+            "tokens_est": entry.spec_tokens_est,
+            "exact": entry.spec_exact,
+            "measured_at": entry.spec_measured_at,
+            "range_state": _spec_stats.classify(entry.spec_tokens_est, stats),
+            "stats": stats.public(),
+        }
+
+    def mark_spec_ready(self, queue_id: str) -> QueueEntry | None:
+        """Promote ``spec_pending`` -> ``pending`` once the spec is ready-for-dev.
+
+        The spec body replaces ``task`` so the launcher path is unchanged from
+        here on, and the spec's size is recorded into the expected-range
+        distribution.
+        """
+
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if entry.status not in {"spec_pending", "pending"}:
+            raise ValueError(f"cannot mark spec ready for status {entry.status}")
+        if not entry.spec_file:
+            raise ValueError("entry has no spec_file")
+        path = Path(entry.spec_file)
+        if not path.is_file():
+            raise ValueError("spec_file does not exist")
+        text = path.read_text(encoding="utf-8")
+        status = _spec_stats.spec_status_from_text(text)
+        if status != _spec_stats.SPEC_STATUS_READY:
+            raise ValueError(
+                f"spec status is {status or 'missing'!r}; set frontmatter status: {_spec_stats.SPEC_STATUS_READY}"
+            )
+        _, body = _spec_stats.parse_frontmatter(text)
+        entry.task = _validate_task(body)
+        measure = _spec_stats.measure_text(text)
+        entry.spec_status = status
+        entry.spec_chars = measure.chars
+        entry.spec_tokens_est = measure.tokens_est
+        entry.spec_exact = measure.exact
+        entry.spec_measured_at = measure.measured_at
+        stats = self.record_spec_finished(entry.queue_id, measure.tokens_est)
+        entry.spec_range_state = _spec_stats.classify(measure.tokens_est, stats)
+        entry.status = "pending"
+        return self.update(entry)
 
     def _path(self, queue_id: str) -> Path:
         if not _safe_queue_id(queue_id):
@@ -355,6 +532,8 @@ class QueueStore:
         queue_id = f"q-{uuid.uuid4().hex[:16]}"
         now = _now()
         entry = QueueEntry(queue_id=queue_id, created_at=now, updated_at=now, **params)
+        if entry.spec_tokens_est is not None:
+            entry.spec_range_state = _spec_stats.classify(entry.spec_tokens_est, self.spec_stats())
         self._write(entry)
         return entry
 
@@ -459,7 +638,7 @@ class QueueStore:
         entry = self.get(queue_id)
         if entry is None:
             return None
-        if entry.status != "pending":
+        if entry.status not in {"pending", "spec_pending"}:
             return None
         entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
         return self.update(entry)

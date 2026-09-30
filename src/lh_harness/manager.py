@@ -11,6 +11,7 @@ import stat as stat_module
 import time
 from dataclasses import asdict, dataclass, field
 import traceback
+import warnings
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -218,6 +219,17 @@ async def _run_impl(
             progress(event, payload)
         except Exception:  # progress reporting must never break a run
             logger.debug("progress callback failed for %s", event, exc_info=True)
+
+    # Emitted once per run, before any round: an oversized task text is almost
+    # always raw prose that the queue spec stage should have distilled. It is a
+    # warning, not a cap; the run continues with the full text.
+    if len(task) > config.task_text_warn_chars:
+        warnings.warn(
+            f"task text is {len(task)} chars (> {config.task_text_warn_chars}); "
+            "distil it into a spec via the queue spec stage",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     # Role binding is resolved once at startup so the main loop can stay focused
     # on state transitions instead of adapter fallback logic.

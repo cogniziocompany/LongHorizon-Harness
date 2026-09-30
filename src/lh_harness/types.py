@@ -123,17 +123,23 @@ class HarnessConfig:
     auditor_output_chars: int = 24_000
     role_verified_context_chars: int = 60_000
     role_history_chars: int = 100_000
+    # A task text larger than this is almost certainly raw prose that should
+    # have been distilled into a spec first (see
+    # docs/handoffs/spec-staging-2026-09-10.md). It is a warning threshold,
+    # not a cap: the run proceeds with the full text.
+    task_text_warn_chars: int = 8_000
     # English is the production default; Chinese remains available for
     # OSWorldv2-compatible role prompts and operator-facing control headers.
     prompt_language: PromptLanguage = "en"
 
     # Environment overrides for the context-injection ceilings, in
-    # (variable, field) order. Kept as a table so a fourth cap cannot be added
+    # (variable, field) order. Kept as a table so a new cap cannot be added
     # to the dataclass and forgotten here.
     _ENV_CAP_OVERRIDES: ClassVar[tuple[tuple[str, str], ...]] = (
         ("LH_HARNESS_AUDITOR_OUTPUT_CHARS", "auditor_output_chars"),
         ("LH_HARNESS_ROLE_VERIFIED_CONTEXT_CHARS", "role_verified_context_chars"),
         ("LH_HARNESS_ROLE_HISTORY_CHARS", "role_history_chars"),
+        ("LH_HARNESS_TASK_TEXT_WARN_CHARS", "task_text_warn_chars"),
     )
 
     def __post_init__(self) -> None:

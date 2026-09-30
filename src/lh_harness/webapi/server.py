@@ -34,7 +34,8 @@ from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
 from ..supervisor.control_bus import CommandConflict, RevisionConflict
 from ..fleet import get_reporter
-from ..queue import QueueStore, default_queue_config, queue_config_from_config
+from ..queue import VALID_STATUSES, QueueStore, default_queue_config, queue_config_from_config
+from ..spec_stats import classify as classify_spec
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
@@ -880,6 +881,7 @@ def create_app(
                 queue_config = queue_config_from_config(project)
         except Exception:
             pass
+        queue_store.spec_stats_config = dict(queue_config.get("spec_stats") or queue_store.spec_stats_config)
     launcher: Launcher | None = None
     if supervisor is not None and queue_store is not None:
         launcher = Launcher(supervisor, queue_store, queue_config=queue_config)
@@ -1050,24 +1052,82 @@ def create_app(
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
         entries = queue_store.list()
-        valid_statuses = {"pending", "launched", "done", "failed"}
+        # Single source of truth for statuses: queue.VALID_STATUSES. An entry
+        # whose status is missing from ``groups`` would raise here, and one
+        # missing from the store's set is silently dropped by _read_path, so
+        # both derive from the same tuple.
+        valid_statuses = set(VALID_STATUSES)
         filtered = entries
         if status is not None:
             if status not in valid_statuses:
-                raise HTTPException(status_code=422, detail=f"status must be one of: {', '.join(sorted(valid_statuses))}")
+                raise HTTPException(status_code=422, detail=f"status must be one of: {', '.join(VALID_STATUSES)}")
             filtered = [item for item in entries if item.status == status]
-        groups: dict[str, list[dict[str, Any]]] = {
-            "pending": [],
-            "launched": [],
-            "done": [],
-            "failed": [],
-        }
+        groups: dict[str, list[dict[str, Any]]] = {name: [] for name in VALID_STATUSES}
         for item in entries:
             groups[item.status].append(item.to_dict())
         return {
             "entries": [item.to_dict() for item in filtered],
             "groups": groups,
             "counts": queue_store.counts(),
+            "spec_stats": queue_store.spec_stats().public(),
+        }
+
+    @app.get("/api/queue/spec_stats")
+    def queue_spec_stats() -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        return queue_store.spec_stats().public()
+
+    @app.post("/api/queue/spec_stats/record")
+    def queue_spec_stats_record(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        """Record a finished spec's size from an external queue (the live file queue).
+
+        Both queues feed one distribution; the file queue's ``stage_specs.py``
+        posts here when a spec flips to ready-for-dev.
+        """
+
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        key = body.get("key")
+        tokens_est = body.get("tokens_est")
+        if not isinstance(key, str) or not key.strip() or len(key) > 256:
+            raise HTTPException(status_code=422, detail="key must be a non-empty string")
+        if isinstance(tokens_est, bool) or not isinstance(tokens_est, int) or tokens_est < 0:
+            raise HTTPException(status_code=422, detail="tokens_est must be a non-negative integer")
+        try:
+            stats = queue_store.record_spec_finished(key.strip(), tokens_est)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"ok": True, "range_state": classify_spec(tokens_est, stats), **stats.public()}
+
+    @app.get("/api/queue/{queue_id}/spec")
+    def get_queue_spec(queue_id: str) -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        try:
+            result = queue_store.read_spec(queue_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        return result
+
+    @app.post("/api/queue/{queue_id}/spec")
+    def mark_queue_spec_ready(queue_id: str) -> dict[str, Any]:
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        try:
+            entry = queue_store.mark_spec_ready(queue_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if entry is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        return {
+            "ok": True,
+            "queue_id": queue_id,
+            "status": entry.status,
+            "spec_tokens_est": entry.spec_tokens_est,
+            "spec_range_state": entry.spec_range_state,
         }
 
     @app.delete("/api/queue/{queue_id}")

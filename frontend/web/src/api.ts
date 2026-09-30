@@ -285,6 +285,80 @@ export async function createRun(input: {
   return data.run;
 }
 
+export type QueueStatus = 'spec_pending' | 'pending' | 'launched' | 'done' | 'failed';
+export type SpecRangeState = 'in_range' | 'below' | 'above' | 'unestablished';
+
+export interface SpecStats {
+  n: number;
+  median: number | null;
+  mad: number | null;
+  lower: number | null;
+  upper: number | null;
+  updated_at: number | null;
+  established: boolean;
+}
+
+export interface QueueEntry {
+  queue_id: string;
+  name: string;
+  task: string;
+  workspace: string;
+  max_rounds: number;
+  trio: string;
+  priority: number;
+  requested_by: string;
+  status: QueueStatus;
+  run_id: string | null;
+  reason: string | null;
+  skip_reasons: string[];
+  created_at: number;
+  updated_at: number;
+  launched_at: number | null;
+  spec_file: string | null;
+  spec_status: 'draft' | 'ready-for-dev' | null;
+  spec_chars: number | null;
+  spec_tokens_est: number | null;
+  spec_exact: boolean;
+  spec_measured_at: number | null;
+  spec_range_state: SpecRangeState | null;
+}
+
+export interface QueueView {
+  entries: QueueEntry[];
+  groups: Record<QueueStatus, QueueEntry[]>;
+  counts: Record<string, number>;
+  spec_stats: SpecStats;
+}
+
+export interface QueueSpecView {
+  queue_id: string;
+  spec_file: string | null;
+  frontmatter: Record<string, unknown>;
+  body: string;
+  chars: number;
+  tokens_est: number;
+  exact: boolean;
+  measured_at: number | null;
+  range_state: SpecRangeState;
+  stats: SpecStats;
+}
+
+export function fetchQueue(): Promise<QueueView> {
+  return getJson<QueueView>('/api/queue');
+}
+
+export function fetchQueueSpec(queueId: string): Promise<QueueSpecView> {
+  return getJson<QueueSpecView>(`/api/queue/${encodeURIComponent(queueId)}/spec`);
+}
+
+export async function markSpecReady(queueId: string): Promise<{ ok: true; queue_id: string; status: QueueStatus }> {
+  const response = await fetch(`/api/queue/${encodeURIComponent(queueId)}/spec`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: '{}',
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.json() as Promise<{ ok: true; queue_id: string; status: QueueStatus }>;
+}
+
 export async function refreshModels(): Promise<WebMeta> {
   const response = await fetch('/api/models/refresh', {
     method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: '{}',

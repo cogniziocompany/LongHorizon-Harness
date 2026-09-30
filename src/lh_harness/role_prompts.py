@@ -51,13 +51,27 @@ def build_role_manager_prompt(
     language: str = "en",
     max_history_chars: int = 36_000,
 ) -> str:
+    """Build the manager prompt.
+
+    ``max_history_chars`` bounds the TOTAL injected history: the auditor-report
+    section and the harness-feedback section share one budget rather than each
+    receiving it in full. Harness feedback is a small protocol/completion
+    correction, so it gets a quarter; auditor reports (which carry rejection
+    reasons the manager must act on) get the rest. Both sections keep the
+    existing head+tail clipping of ``_clip_preserve``, so the newest rounds at
+    the tail survive truncation and the middle (oldest-but-one) is what drops.
+    The two variables below are computed before the language branch, so the
+    ``en`` and ``zh`` prompts share the same bounded sections.
+    """
     lang = normalize_prompt_language(language)
     configured_budget = max(round_index, int(round_budget or round_index))
     remaining_rounds = max(1, configured_budget - round_index + 1)
+    feedback_share = max_history_chars // 4
+    auditor_share = max_history_chars - feedback_share
     auditor_reports = format_verified_intermediate_context(
-        rounds, max_chars=max_history_chars, language=lang
+        rounds, max_chars=auditor_share, language=lang
     )
-    harness_feedback = format_harness_feedback_context(rounds, max_chars=max_history_chars)
+    harness_feedback = format_harness_feedback_context(rounds, max_chars=feedback_share)
     if lang == "en":
         return f"""\
 {MANAGER_INSTRUCTIONS[lang].strip()}

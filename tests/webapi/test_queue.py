@@ -259,7 +259,7 @@ def test_api_queue_status_filter(tmp_path: Path) -> None:
 
 def test_default_queue_config_shape() -> None:
     config = default_queue_config()
-    assert set(config) == {"trios", "capacity"}
+    assert set(config) == {"trios", "capacity", "spec_stats"}
     assert set(config["trios"]) == {"kimi", "qwen"}
     assert config["capacity"]["kimi_max"] == 3
     assert config["capacity"]["qwen_max"] == 1

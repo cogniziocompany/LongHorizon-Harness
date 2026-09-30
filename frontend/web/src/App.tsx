@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useReducer, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import {
   AlertTriangle,
@@ -42,12 +42,17 @@ import {
 } from 'lucide-react';
 import { MAX_ROUNDS, type ArtifactList, type EventEnvelope, type RunSummary, type Snapshot } from '../../core/src/types';
 import { availableCommands, isTrajectoryNoise, managerPlanSummary, managerPlanText, normaliseMaxRounds, projectArtifactView, projectStatus, dedupeEvents, parseCommand, parseNewRunArgs, phaseLabel, projectTrajectoryView, reducePanelState, sortTranscript, DEFAULT_PANEL_STATE, type ArtifactProjection, type FileChangeItem, type PanelName, type StatusView, type TrajectoryItem, type ValidationResultSummary } from '../../core/src';
+import type { StatusState } from '../../core/src/statusView';
 import {
+  ApiError,
   abortRun,
   createRun,
   fetchArtifact,
   fetchArtifacts,
   fetchMeta,
+  fetchQueue,
+  fetchQueueSpec,
+  markSpecReady,
   refreshModels,
   fetchRuns,
   fetchTrajectory,
@@ -65,7 +70,11 @@ import {
   type WebMeta,
   type AgentChoice,
   type ModelChoice,
+  type QueueEntry,
+  type QueueSpecView,
+  type QueueStatus,
   type RoleRuntimeConfig,
+  type SpecStats,
   type TrajectoryView,
 } from './api';
 import { useRunFeed } from './useRunFeed';
@@ -1376,6 +1385,7 @@ export default function App() {
           {filteredRuns.map((run) => <button key={run.id} className={`session-item ${run.id === runId ? 'selected' : ''}`} onClick={() => setRunId(run.id)}><span className={statusClass(run.status)} /><span className="session-copy"><strong>{run.task || 'Untitled task'}</strong><small>{run.id}</small></span></button>)}
           {!filteredRuns.length && <div className="sidebar-empty">{text('暂无会话', 'No tasks yet')}</div>}
         </div>
+        <QueuePanel authRevision={authRevision} onUnauthorized={() => setAuthOpen(true)} />
         <div className="sidebar-footer"><span className={`connection-dot connection-${runId ? connection : 'idle'}`} />{!runId ? text('空闲', 'Idle') : connection === 'connected' ? text('已连接', 'Connected') : connection === 'loading' ? text('连接中', 'Connecting') : connection === 'reconnecting' ? text('重连中', 'Reconnecting') : connection === 'closed' ? text('已断开', 'Disconnected') : text('连接异常', 'Connection error')}<span>·</span> {text('本地工作区', 'Local workspace')}<button type="button" className="connection-settings" onClick={() => setAuthOpen(true)} title={text('连接设置', 'Connection settings')} aria-label={text('连接设置', 'Connection settings')}><KeyRound size={13} /></button></div>
       </aside>
 
@@ -2058,6 +2068,186 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
       {tab === 'events' && <div id="details-panel-events" className="drawer-content" role="tabpanel" aria-labelledby="details-tab-events"><div className="event-list-drawer">{events.map((event) => <div key={event.event_id}><time>{formatTime(event.ts)}</time><span>{eventSummary(event, language)}</span></div>)}</div></div>}
     </>}
   </aside></div>;
+}
+
+const QUEUE_POLL_MS = 15_000;
+const QUEUE_GROUP_ORDER: QueueStatus[] = ['spec_pending', 'pending', 'launched', 'done', 'failed'];
+
+/** Map queue lifecycle states onto the existing StatusState vocabulary (no new states). */
+function queueStageState(status: QueueStatus): StatusState {
+  if (status === 'spec_pending') return 'waiting';
+  if (status === 'pending' || status === 'launched') return 'active';
+  if (status === 'done') return 'done';
+  return 'failed';
+}
+
+function formatTokens(tokens: number | null | undefined): string {
+  if (tokens === null || tokens === undefined || !Number.isFinite(tokens)) return '—';
+  if (tokens < 1000) return String(Math.round(tokens));
+  return `${(tokens / 1000).toFixed(1)}k`;
+}
+
+function formatBytes(chars: number | null | undefined): string {
+  if (chars === null || chars === undefined || !Number.isFinite(chars)) return '—';
+  if (chars < 1024) return `${chars} B`;
+  return `${(chars / 1024).toFixed(1)} KB`;
+}
+
+function specSizeLabel(tokens: number | null | undefined, chars: number | null | undefined): string {
+  return `~${formatTokens(tokens)} tok · ${formatBytes(chars)}`;
+}
+
+function outOfRangeNotice(tokens: number, stats: SpecStats): string {
+  const median = stats.median === null ? '?' : formatTokens(stats.median);
+  return `Spec is ${formatTokens(tokens)} tok; finished specs run ${formatTokens(stats.lower)}–${formatTokens(stats.upper)} (median ${median}, n=${stats.n})`;
+}
+
+function QueuePanel({ authRevision, onUnauthorized }: { authRevision: number; onUnauthorized: () => void }) {
+  const { text } = useUiLanguage();
+  const [entries, setEntries] = useState<QueueEntry[]>([]);
+  const [stats, setStats] = useState<SpecStats | null>(null);
+  const [unconfigured, setUnconfigured] = useState(false);
+  const [error, setError] = useState('');
+  const [loaded, setLoaded] = useState(false);
+  const [openId, setOpenId] = useState('');
+  const [dismissed, setDismissed] = useState<Record<string, boolean>>({});
+  const generation = useRef(0);
+  // The parent passes an inline handler; keep it in a ref so the poll interval
+  // is not torn down and recreated on every App render.
+  const unauthorizedRef = useRef(onUnauthorized);
+  unauthorizedRef.current = onUnauthorized;
+
+  const refresh = useCallback(() => {
+    const requestGeneration = ++generation.current;
+    return fetchQueue().then((view) => {
+      if (requestGeneration !== generation.current) return;
+      setEntries(view.entries);
+      setStats(view.spec_stats);
+      setUnconfigured(false);
+      setError('');
+      setLoaded(true);
+    }).catch((reason: unknown) => {
+      if (requestGeneration !== generation.current) return;
+      setLoaded(true);
+      // 501 means the server has no runs root: not an error, just nothing to show.
+      if (reason instanceof ApiError && reason.status === 501) { setUnconfigured(true); setError(''); return; }
+      if (isUnauthorized(reason)) unauthorizedRef.current();
+      setError(String(reason));
+    });
+  // `authRevision` is a deliberate dependency: a saved token must trigger a re-poll.
+  }, [authRevision]);
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => { void refresh(); }, QUEUE_POLL_MS);
+    return () => { window.clearInterval(timer); generation.current += 1; };
+  }, [refresh]);
+
+  const groups = useMemo(() => {
+    const byStatus: Partial<Record<QueueStatus, QueueEntry[]>> = {};
+    for (const entry of entries) (byStatus[entry.status] ??= []).push(entry);
+    return QUEUE_GROUP_ORDER.filter((status) => byStatus[status]?.length).map((status) => ({ status, items: byStatus[status] as QueueEntry[] }));
+  }, [entries]);
+  const groupTitle = (status: QueueStatus) => status === 'spec_pending' ? text('待定规格', 'Spec pending') : status === 'pending' ? text('排队中', 'Pending') : status === 'launched' ? text('已启动', 'Launched') : status === 'done' ? text('已完成', 'Done') : text('失败', 'Failed');
+  const stateLabel = (state: StatusState) => state === 'waiting' ? text('等待', 'waiting') : state === 'active' ? text('进行中', 'active') : state === 'done' ? text('完成', 'done') : text('失败', 'failed');
+  const rangeLine = stats?.established
+    ? text(`预期 ${formatTokens(stats.lower)}–${formatTokens(stats.upper)} tok，n=${stats.n}`, `expected ${formatTokens(stats.lower)}–${formatTokens(stats.upper)} tok, n=${stats.n}`)
+    : text('范围尚未建立', 'range not yet established');
+  const openEntry = entries.find((entry) => entry.queue_id === openId) ?? null;
+
+  return <div className="queue-panel">
+    <div className="session-label">{text('队列', 'Queue')} <span>{entries.length}</span></div>
+    <div className="queue-range">{unconfigured ? '' : rangeLine}</div>
+    {unconfigured && <div className="sidebar-empty queue-muted">{text('队列未配置', 'queue not configured')}</div>}
+    {!unconfigured && error && <div className="sidebar-empty queue-error">{error}</div>}
+    {!unconfigured && !error && loaded && !entries.length && <div className="sidebar-empty">{text('队列为空', 'Queue is empty')}</div>}
+    {!unconfigured && <div className="queue-list">
+      {groups.map((group) => <div key={group.status} className="queue-group">
+        <div className="queue-group-title">{groupTitle(group.status)} <span>{group.items.length}</span></div>
+        {group.items.map((entry) => {
+          const state = queueStageState(entry.status);
+          const flagged = entry.spec_range_state === 'above' || entry.spec_range_state === 'below';
+          return <button type="button" key={entry.queue_id} className={`queue-row ${entry.queue_id === openId ? 'selected' : ''}`} onClick={() => setOpenId(entry.queue_id)} title={entry.task}>
+            <span className={`queue-badge phase-${state}`}>{stateLabel(state)}</span>
+            <span className="queue-copy"><strong>{entry.name || entry.queue_id}</strong><small>{entry.workspace}{entry.trio ? ` · ${entry.trio}` : ''}</small></span>
+            <span className={`queue-size ${flagged ? 'queue-size-flagged' : ''}`}>
+              {entry.spec_file
+                ? <>{flagged && <AlertTriangle size={11} />}<span>{specSizeLabel(entry.spec_tokens_est, entry.spec_chars)}</span><em>{entry.spec_exact ? text('精确', 'exact') : text('估算', 'est')}</em></>
+                : <em>{text('无规格', 'no spec')}</em>}
+            </span>
+          </button>;
+        })}
+      </div>)}
+    </div>}
+    {openEntry && <QueueSpecDialog
+      entry={openEntry}
+      dismissed={Boolean(dismissed[openEntry.queue_id])}
+      onDismiss={() => setDismissed((current) => ({ ...current, [openEntry.queue_id]: true }))}
+      onClose={() => setOpenId('')}
+      onMarked={() => { void refresh(); }}
+    />}
+  </div>;
+}
+
+function QueueSpecDialog({ entry, dismissed, onDismiss, onClose, onMarked }: { entry: QueueEntry; dismissed: boolean; onDismiss: () => void; onClose: () => void; onMarked: () => void }) {
+  const { text } = useUiLanguage();
+  const backdrop = useBackdropDismiss(onClose);
+  const [spec, setSpec] = useState<QueueSpecView | null>(null);
+  const [loadError, setLoadError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState('');
+  const [reloads, setReloads] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSpec(null); setLoadError('');
+    if (!entry.spec_file) return;
+    fetchQueueSpec(entry.queue_id).then((view) => { if (!cancelled) setSpec(view); }).catch((reason: unknown) => { if (!cancelled) setLoadError(String(reason)); });
+    return () => { cancelled = true; };
+  }, [entry.queue_id, entry.spec_file, reloads]);
+
+  const tokens = spec?.tokens_est ?? entry.spec_tokens_est;
+  const chars = spec?.chars ?? entry.spec_chars;
+  const exact = spec?.exact ?? entry.spec_exact;
+  const rangeState = spec?.range_state ?? entry.spec_range_state;
+  const stats = spec?.stats ?? null;
+  const outOfRange = (rangeState === 'above' || rangeState === 'below') && tokens !== null && tokens !== undefined && stats !== null;
+
+  const markReady = async () => {
+    setBusy(true); setActionError('');
+    try {
+      await markSpecReady(entry.queue_id);
+      onMarked();
+      setReloads((value) => value + 1);
+    } catch (reason) {
+      setActionError(String(reason));
+    } finally { setBusy(false); }
+  };
+
+  return <div className="auth-backdrop" {...backdrop}>
+    <div className="auth-dialog queue-dialog" role="dialog" aria-modal="true" aria-label={text('规格预览', 'Spec preview')}>
+      <div className="auth-dialog-head"><span className="auth-dialog-icon"><FileText size={16} /></span><div><span className="drawer-eyebrow">QUEUE</span><h2>{entry.name || entry.queue_id}</h2></div><button type="button" className="drawer-close" onClick={onClose} aria-label={text('关闭', 'Close')}><X size={18} /></button></div>
+      <div className="queue-dialog-meta">
+        <span>{entry.workspace}{entry.trio ? ` · ${entry.trio}` : ''}</span>
+        <span className={`queue-size ${outOfRange ? 'queue-size-flagged' : ''}`}>
+          {entry.spec_file ? <>{outOfRange && <AlertTriangle size={11} />}<span>{specSizeLabel(tokens, chars)}</span><em>{exact ? text('精确', 'exact') : text('估算', 'est')}</em></> : <em>{text('无规格', 'no spec')}</em>}
+        </span>
+      </div>
+      {outOfRange && !dismissed && stats && <div className="error-line queue-notice" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{outOfRangeNotice(tokens as number, stats)}<button type="button" onClick={onDismiss}>{text('关闭', 'Dismiss')}</button></div>}
+      {actionError && <div className="error-line queue-notice" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{actionError}<button type="button" onClick={() => setActionError('')}>{text('关闭', 'Dismiss')}</button></div>}
+      <div className="queue-spec-body">
+        {!entry.spec_file && <p className="auth-dialog-copy">{text('此条目没有规格文件。', 'This entry has no spec file.')}</p>}
+        {entry.spec_file && !spec && !loadError && <p className="auth-dialog-copy">{text('正在加载…', 'Loading…')}</p>}
+        {loadError && <p className="auth-dialog-copy queue-error">{loadError}</p>}
+        {spec && <pre>{spec.body}</pre>}
+      </div>
+      <div className="auth-dialog-actions">
+        <span className="queue-dialog-status">{entry.spec_file ?? ''}{entry.spec_status ? ` · ${entry.spec_status}` : ''}</span>
+        <button type="button" onClick={onClose}>{text('关闭', 'Close')}</button>
+        <button type="button" className="primary-action" disabled={busy || entry.status !== 'spec_pending'} onClick={() => void markReady()}>{busy ? text('处理中…', 'Working…') : text('标记就绪', 'Mark ready')}</button>
+      </div>
+    </div>
+  </div>;
 }
 
 function AuthDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
