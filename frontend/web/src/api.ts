@@ -1,4 +1,4 @@
-import type { ArtifactList, EventEnvelope, RunSummary, Snapshot } from '../../core/src/types';
+import type { ArtifactList, EventEnvelope, QueueEntry, RunSummary, Snapshot } from '../../core/src/types';
 
 const WEB_TOKEN_KEY = 'lh-web-token';
 let volatileWebToken = '';
@@ -250,6 +250,43 @@ export async function postInstruction(runId: string, instructions: string, reque
     method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(), 'Idempotency-Key': requestKey }, body: JSON.stringify({ instructions }),
   });
   if (!response.ok) throw await responseError(response);
+}
+
+export interface QueueCounts {
+  spec_pending: number;
+  pending: number;
+  launched: number;
+  done: number;
+  failed: number;
+  blocked: number;
+}
+
+export interface QueueView {
+  entries: QueueEntry[];
+  /** Entries grouped by their ``status`` (always carries every canonical group). */
+  groups: Record<string, QueueEntry[]>;
+  counts: QueueCounts;
+}
+
+/** Fetch the queue projection: entries, status groups, and per-status counts. */
+export function fetchQueue(): Promise<QueueView> {
+  return getJson<QueueView>('/api/queue');
+}
+
+/** Read the spec fields for one queue entry (Visionary intake preview surface). */
+export function fetchQueueSpec(queueId: string): Promise<{ ok: boolean; queue_id: string; spec_file: string | null; spec_status: string | null; spec: string | null }> {
+  return getJson<{ ok: boolean; queue_id: string; spec_file: string | null; spec_status: string | null; spec: string | null }>(`/api/queue/${encodeURIComponent(queueId)}/spec`);
+}
+
+/** Promote a ``spec_pending`` entry to ``pending`` (Visionary intake "Mark ready"). */
+export async function markQueueSpecReady(queueId: string, requestedBy?: string): Promise<{ ok: boolean; queue_id: string; status: string }> {
+  const payload: Record<string, unknown> = {};
+  if (requestedBy !== undefined) payload.requested_by = requestedBy;
+  const response = await fetch(`/api/queue/${encodeURIComponent(queueId)}/spec`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.json() as Promise<{ ok: boolean; queue_id: string; status: string }>;
 }
 
 export async function resolveApproval(

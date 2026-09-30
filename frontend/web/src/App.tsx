@@ -41,7 +41,7 @@ import {
   ZoomOut,
   type LucideIcon,
 } from 'lucide-react';
-import { MAX_ROUNDS, type ArtifactList, type EventEnvelope, type RunSummary, type Snapshot } from '../../core/src/types';
+import { MAX_ROUNDS, type ArtifactList, type EventEnvelope, type QueueEntry, type RunSummary, type Snapshot } from '../../core/src/types';
 import { availableCommands, isTrajectoryNoise, managerPlanSummary, managerPlanText, normaliseMaxRounds, projectArtifactView, projectStatus, dedupeEvents, parseCommand, parseNewRunArgs, phaseLabel, projectTrajectoryView, reducePanelState, sortTranscript, DEFAULT_PANEL_STATE, type ArtifactProjection, type FileChangeItem, type PanelName, type StatusView, type TrajectoryItem, type ValidationResultSummary } from '../../core/src';
 import {
   abortRun,
@@ -63,6 +63,10 @@ import {
   isUnauthorized,
   setStoredAuthToken,
   storedAuthToken,
+  fetchQueue,
+  fetchQueueSpec,
+  markQueueSpecReady,
+  type QueueView,
   type WebMeta,
   type AgentChoice,
   type ModelChoice,
@@ -1394,6 +1398,7 @@ export default function App() {
 
         {visibleError && <div className="error-line" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{visibleError}<button onClick={() => { setError(''); setDismissedFeedError(feed.error); }}>{text('关闭', 'Dismiss')}</button></div>}
         <div className={`composer-wrap ${composerInteractive ? '' : 'composer-disabled'}`}><textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void sendInstruction(); } }} placeholder={composerPlaceholder} disabled={composerBusy || !composerInteractive} /><div className="composer-footer"><span>{composerFooter}{composerInteractive && <> · <kbd>⌘</kbd><kbd>↵</kbd> {text('发送', 'Send')}</>}</span><button onClick={() => void sendInstruction()} disabled={composerBusy || !composerCanSend}>{text('发送', 'Send')}</button></div></div>
+        <QueuePanel runId={runId} text={text} onAuthOpen={() => setAuthOpen(true)} authRevision={authRevision} />
       </main>
 
       {mobileStatusOpen && <button type="button" className="status-mobile-backdrop" onClick={() => setMobileStatusOpen(false)} aria-label={text('关闭任务状态', 'Close task status')} />}
@@ -1502,6 +1507,128 @@ function localizedContention(contention: { severity: string; peers: Array<{ run_
     `Tier: ${contention.severity}. Shared tree/repository with ${peerText}.`,
   );
   return { title, body };
+}
+
+/** The Visionary-intake spec queue: a badge for the specs awaiting review, a
+ * preview card per spec, and the "Mark ready" button that promotes a spec
+ * entry so the launcher will launch it. */
+function QueuePanel({ runId, text, onAuthOpen, authRevision }: { runId: string | null; text: (zh: string, en: string) => string; onAuthOpen: () => void; authRevision: number }) {
+  const [queueView, setQueueView] = useState<QueueView | null>(null);
+  const [queueSpec, setQueueSpec] = useState<{ spec: string | null; spec_status: string | null; spec_file: string | null } | null>(null);
+  const [queueLoading, setQueueLoading] = useState(true);
+  const [queueMarkBusy, setQueueMarkBusy] = useState(false);
+  const [queueMarked, setQueueMarked] = useState(false);
+  const [queuePreviewError, setQueuePreviewError] = useState('');
+  const [queuePreviewLoading, setQueuePreviewLoading] = useState(false);
+  const [queueError, setQueueError] = useState('');
+  const [queueRefreshKey, setQueueRefreshKey] = useState(0);
+
+  useEffect(() => {
+    if (!runId) return;
+    const onQueueNotFound = () => { setQueueRefreshKey((value) => value + 1); };
+    window.addEventListener('lh-queue-not-found', onQueueNotFound);
+    return () => window.removeEventListener('lh-queue-not-found', onQueueNotFound);
+  }, [runId]);
+
+  useEffect(() => {
+    const onQueueFailure = (reason: unknown) => {
+      if (isUnauthorized(reason)) onAuthOpen();
+      setQueueError(isUnauthorized(reason) ? text('此 Web 服务需要访问令牌，请在连接设置中填写。', 'This Web service requires an access token. Enter it in Connection settings.') : String(reason));
+    };
+    const refresh = () => {
+      setQueueError('');
+      setQueueMarked(false);
+      setQueueView(null);
+      setQueueSpec(null);
+      setQueuePreviewError('');
+      setQueuePreviewLoading(false);
+      void fetchQueue()
+        .then((next) => { setQueueView(next); setQueueSpec(null); setQueuePreviewLoading(false); setQueueLoading(false); })
+        .catch(onQueueFailure);
+    };
+    void refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [runId, authRevision, text]);
+
+  async function markReady(entry: QueueEntry) {
+    setQueueMarkBusy(true);
+    setQueueMarked(false);
+    setQueueView((current) => current ? { ...current, groups: { ...current.groups, spec_pending: [] }, counts: { ...current.counts, spec_pending: 0 } } : null);
+    try {
+      const next = await markQueueSpecReady(entry.queue_id, text('我', 'Me'));
+      setQueueMarked(true);
+      setQueueView((current) => current ? { ...current, groups: { ...current.groups, spec_pending: [] }, counts: { ...current.counts, spec_pending: 0 } } : null);
+      setQueueSpec(null);
+    } catch (reason) {
+      setQueueError(String(reason));
+    } finally {
+      setQueueMarkBusy(false);
+    }
+  }
+
+  async function loadSpec(entry: QueueEntry) {
+    if (!entry.spec_file) return;
+    setQueuePreviewLoading(true);
+    setQueuePreviewError('');
+    try {
+      const next = await fetchQueueSpec(entry.queue_id);
+      setQueueSpec(next);
+    } catch (reason) {
+      setQueuePreviewError(String(reason));
+    } finally {
+      setQueuePreviewLoading(false);
+    }
+  }
+
+  const specPending = queueView ? queueView.counts.spec_pending : 0;
+  return (
+    <section className="queue-panel" aria-label={text('Spec 队列', 'Spec queue')}>
+      <header className="queue-panel-head"><div className="queue-eyebrow">{text('Spec 队列', 'Spec queue')}</div><div className="queue-panel-actions"><span className="queue-badge-count" title={text('待审阅 spec 数量', 'Specs awaiting review')}>{specPending}</span>{queueError && <button type="button" className="queue-refresh" onClick={() => setQueueRefreshKey((value) => value + 1)} title={text('刷新', 'Refresh')} aria-label={text('刷新队列', 'Refresh queue')}><LoaderCircle size={13} /></button>}</div></header>
+      {queueError && <div className="queue-error" role="alert">{queueError}<button type="button" className="queue-error-dismiss" onClick={() => setQueueError('')} aria-label={text('关闭错误', 'Dismiss error')}>{text('关闭', 'Dismiss')}</button></div>}
+      {queueMarked && <div className="queue-success" role="status">{text('已标记就绪', 'Marked ready')}</div>}
+      {queueLoading ? <div className="queue-loading"><LoaderCircle className="trajectory-spinner" size={15} /><span>{text('加载中…', 'Loading…')}</span></div> : queueView ? <>
+        <div className="queue-badge-row">
+          {specPending > 0 && <QueueBadge count={specPending} />}
+          {queueView.groups.pending.length > 0 && <span className="queue-group-count"><FileText size={12} /><strong>{queueView.groups.pending.length}</strong><small>{text('待启动', 'Pending')}</small></span>}
+        </div>
+        {specPending > 0 && <div className="queue-spec-list">{queueView.groups.spec_pending.length ? (queueView.groups.spec_pending.map((entry) => <QueuePreviewCard key={entry.queue_id} entry={entry} onMarkReady={markReady} loading={queuePreviewLoading} marked={queueMarked} busy={queueMarkBusy} specText={queueSpec?.spec ?? entry.spec ?? null} onToggleSpec={() => loadSpec(entry)} />)) : <p className="queue-empty">{text('尚无待审阅 spec', 'No specs awaiting review yet')}</p>}</div>}
+        {specPending === 0 && <p className="queue-empty">{text('当前没有待审阅的 spec', 'There are no specs awaiting review right now')}</p>}
+        {queueView.groups.pending.length > 0 && <div className="queue-entry-list">{queueView.groups.pending.map((entry) => <QueueEntryRow key={entry.queue_id} entry={entry} onMarkReady={markReady} busy={queueMarkBusy} />)}</div>}
+      </> : <div className="queue-empty">{text('暂无队列数据', 'No queue data')}</div>}
+    </section>
+  );
+}
+
+function QueueBadge({ count }: { count: number }) {
+  const { text } = useUiLanguage();
+  if (!count) return null;
+  return <span className="queue-badge" title={count === 1 ? text('1 个 spec 待审阅', '1 spec awaiting review') : text(`${count} 个 spec 待审阅`, `${count} specs awaiting review`)}>{count}</span>;
+}
+
+function QueuePreviewCard({ entry, onMarkReady, loading, marked, busy, specText, onToggleSpec }: { entry: QueueEntry; onMarkReady: (entry: QueueEntry) => void; loading: boolean; marked: boolean; busy: boolean; specText: string | null; onToggleSpec: () => void }) {
+  const { text } = useUiLanguage();
+  const statusLabel = entry.spec_status ?? text('未知', 'unknown');
+  const statusClass = statusLabel === 'ready-for-dev' ? 'phase-ready-for-dev' : statusLabel === 'draft' ? 'phase-draft' : 'phase-pending';
+  return <section className="queue-preview-card" aria-label={text('Spec 预览', 'Spec preview')}>
+    <div className="queue-preview-head"><div><span className={`queue-status-dot phase-${statusClass}`}></span><strong>{text('Spec', 'Spec')}: <code>{statusLabel}</code></strong></div><button type="button" className="queue-preview-toggle" onClick={onToggleSpec} aria-label={text('查看 spec 正文', 'View spec body')} title={text('查看 spec', 'View spec')}><FileText size={14} /></button></div>
+    {loading ? <div className="queue-loading"><LoaderCircle className="trajectory-spinner" size={15} /><span>{text('加载中…', 'Loading…')}</span></div> : specText !== null ? <pre className="queue-spec-text">{specText}</pre> : <p className="queue-no-spec">{text('尚无 spec 正文', 'No spec body yet')}</p>}
+    <div className="queue-preview-foot"><small className="queue-from">{text('来源', 'From')}: <code>{compactText(entry.spec_file ?? '', 40) || '—'}</code></small><button type="button" className="queue-mark-ready" onClick={() => onMarkReady(entry)} disabled={marked || busy} title={text('标记为就绪，让 worker 可启动', 'Mark ready so the worker can launch it')}>{marked ? text('已标记就绪', 'Marked ready') : text('标记为就绪', 'Mark ready')}</button></div>
+  </section>;
+}
+
+function QueueEntryRow({ entry, onMarkReady, busy }: { entry: QueueEntry; onMarkReady: (entry: QueueEntry) => void; busy: boolean }) {
+  const { text } = useUiLanguage();
+  const statusClass = entry.spec_status === 'ready-for-dev' ? 'phase-ready-for-dev' : entry.spec_status === 'draft' ? 'phase-draft' : 'phase-pending';
+  return <li key={entry.queue_id}>
+    <button type="button" className="queue-entry-row" onClick={() => onMarkReady(entry)}>
+      <span className={`queue-entry-status phase-${statusClass}`}><span className="queue-entry-dot"></span></span>
+      <span className="queue-entry-main"><strong>{entry.name}</strong><span>{compactText(entry.task, 50)}</span></span>
+      <span className="queue-entry-action">{busy ? text('处理中…', 'Processing…') : text('标记就绪', 'Mark ready')}</span>
+    </button>
+  </li>;
 }
 
 function StatusPanel({ view, snapshot, connection, mobileOpen, onMobileClose, onDetails }: { view: StatusView; snapshot: Snapshot; connection: string; mobileOpen: boolean; onMobileClose: () => void; onDetails: () => void }) {
