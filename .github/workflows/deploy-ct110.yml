@@ -104,6 +104,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
+          activate-environment: true
 
       - uses: actions/setup-node@v4
         with:
