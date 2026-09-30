@@ -1434,7 +1434,8 @@ def _should_accept_auditor_format_repair(result: EpisodeResult, report_text: str
 
 def _format_repair_budget(budget: EpisodeBudget) -> EpisodeBudget:
     return EpisodeBudget(
-        max_duration_seconds=max(30, min(budget.max_duration_seconds, 120)),
+        # 300 s: a local 9B model on one 3090 needs minutes, not seconds, to re-emit a header.
+        max_duration_seconds=max(30, min(budget.max_duration_seconds, 300)),
     )
 
 
