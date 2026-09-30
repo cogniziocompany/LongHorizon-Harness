@@ -33,6 +33,13 @@ import urllib.request
 API = "https://api.github.com"
 FAILING = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
 PASSING = {"success", "neutral", "skipped"}
+# Job names of .github/workflows/deploy-ct110.yml (keep in sync): its check runs are not CI.
+DEPLOY_JOB_PREFIXES = (
+    "Preflight (ref resolves",
+    "Build deployable wheel",
+    "Deploy to CT110",
+    "Ship overseer-sweep systemd units",
+)
 
 
 def get(path: str) -> dict:
@@ -97,6 +104,16 @@ def main() -> int:
     branch_sha = get(f"/repos/{repo}/commits/{urllib.parse.quote(default_branch, safe='')}")["sha"]
     check_runs = get(f"/repos/{repo}/commits/{branch_sha}/check-runs?per_page=100")
     runs = check_runs.get("check_runs") or []
+    # The deploy workflow's own jobs are check runs on the same sha, but they are not CI of the
+    # default branch: this run's Preflight is always in flight while it executes, and a cancelled
+    # or failed earlier deploy would read as "red". Ignore them, so the gate judges only real CI.
+    this_run = os.environ.get("GITHUB_RUN_ID", "")
+    own_prefix = f"/actions/runs/{this_run}/" if this_run else None
+    runs = [
+        r for r in runs
+        if not (own_prefix and own_prefix in (r.get("details_url") or ""))
+        and not str(r.get("name", "")).startswith(DEPLOY_JOB_PREFIXES)
+    ]
     if not runs:
         # Real repo fact on 2026-09-24: no workflow triggers on push to main.
         print(f"::warning::no check runs on {default_branch} tip {branch_sha[:12]} — "
