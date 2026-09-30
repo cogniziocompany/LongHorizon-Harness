@@ -506,7 +506,7 @@ async def _run_impl(
         await _write_remote_round_text(env, config, round_index, "task_state.txt", current_task_state)
         await _write_remote_round_text(env, config, round_index, "task_contract.txt", current_task_contract)
 
-        next_step = parse_role_manager_next_step(plan_text)
+        next_step = _effective_next_step(parse_role_manager_next_step(plan_text))
         last_plan = plan_text
         _append_event(
             events_path,
@@ -1430,6 +1430,13 @@ def _should_accept_auditor_format_repair(result: EpisodeResult, report_text: str
     if _workspace_mutation_detected(result):
         return False
     return has_valid_auditor_control_header(report_text)
+
+
+def _effective_next_step(next_step: RoleNextStep) -> RoleNextStep:
+    """Headless nodes set LH_HARNESS_DISABLE_GUI_ROUTE=1: a gui route can only time out there."""
+    if next_step == MANAGER_NEXT_GUI and os.environ.get("LH_HARNESS_DISABLE_GUI_ROUTE", "").strip() == "1":
+        return MANAGER_NEXT_CLI
+    return next_step
 
 
 def _format_repair_budget(budget: EpisodeBudget) -> EpisodeBudget:
