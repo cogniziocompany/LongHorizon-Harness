@@ -107,9 +107,9 @@ async def test_repair_timeout_preserves_successful_auditor_report(tmp_path: Path
     assert "Integrity: suspect" not in report
     assert "Auditor runtime failed" not in report
 
-    # The repair pass really ran, under the 120 s clamp.
+    # The repair pass really ran, under the 300 s clamp.
     assert len(calls) == 1
-    assert calls[0]["budget"].max_duration_seconds == 120
+    assert calls[0]["budget"].max_duration_seconds == 300
 
     # The recorded status notes the repair attempt and its failure.
     assert status["format_repair_attempted"] is True
@@ -122,9 +122,9 @@ async def test_repair_timeout_preserves_successful_auditor_report(tmp_path: Path
     assert done_event["accepted"] is False
     assert done_event["episode_status"]["status"] == "timeout"
 
-    # Repair budget clamp remains exactly 120 s.
+    # Repair budget clamp remains exactly 300 s.
     repair_budget = _format_repair_budget(EpisodeBudget(max_duration_seconds=300))
-    assert repair_budget.max_duration_seconds == 120
+    assert repair_budget.max_duration_seconds == 300
 
 
 @pytest.mark.asyncio
