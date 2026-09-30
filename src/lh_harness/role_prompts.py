@@ -480,7 +480,10 @@ def format_audit_findings(
 
 def parse_role_manager_next_step(text: str) -> RoleNextStep:
     for line in str(text or "").splitlines():
-        normalized = line.strip().strip("*").replace(" ", "").replace("　", "").lower()
+        # Local models wrap the route in markdown (**Next:** cli, `Next: cli`, > Next: cli)
+        # or write "Next step:"; strip those before matching.
+        normalized = re.sub(r"[*`>]", "", line).strip().replace(" ", "").replace("　", "").lower()
+        normalized = normalized.replace("nextstep:", "next:").replace("nextstep：", "next:")
         # Models commonly append a short rationale after the required route,
         # e.g. `Next: done — all constraints passed`. Treat only an explicitly
         # delimited suffix as commentary so prose such as `Next: done later`
