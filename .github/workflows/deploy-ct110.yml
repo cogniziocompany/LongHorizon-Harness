@@ -391,10 +391,35 @@ jobs:
     runs-on: [self-hosted, lan-deploy]
     environment: ct110-prod
     timeout-minutes: 15
+    # run_on_ct110.sh needs PVE_HOST / PVE_USER / CT_ID / SSH_KEY_FILE. Since the
+    # ct111 change (93946f4) those live on the deploy job only, so this job failed
+    # with "set PVE_HOST" (run 36923728646). It is CT110-only, so it reads the CT110
+    # names directly; distinct UNITS_* keys keep the deploy job's per-target lines
+    # unique, and the stage step below exports the names the script expects.
+    env:
+      UNITS_PVE_SSH_KEY: ${{ secrets.CT110_PVE_SSH_KEY }}
+      UNITS_PVE_HOST: ${{ vars.CT110_PVE_HOST || 'corsairai300' }}
+      UNITS_PVE_USER: ${{ vars.CT110_PVE_SSH_USER || 'root' }}
+      UNITS_CT_ID: ${{ vars.CT110_CT_ID || '110' }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.sha }}
+
+      - name: Stage SSH key and CT110 connection facts
+        run: |
+          set -euo pipefail
+          [ -n "$UNITS_PVE_SSH_KEY" ] || { echo "::error::secret CT110_PVE_SSH_KEY is not set in environment ct110-prod"; exit 1; }
+          key_file="$RUNNER_TEMP/ct110_pve_key"
+          install -m 600 /dev/null "$key_file"
+          printf '%s\n' "$UNITS_PVE_SSH_KEY" > "$key_file"
+          {
+            echo "SSH_KEY_FILE=$key_file"
+            echo "PVE_HOST=$UNITS_PVE_HOST"
+            echo "PVE_USER=$UNITS_PVE_USER"
+            echo "CT_ID=$UNITS_CT_ID"
+          } >> "$GITHUB_ENV"
+          echo "pve_host=$UNITS_PVE_HOST pve_user=$UNITS_PVE_USER ct_id=$UNITS_CT_ID"
 
       - name: Stage unit files
         run: |
