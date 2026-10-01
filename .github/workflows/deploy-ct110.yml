@@ -359,8 +359,11 @@ jobs:
       # that suspended them — the success path resumes them after verify,
       # and a failed deploy (including the automatic rollback below) resumes
       # them here so a suspend can never strand a run in the manifest.
+      # Gate on "the suspend step ran" (outcome != 'skipped'), not on its
+      # success: a suspend that stopped some runs and then failed must still
+      # put them back. resume_runs.py exits 0 on an empty manifest.
       - name: Resume suspended runs (fc-H4b)
-        if: ${{ !inputs.dry_run && always() && inputs.active_runs == 'suspend' && steps.suspend_runs.outcome == 'success' }}
+        if: ${{ !inputs.dry_run && always() && inputs.active_runs == 'suspend' && steps.suspend_runs.outcome != 'skipped' }}
         run: |
           python3 scripts/deploy/ct110/resume_runs.py \
             --url "$CT110_WEB_URL"

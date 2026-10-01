@@ -271,10 +271,12 @@ def test_suspend_mode_order_and_resume_guard() -> None:
     assert _step_index(steps, "Clear drain") < _step_index(steps, "Automatic rollback")
 
     resume = next(step for step in steps if "resume_runs.py" in step.get("run", ""))
-    # always() so the automatic-rollback path resumes too — but only once
-    # the suspend step actually succeeded.
+    # always() so the automatic-rollback path resumes too, and whenever the
+    # suspend step RAN (not only when it succeeded): a partial suspend that
+    # then failed must still put the parked runs back.
     assert "always()" in resume["if"]
-    assert "steps.suspend_runs.outcome == 'success'" in resume["if"]
+    assert "steps.suspend_runs.outcome != 'skipped'" in resume["if"]
+    assert "steps.suspend_runs.outcome == 'success'" not in resume["if"]
 
     rollback = steps[_step_index(steps, "Automatic rollback")]
     assert "failure()" in rollback["if"]
