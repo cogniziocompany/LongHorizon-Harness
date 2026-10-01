@@ -40,9 +40,11 @@ install, credentials, registration — is `scripts/deploy/node/README.md`.
 | preflight | runner | `preflight.py`: ref resolves to a sha; a `vX.Y.Z` tag matches `pyproject.toml` version; default-branch tip has no red/in-flight checks |
 | build | runner | npm Web bundle + `python -m build --wheel`; wheel version and bundled Web UI verified |
 | drain | runner | `set_drain.py --enable`: POST `/api/queue/drain` stops NEW queue launches (TASK 242); live runs finish untouched, and the flag survives the restart so a failed verify leaves CT110 drained rather than refilling the slots |
-| wait | runner | `wait_zero_active.py`: counted consecutive zero-active polls of `GET /api/runs` |
+| suspend | runner | `suspend_runs.py` (fc-H4b, `active_runs=suspend` only): POST `/api/maintenance/suspend` stops every ACTIVE run and parks it in a persisted manifest |
+| wait | runner | `wait_zero_active.py`: counted consecutive zero-active polls of `GET /api/runs` — with `active_runs=suspend` a fixed 10-minute timeout (only the suspend stops have to land); with `active_runs=wait`, `wait_timeout_minutes` as before |
 | deploy | runner → PVE → CT110 | `run_on_ct110.sh` pushes bytes (sha256-verified at both hops) and runs `ct110_deploy.sh deploy` |
 | verify | runner / CT110 | `systemctl is-active` == active; installed `lh_harness.__version__` == target; `GET /api/meta` == 200 AND `meta.drain.enabled == true` (the restarted service must come back drained) |
+| resume runs | runner | `resume_runs.py` (fc-H4b, `active_runs=suspend` only): POST `/api/maintenance/resume` puts every parked run back (`mode=continue`) and polls `GET /api/runs` until each is ACTIVE again — runs BEFORE the drain clears, on the success path and the automatic-rollback path alike (fails by name if a run never comes back) |
 | resume | runner | `set_drain.py --disable`: clears the drain and verifies `meta.drain.enabled == false` — runs whenever the flag was set (success or failure path), so a failed deploy never leaves the queue frozen |
 | rollback | runner → CT110 | automatic on any failure AFTER the deploy step has started (a skipped deploy step — wheel download, SSH key staging, zero-active wait — aborts the run with NO service restart); loud sentinel if the rollback itself fails |
 
@@ -78,6 +80,45 @@ Greppable terminal markers: `CT110_DEPLOY_OK`, `CT110_DEPLOY_FAILED_ROLLBACK_OK`
    the previous version. The workflow gates rollback on the deploy step
    having actually started (`steps.deploy.outcome` in `success`/`failure`),
    so a pre-deploy failure can never reach the rollback's service restart.
+5. **Long runs can outwait the zero-active window, so the default is to stop
+   and resume them (fc-H4b).** `active_runs=suspend` (the default) drains the
+   queue, stops every ACTIVE run with POST `/api/maintenance/suspend` (the API
+   refuses with 409 unless the drain is already set), waits at most 10 minutes
+   for the stops to land, deploys, verifies, then puts every parked run back
+   with POST `/api/maintenance/resume` (`mode=continue`) and only clears the
+   drain once each resumed run is ACTIVE again. The resume step is
+   `always()`-gated on the suspend step having succeeded, so it also fires on
+   the automatic-rollback path — a suspended run is never left behind, and the
+   resume step fails by name if a run does not come back within
+   `--timeout-minutes` (default 5). `active_runs=wait` is exactly the lesson-3
+   behaviour. **Cost:** the round a suspended run had in progress is redone
+   after resume.
+
+## ACTIVE runs during the deploy: `active_runs=suspend` (default) or `wait`
+
+A deploy restarts `lh-harness.service`, which kills every in-flight run, so an
+ACTIVE run must be gone before the deploy touches the host. The
+`active_runs` input chooses how:
+
+- **`suspend` (default, fc-H4b).** After the drain stops new launches,
+  `suspend_runs.py` POSTs `/api/maintenance/suspend`: the service stops every
+  ACTIVE run and parks it in `runs_root/queue/maintenance_manifest.json`.
+  A short zero-active wait (fixed 10-minute timeout — only the stops have to
+  land) confirms idleness, the deploy runs and verifies, then
+  `resume_runs.py` POSTs `/api/maintenance/resume`, which restarts every
+  parked run with `mode=continue`, and polls `GET /api/runs` until each one
+  reports an ACTIVE status again (5-minute default; the step fails naming any
+  run that does not come back). Only then is the drain cleared. The resume
+  step is `always()`-gated on the suspend step having succeeded, so parked
+  runs also come back when the deploy fails and automatically rolls back —
+  a suspended run is never left behind.
+- **`wait`.** Exactly the pre-fc-H4b behaviour: no suspend, no resume, and
+  the zero-active wait simply outlives the live runs for up to
+  `wait_timeout_minutes` (default 30).
+
+**Cost of `suspend`:** the round a suspended run had in progress is redone
+after resume. Choose `wait` for a deploy that must not disturb a run's
+in-flight round at all.
 
 ## Assumptions (mechanics that live only on PTAIT09 and could not be read)
 
@@ -139,6 +180,8 @@ gh workflow run deploy-ct110.yml --ref <branch-with-workflow> \
   -f target_ref=v0.1.8 -f dry_run=true   # preflight+build only, never touches CT110
 gh workflow run deploy-ct110.yml --ref <branch-with-workflow> \
   -f target=ct111 -f target_ref=v0.1.8   # the finance node; omit target for CT110
+gh workflow run deploy-ct110.yml --ref <branch-with-workflow> \
+  -f target_ref=v0.1.8 -f active_runs=wait  # never stops runs; waits them out (pre-fc-H4b behaviour)
 ```
 
 Until the PR carrying this workflow merges to main, dispatch with
