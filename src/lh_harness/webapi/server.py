@@ -46,7 +46,12 @@ from ..overseer_state import resolve_overseer_root
 from . import mcp_jsonrpc as mcp_protocol
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
-from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
+from ..supervisor.lifecycle import (
+    TERMINAL_STATUSES,
+    canonical_lifecycle_status,
+    is_active_status,
+    resume_epoch,
+)
 from ..supervisor.control_bus import CommandConflict, RevisionConflict, _append_jsonl
 from ..fleet import get_reporter
 from ..queue import (
@@ -649,6 +654,101 @@ def _public_owner(owner: dict[str, Any]) -> dict[str, Any]:
 
 def _event_tailer(state: DashboardState, run_id: str) -> EventTailer:
     return EventTailer(state.role_dir / "events.jsonl", run_id=run_id)
+
+
+def _queue_run_map(queue_store: QueueStore | PgQueueStore | None) -> dict[str, dict[str, str | None]]:
+    """Map ``run_id`` -> ``{"queue_id", "name"}`` from durable queue entries.
+
+    Runs carry no queue linkage of their own; the queue entry is the durable
+    record that names which task a launch came from.  One ``list()`` scan
+    (small bounded per-entry reads) serves every row of a liveness poll, and
+    a queue-store failure degrades the linkage to ``None`` instead of failing
+    the liveness response.
+    """
+
+    mapping: dict[str, dict[str, str | None]] = {}
+    if queue_store is None:
+        return mapping
+    try:
+        entries = queue_store.list()
+    except Exception:
+        return mapping
+    for entry in entries:
+        run_id = getattr(entry, "run_id", None)
+        if not run_id:
+            continue
+        name = getattr(entry, "name", None)
+        mapping.setdefault(
+            str(run_id),
+            {
+                "queue_id": str(getattr(entry, "queue_id", "") or "") or None,
+                "name": str(name) if name else None,
+            },
+        )
+    return mapping
+
+
+def _latest_projection(
+    registry: StateRegistry,
+    item: dict[str, Any],
+    queue_map: dict[str, dict[str, str | None]],
+    now: float,
+) -> dict[str, Any] | None:
+    """Build one ``/api/runs/*/latest`` row without a snapshot build.
+
+    Cost per row: the registry's cheap durable ``status.json`` item plus one
+    bounded tail read of the run's ``events.jsonl`` (``EventTailer.read_last``
+    seeks from the end; the whole log is never replayed).  ``round`` comes
+    from the durable item when it has one and from the last event otherwise;
+    ``active_role`` is reported only when the last event is an unclosed
+    ``*.started`` of a non-terminal run, which is the cheapest honest signal.
+    """
+
+    run_id = str(item.get("id") or "")
+    if not run_id:
+        return None
+    state = registry.state_for(run_id)
+    if state is None:
+        return None
+    status = canonical_lifecycle_status(item.get("status"), default="unknown")
+    tailer = _event_tailer(state, run_id)
+    tail = tailer.read_last(1)
+    last = tail[-1] if tail else None
+    last_event: dict[str, Any] | None = None
+    last_event_age_seconds: float | None = None
+    if last is not None:
+        last_event = {
+            "id": last.event_id,
+            "type": last.type,
+            "ts": last.ts,
+            "round": last.round,
+            "role": last.role,
+        }
+        last_event_age_seconds = now - last.ts
+    round_value: int | None = None
+    raw_round = item.get("round")
+    if isinstance(raw_round, int) and not isinstance(raw_round, bool):
+        round_value = raw_round
+    elif last is not None and isinstance(last.round, int):
+        round_value = last.round
+    active_role: str | None = None
+    if last is not None and status not in TERMINAL_STATUSES and last.type.endswith(".started"):
+        active_role = last.role
+    queue_link = queue_map.get(run_id) or {}
+    return {
+        "run_id": run_id,
+        "status": status,
+        "round": round_value,
+        "active_role": active_role,
+        "queue_id": queue_link.get("queue_id"),
+        "name": queue_link.get("name"),
+        "last_event": last_event,
+        "last_event_age_seconds": last_event_age_seconds,
+        "console_path": f"/runs/{run_id}",
+        "now": now,
+        # Placeholder for task fc-H2; no time-limit logic lives in fc-H1a.
+        "time_limit": None,
+    }
 
 
 def _emit_run_created_event(
@@ -1834,6 +1934,50 @@ def create_app(
         if isinstance(created.get("owner"), dict):
             created = {**created, "owner": _public_owner(created["owner"])}
         return {"ok": True, "run": created}
+
+    # Registered BEFORE the ``/api/runs/{run_id}/...`` routes so "latest" is
+    # never parsed as a run id.  Both routes stay cheap by design: durable
+    # status.json items plus one bounded tail read per run, never a snapshot
+    # build.  The standard /api bearer middleware guards them unchanged.
+    @app.get("/api/runs/latest")
+    def runs_latest() -> dict[str, Any]:
+        """Latest event for every ACTIVE-status run (overseer liveness).
+
+        Lets an overseer tell a quiet run from a dead one without building
+        per-run snapshots or hand-setting time limits (task fc-H1a).
+        """
+
+        now = time.time()
+        queue_map = _queue_run_map(queue_store)
+        rows: list[dict[str, Any]] = []
+        for item in registry.run_items_cheap():
+            if not is_active_status(item.get("status")):
+                continue
+            row = _latest_projection(registry, item, queue_map, now)
+            if row is not None:
+                rows.append(row)
+        return {"now": now, "runs": rows}
+
+    @app.get("/api/runs/{run_id}/latest")
+    def run_latest(run_id: str) -> dict[str, Any]:
+        """Latest event for one run; 404 for an unknown run."""
+
+        _state_or_404(registry, run_id)
+        item = next(
+            (entry for entry in registry.run_items_cheap() if str(entry.get("id") or "") == run_id),
+            None,
+        )
+        if item is None:
+            item = {"id": run_id, "status": ""}
+            if registry.supervisor is not None:
+                try:
+                    item["status"] = registry.supervisor.status(run_id).get("status") or ""
+                except Exception:
+                    pass
+        row = _latest_projection(registry, item, _queue_run_map(queue_store), time.time())
+        if row is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        return row
 
     def _snapshot_response(
         request: Request,

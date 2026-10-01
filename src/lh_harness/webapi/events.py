@@ -56,6 +56,13 @@ _MAX_EVENT_LOG_BYTES = 8 * 1024 * 1024
 _MAX_EVENT_LINE_BYTES = 512 * 1024
 _MAX_EVENT_RECORDS = 20_000
 
+# First seek-from-end chunk for ``EventTailer.read_last``.  The liveness routes
+# (``/api/runs/{id}/latest``) only need the final records, so the tailer must
+# never replay the whole log: a poll of a 100 MB log stays a 64 KiB read in
+# the common case.  The chunk grows geometrically only when the final records
+# themselves are too large to fit, and never beyond the replay byte budget.
+_TAIL_CHUNK_BYTES = 64 * 1024
+
 
 def _as_int(value: Any) -> int | None:
     try:
@@ -239,6 +246,7 @@ class EventTailer:
         self.last_warnings: list[str] = []
         self.last_first_event_id: str | None = None
         self.last_last_event_id: str | None = None
+        self.last_tail_bytes_read = 0
 
     def read(self, *, limit: int = 500, after: str | None = None) -> list[EventEnvelope]:
         self.last_cursor_gap = False
@@ -342,6 +350,107 @@ class EventTailer:
         self.last_first_event_id = bounded[0].event_id if bounded else None
         self.last_last_event_id = bounded[-1].event_id if bounded else after
         return bounded
+
+    def read_last(self, n: int = 1) -> list[EventEnvelope]:
+        """Return the last ``n`` complete events via bounded seek-from-end reads.
+
+        Unlike :meth:`read` this never replays the bounded window: it seeks to
+        ``_TAIL_CHUNK_BYTES`` before EOF, parses complete records only, and
+        keeps the final ``n``.  The chunk grows geometrically (bounded by the
+        replay byte budget) only when the tail records themselves do not fit —
+        for example one oversized final line.  ``last_tail_bytes_read`` records
+        the total bytes read so callers/tests can assert the poll stayed a
+        tail read.  A missing/unreadable log yields ``[]``, never an error.
+        """
+
+        self.last_warnings = []
+        self.last_tail_bytes_read = 0
+        wanted = max(1, min(int(n), 100))
+        try:
+            fd = _open_control_nofollow(self.path)
+        except OSError:
+            return []
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                return []
+            size = metadata.st_size
+            if size <= 0:
+                return []
+            chunk = min(_TAIL_CHUNK_BYTES, size)
+            while True:
+                start = max(0, size - chunk)
+                os.lseek(fd, start, os.SEEK_SET)
+                raw = os.read(fd, size - start)
+                self.last_tail_bytes_read += len(raw)
+                events = self._parse_tail_records(raw, base_offset=start, head_truncated=start > 0)
+                if len(events) >= wanted or start == 0 or chunk >= _MAX_EVENT_LOG_BYTES:
+                    return events[-wanted:]
+                chunk = min(chunk * 8, _MAX_EVENT_LOG_BYTES, size)
+        finally:
+            os.close(fd)
+
+    def _parse_tail_records(
+        self,
+        raw: bytes,
+        *,
+        base_offset: int,
+        head_truncated: bool,
+    ) -> list[EventEnvelope]:
+        """Parse complete JSONL records from a tail chunk of the event log."""
+
+        if head_truncated:
+            # The first bytes may be the middle of a record.  Drop the partial
+            # record; offsets stay relative to the real file.
+            first_newline = raw.find(b"\n")
+            if first_newline < 0:
+                return []
+            base_offset += first_newline + 1
+            raw = raw[first_newline + 1 :]
+        if raw and not raw.endswith((b"\n", b"\r")):
+            # A worker may be writing the final line while we read.  Never
+            # parse that incomplete tail; it will be picked up on the next poll.
+            last_newline = raw.rfind(b"\n")
+            raw = raw[: last_newline + 1] if last_newline >= 0 else b""
+        events: list[EventEnvelope] = []
+        offset = base_offset
+        sequence = 0
+        for line in raw.splitlines(keepends=True):
+            line_start = offset
+            offset += len(line)
+            text = line.strip()
+            if not text:
+                continue
+            if len(line) > _MAX_EVENT_LINE_BYTES:
+                self.last_warnings.append(
+                    f"ignored oversized event at byte offset {line_start}"
+                )
+                continue
+            try:
+                record = json.loads(text.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.last_warnings.append(f"ignored malformed event at byte offset {line_start}")
+                continue
+            if not isinstance(record, dict):
+                self.last_warnings.append(f"ignored non-object event at byte offset {line_start}")
+                continue
+            sequence += 1
+            try:
+                events.append(
+                    normalize_event(
+                        record,
+                        run_id=self.run_id,
+                        sequence=sequence,
+                        offset=line_start,
+                        fallback_event_id=(
+                            f"{self.run_id}:offset-{line_start:016x}" if head_truncated else None
+                        ),
+                    )
+                )
+            except EventNormalizationError as exc:
+                self.last_warnings.append(f"ignored event {sequence}: {exc}")
+                continue
+        return events
 
     def _read_bounded(self) -> tuple[bytes, int, bool]:
         """Read at most ``_MAX_EVENT_LOG_BYTES`` from the event log.
