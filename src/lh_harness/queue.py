@@ -46,6 +46,40 @@ _VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked"})
 _NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
 _VALID_TRIOS = frozenset({"kimi", "qwen"})
 
+# The requester identity block (task 300).  A JSON object on the entry body
+# (key "requester", stored on QueueEntry as a plain dict) that mechanically
+# records who asked for a task and how to reach them for updates.
+_REQUESTER_KINDS = frozenset({"user", "ai", "service"})
+_REQUESTER_MAX_NAME_CHARS = 128
+_REQUESTER_MAX_HOST_CHARS = 128
+_REQUESTER_MAX_ADDRESS_CHARS = 128
+_REQUESTER_MAX_CWD_CHARS = 4096
+_REQUESTER_MAX_AGENT_CHARS = 64
+_REQUESTER_AGENT_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_REQUESTER_MAX_SESSION_ID_CHARS = 128
+_REQUESTER_MAX_SESSION_REF_CHARS = 64
+_REQUESTER_MAX_NOTIFY_CHARS = 512
+
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _looks_like_hex(value: str) -> bool:
+    """True when ``value`` is a plausible opaque hex/UUID token.
+
+    Used only to decide whether a caller-supplied ``session_ref`` can be
+    shortened to its first six hex chars.  A strict ``[0-9a-fA-F]+`` scan is
+    enough: it accepts the UUID form ``8f14...`` and rejects names that carry
+    any non-hex character, so a "user" named "Sven" never collapses.  A canonical
+    UUID (``8-4-4-4-12`` hex groups) is accepted even though the group dashes are
+    not hex chars, so a Claude Code / Codex session id derives a ref.
+    """
+    if bool(value):
+        if _UUID_RE.match(value):
+            return True
+        return all(char in "0123456789abcdefABCDEF" for char in value)
+    return False
+
 # Body keys accepted by _normalize_request (task 233).  Anything else is
 # rejected with the offending key names in the message instead of being
 # dropped silently.  ``task_file`` and ``roles`` are alternative input keys
@@ -65,6 +99,7 @@ KNOWN_REQUEST_KEYS = frozenset(
         "base_check",
         "requested_by",
         "dedup_key",
+        "requester",
     }
 )
 
@@ -179,6 +214,10 @@ class QueueEntry:
     launched_at: float | None = None
     last_checked_at: float | None = None
     dedup_key: str | None = None
+    # Requester identity block (task 300).  ``None`` when the entry predates the
+    # requirement (old JSON without "requester" loads as None) or when it was
+    # synthesized in legacy mode (``legacy: true``).  A plain dict otherwise.
+    requester: dict[str, Any] | None = None
     # Retry/requeue fields
     retry_of: str | None = None
     attempt: int = 1
@@ -215,6 +254,7 @@ class QueueEntry:
             "launched_at",
             "last_checked_at",
             "dedup_key",
+            "requester",
             "retry_of",
             "attempt",
             "failure_cause",
@@ -324,6 +364,166 @@ def _validate_requested_by(value: Any) -> str:
     return text
 
 
+def _bounded(value: Any, *, field: str, max_chars: int, required: bool = False) -> str:
+    """Bound a string field to ``max_chars`` (mcp_tools-style, local copy).
+
+    Reuses the same contract as ``mcp_tools._bounded`` so the requester block is
+    validated with the surrounding code's conventions: a required field that is
+    missing/empty raises ``<field> is required``, an oversized value raises
+    ``<field> is too long``, and a NUL byte raises ``<field> contains a NUL
+    byte``.
+    """
+    if value is None:
+        text = ""
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        raise ValueError(f"{field} must be a string")
+    if required and not text:
+        raise ValueError(f"{field} is required")
+    if len(text) > max_chars:
+        raise ValueError(f"{field} is too long")
+    if "\x00" in text:
+        raise ValueError(f"{field} contains a NUL byte")
+    return text
+
+
+def _validate_requester(value: Any) -> dict[str, Any] | None:
+    """Validate the ``requester`` identity block.
+
+    Returns the normalized block as a plain dict (``None`` stays ``None``).
+    Only callers may set the fields below; ``legacy`` and ``observed_addr``
+    are store/API-set only and rejected from a client-supplied block with a
+    ``ValueError("requester.<key> …")`` so the existing 422 paths work.  The
+    caller-identity stamp ``verified_caller`` (task 174) is recorded inside the
+    block as ``verified_caller`` (store-set, never caller-supplied).
+
+    The ``legacy`` flag is stamped by the store, not returned here: it marks a
+    block synthesized in legacy mode, and is applied uniformly to both a
+    synthesized block and a supplied block by ``_normalize_request``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, dict):
+        raise ValueError("requester must be an object")
+
+    # Store/API-set-only keys: a client may not set them.  Naming the key keeps
+    # the same spirit as task 233's unknown-field rejection.
+    for key in ("legacy", "observed_addr"):
+        if key in value:
+            raise ValueError(f"requester.{key} is set by the store or the API, not by the caller")
+
+    unknown = sorted(set(value) - {"kind", "name", "host", "address", "cwd", "agent", "session_id", "session_ref", "notify"})
+    if unknown:
+        raise UnknownQueueFieldError(
+            "unknown field(s): " + ", ".join(unknown)
+        )
+
+    if "kind" not in value:
+        raise ValueError("requester.kind is required")
+    kind = value["kind"]
+    if isinstance(kind, bool) or not isinstance(kind, str) or kind.strip() not in _REQUESTER_KINDS:
+        raise ValueError("requester.kind must be one of: user, ai, service")
+    kind = kind.strip()
+
+    if "name" not in value:
+        raise ValueError("requester.name is required")
+    name = _bounded(value["name"], field="requester.name", max_chars=_REQUESTER_MAX_NAME_CHARS, required=True)
+
+    if "host" not in value:
+        raise ValueError("requester.host is required")
+    host = _bounded(value["host"], field="requester.host", max_chars=_REQUESTER_MAX_HOST_CHARS, required=True)
+
+    address = value.get("address")
+    if address is not None:
+        address = _bounded(address, field="requester.address", max_chars=_REQUESTER_MAX_ADDRESS_CHARS)
+
+    is_ai = kind == "ai"
+
+    if is_ai:
+        if "agent" not in value:
+            raise ValueError("requester.agent is required when kind is ai")
+        agent = _bounded(value["agent"], field="requester.agent", max_chars=_REQUESTER_MAX_AGENT_CHARS, required=True)
+        if not _REQUESTER_AGENT_RE.match(agent):
+            raise ValueError("requester.agent must match [A-Za-z0-9._-]")
+        if "session_id" not in value:
+            raise ValueError("requester.session_id is required when kind is ai")
+        session_id = _bounded(value["session_id"], field="requester.session_id", max_chars=_REQUESTER_MAX_SESSION_ID_CHARS, required=True)
+        if "cwd" not in value:
+            raise ValueError("requester.cwd is required when kind is ai")
+        cwd = _bounded(value["cwd"], field="requester.cwd", max_chars=_REQUESTER_MAX_CWD_CHARS, required=True)
+        if "\x00" in cwd:
+            raise ValueError("requester.cwd contains a NUL byte")
+    else:
+        agent = None
+        session_id = None
+        cwd = None
+
+    session_ref = value.get("session_ref")
+    if session_ref is not None:
+        session_ref = _bounded(session_ref, field="requester.session_ref", max_chars=_REQUESTER_MAX_SESSION_REF_CHARS)
+        # A supplied session_ref is trusted as-is (bounded only).
+        block_session_ref = session_ref
+    elif is_ai and session_id and _looks_like_hex(session_id):
+        # Derive the short ref only when absent and the session id looks like a
+        # UUID/hex token; otherwise the AI block carries no session_ref.
+        block_session_ref = session_id[:6]
+    else:
+        block_session_ref = None
+
+    notify = value.get("notify")
+    if notify is None:
+        block_notify = "none"
+    else:
+        block_notify = _bounded(notify, field="requester.notify", max_chars=_REQUESTER_MAX_NOTIFY_CHARS)
+
+    block = {
+        "kind": kind,
+        "name": name,
+        "host": host,
+        "address": address,
+        "cwd": cwd,
+        "agent": agent,
+        "session_id": session_id,
+        "session_ref": block_session_ref,
+        "notify": block_notify,
+    }
+    return block
+
+
+def _derive_requested_by_from_requester(block: dict[str, Any]) -> str:
+    """Build ``{name}@{host}`` (+ ``[{session_ref}]``) from the requester block.
+
+    Only used when scoping is OFF (no verified caller stamp) -- the caller stamp
+    is the ownership proof and never derived (task 174).  When the block carries
+    a ``session_ref`` the derived stamp appends ``[{session_ref}]``; a bare
+    ``host`` stamp omits it.  The block's own ``session_ref`` is preserved here,
+    not re-derived: the derived stamp is a human-facing pointer, not the stored
+    identity.
+    """
+    ref = block.get("session_ref")
+    if ref:
+        return f"{block['name']}@{block['host']} [{_bounded(ref, field='requester.session_ref', max_chars=_REQUESTER_MAX_SESSION_REF_CHARS)}]"
+    return f"{block['name']}@{block['host']}"
+
+
+def _stamp_requester(block: dict[str, Any], *, observed_addr: str | None = None, verified_caller: str | None = None) -> dict[str, Any]:
+    """Store/API-side stamping for the requester block.
+
+    Both stamping keys are store/API-set only: the caller never set them, so
+    the block records the harness's own observation of the client host and the
+    task-174 verified caller as immutable evidence.  A ``None`` stamp is left
+    absent (nothing to record), a value overwrites whatever the caller block
+    carried (the store is authoritative about the address the API saw).
+    """
+    stamped = dict(block)
+    if observed_addr is not None:
+        stamped["observed_addr"] = str(observed_addr)
+    if verified_caller is not None:
+        stamped["verified_caller"] = str(verified_caller)
+    return stamped
+
+
 def _validate_base_check(value: Any) -> str:
     if value is None:
         return ""
@@ -376,7 +576,35 @@ def _validate_continue_branch(value: Any) -> bool:
     return value
 
 
-def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
+def _queue_requester_mode() -> str:
+    """Return the rollout mode for the requester block, read at call time.
+
+    The ``LH_HARNESS_QUEUE_REQUESTER`` env var selects ``strict`` (default) or
+    ``legacy``.  It is read here (not at import time) so tests can monkeypatch
+    the environment around a ``create`` call and the mode still applies to the
+    entry being built.
+    """
+    raw = os.environ.get("LH_HARNESS_QUEUE_REQUESTER", "strict").strip().lower()
+    if raw not in {"strict", "legacy"}:
+        raw = "strict"
+    return raw
+
+
+def _queue_requester_mode() -> str:
+    """Return the rollout mode for the requester block, read at call time.
+
+    The ``LH_HARNESS_QUEUE_REQUESTER`` env var selects ``strict`` (default) or
+    ``legacy``.  It is read here (not at import time) so tests can monkeypatch
+    the environment around a ``create`` call and the mode still applies to the
+    entry being built.
+    """
+    raw = os.environ.get("LH_HARNESS_QUEUE_REQUESTER", "strict").strip().lower()
+    if raw not in {"strict", "legacy"}:
+        raw = "strict"
+    return raw
+
+
+def _normalize_request(body: dict[str, Any], *, legacy: bool = None, caller_stamped: bool = False) -> dict[str, Any]:
     """Convert a POST /api/queue body into validated launch parameters.
 
     Unknown body keys are rejected (task 233) with an error naming every
@@ -384,7 +612,18 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
     continuation tasks as fresh ones when ``continue_branch``/``branch`` went
     missing. ``KNOWN_REQUEST_KEYS`` is also the allowlist behind the MCP tool
     schema and the REST 400 mapping (server.py ``create_queue_entry``).
+
+    ``legacy`` selects the requester-block rollout mode (task 300); when
+    omitted it reads ``LH_HARNESS_QUEUE_REQUESTER`` at call time.  The value is
+    read here, not at import, so the mode is the live environment at enqueue,
+    not the environment the process started with.
+
+    ``requested_by`` stays required and its caller stamp wins over the block --
+    the two are independent proofs.
     """
+    # ``legacy`` is the explicit rollout flag passed by the callers (REST/MCP).
+    # When omitted, fall back to the env var read at call time -- never to True.
+    legacy = bool(legacy) if legacy is not None else (_queue_requester_mode() == "legacy")
 
     unknown = sorted(set(body) - KNOWN_REQUEST_KEYS)
     if unknown:
@@ -411,6 +650,36 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         # at different specificity; accepting both would leave the launcher's
         # behaviour ambiguous, so the enqueue is rejected instead.
         raise ValueError("set branch or continue_branch, not both")
+
+    # Requester identity block (task 300).  ``requested_by`` stays required and
+    # its caller stamp wins over the block -- the two are independent proofs.
+    requester_raw = body.get("requester")
+    requested_by_value = body.get("requested_by")
+    if legacy:
+        # Legacy mode: a missing/null block is synthesized (kind unknown,
+        # legacy true) but a supplied block is still fully validated below.
+        # The synthesized block borrows the caller's ``requested_by`` as its
+        # name (task 174 stamps requested_by from the verified caller, so it is
+        # always present here) and flags itself as synthesized.
+        if requester_raw is None:
+            requester_block = {
+                "kind": "unknown",
+                "name": _validate_name(requested_by_value),
+                "host": "unknown",
+                "notify": "none",
+                "legacy": True,
+            }
+        else:
+            requester_block = _validate_requester(requester_raw)
+    else:
+        # Strict mode: a missing/null block is a hard rejection.
+        if requester_raw is None:
+            raise ValueError("requester is required (kind, name, host; agent, session_id, cwd when kind=ai)")
+        requester_block = _validate_requester(requester_raw)
+
+    if legacy and requester_raw is None:
+        requester_block["legacy"] = True
+
     return {
         "name": _validate_name(body.get("name")),
         "task": task_text,
@@ -423,6 +692,7 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "base_check": _validate_base_check(body.get("base_check")),
         "requested_by": _validate_requested_by(body.get("requested_by")),
         "dedup_key": _validate_dedup_key(body.get("dedup_key")),
+        "requester": requester_block,
     }
 
 
@@ -685,7 +955,7 @@ class QueueStore:
         payload = json.dumps(entry.to_dict(), ensure_ascii=False, sort_keys=True, indent=2)
         _atomic_bytes_write(self._path(entry.queue_id), payload.encode("utf-8"))
 
-    def create(self, body: dict[str, Any]) -> QueueEntry:
+    def create(self, body: dict[str, Any], *, observed_addr: str | None = None, verified_caller: str | None = None) -> QueueEntry:
         """Create a queue entry, de-duplicating by ``dedup_key`` when supplied.
 
         Idempotent-enqueue semantics: when ``dedup_key`` is a non-empty string
@@ -699,6 +969,18 @@ class QueueStore:
         fresh entry -- a retry. Enqueues without a key behave exactly as before,
         each minting a unique ``q-<hex>`` id.
 
+        ``observed_addr`` and ``verified_caller`` stamp the requester block from
+        the server side (task 300): ``observed_addr`` is the client host the REST
+        API saw (store-set only), ``verified_caller`` is the task-174 caller the
+        API stamped as a proof. Both are store/API-set only -- a caller may not
+        supply them, so the block they land in is never the caller's own
+        assertion.
+
+        The requester-block rollout mode (strict vs legacy) is read from
+        ``LH_HARNESS_QUEUE_REQUESTER`` at call time (``_queue_requester_mode``),
+        so a deploy behind the legacy flag synthesizes the block until the
+        external enqueue path sends one; the flag is the documented rollout aid.
+
         Residual: the lookup is a read-then-write over the entry directory. It
         removes duplicate enqueues from sequential or retrying callers; a
         simultaneous cross-process race where two ``create`` calls both miss the
@@ -707,6 +989,20 @@ class QueueStore:
         as new work in the migration plan (section 4), not implemented here.
         """
         params = _normalize_request(body)
+        requester = params.get("requester")
+        if requester is not None:
+            requester = _stamp_requester(requester, observed_addr=observed_addr, verified_caller=verified_caller)
+        # Scoping OFF (no verified caller stamp): derive requested_by from the
+        # requester block's name/host/session_ref.  A supplied stamp wins, so the
+        # derivation never runs when verified_caller is present (task 174).
+        if verified_caller is None:
+            requested_by = params.get("requested_by")
+            if requester is not None:
+                requested_by = _derive_requested_by_from_requester(requester)
+            else:
+                requested_by = _validate_requested_by(requested_by)
+        else:
+            requested_by = _validate_requested_by(params.get("requested_by"))
         dedup_key = params.get("dedup_key")
         if dedup_key:
             existing = self._find_non_terminal_by_dedup(dedup_key)
@@ -714,7 +1010,13 @@ class QueueStore:
                 return existing
         queue_id = f"q-{uuid.uuid4().hex[:16]}"
         now = _now()
-        entry = QueueEntry(queue_id=queue_id, created_at=now, updated_at=now, **params)
+        entry = QueueEntry(
+            queue_id=queue_id,
+            created_at=now,
+            updated_at=now,
+            requester=requester,
+            **{key: value for key, value in params.items() if key != "requester"},
+        )
         self._write(entry)
         return entry
 
@@ -933,7 +1235,8 @@ class QueueStore:
             failure_cause=cause,
             created_at=_now(),
             updated_at=_now(),
-            dedup_key=None  # retries must not collide with original dedup_key
+            dedup_key=None,  # retries must not collide with original dedup_key
+            requester=entry.requester,  # the retry carries the same requester identity
         )
 
         self._write(successor)
