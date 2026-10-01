@@ -1,7 +1,7 @@
 # CT110 OVERSEER TICK ADAPTER — how LOOP-PROMPT.md is executed from CT110 (TASK 236)
 
-This document is the adapter between the authoritative LOOP-PROMPT doctrine
-(`docs/LOOP-PROMPT.md`, unchanged) and the CT110 home of the overseer sweep.
+This document is the adapter between the RETIRED LOOP-PROMPT doctrine
+(`docs/LOOP-PROMPT.md`, history only since 2026-10-01) and the CT110 home of the overseer sweep.
 The doctrine itself is NOT rewritten: every state, rule, step and
 prohibition in it still applies verbatim.  What changes is only **where
 things live** — this file maps each `C:/tmp`-era surface in the doctrine to
@@ -40,11 +40,11 @@ systemctl status "$$"        # must show the tick unit as your cgroup
 
 | Doctrine says | On CT110 it is |
 |---|---|
-| `C:/tmp/queue/LOOP-PROMPT.md` | `docs/LOOP-PROMPT.md` in the repo checkout (authoritative; `README-OVERSEER-APPARATUS.md:14`) |
+| `C:/tmp/queue/LOOP-PROMPT.md` | `docs/LOOP-PROMPT.md` in the repo checkout (RETIRED 2026-10-01, history only; live process = claude-code-teams `agents/orchestrator/OVERSEER.md` + gateway skill `ct110-overseer`) |
 | `C:/tmp/queue/LEDGER.md` | The tick ledger on the CT110 harness API + Postgres (`harness` schema on CT103, task 235 surface; ledger rows via the API/MCP surface below). Until the DB ledger UI (197) serves writes, each tick appends its row through the task 235 API and mirrors it to `docs/LEDGER.md` in the checkout via the normal repo PR flow. |
-| `C:/tmp/queue/OPEN-ASKS.md` | `queue/OPEN-ASKS.md` in the repo checkout (authoritative archive). New rows go through the task 235 API; the repo file is updated by the normal PR flow. |
+| `C:/tmp/queue/OPEN-ASKS.md` | RETIRED 2026-10-01: open asks are derived live from CT110 (`list_open_asks`, `GET /api/runs?status=waiting_approval`, Ship Plane). `queue/OPEN-ASKS.md` is a retired stub. |
 | `C:/tmp/queue/done/*.json`, `blocked/` | The `harness.queue` Postgres store (migrations 001–003) via `GET /api/queue` (states `pending`, `launched`, `done`, `failed`, `blocked`). The `done/`-is-an-upper-bound lesson (RULE 2) reads as: `launched`/`done` are launch-time records; verify actual state with `GET /api/runs/<id>/status`. |
-| `C:/tmp/*-task.txt` | `tasks/*-task.txt` in the repo checkout (authoritative briefs) |
+| `C:/tmp/*-task.txt` | `tasks/*-task.txt` in the repo checkout (historical briefs; new task text goes IN the CT110 enqueue call) |
 | `C:/tmp/HANDOFF-*.md` | `docs/handoffs/HANDOFF-*.md` in the repo checkout |
 | `GET /api/runs` (PTAIT09-launched runs) | Same route, same host: `GET $CT110_WEB_URL/api/runs` with the `LH_HARNESS_WEB_TOKEN` bearer. All doctrine RULE 1 lessons about this endpoint (`{"runs":[...]}` shape, `id` not `run_id`, no bare curl, snapshot path, approvals in `approvals[]`) apply verbatim. |
 | Ship Plane republish | The hosted Ship Plane page (task 104, folded in). A scheduled tick in read-only mode never republishes; in act mode the doctrine's skip-line applies ('republish pending, interactive') unless the hosted page is writable by the tick. |
