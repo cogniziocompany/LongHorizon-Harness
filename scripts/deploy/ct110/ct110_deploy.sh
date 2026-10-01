@@ -88,7 +88,10 @@ api_token() {
 # Count runs in an ACTIVE lifecycle state via the LOCAL API.  Status set from
 # src/lh_harness/supervisor/lifecycle.py: ACTIVE_STATUSES.
 active_run_count() {
-  curl -sf --max-time 15 -H "Authorization: Bearer $(api_token)" "$API_URL/api/runs" \
+  # Summary form (~123 KB, carries status) instead of the full list (~5.6 MB), which timed out
+  # at 15 s and, under set -e/pipefail, killed the deploy with curl exit 28 before install
+  # (run 36801068351). A failed fetch now reaches the parser as empty input -> -1 -> abort.
+  { curl -sf --max-time 60 -H "Authorization: Bearer $(api_token)" "$API_URL/api/runs?fields=summary" || true; } \
     | python3 -c '
 import json, sys
 ACTIVE = {"creating", "starting", "running", "waiting_approval", "stopping"}
@@ -175,7 +178,11 @@ case "$MODE" in
     prev="$(cat "$STATE_DIR/previous_version")"
     [[ -n "$prev" ]] || { echo "rollback: $STATE_DIR/previous_version is empty" >&2; exit 3; }
     wheel=""
-    for candidate in "$WHEEL_ARCHIVE"/lh_harness-"$prev"-*-py3-none-any.whl; do
+    # The archive keeps the full local version (lh_harness-0.1.7+a0a067e-py3-none-any.whl),
+    # so match "<prev>-py3..." and "<prev>+<local>-py3..." as well as the old pattern.
+    for candidate in "$WHEEL_ARCHIVE"/lh_harness-"$prev"-py3-none-any.whl \
+                     "$WHEEL_ARCHIVE"/lh_harness-"$prev"+*-py3-none-any.whl \
+                     "$WHEEL_ARCHIVE"/lh_harness-"$prev"-*-py3-none-any.whl; do
       [[ -f "$candidate" ]] && wheel="$candidate" && break
     done
     [[ -n "$wheel" ]] || {
