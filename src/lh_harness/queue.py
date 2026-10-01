@@ -409,7 +409,7 @@ def _validate_requester(value: Any) -> dict[str, Any] | None:
 
     # Store/API-set-only keys: a client may not set them.  Naming the key keeps
     # the same spirit as task 233's unknown-field rejection.
-    for key in ("legacy", "observed_addr"):
+    for key in ("legacy", "observed_addr", "verified_caller"):
         if key in value:
             raise ValueError(f"requester.{key} is set by the store or the API, not by the caller")
 
@@ -590,21 +590,7 @@ def _queue_requester_mode() -> str:
     return raw
 
 
-def _queue_requester_mode() -> str:
-    """Return the rollout mode for the requester block, read at call time.
-
-    The ``LH_HARNESS_QUEUE_REQUESTER`` env var selects ``strict`` (default) or
-    ``legacy``.  It is read here (not at import time) so tests can monkeypatch
-    the environment around a ``create`` call and the mode still applies to the
-    entry being built.
-    """
-    raw = os.environ.get("LH_HARNESS_QUEUE_REQUESTER", "strict").strip().lower()
-    if raw not in {"strict", "legacy"}:
-        raw = "strict"
-    return raw
-
-
-def _normalize_request(body: dict[str, Any], *, legacy: bool = None, caller_stamped: bool = False) -> dict[str, Any]:
+def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
     """Convert a POST /api/queue body into validated launch parameters.
 
     Unknown body keys are rejected (task 233) with an error naming every
@@ -621,9 +607,8 @@ def _normalize_request(body: dict[str, Any], *, legacy: bool = None, caller_stam
     ``requested_by`` stays required and its caller stamp wins over the block --
     the two are independent proofs.
     """
-    # ``legacy`` is the explicit rollout flag passed by the callers (REST/MCP).
-    # When omitted, fall back to the env var read at call time -- never to True.
-    legacy = bool(legacy) if legacy is not None else (_queue_requester_mode() == "legacy")
+    # Rollout mode is read from the environment at call time (task 300).
+    legacy = _queue_requester_mode() == "legacy"
 
     unknown = sorted(set(body) - KNOWN_REQUEST_KEYS)
     if unknown:
@@ -664,7 +649,7 @@ def _normalize_request(body: dict[str, Any], *, legacy: bool = None, caller_stam
         if requester_raw is None:
             requester_block = {
                 "kind": "unknown",
-                "name": _validate_name(requested_by_value),
+                "name": _validate_requested_by(requested_by_value),
                 "host": "unknown",
                 "notify": "none",
                 "legacy": True,
@@ -677,8 +662,13 @@ def _normalize_request(body: dict[str, Any], *, legacy: bool = None, caller_stam
             raise ValueError("requester is required (kind, name, host; agent, session_id, cwd when kind=ai)")
         requester_block = _validate_requester(requester_raw)
 
-    if legacy and requester_raw is None:
-        requester_block["legacy"] = True
+    # requested_by: a supplied value (or the task-174 caller stamp, which the
+    # REST/MCP layers write into the body) always wins.  Only when it is absent
+    # and a real requester block was supplied is it derived from the block.
+    if requested_by_value is None and requester_raw is not None:
+        requested_by = _derive_requested_by_from_requester(requester_block)
+    else:
+        requested_by = _validate_requested_by(requested_by_value)
 
     return {
         "name": _validate_name(body.get("name")),
@@ -690,7 +680,7 @@ def _normalize_request(body: dict[str, Any], *, legacy: bool = None, caller_stam
         "branch": branch,
         "continue_branch": continue_branch,
         "base_check": _validate_base_check(body.get("base_check")),
-        "requested_by": _validate_requested_by(body.get("requested_by")),
+        "requested_by": requested_by,
         "dedup_key": _validate_dedup_key(body.get("dedup_key")),
         "requester": requester_block,
     }
@@ -992,17 +982,6 @@ class QueueStore:
         requester = params.get("requester")
         if requester is not None:
             requester = _stamp_requester(requester, observed_addr=observed_addr, verified_caller=verified_caller)
-        # Scoping OFF (no verified caller stamp): derive requested_by from the
-        # requester block's name/host/session_ref.  A supplied stamp wins, so the
-        # derivation never runs when verified_caller is present (task 174).
-        if verified_caller is None:
-            requested_by = params.get("requested_by")
-            if requester is not None:
-                requested_by = _derive_requested_by_from_requester(requester)
-            else:
-                requested_by = _validate_requested_by(requested_by)
-        else:
-            requested_by = _validate_requested_by(params.get("requested_by"))
         dedup_key = params.get("dedup_key")
         if dedup_key:
             existing = self._find_non_terminal_by_dedup(dedup_key)
