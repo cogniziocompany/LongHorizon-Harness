@@ -41,12 +41,36 @@ name: Deploy CT110 harness
 #       CT110_PVE_SSH_KEY — ed25519 private key allowed to ssh to the PVE host
 #     and optional environment variables (defaults below match today's LAN):
 #       CT110_WEB_URL, CT110_PVE_HOST, CT110_PVE_SSH_USER, CT110_CT_ID
+#
+# TARGETS (inventory: scripts/deploy/nodes.json; new-node runbook:
+# scripts/deploy/node/README.md).  The `target` input picks the node; it
+# defaults to ct110, and every per-target expression below falls back to the
+# CT110 value for anything that is not exactly 'ct111', so a dispatch without
+# `target` is the pre-existing CT110 deploy, unchanged.  For ct111 the
+# GitHub environment is `ct111-prod` with secrets CT111_API_TOKEN /
+# CT111_PVE_SSH_KEY and variables CT111_WEB_URL (REQUIRED, no default) and
+# optional CT111_PVE_HOST / CT111_PVE_SSH_USER / CT111_CT_ID (default 111).
+# Secrets and variables are selected by NAME with
+# `secrets[format('{0}_API_TOKEN', <CT110|CT111>)]`: the name is built from a
+# literal prefix, so there is no `a && secrets.X || secrets.Y` fall-through
+# that could hand one node's credential to the other when a secret is unset.
+# The job-level env names (CT110_API_TOKEN, CT110_WEB_URL, ...) and the
+# CT110_* log markers are kept as-is for both targets: the helper scripts
+# under scripts/deploy/ct110/ read those exact names.
 
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: "Node to deploy (scripts/deploy/nodes.json)"
+        required: true
+        default: ct110
+        type: choice
+        options:
+          - ct110
+          - ct111
       target_ref:
-        description: "Tag (vX.Y.Z) or full commit sha to deploy to CT110"
+        description: "Tag (vX.Y.Z) or full commit sha to deploy to the target node"
         required: true
         type: string
       wait_timeout_minutes:
@@ -55,7 +79,7 @@ on:
         default: "30"
         type: string
       dry_run:
-        description: "Preflight + build only; never touches CT110"
+        description: "Preflight + build only; never touches the target node"
         required: true
         default: false
         type: boolean
@@ -67,8 +91,10 @@ permissions:
 
 # One deploy at a time, and never cancel one mid-restart: a cancelled deploy
 # can leave the service down or half-upgraded with no rollback pass.
+# The group is per target (deploy-ct110 / deploy-ct111): the nodes are
+# independent services, so one node's deploy never queues behind the other's.
 concurrency:
-  group: deploy-ct110
+  group: deploy-${{ inputs.target == 'ct111' && 'ct111' || 'ct110' }}
   cancel-in-progress: false
 
 jobs:
@@ -149,34 +175,57 @@ jobs:
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: ct110-wheel
+          name: ${{ inputs.target == 'ct111' && 'ct111' || 'ct110' }}-wheel
           path: dist/lh_harness-*-py3-none-any.whl
           retention-days: 30
 
   deploy:
-    name: Deploy to CT110 (zero-active window, bytes-safe, verified)
+    name: Deploy to ${{ inputs.target == 'ct111' && 'CT111' || 'CT110' }} (zero-active window, bytes-safe, verified)
     needs: [preflight, build]
     runs-on: [self-hosted, lan-deploy]
-    environment: ct110-prod
+    environment: ${{ inputs.target == 'ct111' && 'ct111-prod' || 'ct110-prod' }}
     timeout-minutes: 90
     env:
+      TARGET_NODE: ${{ inputs.target == 'ct111' && 'ct111' || 'ct110' }}
       EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
-      CT110_API_TOKEN: ${{ secrets.CT110_API_TOKEN }}
-      CT110_PVE_SSH_KEY: ${{ secrets.CT110_PVE_SSH_KEY }}
+      # Secret NAME = <CT110|CT111>_API_TOKEN / _PVE_SSH_KEY (see TARGETS in
+      # the header).  For ct110 these are exactly secrets.CT110_API_TOKEN and
+      # secrets.CT110_PVE_SSH_KEY, as before.
+      CT110_API_TOKEN: ${{ secrets[format('{0}_API_TOKEN', inputs.target == 'ct111' && 'CT111' || 'CT110')] }}
+      CT110_PVE_SSH_KEY: ${{ secrets[format('{0}_PVE_SSH_KEY', inputs.target == 'ct111' && 'CT111' || 'CT110')] }}
       WAIT_TIMEOUT_MINUTES: ${{ inputs.wait_timeout_minutes }}
       # Connection facts are environment VARS (non-secret) with LAN defaults;
-      # they are resolved here, at the job that owns the environment.
-      CT110_WEB_URL: ${{ vars.CT110_WEB_URL || 'http://192.168.21.168:8799' }}
-      PVE_HOST: ${{ vars.CT110_PVE_HOST || 'corsairai300' }}
-      PVE_USER: ${{ vars.CT110_PVE_SSH_USER || 'root' }}
-      CT_ID: ${{ vars.CT110_CT_ID || '110' }}
+      # they are resolved here, at the job that owns the environment.  The
+      # CT110 web URL keeps its LAN default; ct111 has NO default URL (its IP
+      # is assigned per install) and resolves to '' when CT111_WEB_URL is
+      # unset — the "Require target configuration" step then fails the run.
+      CT110_WEB_URL: ${{ vars[format('{0}_WEB_URL', inputs.target == 'ct111' && 'CT111' || 'CT110')] || (inputs.target != 'ct111' && 'http://192.168.21.168:8799' || '') }}
+      PVE_HOST: ${{ vars[format('{0}_PVE_HOST', inputs.target == 'ct111' && 'CT111' || 'CT110')] || 'corsairai300' }}
+      PVE_USER: ${{ vars[format('{0}_PVE_SSH_USER', inputs.target == 'ct111' && 'CT111' || 'CT110')] || 'root' }}
+      CT_ID: ${{ vars[format('{0}_CT_ID', inputs.target == 'ct111' && 'CT111' || 'CT110')] || (inputs.target == 'ct111' && '111' || '110') }}
     steps:
       - uses: actions/checkout@v4
+
+      # ct111 only (skipped for ct110, whose behaviour must not change): a new
+      # node has no safe defaults, so refuse to continue — before anything is
+      # downloaded, drained or pushed — when its URL or a secret is missing.
+      # Runs on dry_run too: a dry run is how the environment gets validated.
+      # Values are never printed, only which NAME is missing.
+      - name: Require target configuration (ct111 has no defaults)
+        if: ${{ inputs.target == 'ct111' }}
+        run: |
+          set -euo pipefail
+          missing=0
+          [ -n "$CT110_WEB_URL" ]     || { echo "::error::variable CT111_WEB_URL is not set in environment ct111-prod (no default: the node's IP is assigned per install)"; missing=1; }
+          [ -n "$CT110_API_TOKEN" ]   || { echo "::error::secret CT111_API_TOKEN is not set in environment ct111-prod"; missing=1; }
+          [ -n "$CT110_PVE_SSH_KEY" ] || { echo "::error::secret CT111_PVE_SSH_KEY is not set in environment ct111-prod"; missing=1; }
+          [ "$missing" -eq 0 ] || exit 1
+          echo "target=$TARGET_NODE ct_id=$CT_ID pve_host=$PVE_HOST web_url=$CT110_WEB_URL"
 
       - name: Download wheel
         uses: actions/download-artifact@v4
         with:
-          name: ct110-wheel
+          name: ${{ inputs.target == 'ct111' && 'ct111' || 'ct110' }}-wheel
           path: stage
 
       - name: Stage SSH key
@@ -313,6 +362,7 @@ jobs:
           {
             echo "## CT110 deploy — $(date -u +%FT%TZ)"
             echo
+            echo "- target node: \`$TARGET_NODE\` (CT $CT_ID)"
             echo "- target_ref: \`${{ inputs.target_ref }}\`"
             echo "- resolved sha: \`${{ needs.preflight.outputs.sha }}\`"
             echo "- expected version: \`$EXPECTED_VERSION\`"
@@ -329,10 +379,13 @@ jobs:
   # mode are documented operator steps (docs/OVERSEER-TICK-CT110.md section
   # 5) that require the 24h read-only comparison first.  A dry_run deploy
   # skips this stage like every other host-touching step.
+  # CT110 ONLY: the overseer sweep is not installed on ct111 (nodes.json
+  # `overseerUnits: false`), so the whole job is skipped for that target and
+  # its `environment: ct110-prod` below stays a literal.
   overseer-units:
     name: Ship overseer-sweep systemd units (install only, never enabled)
     needs: [preflight, deploy]
-    if: ${{ !inputs.dry_run && needs.deploy.result == 'success' }}
+    if: ${{ !inputs.dry_run && needs.deploy.result == 'success' && inputs.target != 'ct111' }}
     runs-on: [self-hosted, lan-deploy]
     environment: ct110-prod
     timeout-minutes: 15

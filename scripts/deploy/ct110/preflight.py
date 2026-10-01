@@ -38,6 +38,7 @@ DEPLOY_JOB_PREFIXES = (
     "Preflight (ref resolves",
     "Build deployable wheel",
     "Deploy to CT110",
+    "Deploy to CT111",  # same job, target=ct111 (the job name carries the target node)
     "Ship overseer-sweep systemd units",
 )
 

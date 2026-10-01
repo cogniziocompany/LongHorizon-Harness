@@ -5,6 +5,8 @@
 # Scope (the artifacts that end up root-readable on CT110):
 #   * packaging/                          — the shipped systemd unit templates
 #   * scripts/deploy/ct110/               — the deploy pipeline's scripts
+#   * scripts/deploy/node/                — new-node first install (scripts +
+#                                           the node unit/config templates)
 #
 # The contract these scans enforce is the one packaging/lh-harness.service
 # documents and docs/SECRETS.md records repo-wide: credentials travel by
@@ -34,6 +36,7 @@ LH_SECRET_SCAN_ROOT="${LH_SECRET_SCAN_ROOT:-$PWD}"
 default_paths=(
   "$LH_SECRET_SCAN_ROOT/packaging"
   "$LH_SECRET_SCAN_ROOT/scripts/deploy/ct110"
+  "$LH_SECRET_SCAN_ROOT/scripts/deploy/node"
 )
 paths=()
 if (( $# )); then

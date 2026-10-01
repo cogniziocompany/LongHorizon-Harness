@@ -5,3 +5,7 @@
 scripts/deploy/**/*.sh text eol=lf
 scripts/deploy/**/*.py text eol=lf
 .github/workflows/*.yml text eol=lf
+# New-node templates are pushed into a CT and installed as-is (systemd unit,
+# harness config), so they follow the same LF rule as the scripts.
+scripts/deploy/node/templates/* text eol=lf
+scripts/deploy/nodes.json text eol=lf

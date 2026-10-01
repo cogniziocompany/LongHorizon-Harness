@@ -1,0 +1,53 @@
+# LongHorizon-Harness node config for ct111 (finance-only node for CFO1).
+#
+# Installed by scripts/deploy/node/bootstrap-node.sh as
+# <service dir>/.lh-harness/config.toml ONLY when that file is absent; an
+# existing config is never overwritten.  No credential belongs here: the
+# gateway key, GitHub token and fleet key live in
+# /home/harness/.lh-harness-secrets.env (the unit's EnvironmentFile).
+
+[run]
+runs_root = "@RUNS_ROOT@"
+# Step 4 of the profile precedence (mcp_profiles.resolve_profile) for anything
+# launched from this directory.
+mcp_profile = "finance"
+
+# The finance MCP profile: the gateway servers CFO1 may use.  Names are the
+# gateway's dash-free aliases.  The profile only selects which servers the
+# harness asks the gateway for; what the node can actually REACH is decided by
+# the gateway key in LH_HARNESS_MCP_GATEWAY_KEY, which must itself be scoped
+# to these servers (that key is the enforcement boundary, not this list).
+[run.mcp_profiles.finance]
+description = "Finance: kb, gateway guides/skills, memory, quickbooks, stripe."
+servers = ["kb", "guides", "skills", "memory", "quickbooks", "stripe"]
+read_only = false
+
+# Auditor roles must resolve to a read-only profile (TASK 234): the launcher
+# refuses every queue entry otherwise.  quickbooks/stripe are left out because
+# the gateway cannot scope a server to read-only.
+[run.mcp_profiles.finance_audit]
+description = "Finance audit (read-only): kb, gateway guides/skills, memory."
+servers = ["kb", "guides", "skills", "memory"]
+read_only = true
+
+[run.roles.auditor]
+mcp_profile = "finance_audit"
+
+# Trio NAMES are fixed by the harness (config.py _QUEUE_TRIOS: only "kimi" and
+# "qwen" are valid), so this node reuses them with the finance profile.  The
+# agent/model values below are the documented fleet defaults (docs/queue.md);
+# align them with what CT110 runs before the first real task.
+[queue.trios.kimi]
+agent = "claude_code"
+model = "kimi-k2.7-code:cloud"
+mcp_profile = "finance"
+
+[queue.trios.qwen]
+agent = "codex"
+model = "qwen3.8"
+mcp_profile = "finance"
+
+# Deliberately small: this node serves one agent.
+[queue.capacity]
+kimi_max = 2
+qwen_max = 1
