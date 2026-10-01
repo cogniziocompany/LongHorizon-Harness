@@ -7,6 +7,11 @@ finish; wait_zero_active.py then finds the window much sooner because the
 three kimi slots no longer refill.  The flag persists across the restart,
 so after the deploy we clear it explicitly.
 
+With --verify-state and neither --enable nor --disable the script is a
+read-only check: it never writes the flag, it only polls /api/meta.  The
+post-restart "drain survived" step uses this, so it proves the flag the
+restart inherited rather than re-asserting it.
+
 Stdlib only: the lan-deploy runner is a bare Debian 12 box.
 
 Reads the bearer token from the CT110_API_TOKEN environment variable
@@ -51,7 +56,7 @@ def _meta(url: str, token: str, timeout: float = 15) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True, help="base URL, e.g. http://192.168.21.168:8799")
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group()
     group.add_argument("--enable", action="store_true", help="set the drain flag (stops new launches)")
     group.add_argument("--disable", action="store_true", help="clear the drain flag (resume launching)")
     parser.add_argument("--reason", default="deploy maintenance window (TASK 242)",
@@ -61,6 +66,8 @@ def main() -> int:
     parser.add_argument("--verify-attempts", type=int, default=1)
     parser.add_argument("--verify-interval-seconds", type=float, default=5)
     args = parser.parse_args()
+    if not args.enable and not args.disable and not args.verify_state:
+        parser.error("one of --enable, --disable, or --verify-state (read-only check) is required")
 
     token = os.environ.get("CT110_API_TOKEN", "")
     if not token:
@@ -68,15 +75,16 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    payload: dict[str, object] = {"enabled": bool(args.enable)}
-    if args.enable:
-        payload["reason"] = args.reason
-    try:
-        result = _post(args.url, token, payload)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        print(f"::error::POST /api/queue/drain failed: {exc}", file=sys.stderr)
-        return 1
-    print(f"drain write accepted: {json.dumps(result.get('drain', {}), sort_keys=True)}")
+    if args.enable or args.disable:
+        payload: dict[str, object] = {"enabled": bool(args.enable)}
+        if args.enable:
+            payload["reason"] = args.reason
+        try:
+            result = _post(args.url, token, payload)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            print(f"::error::POST /api/queue/drain failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"drain write accepted: {json.dumps(result.get('drain', {}), sort_keys=True)}")
 
     if not args.verify_state:
         return 0
