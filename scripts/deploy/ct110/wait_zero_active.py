@@ -32,11 +32,13 @@ ACTIVE_STATUSES = {"creating", "starting", "running", "waiting_approval", "stopp
 def count_active(url: str, token: str) -> int:
     """Return the number of active runs, or -1 when the count is unknowable."""
     request = urllib.request.Request(
-        url.rstrip("/") + "/api/runs",
+        # Summary form (~123 KB, carries status): the full list (~5.6 MB) timed out at 15 s on
+        # most polls, so the count was "unknowable" for the whole 90-minute wait (run 36827575382).
+        url.rstrip("/") + "/api/runs?fields=summary",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=60) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError) as exc:
         print(f"poll: GET /api/runs failed: {exc}", file=sys.stderr)

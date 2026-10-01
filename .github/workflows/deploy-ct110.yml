@@ -184,7 +184,9 @@ jobs:
     needs: [preflight, build]
     runs-on: [self-hosted, lan-deploy]
     environment: ${{ inputs.target == 'ct111' && 'ct111-prod' || 'ct110-prod' }}
-    timeout-minutes: 90
+    # Must exceed the longest wait_timeout_minutes (90) plus push/restart/verify, or GitHub
+    # kills the job mid-wait (run 36827575382 died at exactly 1h30m).
+    timeout-minutes: 150
     env:
       TARGET_NODE: ${{ inputs.target == 'ct111' && 'ct111' || 'ct110' }}
       EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
