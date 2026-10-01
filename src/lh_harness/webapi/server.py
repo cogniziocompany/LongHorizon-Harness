@@ -27,7 +27,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 
 from ..dashboard.state import DashboardState
-from ..launcher import Launcher
+from ..launcher import (
+    Launcher,
+    maintenance_manifest_path,
+    read_maintenance_manifest,
+)
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
 from ..caller_auth import (
     ANON_CALLER,
@@ -46,8 +50,8 @@ from ..overseer_state import resolve_overseer_root
 from . import mcp_jsonrpc as mcp_protocol
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
-from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
-from ..supervisor.control_bus import CommandConflict, RevisionConflict, _append_jsonl
+from ..supervisor.lifecycle import TERMINAL_STATUSES, ACTIVE_STATUSES, canonical_lifecycle_status, resume_epoch
+from ..supervisor.control_bus import CommandConflict, RevisionConflict, _append_jsonl, _atomic_bytes_write
 from ..fleet import get_reporter
 from ..queue import (
     PgQueueStore,
@@ -1297,6 +1301,9 @@ def create_app(
                 "resume": supervisor is not None and not bool(getattr(supervisor, "attached_only", False)),
                 "stop": supervisor is not None,
                 "abort": supervisor is not None,
+                # fc-H4a: suspend/resume every active run as one maintenance
+                # operation; usable when both sides exist to stop and re-start.
+                "maintenance": supervisor is not None and queue_store is not None,
                 "fleet_mcp_tools": queue_store is not None,
             },
             drain=drain,
@@ -1436,6 +1443,198 @@ def create_app(
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"could not persist drain state: {exc}") from exc
         return {"ok": True, "drain": state}
+
+    # ------------------------------------------------------------------
+    # Maintenance suspend/resume (fc-H4a)
+    #
+    # A deploy drains the queue, then POST /api/maintenance/suspend stops
+    # every ACTIVE run through the supervisor and records them in
+    # runs_root/queue/maintenance_manifest.json.  After the deploy,
+    # POST /api/maintenance/resume puts each parked run back with
+    # supervisor.resume(mode="continue") and deletes the manifest once every
+    # run is active again.  The launcher refuses to reconcile a parked run's
+    # queue entry to failed while the manifest lists it.
+    #
+    # These inherit the single bearer-token boundary that guards every /api/
+    # route, exactly like POST /api/queue/drain above.
+    # ------------------------------------------------------------------
+
+    def _maintenance_runs_root() -> Path | None:
+        root = getattr(queue_store, "runs_root", None) if queue_store is not None else None
+        if root is None:
+            root = registry.runs_root
+        return Path(root) if root is not None else None
+
+    @app.get("/api/maintenance")
+    def get_maintenance() -> dict[str, Any]:
+        """Return the current maintenance manifest, or the empty shape."""
+
+        root = _maintenance_runs_root()
+        if root is None:
+            return {"runs": []}
+        return read_maintenance_manifest(root)
+
+    @app.post("/api/maintenance/suspend")
+    def maintenance_suspend(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        """Stop every active run and park it in the maintenance manifest.
+
+        Refused with 409 unless the queue drain is already enabled: suspend is
+        the second half of a deploy window, never a standalone kill switch.
+        Repeat calls merge into the existing manifest — entries are never
+        dropped, so a second suspend cannot orphan the first batch's resume
+        bookkeeping.
+        """
+
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="maintenance requires a configured runs root")
+        if supervisor is None:
+            raise HTTPException(status_code=501, detail="suspend requires the standalone Web supervisor")
+        root = _maintenance_runs_root()
+        if root is None:
+            raise HTTPException(status_code=501, detail="maintenance requires a configured runs root")
+        reason = body.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise HTTPException(status_code=422, detail="reason must be a string")
+        get_drain = getattr(queue_store, "get_drain", None)
+        drain: dict[str, Any] = {}
+        if get_drain is not None:
+            try:
+                drain = get_drain() or {}
+            except Exception:
+                drain = {}
+        if not drain.get("enabled"):
+            raise HTTPException(
+                status_code=409,
+                detail="queue drain must be enabled before maintenance suspend",
+            )
+
+        manifest = read_maintenance_manifest(root)
+        parked = [
+            item
+            for item in manifest.get("runs", [])
+            if isinstance(item, dict) and item.get("run_id")
+        ]
+        parked_ids = {str(item["run_id"]) for item in parked}
+        launched_by_run: dict[str, str] = {}
+        for entry in queue_store.list():
+            if entry.status == "launched" and entry.run_id:
+                launched_by_run[entry.run_id] = entry.queue_id
+
+        stopped: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        try:
+            run_items = supervisor.list_run_items()
+        except Exception:
+            run_items = []
+        for item in run_items or []:
+            run_id = item.get("id") if isinstance(item, dict) else None
+            if not run_id or str(run_id) in parked_ids:
+                continue
+            run_id = str(run_id)
+            try:
+                status = supervisor.status(run_id)
+            except Exception as exc:
+                errors.append({"run_id": run_id, "error": str(exc)})
+                continue
+            if canonical_lifecycle_status(status.get("status")) not in ACTIVE_STATUSES:
+                continue
+            try:
+                epoch = resume_epoch(status) or resume_epoch(supervisor.owner(run_id))
+            except Exception:
+                epoch = 0
+            try:
+                supervisor.stop(run_id)
+            except Exception as exc:
+                # The run may have exited between the status read and the
+                # signal; leave it out of the manifest so resume never tries
+                # to revive a run suspend could not actually park.
+                errors.append({"run_id": run_id, "error": str(exc)})
+                continue
+            record = {
+                "run_id": run_id,
+                "queue_id": launched_by_run.get(run_id),
+                "resume_epoch_before": epoch,
+            }
+            stopped.append(record)
+            parked_ids.add(run_id)
+
+        payload = {
+            "reason": reason if reason is not None else manifest.get("reason"),
+            "created_at": manifest.get("created_at") or time.time(),
+            "runs": parked + stopped,
+        }
+        try:
+            _atomic_bytes_write(
+                maintenance_manifest_path(root),
+                json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+            )
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"could not persist maintenance manifest: {exc}"
+            ) from exc
+        return {"ok": True, "stopped": stopped, "errors": errors, "manifest": payload}
+
+    @app.post("/api/maintenance/resume")
+    def maintenance_resume() -> dict[str, Any]:
+        """Resume every run parked in the maintenance manifest.
+
+        Each manifest run that reached a terminal status is resumed with
+        mode="continue"; runs already active count as success.  The manifest
+        is deleted only when every run resumed or was already active — a
+        failing resume keeps its entry so the operator can retry.
+        """
+
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="maintenance requires a configured runs root")
+        if supervisor is None or bool(getattr(supervisor, "attached_only", False)):
+            raise HTTPException(status_code=501, detail="resume requires the standalone Web supervisor")
+        root = _maintenance_runs_root()
+        if root is None:
+            raise HTTPException(status_code=501, detail="maintenance requires a configured runs root")
+
+        manifest = read_maintenance_manifest(root)
+        results: list[dict[str, Any]] = []
+        remaining: list[dict[str, Any]] = []
+        for record in manifest.get("runs", []):
+            run_id = record.get("run_id") if isinstance(record, dict) else None
+            if not run_id:
+                results.append({"run_id": run_id, "ok": False, "error": "manifest entry has no run_id"})
+                remaining.append(record)
+                continue
+            run_id = str(run_id)
+            try:
+                status = supervisor.status(run_id)
+                lifecycle = canonical_lifecycle_status(status.get("status"))
+            except Exception as exc:
+                results.append({"run_id": run_id, "ok": False, "error": str(exc)})
+                remaining.append(record)
+                continue
+            if lifecycle in ACTIVE_STATUSES:
+                results.append({"run_id": run_id, "ok": True, "error": None})
+                continue
+            try:
+                supervisor.resume(run_id, mode="continue")
+                results.append({"run_id": run_id, "ok": True, "error": None})
+            except (TypeError, ValueError, OSError, RevisionConflict, IdempotencyConflict) as exc:
+                results.append({"run_id": run_id, "ok": False, "error": str(exc)})
+                remaining.append(record)
+
+        path = maintenance_manifest_path(root)
+        try:
+            if remaining:
+                _atomic_bytes_write(
+                    path,
+                    json.dumps(
+                        {**manifest, "runs": remaining}, ensure_ascii=False, sort_keys=True
+                    ).encode("utf-8"),
+                )
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"could not update maintenance manifest: {exc}"
+            ) from exc
+        return {"ok": not remaining, "runs": results}
 
     @app.get("/api/queue")
     def list_queue(

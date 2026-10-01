@@ -52,6 +52,48 @@ _MAX_REASON_LEN = 4_000
 
 logger = logging.getLogger(__name__)
 
+# Maintenance manifest (fc-H4a): POST /api/maintenance/suspend stops every
+# active run and records it here so a later /api/maintenance/resume can put
+# the same runs back with mode="continue".  The file lives beside the drain
+# flag (``runs_root/queue/``); the launcher consults it so a maintenance-
+# stopped run is never reconciled to a failed queue entry while it waits for
+# its resume.
+MAINTENANCE_MANIFEST_NAME = "maintenance_manifest.json"
+
+
+def maintenance_manifest_path(runs_root: str | Path) -> Path:
+    """Path of the maintenance manifest inside the queue directory."""
+
+    return Path(runs_root) / "queue" / MAINTENANCE_MANIFEST_NAME
+
+
+def read_maintenance_manifest(runs_root: str | Path) -> dict[str, Any]:
+    """Read the maintenance manifest, tolerating absence and corruption.
+
+    A missing or unreadable manifest maps to the empty shape so consumers
+    (launcher reconciliation, /api/maintenance GET) never crash on a file a
+    half-finished deploy left behind.
+    """
+
+    try:
+        data = json.loads(maintenance_manifest_path(runs_root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"runs": []}
+    if not isinstance(data, dict) or not isinstance(data.get("runs"), list):
+        return {"runs": []}
+    return data
+
+
+def maintenance_manifest_run_ids(runs_root: str | Path) -> set[str]:
+    """Run ids currently parked by a maintenance suspend."""
+
+    return {
+        str(item["run_id"])
+        for item in read_maintenance_manifest(runs_root)["runs"]
+        if isinstance(item, dict) and item.get("run_id")
+    }
+
+
 # Stall detector (task 230): when eligible queue entries exist but no launch
 # succeeds for this many consecutive cycles, the launcher stops being silent
 # about it (the 2026-09-24 cutover-168 incident ran ~4.5h with a refused head
@@ -611,6 +653,13 @@ class Launcher:
             lifecycle = canonical_lifecycle_status(status.get("status"))
             if lifecycle in ACTIVE_STATUSES:
                 continue
+            # Maintenance (fc-H4a): a suspend parks the run in the manifest
+            # for /api/maintenance/resume.  Leave its entry launched — marking
+            # it failed here would destroy the resume bookkeeping the deploy
+            # relies on.  Once the run is active again the checks above resume
+            # normal handling.
+            if run_id in self._maintenance_run_ids():
+                continue
             run_status = status.get("status") or "unknown"
             # The supervisor exposes owner/status but not the manager report.
             # Read the durable audit result directly from the run directory.
@@ -668,6 +717,14 @@ class Launcher:
             return {}
         report_path = Path(runs_root) / run_id / "lh_harness" / "report.json"
         return _read_report_json(report_path)
+
+    def _maintenance_run_ids(self) -> set[str]:
+        """Run ids parked by POST /api/maintenance/suspend for this root."""
+
+        runs_root = getattr(self.supervisor, "runs_root", None)
+        if runs_root is None:
+            return set()
+        return maintenance_manifest_run_ids(runs_root)
 
     def _capacity_reason(self, entry: QueueEntry, capacities: dict[str, int]) -> str | None:
         if capacities.get(entry.trio, 0) <= 0:
