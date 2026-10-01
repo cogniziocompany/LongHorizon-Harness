@@ -28,6 +28,18 @@ name: Deploy CT110 harness
 #      clearing it is an explicit, verified step.
 #   4. A DEPLOY-HOLD hold file aborts the deploy so a known-bad main cannot
 #      ship (09-18 mechanism; path candidates in ct110_deploy.sh).
+#   5. A zero-active WAIT can also take forever when the live runs are long,
+#      so since fc-H4b the default is to STOP them instead
+#      (active_runs=suspend): with the drain set, POST
+#      /api/maintenance/suspend parks every ACTIVE run in a persisted
+#      manifest, a short zero-active wait (10 minutes, only for the stops to
+#      land) confirms idleness, and after the deploy verifies, POST
+#      /api/maintenance/resume puts every parked run back (mode=continue)
+#      BEFORE the drain clears — on the success path and on the
+#      automatically-rolled-back path alike, so a suspended run is never
+#      left behind.  active_runs=wait is exactly the lesson-3 behaviour.
+#      Cost (scripts/deploy/ct110/README.md): a suspended run's round in
+#      progress is redone after resume.
 #
 # NEVER auto-triggered: the only trigger is workflow_dispatch, so a push to
 # main ships nothing by itself.
@@ -83,6 +95,14 @@ on:
         required: true
         default: false
         type: boolean
+      active_runs:
+        description: "ACTIVE runs during the deploy: 'suspend' stops and resumes them around it (default, fc-H4b), 'wait' waits for a zero-active window"
+        required: true
+        default: suspend
+        type: choice
+        options:
+          - suspend
+          - wait
 
 permissions:
   contents: read
@@ -249,8 +269,31 @@ jobs:
             --reason "deploy $EXPECTED_VERSION (${{ needs.preflight.outputs.sha }}) maintenance window" \
             --verify-state enabled
 
+      - name: Suspend active runs (fc-H4b)
+        id: suspend_runs
+        if: ${{ !inputs.dry_run && inputs.active_runs == 'suspend' }}
+        run: |
+          # With the drain set (no new launches), stop every ACTIVE run
+          # through the maintenance API; the service parks them in a
+          # manifest so the resume step below puts them back after verify.
+          python3 scripts/deploy/ct110/suspend_runs.py \
+            --url "$CT110_WEB_URL" \
+            --reason "deploy $EXPECTED_VERSION (${{ needs.preflight.outputs.sha }}) maintenance window"
+
+      - name: Wait for the suspended runs to stop (fc-H4b)
+        if: ${{ !inputs.dry_run && inputs.active_runs == 'suspend' }}
+        run: |
+          # The stop signals above land asynchronously; this wait only has
+          # to outlive THEM (the drain already blocks replacements), so the
+          # timeout is a fixed 10 minutes, not WAIT_TIMEOUT_MINUTES.
+          python3 scripts/deploy/ct110/wait_zero_active.py \
+            --url "$CT110_WEB_URL" \
+            --consecutive 3 \
+            --interval-seconds 15 \
+            --timeout-minutes 10
+
       - name: Wait for a counted zero-active window (GET /api/runs)
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && inputs.active_runs == 'wait' }}
         run: |
           python3 scripts/deploy/ct110/wait_zero_active.py \
             --url "$CT110_WEB_URL" \
@@ -311,6 +354,16 @@ jobs:
       - name: DEPLOY OK
         if: ${{ !inputs.dry_run }}
         run: echo "CT110_DEPLOY_OK version=$EXPECTED_VERSION sha=${{ needs.preflight.outputs.sha }}"
+
+      # fc-H4b: parked runs come back BEFORE the drain clears, on every path
+      # that suspended them — the success path resumes them after verify,
+      # and a failed deploy (including the automatic rollback below) resumes
+      # them here so a suspend can never strand a run in the manifest.
+      - name: Resume suspended runs (fc-H4b)
+        if: ${{ !inputs.dry_run && always() && inputs.active_runs == 'suspend' && steps.suspend_runs.outcome == 'success' }}
+        run: |
+          python3 scripts/deploy/ct110/resume_runs.py \
+            --url "$CT110_WEB_URL"
 
       - name: Clear drain (resume queue launches, task 242)
         if: ${{ !inputs.dry_run && always() && steps.set_drain.outcome == 'success' }}
