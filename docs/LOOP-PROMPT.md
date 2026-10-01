@@ -1,3 +1,8 @@
+> **RETIRED 2026-10-01 (Paxton).** This is the old ptait09 overseer doctrine, kept as HISTORY ONLY. Do not execute it.
+> The live process: the CT110 overseer tick (claude-code-teams `agents/orchestrator/OVERSEER.md` + `routines/overseer-tick.md`)
+> and the gateway skills `ct110-overseer` / `lh-orchestrator`. State lives on CT110 and GitHub only; every `C:/tmp/...` path
+> below is retired (a PreToolUse hook on ptait09 blocks writes there).
+
 # OVERSEER SWEEP — every 5 minutes
 
 ## THE /goal
