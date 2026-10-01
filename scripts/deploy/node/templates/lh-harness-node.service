@@ -1,0 +1,42 @@
+# LongHorizon-Harness service unit for a NEW node (installed by
+# scripts/deploy/node/bootstrap-node.sh as /etc/systemd/system/lh-harness.service).
+#
+# Derived from packaging/lh-harness.service; the differences are deliberate:
+#   * venv layout: the node runs a NON-editable wheel install in the
+#     root-owned /home/harness/venv (the layout scripts/deploy/ct110/
+#     ct110_deploy.sh upgrades and verifies), not a repo-local .venv.
+#   * --host 0.0.0.0: the web API must be reachable from the LAN (the deploy
+#     runner, Hydra).  lh-harness refuses a non-loopback bind without a
+#     bearer token; the token arrives through the EnvironmentFile.
+#   * --workspace-root: runs are confined to the node's own workspace root.
+#   * --runs-root: run state lives outside the service directory.
+#   * --no-open: a headless service must not try to open a browser.
+#
+# The at-sign placeholders in [Service] are substituted by bootstrap-node.sh
+# (which refuses to install a unit with one left over).  The same task-272 contract
+# as the packaged unit applies: credentials reach the service ONLY through
+# the EnvironmentFile below (mode 600, owner harness).  This template carries
+# no Environment= line at all, and no secret-bearing Environment=NAME=value
+# may ever be added (scripts/deploy/secret_scan.sh and
+# tests/test_deploy_node_targets.py enforce it).
+#
+# OOMPolicy=continue (TASK 202) and Delegate=memory pids (TASK 208) are kept
+# exactly as in packaging/lh-harness.service — see that file for the why.
+
+[Unit]
+Description=LongHorizon-Harness service (run supervisor + web API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=harness
+WorkingDirectory=@SERVICE_DIR@
+ExecStart=/home/harness/venv/bin/python -m lh_harness web --host 0.0.0.0 --port @PORT@ --no-open --runs-root @RUNS_ROOT@ --workspace-root @WORKSPACE_ROOT@
+EnvironmentFile=/home/harness/.lh-harness-secrets.env
+Restart=on-failure
+RestartSec=5s
+OOMPolicy=continue
+Delegate=memory pids
+
+[Install]
+WantedBy=default.target

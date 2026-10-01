@@ -6,6 +6,33 @@
 disconnected. The workflow is `workflow_dispatch`-only and every job runs on
 the LAN runner (CT210, label `lan-deploy`).
 
+## Targets (one pipeline, several nodes)
+
+The workflow keeps its name and file (`deploy-ct110.yml`) but takes a `target` input
+(`ct110` default, `ct111`). The scripts in this directory were already parameterised by
+`CT_ID`, `PVE_HOST`, `--url` and so on, so they are shared unchanged; only the workflow chooses
+per target:
+
+| | `ct110` (default) | `ct111` |
+| --- | --- | --- |
+| GitHub environment | `ct110-prod` | `ct111-prod` |
+| Secrets | `CT110_API_TOKEN`, `CT110_PVE_SSH_KEY` | `CT111_API_TOKEN`, `CT111_PVE_SSH_KEY` |
+| Variables | `CT110_WEB_URL`, `CT110_PVE_HOST`, `CT110_PVE_SSH_USER`, `CT110_CT_ID` | `CT111_WEB_URL` (**required**, no default), `CT111_PVE_HOST`, `CT111_PVE_SSH_USER`, `CT111_CT_ID` (default `111`) |
+| Concurrency group | `deploy-ct110` | `deploy-ct111` |
+| Wheel artifact | `ct110-wheel` | `ct111-wheel` |
+| `overseer-units` job | runs | skipped |
+
+A dispatch without `target` is the CT110 deploy exactly as before. Secret and variable names
+are built from a literal prefix (`secrets[format('{0}_API_TOKEN', 'CT110' | 'CT111')]`), so an
+unset secret resolves to empty and fails the run instead of falling through to the other node's
+credential. Inside the job the env names (`CT110_API_TOKEN`, `CT110_WEB_URL`, …) and the
+`CT110_*` log markers are the same for both targets because the helper scripts read those
+names; the deployment record states the target node.
+
+The inventory is `scripts/deploy/nodes.json` (names only), kept in agreement with the workflow
+by `tests/test_deploy_node_targets.py`. Creating a node from nothing — container, first
+install, credentials, registration — is `scripts/deploy/node/README.md`.
+
 ## Stage map
 
 | Stage | Where | What |
@@ -110,6 +137,8 @@ gh workflow run deploy-ct110.yml --ref <branch-with-workflow> \
   -f target_ref=v0.1.8
 gh workflow run deploy-ct110.yml --ref <branch-with-workflow> \
   -f target_ref=v0.1.8 -f dry_run=true   # preflight+build only, never touches CT110
+gh workflow run deploy-ct110.yml --ref <branch-with-workflow> \
+  -f target=ct111 -f target_ref=v0.1.8   # the finance node; omit target for CT110
 ```
 
 Until the PR carrying this workflow merges to main, dispatch with

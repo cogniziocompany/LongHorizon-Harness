@@ -1,0 +1,66 @@
+{
+  "_readme": [
+    "Inventory of LongHorizon-Harness nodes that .github/workflows/deploy-ct110.yml can deploy.",
+    "NAMES only: every secret/var entry is the NAME of a GitHub environment secret or variable,",
+    "never a value. The workflow does not read this file at run time (its per-target selection is",
+    "static expressions, so a bad edit here can never change a production deploy);",
+    "tests/test_deploy_node_targets.py fails when the two disagree. To add a node: add an entry",
+    "here, add the node id to the workflow's `target` choice + its selection expressions, and",
+    "follow scripts/deploy/node/README.md."
+  ],
+  "defaultTarget": "ct110",
+  "nodes": {
+    "ct110": {
+      "description": "General-purpose harness node (all repos).",
+      "ctId": 110,
+      "hostname": "lh-harness",
+      "pveHost": "corsairai300",
+      "githubEnvironment": "ct110-prod",
+      "concurrencyGroup": "deploy-ct110",
+      "wheelArtifact": "ct110-wheel",
+      "overseerUnits": true,
+      "secrets": {
+        "apiToken": "CT110_API_TOKEN",
+        "pveSshKey": "CT110_PVE_SSH_KEY"
+      },
+      "vars": {
+        "webUrl": "CT110_WEB_URL",
+        "pveHost": "CT110_PVE_HOST",
+        "pveSshUser": "CT110_PVE_SSH_USER",
+        "ctId": "CT110_CT_ID"
+      },
+      "workflowDefaults": {
+        "webUrl": "http://192.168.21.168:8799",
+        "pveHost": "corsairai300",
+        "pveSshUser": "root",
+        "ctId": "110"
+      }
+    },
+    "ct111": {
+      "description": "Finance-only harness node for CFO1 (finance repos, finance-scoped credentials).",
+      "ctId": 111,
+      "hostname": "cct-cfo-harness-01",
+      "pveHost": "corsairai300",
+      "githubEnvironment": "ct111-prod",
+      "concurrencyGroup": "deploy-ct111",
+      "wheelArtifact": "ct111-wheel",
+      "overseerUnits": false,
+      "secrets": {
+        "apiToken": "CT111_API_TOKEN",
+        "pveSshKey": "CT111_PVE_SSH_KEY"
+      },
+      "vars": {
+        "webUrl": "CT111_WEB_URL",
+        "pveHost": "CT111_PVE_HOST",
+        "pveSshUser": "CT111_PVE_SSH_USER",
+        "ctId": "CT111_CT_ID"
+      },
+      "workflowDefaults": {
+        "webUrl": null,
+        "pveHost": "corsairai300",
+        "pveSshUser": "root",
+        "ctId": "111"
+      }
+    }
+  }
+}
