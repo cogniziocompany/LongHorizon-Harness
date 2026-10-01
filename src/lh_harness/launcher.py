@@ -1104,6 +1104,10 @@ class Launcher:
                 "workspace": workspace,
                 "requested_by": entry.requested_by,
                 "workspace_base": base.summary(),
+                # Task 300: the structured requester identity block, or null when
+                # the entry predates the requirement / was synthesized in legacy
+                # mode.  Carried as-is (a plain dict or None); never stamped.
+                "requester": entry.requester,
             },
         )
         if launched is not None:

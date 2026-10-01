@@ -206,14 +206,30 @@ class PgQueueStore:
 
     # -- create ---------------------------------------------------------------
 
-    def create(self, body: dict[str, Any]) -> QueueEntry:
+    def create(
+        self,
+        body: dict[str, Any],
+        *,
+        observed_addr: str | None = None,
+        verified_caller: str | None = None,
+    ) -> QueueEntry:
         """Create a queue entry, de-duplicating by ``dedup_key`` when supplied.
 
         Idempotent-enqueue semantics mirror the file store exactly.
+
+        Task 300: the requester block is validated (strict/legacy) and stamped
+        exactly like the file store, and returned on the entry.  It is NOT yet
+        persisted: ``harness.queue`` has no requester column, so a re-read loads
+        ``requester=None``.  Adding the column is a schema migration tracked as
+        follow-up work; the file store (CT110's backend) persists it fully.
         """
-        from .queue import _normalize_request  # lazy: see TYPE_CHECKING note
+        from .queue import _normalize_request, _stamp_requester  # lazy: see TYPE_CHECKING note
 
         params = _normalize_request(body)
+        if params.get("requester") is not None:
+            params["requester"] = _stamp_requester(
+                params["requester"], observed_addr=observed_addr, verified_caller=verified_caller
+            )
         dedup_key = params.get("dedup_key")
         now = time.time()
         queue_id = f"q-{uuid.uuid4().hex[:16]}"

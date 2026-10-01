@@ -87,3 +87,20 @@ class LoopbackTestClient(_Orig):
 
 starlette_testclient.TestClient = LoopbackTestClient
 fastapi_testclient.TestClient = LoopbackTestClient
+
+
+import pytest as _pytest_task300
+
+
+@_pytest_task300.fixture(autouse=True)
+def _queue_requester_legacy_default(monkeypatch):
+    """Task 300: run the pre-existing suite in requester ``legacy`` mode.
+
+    Strict mode (the production default) requires a ``requester`` block on
+    every enqueue.  The many existing enqueue call sites predate it, so the
+    suite defaults to the documented rollout flag; legacy mode synthesizes the
+    block and leaves every other behaviour unchanged, which is itself the
+    backward-compatibility check.  Tests that exercise strict mode override this
+    with ``monkeypatch.setenv("LH_HARNESS_QUEUE_REQUESTER", "strict")``.
+    """
+    monkeypatch.setenv("LH_HARNESS_QUEUE_REQUESTER", "legacy")

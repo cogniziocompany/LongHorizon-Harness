@@ -78,6 +78,14 @@ Accepted fields (all persisted on the queue entry):
   the verified caller identity; a client-supplied value is overridden.
 - base_check (string, optional): base commit/branch check guard.
 
+- requester (object, required): structured identity block (task 300). Send
+  kind, name, and host at minimum. When kind is 'ai' you must also send agent
+  (claude, codex, cursor, openwebui, hydra, chat-overseer, or any
+  [A-Za-z0-9._-]{1,64}), session_id (full session id, <=128), and cwd (your
+  working directory, <=4096, no NUL). session_ref and notify are optional.
+  The block is validated and normalized by the store; legacy and observed_addr
+  are stamped server-side and must not be set.
+
 Unknown fields are rejected with an error naming them; they are never
 dropped silently.
 
@@ -215,6 +223,43 @@ def _boolean_param(description: str, default: bool) -> dict[str, Any]:
     return {"type": "boolean", "description": description, "default": default}
 
 
+def _requester_param() -> dict[str, Any]:
+    """MCP schema for the task-300 requester identity block.
+
+    A nested object (``type: object``) with ``additionalProperties: false`` so
+    a chat client cannot smuggle a sub-field the store does not recognize.  The
+    block is required on every enqueue (strict mode); its sub-fields are
+    described here for the client, while the store performs the real validation
+    (required kind/name/host, kind=ai implies agent/session_id/cwd, the hex
+    session_ref derivation, and the store/API-set-only rejection of legacy and
+    observed_addr).
+    """
+    return {
+        "type": "object",
+        "description": (
+            "Structured identity for who requested this task. Required on every "
+            "enqueue. Send kind, name, and host at minimum. When kind is 'ai' you "
+            "must also send agent (client token: claude, codex, cursor, openwebui, "
+            "hydra, chat-overseer, or any [A-Za-z0-9._-]{1,64}) and session_id (full "
+            "session id, <=128 chars), and cwd (your working directory, <=4096, no "
+            "NUL). omit notify (defaults to 'none'). Do not set legacy or observed_addr: "
+            "those are stamped server-side."
+        ),
+        "additionalProperties": False,
+        "properties": {
+            "kind": {"type": "string", "description": "One of: user, ai, service. 'unknown' is store-only.", "enum": ["user", "ai", "service"]},
+            "name": {"type": "string", "description": "Username, person or agent/client name. <=128 chars, no NUL.", "maxLength": 128},
+            "host": {"type": "string", "description": "Device/hostname (PTAIT09, ct110, htpc01). <=128 chars.", "maxLength": 128},
+            "address": {"type": "string", "description": "Optional IP or similar the caller claims. <=128 chars.", "maxLength": 128},
+            "cwd": {"type": "string", "description": "Required when kind is 'ai'. Requester working directory. <=4096 chars, no NUL.", "maxLength": 4096},
+            "agent": {"type": "string", "description": "Required when kind is 'ai'. Client token: claude, codex, cursor, openwebui, hydra, chat-overseer, or any [A-Za-z0-9._-]{1,64}.", "pattern": "^[A-Za-z0-9._-]{1,64}$", "maxLength": 64},
+            "session_id": {"type": "string", "description": "Required when kind is 'ai'. Full session id (Claude Code UUID, Codex/Cursor id). <=128 chars.", "maxLength": 128},
+            "session_ref": {"type": "string", "description": "Optional; when absent and session_id looks like a UUID/hex, the first 6 hex chars are derived."},
+            "notify": {"type": "string", "description": "Optional free-form string, where updates should go (e.g. 'handoff:/tmp/x.md', 'sendmessage:overseer1', 'open-asks', 'none'). Default 'none'. <=512 chars.", "maxLength": 512},
+        },
+    }
+
+
 def _optional_integer_param(description: str) -> dict[str, Any]:
     """Integer parameter the caller may omit entirely (no filled-in default)."""
     return {"type": "integer", "description": description}
@@ -268,6 +313,11 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                 # requires it -- the value a client passes is overridden, never
                 # trusted.
                 "requested_by": requested_by_hint,
+                # Task 300: the structured requester identity block.  Required
+                # on every enqueue (strict mode).  It is a nested object with
+                # additionalProperties=false; the store validates and normalizes
+                # it, stamping observed_addr/verified_caller server-side.
+                "requester": _requester_param(),
             },
         ),
         _tool_spec(
@@ -622,8 +672,19 @@ def _enqueue(
         ),
         "dedup_key": _bounded(arguments.get("dedup_key"), field="dedup_key", max_chars=256),
     }
+    # Task 300: the requester block is passed through verbatim (validated by the
+    # store) and stamped with the verified caller.  ``arguments["requester"]``
+    # is the dict the client supplied; ``caller`` (the verified identity) is the
+    # stamp.  When scoping is OFF (caller is None) the client-supplied block is
+    # still required in strict mode, so it must be present for the create to
+    # succeed.  AdditionalProperties=false in the schema keeps a non-dict
+    # requester from reaching here unguarded.
+    body["requester"] = arguments.get("requester")
     try:
-        entry = queue_store.create(body)
+        entry = queue_store.create(
+            body,
+            verified_caller=caller,
+        )
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "code": 422}
     result: dict[str, Any] = {"ok": True, "queue_id": entry.queue_id, "status": entry.status}

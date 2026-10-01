@@ -32,7 +32,16 @@ capacity allows.
   "max_rounds": 25,
   "priority": 0,
   "base_check": "origin/main",
-  "requested_by": "openwebui"
+  "requested_by": "openwebui",
+  "requester": {
+    "kind": "ai",
+    "name": "paxton via claude",
+    "host": "PTAIT09",
+    "cwd": "C:/Users/PaxtonTait/source/LongHorizon-Harness",
+    "agent": "claude",
+    "session_id": "b5038555-9e10-4bb3-a81e-aa03a602d445",
+    "notify": "sendmessage:overseer1"
+  }
 }
 ```
 
@@ -266,10 +275,12 @@ go through `update`, `queue.py:406`–`409`); the terminal cause is in `reason`.
 
 ### Caller-supplied vs. service-owned
 
-A caller supplies nine input fields through the enqueue body: `name`, `task` (or
+A caller supplies ten input fields through the enqueue body: `name`, `task` (or
 `task_file`), `workspace`, `trio` (or `roles`), `max_rounds`, `priority`,
-`base_check`, `requested_by`, and `dedup_key`. Of these, `max_rounds`,
-`priority`, `base_check`, and `dedup_key` are optional; the rest are required.
+`base_check`, `requested_by`, `dedup_key`, and `requester`. Of these, `max_rounds`,
+`priority`, `base_check`, and `dedup_key` are optional; the rest are required
+(`requested_by` may be omitted when a `requester` block is supplied and no
+verified caller is stamped; it is then derived as `name@host [session_ref]`).
 `task_file` and `roles` are alternative input keys for `task` and `trio`
 respectively, not separate stored fields.
 
@@ -282,6 +293,51 @@ written only by the launcher. A caller cannot set `queue_id`, `status`,
 `run_id`, `launched_at`, `reason`, `skip_reasons`, `created_at`, `updated_at`,
 or `last_checked_at` through the enqueue body — `QueueStore.create` reads only
 the nine input fields via `_normalize_request` (`queue.py:228`–`253`).
+
+## Requester identity block (`requester`, task 300)
+
+Every new queue entry records who asked for it and how to reach them. The block
+is a JSON object under the body key `requester`, stored on the entry as a plain
+dict, returned by `GET /api/queue`, carried onto requeued successors, and copied
+into the `queue.launched` run event.
+
+| key | required | rule |
+|---|---|---|
+| `kind` | yes | `user`, `ai` or `service` (`unknown` is store-only, see legacy mode) |
+| `name` | yes | username, person, or agent/client name; at most 128 chars |
+| `host` | yes | device or hostname (`PTAIT09`, `ct110`); at most 128 chars |
+| `address` | no | IP or similar the caller claims; at most 128 chars |
+| `cwd` | when `kind=ai` | requester working directory; at most 4096 chars |
+| `agent` | when `kind=ai` | client token matching `[A-Za-z0-9._-]{1,64}` (`claude`, `codex`, `cursor`, `openwebui`, `hydra`, `chat-overseer`) |
+| `session_id` | when `kind=ai` | full session id (Claude Code UUID, Codex/Cursor id); at most 128 chars |
+| `session_ref` | no | short ref; derived as the first 6 chars of a hex/UUID `session_id` when absent |
+| `notify` | no | where updates should go (`sendmessage:overseer1`, `handoff:<path>`, `open-asks`); default `none`. Stored and shown only; nothing delivers it yet |
+
+Store/API-set keys, which a caller may never send (the request is rejected naming the key):
+
+- `observed_addr`: the client host the REST API saw. The MCP path leaves it unset.
+- `verified_caller`: the task-174 verified caller identity, when scoping is on.
+- `legacy`: `true` on a block the store synthesized in legacy mode.
+
+Unknown sub-keys are rejected by name (400), like unknown body keys (task 233).
+Other violations raise `ValueError("requester.<key> ...")`, which is 422 on REST
+and `{"ok": false, "code": 422}` on MCP.
+
+### Rollout flag: `LH_HARNESS_QUEUE_REQUESTER`
+
+- `strict` (default): an enqueue without a block is rejected with
+  `requester is required (kind, name, host; agent, session_id, cwd when kind=ai)`.
+- `legacy`: a missing block is synthesized as
+  `{"kind": "unknown", "name": <requested_by>, "host": "unknown", "notify": "none", "legacy": true}`.
+  A supplied block is still fully validated.
+
+The flag is read at enqueue time. It is a rollout aid. Set it to `legacy` on a
+node until every enqueue client (notably the gateway `hydrafleet-enqueue_task`
+tool) sends a block, then remove it.
+
+The Postgres backend validates and stamps the block but does not persist it
+yet, because `harness.queue` has no requester column; a re-read returns
+`requester: null`. The file store persists it fully.
 
 ## Idempotent enqueue (`dedup_key`)
 

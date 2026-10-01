@@ -18,6 +18,16 @@ The new supervisor owns run lifecycle. Any in-flight runs started by the old CLI
    ```
 4. Stop the old overseer-side launcher process if it is still running.
 
+## 1b. Before the deploy -- requester rollout flag (task 300)
+
+From task 300 on, `POST /api/queue` and the `harness_enqueue_task` MCP tool
+require a `requester` block by default. Before restarting onto that version, add
+`Environment=LH_HARNESS_QUEUE_REQUESTER=legacy` to the `lh-harness` systemd unit
+(or its EnvironmentFile) and `systemctl daemon-reload`. Otherwise every enqueue
+from a client that does not send the block yet, including the gateway
+`hydrafleet-enqueue_task` tool, fails with 422. Remove the flag once those
+clients send the block.
+
 ## 2. Deploy with `deploy-harness.sh`
 
 Run the standard deploy script from the project checkout on CT110:

@@ -1364,8 +1364,18 @@ def create_app(
             # (task 174 scope item 3).
             stamped = dict(body)
             stamped["requested_by"] = caller
+            # The requester block is passed through as an opaque dict; the
+            # client may supply it (validated by the store), and the server
+            # stamps the host it observed and the verified caller into it.  The
+            # client may not set observed_addr/verified_caller -- the store
+            # rejects them from the block and stamps them here instead (task 300).
+            observed = request.client.host if request.client is not None else None
             try:
-                entry = queue_store.create(stamped)
+                entry = queue_store.create(
+                    stamped,
+                    observed_addr=observed,
+                    verified_caller=caller,
+                )
             except UnknownQueueFieldError as exc:
                 # Task 233: a body with keys outside the accepted set is a client
                 # error (400) that names every offending field -- never a silent
@@ -1375,9 +1385,13 @@ def create_app(
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             return {"ok": True, "queue_id": entry.queue_id, "requested_by": caller}
         # Scoping OFF (no [callers] configured): the store's own contract
-        # (task 233) validates the client-supplied requested_by.
+        # (task 233) validates the client-supplied requested_by.  No verified
+        # caller is stamped, and the client-supplied requester block is still
+        # validated (strict mode still requires it).  ``observed_addr`` is
+        # stamped from the request client when present (store-set only).
+        observed = request.client.host if request.client is not None else None
         try:
-            entry = queue_store.create(body)
+            entry = queue_store.create(body, observed_addr=observed)
         except UnknownQueueFieldError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:
