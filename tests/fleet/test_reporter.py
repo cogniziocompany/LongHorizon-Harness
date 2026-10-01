@@ -291,19 +291,46 @@ def test_non_blocking_on_failure(_isolate_reporter, monkeypatch):
     reporter.stop(timeout=2.0)
 
 
-def test_labels_parsing_and_heartbeat_shape(http_server, _isolate_reporter):
+def test_labels_parsing_and_heartbeat_shape(http_server, _isolate_reporter, tmp_path):
     """Optional labels are parsed and heartbeat has the documented shape."""
     _setenv(http_server, "label-node", "label-key", "kind=ct110,repo=LongHorizon-Harness")
     reporter = get_reporter(version="0.1.0", capacity=3, reset=True)
     assert reporter.labels == {"kind": "ct110", "repo": "LongHorizon-Harness"}
+
+    # round/activeRole come from the run's last durable event, not from keys
+    # on the run summary (build_run_summary never produces them).  Write the
+    # event ledger the heartbeat tails for run-42.
+    log_dir = tmp_path / "run-42" / "lh_harness"
+    role_dir = log_dir / "role_orchestration"
+    role_dir.mkdir(parents=True)
+    with (role_dir / "events.jsonl").open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "schema_version": 2,
+            "event_id": "run-42:000001",
+            "type": "round.manager.completed",
+            "ts": time.time() - 60,
+            "round": 1,
+            "role": "manager",
+        }) + "\n")
+        fh.write(json.dumps({
+            "schema_version": 2,
+            "event_id": "run-42:000002",
+            "type": "round.executor.started",
+            "ts": time.time() - 5,
+            "round": 2,
+            "role": "executor",
+        }) + "\n")
 
     reporter.queue_heartbeat(
         [
             {
                 "id": "run-42",
                 "status": "running",
-                "active_round": 2,
-                "active_role": "executor",
+                "log_dir": str(log_dir),
+                # Stale/orphaned keys a summary might still carry: the event
+                # tail is the source of truth for round/activeRole.
+                "active_round": 99,
+                "active_role": "auditor",
                 "model": "kimi-k2.7-code:cloud",
                 "repo": "LongHorizon-Harness",
                 "workspace": "/home/harness/work",
@@ -330,6 +357,77 @@ def test_labels_parsing_and_heartbeat_shape(http_server, _isolate_reporter):
     assert runs[0]["round"] == 2
     assert runs[0]["activeRole"] == "executor"
     assert runs[0]["youtrackIssueId"] == "MCP-123"
+
+
+def test_heartbeat_ui_base_url_from_env(http_server, _isolate_reporter, monkeypatch):
+    """node.uiBaseUrl carries LH_HARNESS_FLEET_UI_BASE_URL, trailing slash stripped."""
+    _setenv(http_server, "ui-node", "ui-key", None)
+    monkeypatch.setenv("LH_HARNESS_FLEET_UI_BASE_URL", "https://lh-node.example.test/console/")
+    reporter = get_reporter(reset=True)
+    reporter.queue_heartbeat([], 0, 0)
+    reporter.stop(timeout=5.0)
+
+    body = _StubHandler.requests[0]["body"]
+    assert body["node"]["uiBaseUrl"] == "https://lh-node.example.test/console"
+
+
+def test_heartbeat_ui_base_url_empty_when_unset(http_server, _isolate_reporter, monkeypatch):
+    """Unset LH_HARNESS_FLEET_UI_BASE_URL reports an empty uiBaseUrl."""
+    _setenv(http_server, "ui-node", "ui-key", None)
+    monkeypatch.delenv("LH_HARNESS_FLEET_UI_BASE_URL", raising=False)
+    reporter = get_reporter(reset=True)
+    reporter.queue_heartbeat([], 0, 0)
+    reporter.stop(timeout=5.0)
+
+    body = _StubHandler.requests[0]["body"]
+    assert body["node"]["uiBaseUrl"] == ""
+
+
+def test_heartbeat_run_rows_carry_last_event_identity(http_server, _isolate_reporter, tmp_path):
+    """Run rows expose round, activeRole, a bounded lastEvent, and its age."""
+    _setenv(http_server, "id-node", "id-key", None)
+    reporter = get_reporter(reset=True)
+
+    log_dir = tmp_path / "run-1" / "lh_harness"
+    role_dir = log_dir / "role_orchestration"
+    role_dir.mkdir(parents=True)
+    last_ts = time.time() - 30.0
+    with (role_dir / "events.jsonl").open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "schema_version": 2,
+            "event_id": "run-1:000004",
+            "type": "round.auditor.started",
+            "ts": last_ts,
+            "round": 4,
+            "role": "auditor",
+        }) + "\n")
+
+    runs = [
+        {"id": "run-1", "status": "running", "updated_at": 2.0, "log_dir": str(log_dir)},
+        # No log_dir at all: the tail reader has nothing to read and every
+        # identity field must degrade to None, never raise.
+        {"id": "run-2", "status": "running", "updated_at": 1.0},
+    ]
+    reporter.queue_heartbeat(runs, active=2, cap=2, queue_len=0)
+    reporter.stop(timeout=5.0)
+
+    body = _StubHandler.requests[0]["body"]
+    by_id = {row["runId"]: row for row in body["runs"]}
+
+    row = by_id["run-1"]
+    assert row["round"] == 4
+    assert row["activeRole"] == "auditor"
+    last_event = row["lastEvent"]
+    assert last_event == {"id": "run-1:000004", "type": "round.auditor.started", "ts": last_ts}
+    age = row["lastEventAgeSeconds"]
+    assert isinstance(age, float)
+    assert 25.0 <= age <= 120.0
+
+    row2 = by_id["run-2"]
+    assert row2["round"] is None
+    assert row2["activeRole"] is None
+    assert row2["lastEvent"] is None
+    assert row2["lastEventAgeSeconds"] is None
 
 
 def test_event_hook_trims_transcripts(_isolate_reporter):

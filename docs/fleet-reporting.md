@@ -17,6 +17,7 @@ web`) or a supervised node (`docker/compose.node.yml`):
 | `LH_HARNESS_FLEET_KEY` | yes | *(none)* | Per-host read key used to HMAC-sign every POST body. |
 | `LH_HARNESS_FLEET_NODE` | no | `socket.gethostname()` | Unique node identity reported as `X-Fleet-Host`. |
 | `LH_HARNESS_FLEET_LABELS` | no | *(none)* | Comma-separated `key=value` labels such as `kind=ct110,repo=LongHorizon-Harness`. |
+| `LH_HARNESS_FLEET_UI_BASE_URL` | no | *(none)* | Public base URL of this node's own Web console, reported as `node.uiBaseUrl` in the heartbeat so fleet-admin can deep-link to the node's dashboard. The trailing slash is stripped; unset reports `""`. Environment-only — the config loader has no `[fleet]` table. |
 
 When `LH_HARNESS_FLEET_URL` is unset, the reporter is not created and the system
 behaves exactly as before.
@@ -41,8 +42,13 @@ prompts, and other large nested objects are stripped before transmission.  The
 reporter batches events for two seconds and POSTs them to
 `{LH_HARNESS_FLEET_URL}/harness/events`.
 
-Gate state changes (`approval_created`, `approval_resolved`) and supervisor
-`run.status` updates are also emitted as events.
+Gate state changes (`approval_created`, `approval_resolved`), supervisor
+`run.status` updates, and the launcher's queue ledger events —
+`queue.launched`, `queue.done`, `queue.failed` (per-run ledgers) and
+`queue.requeued`, `queue.skipped` (service ledger) — are also emitted as
+events.  The local JSONL ledgers remain the durable record; the fleet push is
+a fail-open side-car that never alters launcher behaviour when fleet is
+unconfigured.
 
 ### 2. Heartbeats
 
@@ -56,7 +62,7 @@ Every 30 seconds the reporter POSTs one heartbeat to
     "version": "0.1.7",
     "kind": "ct110",
     "labels": {"kind": "ct110", "repo": "LongHorizon-Harness"},
-    "uiBaseUrl": ""
+    "uiBaseUrl": "https://ct110-lab.example.ai"
   },
   "runs": [
     {
@@ -69,6 +75,8 @@ Every 30 seconds the reporter POSTs one heartbeat to
       "repo": "LongHorizon-Harness",
       "workspace": "/home/harness/work/LongHorizon-Harness",
       "youtrackIssueId": "MCP-123",
+      "lastEvent": {"id": "20250907T120000Z_abcd1234:000042", "type": "round.executor.started", "ts": 1757170800.0},
+      "lastEventAgeSeconds": 17.5,
       "summary": {}
     }
   ],
@@ -79,6 +87,18 @@ Every 30 seconds the reporter POSTs one heartbeat to
   "runsTruncated": false
 }
 ```
+
+**Run identity from the event tail**: run summaries carry no active-round or
+active-role fields of their own, so `round`, `activeRole`, and `lastEvent`
+(`{id, type, ts}` plus `lastEventAgeSeconds`) are derived from the run's last
+durable event, read with the same bounded seek-from-end
+`EventTailer.read_last` tail read that the `/api/runs/{id}/latest` liveness
+route uses (a 64 KiB tail chunk in the common case, geometric growth only for
+oversized final records).  The read happens at most once per serialized run
+row and the projection is a fixed small shape regardless of ledger size.
+When a run has no readable event ledger all four fields are `null`.
+`node.uiBaseUrl` comes from `LH_HARNESS_FLEET_UI_BASE_URL` (trailing slash
+stripped, `""` when unset).
 
 **Payload bounding**: A long-lived node accumulates hundreds of completed
 runs whose per-run summaries dominate the heartbeat (measured on CT110,
