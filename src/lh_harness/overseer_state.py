@@ -526,12 +526,12 @@ def read_ledger(
     )
 
 
-def list_open_asks(
+def _list_open_asks_file(
     arguments: dict[str, Any],
     *,
     overseer_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Return rows from ``queue/OPEN-ASKS.md``.
+    """Return rows from ``queue/OPEN-ASKS.md`` (the file half of ``list_open_asks``).
 
     By default only rows whose ``state`` column still looks open are returned.
     Pass ``include_closed: true`` to see closed/answered/superseded rows too.
@@ -636,6 +636,109 @@ def list_open_asks(
             "rows": rows[:limit],
         }
     )
+
+
+_LIVE_ASK_CHARS = 200
+_LIVE_EVIDENCE_CHARS = 300
+
+
+def live_open_ask_rows(
+    gated: list[dict[str, Any]],
+    blocked: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Open-asks rows derived from live harness state (task A3).
+
+    ``gated``: one item per PENDING approval of a run in ``waiting_approval``,
+    ``{"run_id", "approval_id", "title", "message"}``.
+    ``blocked``: one item per queue entry in status ``blocked``,
+    ``{"queue_id", "name", "reason"}``.
+    Rows carry exactly the seven ``queue/OPEN-ASKS.md`` columns, so every
+    consumer of ``list_open_asks`` renders them unchanged.  Items without an
+    id are skipped.
+    """
+    rows: list[dict[str, str]] = []
+    for item in gated:
+        run_id = str(item.get("run_id") or "")
+        approval_id = str(item.get("approval_id") or "")
+        if not run_id or not approval_id:
+            continue
+        text = str(item.get("title") or item.get("message") or "waiting for a gate decision")
+        rows.append(
+            {
+                "id": f"gate-{run_id}-{approval_id}",
+                "ask": f"Run {run_id} is gated: {text[:_LIVE_ASK_CHARS]}",
+                "kind": "GATE",
+                "evidence": f"/runs/{run_id}",
+                "recommended": "",
+                "default_if_silent": "the run stays gated and keeps its slot",
+                "state": "open",
+            }
+        )
+    for item in blocked:
+        queue_id = str(item.get("queue_id") or "")
+        if not queue_id:
+            continue
+        name = str(item.get("name") or queue_id)
+        rows.append(
+            {
+                "id": f"blocked-{queue_id}",
+                "ask": f"Queue entry {name[:_LIVE_ASK_CHARS]} is blocked",
+                "kind": "BLOCKED",
+                "evidence": str(item.get("reason") or "")[:_LIVE_EVIDENCE_CHARS],
+                "recommended": "",
+                "default_if_silent": "the entry stays blocked",
+                "state": "open",
+            }
+        )
+    return rows
+
+
+def list_open_asks(
+    arguments: dict[str, Any],
+    *,
+    overseer_root: str | Path | None = None,
+    live_rows: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Return open asks: live rows first, then rows from ``queue/OPEN-ASKS.md``.
+
+    ``live_rows`` (task A3) come from :func:`live_open_ask_rows`.  ``None``
+    means no live state is wired and keeps the file-only behaviour, where a
+    missing archive, file or table is an error.  With live rows those are not
+    errors: the response carries the reason in ``file_note`` instead.  By
+    default only file rows whose ``state`` still looks open are returned; pass
+    ``include_closed: true`` to see closed/answered/superseded rows too.
+    """
+    result = _list_open_asks_file(arguments, overseer_root=overseer_root)
+    if live_rows is None:
+        return result
+    if not result.get("ok"):
+        if result.get("code") == 400:
+            return result
+        result = _ok(
+            {
+                "updated_line": "",
+                "total_rows": 0,
+                "open_rows": 0,
+                "rows": [],
+                "file_note": str(result.get("error") or ""),
+            }
+        )
+    try:
+        limit = _bounded_int(
+            arguments.get("limit"),
+            field="limit",
+            default=_DEFAULT_LIST_LIMIT,
+            lo=1,
+            hi=_MAX_LIST_LIMIT,
+        )
+    except ValueError as exc:
+        return _bad_request(str(exc))
+    rows = list(live_rows) + list(result.get("rows") or [])
+    result["rows"] = rows[:limit]
+    result["live_rows"] = len(live_rows)
+    result["total_rows"] = int(result.get("total_rows") or 0) + len(live_rows)
+    result["open_rows"] = int(result.get("open_rows") or 0) + len(live_rows)
+    return result
 
 
 def _split_table_cells(line: str) -> list[str]:
