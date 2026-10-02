@@ -6,12 +6,20 @@ let volatileWebToken = '';
 /** A fetch failure that keeps the HTTP status available to the UI. */
 export class ApiError extends Error {
   readonly status: number;
+  /** True when a single-sign-on proxy, not the harness, refused the request. */
+  readonly signInRequired: boolean;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, signInRequired = false) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.signInRequired = signInRequired;
   }
+}
+
+/** The SSO session in front of the harness has expired; a reload signs in again. */
+export function isSignInRequired(reason: unknown): boolean {
+  return reason instanceof ApiError && reason.signInRequired;
 }
 
 export function storedAuthToken(): string {
@@ -64,6 +72,12 @@ export function isConflict(reason: unknown): boolean {
 
 async function responseError(response: Response): Promise<ApiError> {
   let message = `${response.status} ${response.statusText}`.trim();
+  // The harness always answers a missing bearer with `WWW-Authenticate:
+  // Bearer`.  A 401 without it came from the SSO edge, where a token dialog
+  // cannot help; the page has to go back through sign-in.
+  if (response.status === 401 && !/^\s*bearer\b/iu.test(response.headers.get('www-authenticate') || '')) {
+    return new ApiError(401, 'Your sign-in session has expired.', true);
+  }
   try {
     const payload = await response.clone().json() as { detail?: unknown };
     if (payload && typeof payload.detail === 'string' && payload.detail.trim()) message = payload.detail.trim();
@@ -165,8 +179,11 @@ export async function getJson<T>(path: string): Promise<T> {
 }
 
 export async function fetchRuns(): Promise<RunSummary[]> {
-  const data = await getJson<{ runs: RunSummary[] }>('/api/runs');
-  return data.runs;
+  // The full listing reads every run directory (several MB and seconds on a
+  // busy node); the run list only needs id, status and a title.
+  // `task_name` is the bounded first line of the task.
+  const data = await getJson<{ runs: Array<Omit<RunSummary, 'task'> & { task_name?: string; task?: string }> }>('/api/runs?fields=summary');
+  return data.runs.map((run) => ({ ...run, task: run.task ?? run.task_name ?? '' }) as RunSummary);
 }
 
 export function fetchMeta(): Promise<WebMeta> {

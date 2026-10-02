@@ -5,7 +5,7 @@ import {
   type FeedConnectionStatus,
 } from '../../core/src/runFeed';
 import type { OperatorMessage, Snapshot } from '../../core/src/types';
-import { fetchEvents, fetchSnapshot, isNotFound, isUnauthorized, streamRun } from './api';
+import { fetchEvents, fetchSnapshot, isNotFound, isSignInRequired, isUnauthorized, streamRun } from './api';
 import { useUiLanguage } from './i18n';
 
 export const EMPTY_SNAPSHOT: Snapshot = {
@@ -78,6 +78,10 @@ export function useRunFeed(runId: string, authRevision = 0): RunFeedHandle {
           // immediately so a fresh server opens on the welcome screen instead
           // of reconnecting forever to an id from another runs root.
           window.dispatchEvent(new CustomEvent('lh-run-not-found'));
+          return;
+        }
+        if (isSignInRequired(reason)) {
+          window.dispatchEvent(new CustomEvent('lh-sign-in-required'));
           return;
         }
         setError(isUnauthorized(reason) ? '401 invalid or missing bearer token' : String(reason));

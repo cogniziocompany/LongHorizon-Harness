@@ -311,6 +311,29 @@ function preferSnapshot(current: Snapshot | null, incoming: Snapshot): Snapshot 
   return withDurableInteractions(incoming, current);
 }
 
+/**
+ * Fill the arrays a partial snapshot leaves out.  `?fields=summary` omits
+ * `rounds`, `events` and `legacy`; every merge below assumes they exist, and
+ * one missing array used to throw inside the reducer and unmount the app.
+ * Rounds the summary did not carry are kept from the current snapshot.
+ */
+function completeSnapshot(incoming: Snapshot, current: Snapshot | null): Snapshot {
+  return {
+    ...incoming,
+    rounds: Array.isArray(incoming.rounds) ? incoming.rounds : current?.rounds || [],
+    events: Array.isArray(incoming.events) ? incoming.events : [],
+    approvals: Array.isArray(incoming.approvals) ? incoming.approvals : current?.approvals || [],
+    operator_messages: Array.isArray(incoming.operator_messages) ? incoming.operator_messages : current?.operator_messages || [],
+    controls: incoming.controls || current?.controls || { can_inject: false, can_abort: false, can_resume: false },
+    diagnostics: {
+      ...(incoming.diagnostics || {}),
+      last_event_id: incoming.diagnostics?.last_event_id ?? null,
+      event_count: incoming.diagnostics?.event_count ?? 0,
+      warnings: Array.isArray(incoming.diagnostics?.warnings) ? incoming.diagnostics.warnings : [],
+    },
+  };
+}
+
 /** Create an empty, immutable feed state for one selected run. */
 export function createRunFeedState(
   runId: string | null = null,
@@ -400,8 +423,8 @@ export function reduceRunFeed(state: RunFeedState, action: RunFeedAction): RunFe
     };
   }
 
-  const { snapshot } = action;
-  if (!sameRun(state.runId, snapshot)) return state;
+  if (!action.snapshot?.run || !sameRun(state.runId, action.snapshot)) return state;
+  const snapshot = completeSnapshot(action.snapshot, state.snapshot);
 
   if (action.type === 'snapshot') {
     const resetHistory = snapshot.diagnostics?.resync_required === true || snapshot.diagnostics?.cursor_gap === true;
