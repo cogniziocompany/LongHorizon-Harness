@@ -29,7 +29,14 @@ import urllib.request
 ACTIVE_STATUSES = {"creating", "starting", "running", "waiting_approval", "stopping"}
 
 
-def _resume(url: str, token: str, timeout: float = 15) -> dict[str, object]:
+# POST /api/maintenance/{suspend,resume} stops/starts every active run before it
+# answers; on CT110 that took >15 s (2026-10-02 deploy 37062516845: suspend timed
+# out client-side, landed server-side, and the empty-manifest resume stranded the
+# runs). Wait long enough for the server to finish and write the manifest.
+MAINTENANCE_POST_TIMEOUT = 120.0
+
+
+def _resume(url: str, token: str, timeout: float = MAINTENANCE_POST_TIMEOUT) -> dict[str, object]:
     request = urllib.request.Request(
         url.rstrip("/") + "/api/maintenance/resume",
         data=b"{}",
