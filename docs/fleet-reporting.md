@@ -44,6 +44,31 @@ reporter batches events for two seconds and POSTs them to
 Gate state changes (`approval_created`, `approval_resolved`) and supervisor
 `run.status` updates are also emitted as events.
 
+#### Episode stats
+
+Every role done/failed event (`manager_round_done`, `executor_role_done`,
+`auditor_role_done`, `agent_runtime_failed`, ...) carries
+`payload.episode_status.stats`, a set of counters computed from the episode's
+Claude Code stream-json log by `src/lh_harness/episode_stats.py`:
+
+| Field | Meaning |
+| --- | --- |
+| `model` | Model that actually served the episode (e.g. `ornith-1.5:9b-256k`). |
+| `turns` | Model turns (distinct assistant message ids). |
+| `tool_calls`, `tool_errors` | Tool calls made, and tool results flagged as errors. |
+| `edits`, `files_touched` | `Edit`/`Write`/`NotebookEdit` calls, and distinct files they named. |
+| `tool_result_chars` | Characters of tool output fed back to the model. |
+| `thinking_tokens`, `max_turn_thinking_tokens` | Estimated thinking tokens: episode total and largest single turn. |
+| `api_retries`, `compactions` | Claude Code API retries and context compactions. |
+| `max_gap_seconds` | Longest wait between a tool result and the next model turn. |
+| `stalls`, `stall_seconds` | Waits of 120 s or more, and their total. |
+
+`stats` is `null` for agents that do not emit stream-json.  The counters hold
+no prompt, thinking or tool content.  They exist so sizing questions ("how many
+turns and files does an episode that finishes on the local lane have?") and
+stall questions ("how much executor time is spent waiting on a busy lane?")
+can be answered from `fleet.harness_events` instead of from run directories.
+
 ### 2. Heartbeats
 
 Every 30 seconds the reporter POSTs one heartbeat to

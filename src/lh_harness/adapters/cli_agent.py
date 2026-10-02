@@ -12,6 +12,7 @@ from pathlib import PurePath
 
 from ..environment.base import Environment
 from ..environment.remote_files import write_remote_text
+from ..episode_stats import summarize_episode
 from ..runtime_signals import detect_runtime_signals
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH, EpisodeBudget, EpisodeResult
 
@@ -201,6 +202,7 @@ class CommandAgentAdapter:
                 "trajectory_format": "jsonl",
                 "assistant_visible_output": visible_output,
                 "runtime_signals": runtime_signals,
+                "episode_stats": summarize_episode(stdout_log),
                 "stall_window_seconds": stall_window,
                 "actions_log_diagnostics_only": bool(
                     self.visible_output_parser is not None and not visible_output
