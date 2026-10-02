@@ -470,6 +470,15 @@ def _ps_query(pid: int, field: str) -> str | None:
         return None
 
 
+
+def _task_name(task: Any) -> str:
+    """First non-empty line of a run's task text, cut to 120 characters."""
+
+    for line in str(task or "").splitlines():
+        if line.strip():
+            return line.strip()[:120]
+    return ""
+
 class IdempotencyConflict(ValueError):
     """Raised when a key is replayed with a different operation payload."""
 
@@ -1727,6 +1736,10 @@ class RunSupervisor:
                     "agent": owner.get("agent"),
                     "model": owner.get("model"),
                     "log_dir": str(_summary_logs_dir(Path(entry.path))),
+                    # First non-empty task line (<=120 chars) so cheap callers
+                    # (Hydra's fleet list, fields=summary) keep a run label
+                    # without downloading the full task text.
+                    "task_name": _task_name(owner.get("task")),
                 }
             )
         items.sort(key=lambda item: item["mtime"], reverse=True)

@@ -185,3 +185,18 @@ def test_unknown_status_rows_are_excluded_by_default_projection(tmp_path: Path) 
     ids = {row["id"] for row in payload.json()["runs"]}
     assert "not-a-run" not in ids
     assert "run-real" in ids
+
+def test_summary_rows_carry_task_name_first_line(tmp_path: Path) -> None:
+    """Hydra's fleet list reads fields=summary and still needs a run label."""
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    _make_run(root, "run-a", status="running", task="\n  TASK A1 - short title\nline two " + "x" * 5000)
+    _make_run(root, "run-b", status="failed", task="T" * 300)
+    supervisor = RunSupervisor(root, workspace_root=tmp_path)
+    dashboard = DashboardState(root / "run-a", runs_root=root, control_enabled=False)
+    client = TestClient(create_app(state=dashboard, runs_root=root, run_id="run-a", supervisor=supervisor))
+    rows = {r["id"]: r for r in client.get("/api/runs?fields=summary").json()["runs"]}
+    assert rows["run-a"]["task_name"] == "TASK A1 - short title"
+    assert rows["run-b"]["task_name"] == "T" * 120
+    assert "task" not in rows["run-a"]
