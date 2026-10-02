@@ -34,6 +34,11 @@ _ENV_NODE = "LH_HARNESS_FLEET_NODE"
 _ENV_KEY = "LH_HARNESS_FLEET_KEY"
 _ENV_LABELS = "LH_HARNESS_FLEET_LABELS"
 _ENV_ALL = (_ENV_URL, _ENV_NODE, _ENV_KEY, _ENV_LABELS)
+# Optional (intentionally NOT in _ENV_ALL): the public base URL of this node's
+# Web console, reported as ``node.uiBaseUrl`` in the heartbeat so fleet-admin
+# can deep-link from the fleet window to the node's own dashboard.  A missing
+# or unset value reports "".
+_ENV_UI_BASE_URL = "LH_HARNESS_FLEET_UI_BASE_URL"
 
 _BATCH_INTERVAL_SECONDS = 2.0
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
@@ -139,6 +144,7 @@ class FleetReporter:
                 ", ".join(self._missing_env),
             )
         self._url = (env_values[_ENV_URL] or "").rstrip("/")
+        self._ui_base_url = (os.environ.get(_ENV_UI_BASE_URL) or "").rstrip("/")
         self._ever_succeeded = False
         self._last_attempt_ok: bool | None = None
         self._last_attempt_error: str | None = None
@@ -250,6 +256,12 @@ class FleetReporter:
         summaries dominate the payload (measured ~10 KB per run; a 532-run
         store produced a 5.47 MB body that the fleet plane rejected with
         HTTP 413), so the full run list must never be sent.
+
+        ``node.uiBaseUrl`` reports the optional
+        ``LH_HARNESS_FLEET_UI_BASE_URL`` (trailing slash stripped, ``""``
+        when unset); each run row additionally carries ``round``,
+        ``activeRole``, and a bounded ``lastEvent`` projection with
+        ``lastEventAgeSeconds`` derived from the run's last durable event.
         """
         if not self._enabled:
             return
@@ -290,29 +302,25 @@ class FleetReporter:
                 f"{active_before_cap} to {_MAX_ACTIVE_RUNS_PER_HEARTBEAT} most recent; "
                 "aggregate counts still cover every run"
             )
+        # Serialize run rows only after the cap so the tail read (one bounded
+        # seek-from-end per run) happens at most 200 times per heartbeat.
+        # ``round``/``activeRole``/``lastEvent`` are derived from the run's
+        # last durable event via the same ``EventTailer.read_last`` reader the
+        # /api/runs/{id}/latest liveness route uses; run summaries carry no
+        # active-round/active-role fields of their own.
+        now = time.time()
+        serialized_runs = [
+            _heartbeat_run_row(run, now=now) for run in active_runs
+        ]
         body = {
             "node": {
                 "name": self._node,
                 "version": self._version,
                 "kind": self._labels.get("kind"),
                 "labels": self._labels,
-                "uiBaseUrl": "",
+                "uiBaseUrl": self._ui_base_url,
             },
-            "runs": [
-                {
-                    "runId": run.get("id"),
-                    "run_id": run.get("id"),
-                    "status": run.get("status"),
-                    "round": run.get("active_round"),
-                    "activeRole": run.get("active_role"),
-                    "model": run.get("model"),
-                    "repo": run.get("repo"),
-                    "workspace": run.get("workspace"),
-                    "youtrackIssueId": run.get("youtrack_issue_id"),
-                    "summary": {k: v for k, v in run.items() if k not in {"id", "status"}},
-                }
-                for run in active_runs
-            ],
+            "runs": serialized_runs,
             "capacity": {"active": active, "cap": cap},
             "queueLen": queue_len,
             # Launcher liveness (task 173, scope 6): the lease's last refresh
@@ -566,6 +574,79 @@ def _parse_labels(raw: str) -> dict[str, str]:
             if key:
                 labels[key] = value
     return labels
+
+
+def _tail_last_event(run_id: str, log_dir: Any) -> Any | None:
+    """Read the run's last durable event via the fc-H1a seek-from-end tailer.
+
+    Returns ``None`` for missing/invalid inputs, an unreadable ledger, or any
+    unexpected failure — the heartbeat must never die on one run's event log.
+    The reader is ``EventTailer.read_last`` (the same bounded 64 KiB
+    seek-from-end tail read the ``/api/runs/{id}/latest`` liveness route
+    uses), so a heartbeat over a 100 MB event log stays a tail read.
+
+    The import is lazy for the same reason the supervisor.lifecycle import in
+    :meth:`FleetReporter.queue_heartbeat` is lazy: webapi.events imports
+    supervisor.control_bus, which imports this module — a module-level import
+    here would be circular.
+    """
+    if not run_id or not isinstance(log_dir, str) or not log_dir:
+        return None
+    try:
+        from ..webapi.events import EventTailer
+    except Exception:
+        return None
+    role_root = Path(log_dir)
+    canonical = role_root / "role_orchestration" / "events.jsonl"
+    legacy = role_root / "role_management" / "events.jsonl"
+    try:
+        # Same canonical/legacy selection as DashboardState._role_dir.
+        path = canonical if canonical.exists() or not legacy.exists() else legacy
+    except OSError:
+        path = canonical
+    try:
+        events = EventTailer(path, run_id=run_id).read_last(1)
+    except Exception:
+        return None
+    return events[-1] if events else None
+
+
+def _heartbeat_run_row(run: dict[str, Any], *, now: float) -> dict[str, Any]:
+    """Serialize one run summary into a heartbeat row with liveness identity.
+
+    ``round`` and ``activeRole`` come from the run's last durable event: run
+    summaries (``build_run_summary``) carry no active-round/active-role fields
+    of their own, so reading the event tail is what lets the fleet window show
+    what a live run is actually doing.  ``lastEvent`` is a small
+    ``{id, type, ts}`` projection plus ``lastEventAgeSeconds``, keeping the
+    row bounded regardless of the event ledger's size.
+    """
+    run_id = run.get("id")
+    last_event = _tail_last_event(str(run_id or ""), run.get("log_dir"))
+    last_event_block: dict[str, Any] | None = None
+    last_event_age: float | None = None
+    if last_event is not None:
+        last_event_block = {
+            "id": last_event.event_id,
+            "type": last_event.type,
+            "ts": last_event.ts,
+        }
+        if last_event.ts and last_event.ts > 0:
+            last_event_age = max(0.0, round(now - last_event.ts, 3))
+    return {
+        "runId": run_id,
+        "run_id": run_id,
+        "status": run.get("status"),
+        "round": last_event.round if last_event is not None else None,
+        "activeRole": last_event.role if last_event is not None else None,
+        "model": run.get("model"),
+        "repo": run.get("repo"),
+        "workspace": run.get("workspace"),
+        "youtrackIssueId": run.get("youtrack_issue_id"),
+        "lastEvent": last_event_block,
+        "lastEventAgeSeconds": last_event_age,
+        "summary": {k: v for k, v in run.items() if k not in {"id", "status"}},
+    }
 
 
 def _json_default(value: object) -> Any:

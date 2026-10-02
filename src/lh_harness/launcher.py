@@ -1289,6 +1289,15 @@ class Launcher:
             "payload": payload,
         }
         self._append_jsonl(role_dir / "events.jsonl", record)
+        # Push the same record to fleet-admin when configured.  The local
+        # ledger is already durable; any fleet failure must remain a side-car
+        # concern and never propagate into the launcher tick.
+        try:
+            from .fleet.reporter import post_event_record
+
+            post_event_record(record)
+        except Exception:
+            logger.exception("fleet event hook failed; dropping telemetry")
 
     def _emit_service_event(self, event_type: str, payload: dict[str, Any]) -> None:
         # A store without a file root (the PG backend) has no service event
@@ -1310,6 +1319,15 @@ class Launcher:
         if queue_root is None:
             return
         self._append_jsonl(queue_root / "service_events.jsonl", record)
+        # Push the same record to fleet-admin when configured.  The local
+        # ledger is already durable; any fleet failure must remain a side-car
+        # concern and never propagate into the launcher tick.
+        try:
+            from .fleet.reporter import post_event_record
+
+            post_event_record(record)
+        except Exception:
+            logger.exception("fleet event hook failed; dropping telemetry")
 
     def _is_retryable_cause(self, cause: str) -> bool:
         """True when a failure cause should spawn a retry (successor entry).
