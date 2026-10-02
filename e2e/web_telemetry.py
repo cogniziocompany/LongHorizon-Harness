@@ -265,7 +265,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"{telemetry.ws_opened} WebSocket handshakes",
                 )
                 if path != "/":
-                    telemetry.check("deep link opens the linked run", telemetry.final_path == run_path,
+                    # A gate link keeps its /gates/<id> segment so it can be copied.
+                    telemetry.check("deep link opens the linked run", telemetry.final_path == path,
                                     telemetry.final_path)
                 else:
                     telemetry.check("root lands on a run URL", telemetry.final_path.startswith("/runs/"),
