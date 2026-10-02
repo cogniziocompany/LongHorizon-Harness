@@ -136,6 +136,31 @@ staged_wheel() {
   printf '%s' "${matches[0]}"
 }
 
+# Every build is the same pyproject version, so a plain `pip install
+# --upgrade` sees "already satisfied" and silently keeps the old code (the
+# 2026-10-01/02 deploys restarted unchanged bytes). Always reinstall this
+# exact wheel, then prove pip recorded it.
+install_wheel() {
+  local wheel="$1" want got
+  # First pass resolves any new or changed dependencies; the second replaces
+  # the package itself even when its version string is unchanged.
+  "$VENV/bin/pip" install --upgrade "$wheel"
+  "$VENV/bin/pip" install --force-reinstall --no-deps "$wheel"
+  want="$(sha256sum "$wheel" | awk '{print $1}')"
+  got="$("$VENV/bin/python" - <<'PY'
+import json
+from importlib.metadata import distribution
+text = distribution("lh-harness").read_text("direct_url.json") or "{}"
+print(json.loads(text).get("archive_info", {}).get("hashes", {}).get("sha256", ""))
+PY
+)"
+  if [[ "$got" != "$want" ]]; then
+    echo "post-install verify: installed wheel sha256 is '${got:-unknown}', staged wheel is $want" >&2
+    return 4
+  fi
+  log "installed wheel sha256 matches staged wheel ($want)"
+}
+
 restart_and_verify() {
   local want="$1" got
   systemctl restart "$SERVICE"
@@ -163,7 +188,7 @@ case "$MODE" in
 
     wheel="$(staged_wheel)"
     log "installing $(basename "$wheel") into $VENV"
-    "$VENV/bin/pip" install --upgrade "$wheel"
+    install_wheel "$wheel"
 
     got="$(restart_and_verify "$EXPECTED_VERSION")"
     # Archive the wheel we just installed so a FUTURE deploy's rollback has a
@@ -188,7 +213,7 @@ case "$MODE" in
     [[ -n "$wheel" ]] || {
       echo "rollback: no archived wheel for version $prev under $WHEEL_ARCHIVE" >&2; exit 3; }
     log "rolling back to $prev from $(basename "$wheel")"
-    "$VENV/bin/pip" install --upgrade "$wheel"
+    install_wheel "$wheel"
     got="$(restart_and_verify "$prev")"
     log "CT110_ROLLBACK_INNER_OK restored=$got"
     ;;
