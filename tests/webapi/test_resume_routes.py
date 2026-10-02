@@ -24,6 +24,11 @@ class FakeProcess:
     def poll(self):
         return self.returncode
 
+    def wait(self, timeout=None):
+        # Hosts that launch workers in a systemd scope settle the launcher's exit
+        # code via worker_isolation.await_scope_exit -> process.wait().
+        return self.returncode
+
 
 @pytest.fixture()
 def client(monkeypatch, tmp_path: Path):
