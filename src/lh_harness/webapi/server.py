@@ -997,7 +997,7 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
         "updated_at": item.get("mtime", 0.0),
         "workspace": str(item.get("workspace") or ""),
     }
-    for field in ("agent", "model", "max_rounds", "prompt_language"):
+    for field in ("agent", "model", "max_rounds", "prompt_language", "task_name"):
         if field in item:
             row[field] = item[field]
     if isinstance(item.get("round"), int) and not isinstance(item.get("round"), bool):
