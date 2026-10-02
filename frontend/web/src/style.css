@@ -572,3 +572,5 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .codex-workbench .ui-language-switch button:hover { color: #4d5351; background: #eceeed; }
 .codex-workbench .ui-language-switch button.active { color: #27614f; background: #fff; box-shadow: 0 1px 3px rgba(30, 34, 32, .12); }
 .codex-workbench .ui-language-switch button:focus-visible { outline: 2px solid rgba(47, 111, 91, .35); outline-offset: 1px; }
+.approval-card.approval-linked { box-shadow: 0 0 0 2px rgba(242, 153, 74, .85); }
+.crash-screen { max-width: 640px; margin: 12vh auto; padding: 0 16px; color: #ddd; font-size: 13px; }.crash-screen h1 { font-size: 18px; }.crash-screen pre { white-space: pre-wrap; color: #f2b8b8; }.crash-screen button { padding: 7px 12px; border: 1px solid #555; border-radius: 6px; color: #eee; background: #353535; }

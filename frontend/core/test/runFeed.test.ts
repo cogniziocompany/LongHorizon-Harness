@@ -62,6 +62,37 @@ function reduce(state: RunFeedState, ...actions: Parameters<typeof reduceRunFeed
   return actions.reduce(reduceRunFeed, state);
 }
 
+function summaryOf(full: Snapshot): Snapshot {
+  // Shape of GET /snapshot?fields=summary: no rounds, events, legacy or warnings.
+  const { rounds: _rounds, events: _events, ...rest } = full;
+  const { warnings: _warnings, ...diagnostics } = full.diagnostics;
+  return { ...rest, diagnostics } as unknown as Snapshot;
+}
+
+test('a summary snapshot arriving first does not throw and yields usable arrays', () => {
+  const full = snapshot('run-a', [event('e1', 1)]);
+  const state = reduceRunFeed(createRunFeedState('run-a'), { type: 'snapshot', snapshot: summaryOf(full) });
+  assert.ok(state.snapshot);
+  assert.deepEqual(state.snapshot.rounds, []);
+  assert.deepEqual(state.snapshot.events, []);
+  assert.deepEqual(state.snapshot.diagnostics.warnings, []);
+});
+
+test('a summary snapshot after the full one keeps rounds and events', () => {
+  const full = { ...snapshot('run-a', [event('e1', 1), event('e2', 2)]), rounds: [{ round_index: 1 } as Snapshot['rounds'][number]] };
+  let state = reduceRunFeed(createRunFeedState('run-a'), { type: 'snapshot', snapshot: full });
+  state = reduceRunFeed(state, { type: 'snapshot', snapshot: summaryOf(full) });
+  assert.equal(state.snapshot?.rounds.length, 1);
+  assert.equal(state.events.length, 2);
+  state = reduceRunFeed(state, { type: 'snapshot', snapshot: full });
+  assert.equal(state.snapshot?.rounds.length, 1);
+});
+
+test('a snapshot without a run object is ignored rather than thrown on', () => {
+  const state = createRunFeedState('run-a');
+  assert.equal(reduceRunFeed(state, { type: 'snapshot', snapshot: {} as Snapshot }), state);
+});
+
 test('creates an isolated feed with a normalized bounded size', () => {
   assert.equal(createRunFeedState().connection, 'closed');
   assert.equal(createRunFeedState('run-a', 2.9).maxEvents, 2);

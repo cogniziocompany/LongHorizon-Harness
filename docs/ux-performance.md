@@ -64,3 +64,15 @@ git checkout 720a1a2
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
     .venv-dev/bin/python scripts/bench_snapshot.py
 ```
+
+## Browser telemetry check
+
+`e2e/web_telemetry.py` opens the Workbench in a real browser the way an operator does and records page errors, HTTP failures, WebSocket handshakes and frames, and per-endpoint latency. It checks four scenarios: a deep link in a fresh tab with no token, an authenticated run deep link, a gate deep link (`/runs/<id>/gates/<approval>`), and `/`.
+
+```bash
+pip install playwright
+LH_HARNESS_WEB_TOKEN=... python e2e/web_telemetry.py \
+    --base-url http://192.168.21.168:8799 --channel msedge --json telemetry.json
+```
+
+`--channel msedge` (or `chrome`) uses the browser that is already installed, so Playwright does not need to download one. To test behind the SSO edge, leave the token unset and pass `--storage-state` with a signed-in browser state.

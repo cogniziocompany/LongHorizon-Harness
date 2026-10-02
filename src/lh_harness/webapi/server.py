@@ -1267,15 +1267,26 @@ def create_app(
 
     snapshot_cache = _SnapshotCache(ttl_seconds=2.0)
 
+    snapshot_build_locks: dict[str, threading.Lock] = {}
+    snapshot_build_locks_guard = threading.Lock()
+
     def _cached_snapshot_for(state: DashboardState, run_id: str) -> dict[str, Any]:
         cached = snapshot_cache.get(state, run_id)
         if cached is not None:
             return cached[1]
-        snapshot = _snapshot_for(registry, state, run_id)
-        signature = snapshot_cache._signature(state, run_id)
-        control_signature = snapshot_cache._control_signature(state)
-        snapshot_cache.put(run_id, signature + (control_signature,), snapshot)
-        return snapshot
+        # A page load asks for the full snapshot, the summary and the stream's
+        # initial frame at once.  Build once and let the others reuse it.
+        with snapshot_build_locks_guard:
+            build_lock = snapshot_build_locks.setdefault(run_id, threading.Lock())
+        with build_lock:
+            cached = snapshot_cache.get(state, run_id)
+            if cached is not None:
+                return cached[1]
+            snapshot = _snapshot_for(registry, state, run_id)
+            signature = snapshot_cache._signature(state, run_id)
+            control_signature = snapshot_cache._control_signature(state)
+            snapshot_cache.put(run_id, signature + (control_signature,), snapshot)
+            return snapshot
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> Any:
@@ -2261,29 +2272,39 @@ def create_app(
         after: str | None = None,
     ) -> None:
         after = _bounded_cursor(after)
-        state_for_run = registry.state_for(run_id)
-        if state_for_run is None:
-            await websocket.close(code=4404, reason="run not found")
-            return
+
+        async def refuse(code: int, reason: str) -> None:
+            # A close before accept() reaches a browser as a failed handshake:
+            # it sees 1006, cannot tell "bad token" from a network blip, and
+            # reconnects forever.  Accept first so the code is delivered.
+            await websocket.accept()
+            await websocket.close(code=code, reason=reason)
+
         origin = websocket.headers.get("origin")
         host = websocket.headers.get("host", "")
         if _is_loopback_host(bind_host) and not _host_header_allowed(host, bind_host):
-            await websocket.close(code=4403, reason="host is not allowed")
+            await refuse(4403, "host is not allowed")
             return
         authenticated, selected_subprotocol = _websocket_auth(websocket, token)
         if not authenticated:
-            await websocket.close(code=4401, reason="invalid or missing bearer token")
+            await refuse(4401, "invalid or missing bearer token")
             return
         if not _origin_allowed(origin, host, origins):
-            await websocket.close(code=4403, reason="origin is not allowed")
+            await refuse(4403, "origin is not allowed")
+            return
+        # Everything below reads the run from disk.  Keep it off the event
+        # loop: one slow snapshot here used to stall every other request.
+        state_for_run = await asyncio.to_thread(registry.state_for, run_id)
+        if state_for_run is None:
+            await refuse(4404, "run not found")
             return
         await websocket.accept(subprotocol=selected_subprotocol)
-        initial_snapshot = _cached_snapshot_for(state_for_run, run_id)
+        initial_snapshot = await asyncio.to_thread(_cached_snapshot_for, state_for_run, run_id)
         await websocket.send_json({"kind": "snapshot", "data": initial_snapshot})
         last_projection_signature = _stream_projection_signature(initial_snapshot)
         tailer = _event_tailer(state_for_run, run_id)
         cursor = after
-        initial = tailer.read(limit=max(1, replay), after=after) if replay else []
+        initial = await asyncio.to_thread(tailer.read, limit=max(1, replay), after=after) if replay else []
         if tailer.last_resync_required:
             await websocket.send_json({
                 "kind": "resync_required",
@@ -2292,11 +2313,11 @@ def create_app(
             })
             # A gap invalidates deltas.  Start the live cursor at the current
             # tail so subsequent frames are contiguous after the snapshot.
-            current_tail = tailer.read(limit=1)
+            current_tail = await asyncio.to_thread(tailer.read, limit=1)
             cursor = current_tail[-1].event_id if current_tail else None
             initial = []
         if not replay and after is None:
-            existing = tailer.read(limit=5000)
+            existing = await asyncio.to_thread(tailer.read, limit=5000)
             cursor = existing[-1].event_id if existing else None
         for item in initial:
             await websocket.send_json({"kind": "event", "data": item.to_dict()})
@@ -2304,7 +2325,7 @@ def create_app(
         idle_ticks = 0
         try:
             while True:
-                fresh = tailer.read(limit=5000, after=cursor)
+                fresh = await asyncio.to_thread(tailer.read, limit=5000, after=cursor)
                 if tailer.last_resync_required:
                     await websocket.send_json({
                         "kind": "resync_required",
@@ -2315,11 +2336,11 @@ def create_app(
                     # that same missing value.  Move to the retained tail after
                     # sending a fresh snapshot; otherwise every poll repeats
                     # the same gap forever and no future event can be emitted.
-                    current_tail = tailer.read(limit=1)
+                    current_tail = await asyncio.to_thread(tailer.read, limit=1)
                     cursor = current_tail[-1].event_id if current_tail else None
                     await websocket.send_json({
                         "kind": "snapshot",
-                        "data": _cached_snapshot_for(state_for_run, run_id),
+                        "data": await asyncio.to_thread(_cached_snapshot_for, state_for_run, run_id),
                     })
                     fresh = []
                 if fresh:
@@ -2330,7 +2351,7 @@ def create_app(
                     # Round files, approvals, and active-role state change beside
                     # the event log. Refresh the projection after each batch so
                     # clients do not need to independently poll every file.
-                    updated_snapshot = _cached_snapshot_for(state_for_run, run_id)
+                    updated_snapshot = await asyncio.to_thread(_cached_snapshot_for, state_for_run, run_id)
                     await websocket.send_json({"kind": "snapshot", "data": updated_snapshot})
                     last_projection_signature = _stream_projection_signature(updated_snapshot)
                 else:
@@ -2339,7 +2360,7 @@ def create_app(
                     # event log. Poll their projection once per second in both
                     # supervised and attached (`lh-harness run`) modes.
                     if idle_ticks % 4 == 0:
-                        updated_snapshot = _cached_snapshot_for(state_for_run, run_id)
+                        updated_snapshot = await asyncio.to_thread(_cached_snapshot_for, state_for_run, run_id)
                         projection_signature = _stream_projection_signature(updated_snapshot)
                         if projection_signature != last_projection_signature:
                             await websocket.send_json({"kind": "snapshot", "data": updated_snapshot})

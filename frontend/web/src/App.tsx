@@ -60,6 +60,7 @@ import {
   fetchImageSource,
   idempotencyKey,
   isConflict,
+  isSignInRequired,
   isUnauthorized,
   setStoredAuthToken,
   storedAuthToken,
@@ -76,16 +77,28 @@ type DetailsTab = 'artifacts' | 'trajectory' | 'events';
 type MessageKind = 'user' | 'plan' | 'assistant' | 'verification' | 'final' | 'live';
 
 // Deep links (hydra's get_run_deep_link) open /runs/<id> or /runs/<id>/gates/<approvalId>.
-const RUN_PATH = /^\/runs\/([^/]+)/;
+const RUN_PATH = /^\/runs\/([^/]+)(?:\/gates\/([^/]+))?/;
 
-function runIdFromPath(): string {
-  const match = RUN_PATH.exec(window.location.pathname);
-  if (!match) return '';
+function pathSegment(value: string | undefined): string {
+  if (!value) return '';
   try {
-    return decodeURIComponent(match[1]);
+    return decodeURIComponent(value);
   } catch {
     return '';
   }
+}
+
+function runIdFromPath(): string {
+  return pathSegment(RUN_PATH.exec(window.location.pathname)?.[1]);
+}
+
+/** Approval named by a `/runs/<id>/gates/<approvalId>` deep link. */
+function gateIdFromPath(): string {
+  return pathSegment(RUN_PATH.exec(window.location.pathname)?.[2]);
+}
+
+function approvalElementId(approvalId: string): string {
+  return `approval-${approvalId}`;
 }
 
 function readRunId(): string {
@@ -100,9 +113,16 @@ function readRunId(): string {
 
 function rememberRunId(value: string): void {
   // Keep the address bar on the selected run so it can be copied and shared.
+  // A gate link for this same run stays as it is so it can still be copied.
   const path = value ? `/runs/${encodeURIComponent(value)}` : '/';
-  if (window.location.pathname !== path) {
-    window.history.replaceState(null, '', path + window.location.search + window.location.hash);
+  const keepsGate = Boolean(value) && runIdFromPath() === value && Boolean(gateIdFromPath());
+  if (window.location.pathname !== path && !keepsGate) {
+    // Switching between runs is navigation, so Back returns to the previous
+    // one.  Filling in the default run on `/` is not: pushing it would make
+    // Back land on `/`, which immediately selects the default run again.
+    const next = path + window.location.search + window.location.hash;
+    if (runIdFromPath() && value) window.history.pushState(null, '', next);
+    else window.history.replaceState(null, '', next);
   }
   try {
     if (value) window.localStorage.setItem('lh-run-id', value);
@@ -827,6 +847,7 @@ export default function App() {
   const [mobileStatusOpen, setMobileStatusOpen] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
   const [authRevision, setAuthRevision] = useState(0);
+  const [signInRequired, setSignInRequired] = useState(false);
   const [panelState, dispatchPanel] = useReducer(reducePanelState, DEFAULT_PANEL_STATE);
   const conversationRef = useRef<HTMLElement>(null);
   const operationKeys = useRef(new Map<string, string>());
@@ -949,13 +970,44 @@ export default function App() {
 
   useEffect(() => {
     const onRunNotFound = () => setRunId('');
+    const onSignInRequired = () => setSignInRequired(true);
+    // Back/Forward between runs: the address bar is the source of truth.
+    const onPopState = () => setRunId(runIdFromPath());
     window.addEventListener('lh-run-not-found', onRunNotFound);
-    return () => window.removeEventListener('lh-run-not-found', onRunNotFound);
+    window.addEventListener('lh-sign-in-required', onSignInRequired);
+    window.addEventListener('popstate', onPopState);
+    return () => {
+      window.removeEventListener('lh-run-not-found', onRunNotFound);
+      window.removeEventListener('lh-sign-in-required', onSignInRequired);
+      window.removeEventListener('popstate', onPopState);
+    };
   }, []);
 
+  // A gate deep link scrolls to and highlights its approval once it renders.
+  const gateId = gateIdFromPath();
+  const gateShown = Boolean(gateId) && snapshot.approvals.some((approval) => approval.approval_id === gateId);
   useEffect(() => {
+    if (!gateShown) return;
+    const element = document.getElementById(approvalElementId(gateId));
+    if (!element) return;
+    element.classList.add('approval-linked');
+    element.scrollIntoView({ block: 'center' });
+  }, [gateShown, gateId]);
+
+  useEffect(() => {
+    // Polling with a refused credential only produces a wall of 401s.  Stop
+    // until the operator saves a token (authRevision) or signs in again.
+    let refused = false;
     const onFailure = (reason: unknown) => {
-      if (isUnauthorized(reason)) setAuthOpen(true);
+      if (isSignInRequired(reason)) {
+        refused = true;
+        setSignInRequired(true);
+        return;
+      }
+      if (isUnauthorized(reason)) {
+        refused = true;
+        setAuthOpen(true);
+      }
       setError(isUnauthorized(reason) ? text('此 Web 服务需要访问令牌，请在连接设置中填写。', 'This Web service requires an access token. Enter it in Connection settings.') : String(reason));
     };
     void fetchMeta().then((next) => {
@@ -965,6 +1017,7 @@ export default function App() {
     }).catch(onFailure);
     runListGeneration.current += 1;
     const refresh = () => {
+      if (refused) return Promise.resolve();
       const requestGeneration = ++runListGeneration.current;
       return fetchRuns().then((items) => {
       if (requestGeneration !== runListGeneration.current) return;
@@ -1412,7 +1465,8 @@ export default function App() {
           {pendingApprovals.map((approval) => <ApprovalCard key={approval.approval_id} approval={approval} busy={busy} userInput={approvalInputs[approval.approval_id] || ''} onUserInput={(value) => setApprovalInputs((current) => ({ ...current, [approval.approval_id]: value }))} extraRounds={approvalRounds[approval.approval_id] || ''} onExtraRounds={(value) => setApprovalRounds((current) => ({ ...current, [approval.approval_id]: value }))} onApprove={approve} />)}
         </section>
 
-        {visibleError && <div className="error-line" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{visibleError}<button onClick={() => { setError(''); setDismissedFeedError(feed.error); }}>{text('关闭', 'Dismiss')}</button></div>}
+        {signInRequired && <div className="error-line" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{text('登录会话已过期，请重新登录。', 'Your sign-in session has expired. Sign in again to continue.')}<button onClick={() => window.location.reload()}>{text('重新登录', 'Sign in')}</button></div>}
+        {!signInRequired && visibleError && <div className="error-line" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{visibleError}<button onClick={() => { setError(''); setDismissedFeedError(feed.error); }}>{text('关闭', 'Dismiss')}</button></div>}
         <div className={`composer-wrap ${composerInteractive ? '' : 'composer-disabled'}`}><textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void sendInstruction(); } }} placeholder={composerPlaceholder} disabled={composerBusy || !composerInteractive} /><div className="composer-footer"><span>{composerFooter}{composerInteractive && <> · <kbd>⌘</kbd><kbd>↵</kbd> {text('发送', 'Send')}</>}</span><button onClick={() => void sendInstruction()} disabled={composerBusy || !composerCanSend}>{text('发送', 'Send')}</button></div></div>
       </main>
 
@@ -1954,7 +2008,7 @@ function ApprovalCard({ approval, busy, userInput, onUserInput, extraRounds, onE
   const roundsValue = extraRounds.trim();
   const roundsInvalid = roundsValue !== '' && !(/^\d+$/.test(roundsValue) && Number(roundsValue) >= 1 && Number(roundsValue) <= MAX_ROUNDS);
   const roundsPayload = () => (roundsValue === '' || roundsInvalid ? undefined : Number(roundsValue));
-  return <article className="approval-card"><div className="message-avatar approval-avatar"><AlertTriangle size={12} /></div><div className="message-body"><div className="message-meta"><strong>{title}</strong><span className="approval-label">{text('需要你的输入', 'Input required')}</span></div><MessageText text={message} />{approval.allow_input && <textarea className="approval-input" value={userInput} onChange={(event) => onUserInput(event.target.value)} placeholder={inputPlaceholder} disabled={busy} />}{allowRounds && <label className="approval-rounds">{text('继续时追加轮数', 'Extra rounds when continuing')}<input type="number" min={1} max={MAX_ROUNDS} step={1} value={extraRounds} disabled={busy} placeholder={text('留空＝沿用原本的轮数上限', 'Blank = keep the configured round budget')} onChange={(event) => onExtraRounds(event.target.value)} /><span className={roundsInvalid ? 'approval-rounds-error' : 'approval-rounds-note'}>{roundsInvalid ? text(`请输入 1 到 ${MAX_ROUNDS} 之间的整数`, `Enter a whole number from 1 to ${MAX_ROUNDS}`) : text('只影响“继续运行”', 'Only affects “Continue run”')}</span></label>} {approval.answers.length > 0 && <div className="approval-answers" aria-label={text('快速回答', 'Quick answers')}>{approval.answers.map((answer) => <button type="button" key={answer} disabled={busy || roundsInvalid} onClick={() => onApprove(approval.approval_id, 'continue', answer, roundsPayload())}>{answer}</button>)}</div>}<div className="approval-actions">{options.map((option) => <button key={option.value} disabled={busy || (roundsInvalid && option.value !== 'stop')} className={option.style === 'danger' ? 'danger-text' : ''} onClick={() => onApprove(approval.approval_id, option.value, undefined, option.value === 'stop' ? undefined : roundsPayload())}>{optionLabel(option.label)}</button>)}</div></div></article>;
+  return <article className="approval-card" id={approvalElementId(approval.approval_id)}><div className="message-avatar approval-avatar"><AlertTriangle size={12} /></div><div className="message-body"><div className="message-meta"><strong>{title}</strong><span className="approval-label">{text('需要你的输入', 'Input required')}</span></div><MessageText text={message} />{approval.allow_input && <textarea className="approval-input" value={userInput} onChange={(event) => onUserInput(event.target.value)} placeholder={inputPlaceholder} disabled={busy} />}{allowRounds && <label className="approval-rounds">{text('继续时追加轮数', 'Extra rounds when continuing')}<input type="number" min={1} max={MAX_ROUNDS} step={1} value={extraRounds} disabled={busy} placeholder={text('留空＝沿用原本的轮数上限', 'Blank = keep the configured round budget')} onChange={(event) => onExtraRounds(event.target.value)} /><span className={roundsInvalid ? 'approval-rounds-error' : 'approval-rounds-note'}>{roundsInvalid ? text(`请输入 1 到 ${MAX_ROUNDS} 之间的整数`, `Enter a whole number from 1 to ${MAX_ROUNDS}`) : text('只影响“继续运行”', 'Only affects “Continue run”')}</span></label>} {approval.answers.length > 0 && <div className="approval-answers" aria-label={text('快速回答', 'Quick answers')}>{approval.answers.map((answer) => <button type="button" key={answer} disabled={busy || roundsInvalid} onClick={() => onApprove(approval.approval_id, 'continue', answer, roundsPayload())}>{answer}</button>)}</div>}<div className="approval-actions">{options.map((option) => <button key={option.value} disabled={busy || (roundsInvalid && option.value !== 'stop')} className={option.style === 'danger' ? 'danger-text' : ''} onClick={() => onApprove(approval.approval_id, option.value, undefined, option.value === 'stop' ? undefined : roundsPayload())}>{optionLabel(option.label)}</button>)}</div></div></article>;
 }
 
 function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof PUBLIC_ROLES[number]; selection: RoleSelection; meta: WebMeta | null; onChange: (value: RoleSelection) => void }) {

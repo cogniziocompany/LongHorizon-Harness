@@ -11,6 +11,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 import lh_harness.dashboard.state as dashboard_state
 from lh_harness.dashboard.state import DashboardState
@@ -202,17 +203,26 @@ def test_api_auth_and_websocket_origin_are_enforced(tmp_path: Path) -> None:
     client = TestClient(app)
     assert client.get("/api/meta").status_code == 401
     assert client.get("/api/meta", headers={"Authorization": "Bearer secret"}).status_code == 200
-    with pytest.raises(Exception):
-        with client.websocket_connect(
-            "/api/runs/run-1/stream?replay=0&token=secret",
-            headers={"Origin": "https://evil.example"},
-        ):
-            pass
+    # Refusals are delivered as close codes after the handshake: a browser
+    # cannot read a pre-accept rejection and would reconnect forever.
+    def refusal_code(url: str, **kwargs: object) -> int:
+        with client.websocket_connect(url, **kwargs) as websocket:
+            with pytest.raises(WebSocketDisconnect) as refused:
+                websocket.receive_json()
+        return refused.value.code
+
     # The long-lived token must not be accepted from a query string.  The
     # Browser transport uses a bounded base64url subprotocol instead.
-    with pytest.raises(Exception):
-        with client.websocket_connect("/api/runs/run-1/stream?replay=0&token=secret"):
-            pass
+    assert refusal_code("/api/runs/run-1/stream?replay=0&token=secret") == 4401
+    assert refusal_code(
+        "/api/runs/run-1/stream?replay=0",
+        subprotocols=_ws_auth_protocols("secret"),
+        headers={"Origin": "https://evil.example"},
+    ) == 4403
+    assert refusal_code(
+        "/api/runs/no-such-run/stream?replay=0",
+        subprotocols=_ws_auth_protocols("secret"),
+    ) == 4404
     with client.websocket_connect(
         "/api/runs/run-1/stream?replay=0",
         subprotocols=_ws_auth_protocols("secret"),
