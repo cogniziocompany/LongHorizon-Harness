@@ -477,6 +477,16 @@ def dispatch(
         }
         handler = overseer_tools.get(tool_name)
         if handler is not None:
+            if tool_name == "list_open_asks":
+                # Task A3: open asks are derived live (gates, blocked queue
+                # entries) on top of the archived queue/OPEN-ASKS.md rows.
+                return _overseer_list_open_asks(
+                    arguments,
+                    overseer_root=overseer_root,
+                    registry=registry,
+                    supervisor=supervisor,
+                    queue_store=queue_store,
+                )
             return handler(arguments, overseer_root=overseer_root)
         # Unreachable while _KNOWN_TOOLS == _SCOPING_ELIGIBLE_TOOLS | the
         # overseer set above (both live in config.py, validated together).
@@ -565,10 +575,78 @@ def _overseer_read_ledger(arguments: dict[str, Any], *, overseer_root: str | Non
     return read_ledger(arguments, overseer_root=overseer_root)
 
 
-def _overseer_list_open_asks(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
-    from .overseer_state import list_open_asks
+def _overseer_list_open_asks(
+    arguments: dict[str, Any],
+    *,
+    overseer_root: str | None,
+    registry: Any = None,
+    supervisor: Any = None,
+    queue_store: Any = None,
+) -> dict[str, Any]:
+    from .overseer_state import list_open_asks, live_open_ask_rows
 
-    return list_open_asks(arguments, overseer_root=overseer_root)
+    live_rows = None
+    if supervisor is not None or queue_store is not None:
+        live_rows = live_open_ask_rows(
+            _gated_approvals(registry, supervisor),
+            _blocked_queue_entries(queue_store),
+        )
+    return list_open_asks(arguments, overseer_root=overseer_root, live_rows=live_rows)
+
+
+# A gate sweep never needs more runs than this per call.
+_MAX_GATED_RUNS = 50
+
+
+def _gated_approvals(registry: Any, supervisor: Any) -> list[dict[str, Any]]:
+    """Pending approvals of runs in ``waiting_approval`` (task A3).
+
+    Cheap path only: the supervisor's summary enumeration plus each gated
+    run's approvals.  A failure reading one run skips that run, so the
+    open-asks surface never goes down with one bad run directory.
+    """
+    if registry is None or supervisor is None or not hasattr(supervisor, "list_run_summaries"):
+        return []
+    try:
+        summaries = supervisor.list_run_summaries(statuses={"waiting_approval"})
+    except Exception:
+        return []
+    items: list[dict[str, Any]] = []
+    for summary in summaries[:_MAX_GATED_RUNS]:
+        run_id = str(summary.get("id") or "")
+        if not run_id:
+            continue
+        try:
+            state = registry.state_for(run_id)
+            approvals = state.list_approvals() if state is not None else []
+        except Exception:
+            continue
+        for approval in approvals:
+            if isinstance(approval, dict) and approval.get("status") == "pending":
+                items.append(
+                    {
+                        "run_id": run_id,
+                        "approval_id": approval.get("approval_id"),
+                        "title": approval.get("title"),
+                        "message": approval.get("message"),
+                    }
+                )
+    return items
+
+
+def _blocked_queue_entries(queue_store: Any) -> list[dict[str, Any]]:
+    """Queue entries parked in status ``blocked`` (task A3)."""
+    if queue_store is None:
+        return []
+    try:
+        entries = queue_store.list()
+    except Exception:
+        return []
+    return [
+        {"queue_id": entry.queue_id, "name": entry.name, "reason": entry.reason}
+        for entry in entries
+        if getattr(entry, "status", None) == "blocked"
+    ]
 
 
 def _overseer_get_handoff(arguments: dict[str, Any], *, overseer_root: str | None) -> dict[str, Any]:
