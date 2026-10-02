@@ -1884,6 +1884,9 @@ def _episode_status(result: EpisodeResult) -> dict[str, Any]:
         "agent_done": metadata.get("agent_done"),
         "exit_code": metadata.get("exit_code"),
         "runtime_signals": metadata.get("runtime_signals"),
+        # Turn/edit/stall counters (episode_stats.py); small enough to pass the
+        # fleet reporter's payload trim, so they reach /harness/events as-is.
+        "stats": metadata.get("episode_stats"),
     }
 
 
