@@ -11,7 +11,7 @@
 **What the onboarding script does** (measured, `ptait09-easybutt0n-ai/scripts/onboard-device.sh`, 196 lines):
 - Clones the runner repo, installs dependencies and writes `.env` with a generated runner key.
 - Builds and starts the `easysvc` supervisor, then checks runner health on port 7334.
-- Installs the Hydra device agent, which registers itself on first start. The default Hydra address is `wss://hydra.cognizioware.com/agent`.
+- Installs the Hydra device agent, which registers itself on first start. The default Hydra address is `wss://hydra.easybutt0n.ai/agent`.
 - Installs Claude Code Remote Control as a fallback link, and optionally Ollama.
 
 **What registering involves beyond the script** (measured; the script prints these as remaining human steps):

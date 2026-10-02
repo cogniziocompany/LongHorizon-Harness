@@ -9,7 +9,7 @@ The suite reports:
 
 And the step's own environment shows the defect:
 
-    HYDRA_ORCHESTRATOR_URL: https://hydra.cognizioware.com
+    HYDRA_ORCHESTRATOR_URL: https://hydra.easybutt0n.ai
     QA_API_URL: http://localhost:8400
     **HYDRA_REPO_DIR: C:\hydra-ci**
 
