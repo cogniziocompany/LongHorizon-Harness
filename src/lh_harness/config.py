@@ -59,6 +59,10 @@ _RUN_KEYS = {
 # per-caller tool scoping and budget ceilings (task 174).
 _TOP_LEVEL_KEYS = {"run", "queue", "experience", "callers"}
 _QUEUE_TRIOS = {"kimi", "qwen"}
+# Trios a config MAY define but that are never filled in by default. ``orfree``
+# runs every role on an OpenRouter free model through the gateway (two keys,
+# 20 requests/minute and 1,000 requests/day each): see docs/queue.md.
+_OPTIONAL_QUEUE_TRIOS = {"orfree"}
 # Per-caller tool scoping and budget ceilings (task 174). The complete set of
 # tool names the MCP dispatch exposes; a caller's ``tools`` allowlist is
 # validated against it. Granting a tool here is what also unlocks its REST
@@ -141,6 +145,7 @@ def _caller_secret_env(name: str) -> str:
 _QUEUE_CAPACITY_KEYS = {
     "kimi_max",
     "qwen_max",
+    "orfree_max",
     "min_healthy_keys",
     "key_health_url",
     "poll_seconds",
@@ -275,9 +280,18 @@ auditor = 300
 # model = "qwen3.8"
 # mcp_profile = "audit"
 
+# Optional: every role on an OpenRouter free model (gateway alias). Free tier:
+# 2 keys x 20 requests/minute, 1,000 requests/day each; prompts may be logged
+# by the upstream provider, so no customer or secret-bearing work here.
+# [queue.trios.orfree]
+# agent = "claude_code"
+# model = "qwen3.8-27b:openrouter-free"
+# mcp_profile = "ops"
+
 # [queue.capacity]
 # kimi_max = 3          # concurrent kimi runs allowed
 # qwen_max = 1          # concurrent qwen runs allowed (QA only, one at a time)
+# orfree_max = 2        # concurrent orfree runs (only used when the trio is defined)
 # min_healthy_keys = 2  # healthy Ollama Cloud keys required before kimi launches
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
@@ -512,7 +526,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     trios = queue.get("trios", {})
     if not isinstance(trios, dict):
         raise ProjectConfigError("[queue.trios] must be a TOML table")
-    unknown_trios = set(trios) - _QUEUE_TRIOS
+    unknown_trios = set(trios) - _QUEUE_TRIOS - _OPTIONAL_QUEUE_TRIOS
     if unknown_trios:
         raise ProjectConfigError(f"unknown queue trio(s): {_names(unknown_trios)}")
     # ``database_url`` is a legitimate key (``queue.py`` reads it to build the
@@ -586,6 +600,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     normalized_capacity: dict[str, Any] = {
         "kimi_max": 3,
         "qwen_max": 1,
+        "orfree_max": 2,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
@@ -595,6 +610,8 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["kimi_max"] = max(0, capacity["kimi_max"])
     if isinstance(capacity.get("qwen_max"), int):
         normalized_capacity["qwen_max"] = max(0, capacity["qwen_max"])
+    if isinstance(capacity.get("orfree_max"), int):
+        normalized_capacity["orfree_max"] = max(0, capacity["orfree_max"])
     if isinstance(capacity.get("min_healthy_keys"), int):
         normalized_capacity["min_healthy_keys"] = max(0, capacity["min_healthy_keys"])
     if isinstance(capacity.get("key_health_url"), str):
