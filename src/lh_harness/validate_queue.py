@@ -172,8 +172,8 @@ def rule_schema(ents):
     for f, d in ents:
         for k in required:
             if k not in d: add("ERROR", "missing-required-field", f"{os.path.basename(f)} has no '{k}'")
-        if d.get("trio") not in (None, "kimi", "qwen", "degraded"):
-            add("ERROR", "unknown-trio", f"{os.path.basename(f)} trio={d.get('trio')!r} (launcher knows kimi|qwen|degraded)")
+        if d.get("trio") not in (None, "kimi", "qwen", "orfree", "degraded"):
+            add("ERROR", "unknown-trio", f"{os.path.basename(f)} trio={d.get('trio')!r} (launcher knows kimi|qwen|orfree|degraded)")
         if "name" in d and os.path.basename(f) != d["name"] + ".json":
             add("WARN", "name-filename-mismatch", f"{os.path.basename(f)} declares name={d['name']!r}")
         if d.get("continue_branch") and not d.get("branch"):

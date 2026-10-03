@@ -44,7 +44,13 @@ _VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked"})
 # once an entry reaches a terminal state (``done``/``failed``) the key is free for
 # a fresh (retry) entry.
 _NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
-_VALID_TRIOS = frozenset({"kimi", "qwen"})
+# Trios every config carries (a missing one gets a safe fallback spec) and
+# trios that exist only when the config defines them. ``orfree`` = every role
+# on an OpenRouter free model through the gateway; an entry enqueued for it on
+# a node whose config does not define it stays pending ("orfree at capacity").
+_REQUIRED_TRIOS = frozenset({"kimi", "qwen"})
+_OPTIONAL_TRIOS = frozenset({"orfree"})
+_VALID_TRIOS = _REQUIRED_TRIOS | _OPTIONAL_TRIOS
 
 # The requester identity block (task 300).  A JSON object on the entry body
 # (key "requester", stored on QueueEntry as a plain dict) that mechanically
@@ -719,7 +725,7 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
             "mcp_profile": mcp_profile,
             "auditor_mcp_profile": str(spec.get("auditor_mcp_profile", "")).strip() or None,
         }
-    for required in _VALID_TRIOS:
+    for required in _REQUIRED_TRIOS:
         if required not in normalized_trios:
             # Keep a safe fallback so the API can still report config shape.
             normalized_trios[required] = {
@@ -730,6 +736,9 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized_capacity = {
         "kimi_max": 3,
         "qwen_max": 1,
+        # Only consulted when [queue.trios.orfree] is defined: remaining
+        # capacity is computed per CONFIGURED trio (launcher._remaining_capacity).
+        "orfree_max": 2,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
@@ -739,6 +748,8 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["kimi_max"] = max(0, capacity["kimi_max"])
     if isinstance(capacity.get("qwen_max"), int):
         normalized_capacity["qwen_max"] = max(0, capacity["qwen_max"])
+    if isinstance(capacity.get("orfree_max"), int):
+        normalized_capacity["orfree_max"] = max(0, capacity["orfree_max"])
     if isinstance(capacity.get("min_healthy_keys"), int):
         normalized_capacity["min_healthy_keys"] = max(0, capacity["min_healthy_keys"])
     if isinstance(capacity.get("key_health_url"), str):

@@ -51,15 +51,17 @@ Accepted fields (all persisted on the queue entry):
 - task (string, required): scoped task text. Provide repo, branch,
   deliverables, and hard rules.
 - workspace (string, required): workspace directory path for the run.
-- trio (string, optional): resource trio, 'kimi' for development work or
-  'qwen' for QA only. No default trio is applied at enqueue time. When
+- trio (string, optional): resource trio, 'kimi' for development work,
+  'qwen' for QA only, or 'orfree' (OpenRouter free model, only on nodes
+  whose config defines it). No default trio is applied at enqueue time. When
   omitted, the entry persists with trio unset and never launches until a
   trio is set: remaining capacity is derived only from the configured
   trios (launcher.py _remaining_capacity), so each launcher pass records
   an ' at capacity' skip for the entry (launcher.py _check_eligibility)
   and it stays pending, unlaunched, consuming no capacity; _launch and
   _shadow_launch_decision guard the same condition with an 'unknown trio'
-  skip. Supply 'kimi' or 'qwen' whenever the task should actually launch.
+  skip. Supply 'kimi', 'qwen' or 'orfree' whenever the task should actually
+  launch.
 - max_rounds (integer, optional): maximum harness rounds (default 25).
 - priority (integer, optional): higher number = earlier launch within the
   same trio (default 0).
@@ -95,6 +97,11 @@ Rules:
   least min_healthy_keys healthy Ollama Cloud keys and counts against kimi_max.
 - trio "qwen" is for QA only (codex backend) and is limited to one concurrent
   run (qwen_max=1).
+- trio "orfree" runs every role on an OpenRouter free model through the
+  gateway (orfree_max, default 2). Free tier: 20 requests/minute and 1,000
+  requests/day per key, and the upstream provider may log prompts. Never send
+  customer data or secret-bearing work to it. It launches only on a node whose
+  config defines [queue.trios.orfree]; elsewhere the entry stays pending.
 - production deploys always go through deployment lanes, never through this
   queue tool.
 - second checkouts are permitted and never blocked, but raise a warning naming
@@ -290,7 +297,8 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                 "task": _string_param("Scoped task text. Provide repo, branch, deliverables, and hard rules.", required=True),
                 "workspace": _string_param("Workspace directory path for the run.", required=True),
                 "trio": _string_param(
-                    "Resource trio: 'kimi' for dev, 'qwen' for QA only. "
+                    "Resource trio: 'kimi' for dev, 'qwen' for QA only, 'orfree' for "
+                    "OpenRouter free-model work (no customer or secret data). "
                     "Optional: omit to store the entry with trio unset; the "
                     "launcher then skips it as 'unknown trio' until a trio "
                     "is set. No default trio is applied at enqueue time.",
