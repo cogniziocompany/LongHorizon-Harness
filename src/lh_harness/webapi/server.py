@@ -48,6 +48,7 @@ from ..caller_auth import (
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
 from ..overseer_state import resolve_overseer_root
 from . import mcp_jsonrpc as mcp_protocol
+from ..build_info import build_info
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import (
@@ -1130,6 +1131,8 @@ def create_app(
     bind_host: str = "127.0.0.1",
     probe_open_pr: "Callable[[Path, str], str | None] | None" = probe_open_pr_gh,
     caller_configs: dict[str, dict[str, Any]] | None = None,
+    ask_runtime: Any = None,
+    settings_runtime: Any = None,
 ) -> FastAPI:
     """Create an API app over a live shared state or a historical runs root.
 
@@ -1167,6 +1170,16 @@ def create_app(
         caller_specs = _load_caller_specs(runs_root)
     else:
         caller_specs = caller_configs_or_defaults(caller_configs)
+    # Task A3d: ask store, vault and grants, resolved once. Never raises: a
+    # bad [asks] table or an unsafe vault disables the ask tools with a logged
+    # reason instead of taking the API down. Tests inject their own runtime.
+    if ask_runtime is None:
+        from ..ask_store import load_ask_runtime
+
+        ask_runtime = load_ask_runtime(runs_root)
+    for _reason in (ask_runtime.disabled_reason, ask_runtime.secrets_disabled_reason):
+        if _reason:
+            logger.warning("ask store: %s", _reason)
 
     def _tools_manifest_for_scoping() -> list[dict[str, Any]]:
         """Manifest for this app: scoped hint when scoping is ON (task 174)."""
@@ -1297,6 +1310,9 @@ def create_app(
             await launcher.stop()
 
     app = FastAPI(title="LongHorizon-Harness Web API", version="1", lifespan=_lifespan)
+    # Read the build identity once, at startup: /api/meta must describe the
+    # code this process loaded, not a wheel installed underneath it later.
+    build_info()
     app.state.registry = registry
     app.state.queue_store = queue_store
     app.state.auth_token = token
@@ -1419,6 +1435,7 @@ def create_app(
                 "fleet_mcp_tools": queue_store is not None,
             },
             drain=drain,
+            build=build_info(),
             mcp_gateway_alias="lhharness",
             agents=catalogue["agents"],
             models=catalogue["models"],
@@ -1839,6 +1856,7 @@ def create_app(
             # without identity enforcement, matching the REST routes.
             caller_configs=caller_specs,
             overseer_root=str(overseer_root) if overseer_root is not None else None,
+            ask_runtime=ask_runtime,
         )
 
     @app.post("/api/mcp/fleet/{tool_name}")
@@ -2668,6 +2686,21 @@ def create_app(
     # rest of the API (events, runs list, queue).
     app.add_middleware(GZipMiddleware, minimum_size=512, compresslevel=5)
 
+    # Embedded settings store: admin settings screen and key restriction view
+    # (/api/admin/*). Admins only; secret values are never returned.
+    from ..config import PROJECT_CONFIG_PATH as _SETTINGS_PROJECT_CONFIG
+    from .settings_routes import register_settings_routes
+
+    register_settings_routes(
+        app,
+        token=token,
+        bearer_matches=_bearer_matches,
+        settings_runtime=settings_runtime,
+        caller_specs=caller_specs,
+        ask_runtime=ask_runtime,
+        project_config_path=_runs_root_config_path(runs_root) or _SETTINGS_PROJECT_CONFIG,
+    )
+
     if _STATIC_DIR.is_dir():
         # Starlette's FileResponse delegates MIME detection to Python.  A
         # Windows registry entry can incorrectly map JavaScript to text/plain,
@@ -2682,6 +2715,12 @@ def create_app(
         @app.get("/runs/{run_id}", include_in_schema=False)
         @app.get("/runs/{run_id}/{rest:path}", include_in_schema=False)
         def _run_page(run_id: str, rest: str = "") -> FileResponse:
+            return FileResponse(index_html, media_type="text/html")
+
+        # The admin screens (/admin, /admin/keys, /admin/audit) are app pages too.
+        @app.get("/admin", include_in_schema=False)
+        @app.get("/admin/{rest:path}", include_in_schema=False)
+        def _admin_page(rest: str = "") -> FileResponse:
             return FileResponse(index_html, media_type="text/html")
 
         app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="dashboard-static")
@@ -2702,12 +2741,21 @@ def run_web_server(
 
     import uvicorn
 
+    from ..safe_subprocess import seal_process_environment
+
     token = _configured_token(auth_token)
     if not _is_loopback_host(host) and not token:
         raise ValueError(
             "refusing to expose the Web control API beyond localhost without "
             "LH_HARNESS_WEB_TOKEN (or --auth-token)"
         )
+    # Task A3d review H-B / M-A: the bearer and the caller HMAC secrets move
+    # from os.environ into memory (no child process inherits them) and the
+    # service becomes non-dumpable (a same-uid worker cannot read
+    # /proc/<pid>/environ or ptrace it). Unconditional, every start.
+    moved = seal_process_environment()
+    if moved:
+        logger.info("moved %d secret variable(s) out of the environment: %s", len(moved), ", ".join(moved))
 
     run_id = Path(log_dir).expanduser().resolve().parent.name if log_dir else None
     effective_root = None if log_dir else runs_root

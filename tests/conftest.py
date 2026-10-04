@@ -104,3 +104,32 @@ def _queue_requester_legacy_default(monkeypatch):
     with ``monkeypatch.setenv("LH_HARNESS_QUEUE_REQUESTER", "strict")``.
     """
     monkeypatch.setenv("LH_HARNESS_QUEUE_REQUESTER", "legacy")
+
+
+@_pytest_task300.fixture()
+def host_independent_worker_isolation(monkeypatch):
+    """Pin worker memory isolation to the log-only plan, whatever the host.
+
+    The supervisor unit tests stub ``subprocess.Popen`` with fake processes
+    (a pid and ``poll()``), but ``RunSupervisor`` still asks
+    ``worker_isolation.prepare_launch`` how to bound the worker, and that
+    probes the HOST: on a machine with ``systemd-run`` and a reachable systemd
+    manager (GitHub's ubuntu runners, VM 211, most dev boxes) it picks the
+    ``systemd-run --scope`` plan.  The fake pid never shows up in the scope's
+    cgroup, so the supervisor settles the "launcher" through
+    ``worker_isolation.await_scope_exit`` -> ``process.wait(timeout=...)`` and
+    the tests die with ``AttributeError: ... has no attribute 'wait'`` (or, for
+    a fake with a non-zero return code, try to ``kill()`` it and relaunch).
+    On a host without systemd the same tests take the unbounded plan and pass,
+    which is why they were green where they were written and red in CI.
+
+    These tests are about run lifecycle, not memory isolation (that has its
+    own suites: test_worker_isolation_fallback.py, test_worker_rss_bound.py,
+    supervisor/test_memory_kill_reason.py), so make the isolation decision
+    deterministic: no systemd scope, no delegated cgroup subtree.
+    """
+
+    from lh_harness import worker_isolation
+
+    monkeypatch.setattr(worker_isolation, "probe_systemd_run", lambda: None)
+    monkeypatch.setattr(worker_isolation, "cgroup_subtree_writable", lambda *a, **k: False)

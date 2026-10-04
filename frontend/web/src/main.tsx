@@ -1,6 +1,7 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
+import AdminApp from './AdminApp';
 import { UiLanguageProvider } from './i18n';
 import './style.css';
 
@@ -26,5 +27,5 @@ class CrashBoundary extends React.Component<{ children: React.ReactNode }, { err
 }
 
 createRoot(document.getElementById('root')!).render(
-  <React.StrictMode><CrashBoundary><UiLanguageProvider><App /></UiLanguageProvider></CrashBoundary></React.StrictMode>,
+  <React.StrictMode><CrashBoundary><UiLanguageProvider>{window.location.pathname.startsWith('/admin') ? <AdminApp /> : <App />}</UiLanguageProvider></CrashBoundary></React.StrictMode>,
 );

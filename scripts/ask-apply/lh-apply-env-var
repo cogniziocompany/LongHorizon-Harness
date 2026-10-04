@@ -1,0 +1,82 @@
+#!/bin/sh
+# lh-apply-env-var FILE VARIABLE  -- task A3d, the remote end of apply_ask_secret.
+#
+# Installed root:root 0755 as /usr/local/sbin/lh-apply-env-var on the TARGET
+# host and pinned as the forced command of one key (see docs/ask-store.md):
+#
+#   restrict,from="192.168.21.168",command="/usr/local/sbin/lh-apply-env-var /opt/cognizioware-mcp-tools/mcp-tools.env GITHUB_MCP_TOKEN" ssh-ed25519 AAAA... lh-ask-vault
+#
+# Runs as the unprivileged user lhapply, which needs read+write on FILE (via a
+# group it shares with the file, mode 0660) and write+search on FILE's
+# directory (for the temp file and the atomic rename). The replaced file keeps
+# its mode and its group; its OWNER becomes lhapply, because only root may
+# chown a file to another user. Root (docker compose) still reads it. If the
+# group cannot be kept, the script refuses and leaves FILE untouched.
+#
+# The command the client asks for is ignored (sshd runs the forced command).
+# The value arrives on stdin as one line. It is never echoed, logged or put
+# on a command line: awk reads it from its environment. The file is replaced
+# atomically (synced before the rename) and keeps its mode and owner. Both
+# "VAR=" and "export VAR=" lines are replaced; duplicates collapse into one.
+# Prints "ok <VARIABLE>" on success.
+set -eu
+umask 077
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: lh-apply-env-var FILE VARIABLE (value on stdin)" >&2
+  exit 2
+fi
+file=$1
+var=$2
+
+case "$var" in
+  ''|[0-9]*|*[!A-Z0-9_]*) echo "refused: bad variable name" >&2; exit 2 ;;
+esac
+case "$file" in
+  /*) ;;
+  *) echo "refused: file must be an absolute path" >&2; exit 2 ;;
+esac
+if [ ! -f "$file" ]; then
+  echo "refused: target file does not exist" >&2
+  exit 3
+fi
+
+value=
+IFS= read -r value || true
+if [ -z "$value" ]; then
+  echo "refused: empty value" >&2
+  exit 4
+fi
+# Env-file safe characters only: no whitespace, quotes, $, backslash or #.
+case "$value" in
+  *[!A-Za-z0-9_.:/+=@~-]*) echo "refused: value has characters an env file cannot hold" >&2; exit 4 ;;
+esac
+
+dir=$(dirname "$file")
+tmp=$(mktemp "$dir/.lh-apply.XXXXXX")
+trap 'rm -f "$tmp"' EXIT INT TERM
+
+LH_APPLY_VALUE=$value awk -v var="$var" '
+  BEGIN { v = ENVIRON["LH_APPLY_VALUE"]; done = 0 }
+  {
+    line = $0; pre = ""
+    if (match(line, /^export[ \t]+/)) { pre = substr(line, 1, RLENGTH); line = substr(line, RLENGTH + 1) }
+    if (index(line, var "=") == 1) {
+      if (!done) { print pre var "=" v; done = 1 }
+      next
+    }
+    print $0
+  }
+  END { if (!done) print var "=" v }
+' "$file" > "$tmp"
+
+if ! chgrp "$(stat -c '%g' "$file")" "$tmp" 2>/dev/null; then
+  echo "refused: cannot keep the file's group (is lhapply in that group?)" >&2
+  exit 5
+fi
+chmod "$(stat -c '%a' "$file")" "$tmp"
+sync "$tmp" 2>/dev/null || sync
+mv -f "$tmp" "$file"
+sync "$dir" 2>/dev/null || true
+trap - EXIT INT TERM
+echo "ok $var"

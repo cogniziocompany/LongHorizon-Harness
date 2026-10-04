@@ -24,6 +24,10 @@ from lh_harness.supervisor.service import (
 )
 from lh_harness.types import MAX_ROUNDS, ManagedRound
 
+# The supervisor tests below stub Popen with FakeProcess; keep the worker
+# memory-isolation choice off the host (see tests/conftest.py).
+pytestmark = pytest.mark.usefixtures("host_independent_worker_isolation")
+
 
 class FakeProcess:
     pid = 4242

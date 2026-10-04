@@ -51,6 +51,7 @@ numbers), and the counterfactual test kills the same child the way the old
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import textwrap
 from pathlib import Path
@@ -137,7 +138,30 @@ _SUBTREE_REASON = (
 
 
 @pytest.fixture(scope="module")
-def subtree():
+def node_bin() -> str:
+    """A Node binary for the V8-shaped children, or a documented honest skip.
+
+    Every test that launches a child here needs a real Node (the point is
+    V8's address-space reservation; CPython does not reproduce it).  CT110
+    and dev hosts have one (the agent workers are Node); a bare CI runner
+    may not, and a missing interpreter is not the production failure mode,
+    so skip with the reason instead of failing on FileNotFoundError.
+    Override with ``LH_TEST_NODE_BIN``.
+    """
+
+    node = _node_binary()
+    resolved = node if os.path.sep in node and os.access(node, os.X_OK) else shutil.which(node)
+    if not resolved:
+        pytest.skip(
+            f"no Node binary ({node!r}) on this host: the V8 address-space "
+            "reservation tests need a real Node 22 child; install node or set "
+            "LH_TEST_NODE_BIN"
+        )
+    return resolved
+
+
+@pytest.fixture(scope="module")
+def subtree(node_bin):
     """The live delegated subtree, or a documented honest skip."""
 
     usable = _subtree_usable()
@@ -188,7 +212,7 @@ def test_v8_shaped_reservation_survives_an_rss_bound(subtree) -> None:
     assert read_scope_oom_kills(plan.cgroup) == 0, "no OOM kill may occur for a reservation"
 
 
-def test_old_address_space_cap_kills_the_same_child() -> None:
+def test_old_address_space_cap_kills_the_same_child(node_bin) -> None:
     """The counterfactual, live: the pre-208 instrument kills this child.
 
     Under the old three-gibibyte address-space cap the same V8-shaped
@@ -208,7 +232,7 @@ def test_old_address_space_cap_kills_the_same_child() -> None:
         resource.setrlimit(resource.RLIMIT_AS, (target, hard))
 
     process = subprocess.Popen(
-        [_node_binary(), "-e", _NODE_RESERVE_SCRIPT],
+        [node_bin, "-e", _NODE_RESERVE_SCRIPT],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         preexec_fn=old_deadly_preexec,

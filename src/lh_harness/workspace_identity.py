@@ -15,6 +15,8 @@ import hashlib
 import os
 import re
 import subprocess
+
+from .safe_subprocess import git_argv
 import threading
 import time
 from dataclasses import dataclass
@@ -44,7 +46,9 @@ class WorkspaceIdentity:
 
 
 def _git_env() -> dict[str, str]:
-    env = os.environ.copy()
+    from .safe_subprocess import child_env
+
+    env = child_env()
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = "echo"
@@ -69,7 +73,7 @@ def _run_git(path: str, *args: str) -> str:
 
     try:
         result = subprocess.run(
-            ["git", "--no-optional-locks", "-C", path, *args],
+            git_argv("--no-optional-locks", "-C", path, *args),
             **_popen_kwargs(),
         )
         return result.stdout.strip() if result.returncode == 0 else ""

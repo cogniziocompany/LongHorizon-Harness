@@ -22,7 +22,9 @@
 #   run_on_ct110.sh exec <cmd...>   run an arbitrary command inside CT110
 #
 # Required environment: PVE_HOST, PVE_USER, SSH_KEY_FILE, CT_ID.
-# deploy additionally: EXPECTED_VERSION.  The wheel is picked up from ./stage/.
+# deploy additionally: EXPECTED_VERSION, and EXPECTED_COMMIT (full sha the
+# wheel was built from; the inner script verifies the installed build commit).
+# The wheel is picked up from ./stage/.
 # units additionally: the two unit files from packaging/ staged under ./stage/units/.
 set -euo pipefail
 
@@ -60,7 +62,7 @@ remote_exec() {  # remote_exec <command-string>; rc/stderr discipline lives here
 
 run_inner() {  # run_inner deploy|rollback|units
   local mode="$1" full rc
-  full="pct exec $CT_ID -- env LH_EXPECTED_VERSION='${EXPECTED_VERSION:-}' bash '$REMOTE_DIR/ct110_deploy.sh' '$mode'"
+  full="pct exec $CT_ID -- env LH_EXPECTED_VERSION='${EXPECTED_VERSION:-}' LH_EXPECTED_COMMIT='${EXPECTED_COMMIT:-}' bash '$REMOTE_DIR/ct110_deploy.sh' '$mode'"
   set +e
   remote_exec "$full"
   rc=$?
