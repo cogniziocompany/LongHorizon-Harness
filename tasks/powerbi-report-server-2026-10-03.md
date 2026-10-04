@@ -50,7 +50,7 @@ spec_status: draft
 **STOP GATE 1:** each `rpt.*` view returns rows that match its source within 10 minutes. Compare run counts with `/api/runs?fields=summary` and the 24 h spend total with the LiteLLM UI. A `pbi_reader` write attempt fails.
 
 ### Phase 2: Power BI Report Server VM (ptait07)
-1. Create a Windows Server 2022 VM: 4 vCPU, 16 GB RAM, 100 GB disk, CPU type `host` (Report Server needs AVX; the i9-13900H has AVX2), static IP, Pi-hole records on both .3 and .4 (append, never replace the list), and `onboot 1`.
+1. Create a Windows Server 2022 VM from the volume-licence ISO on terranas01: `Z:\PC_Software_Audio_Projects\OS_Microsoft OS\SW_DVD9_Win_Server_STD_CORE_2022__64Bit_English_DC_STD_MLF_X22-74290.ISO` (Standard/Datacenter, 5.2 GB). Copy it to ptait07's ISO store and use VirtIO drivers. Size: 4 vCPU, 16 GB RAM, 100 GB disk, CPU type `host` (Report Server needs AVX; the i9-13900H has AVX2), static IP, Pi-hole records on both .3 and .4 (append, never replace the list), and `onboot 1`.
 2. Install SQL Server for the report server catalog. The edition is a blocking decision (see below).
 3. Install Power BI Report Server. An operator enters the product key from the PTAIT09 file. Then configure the catalog database and the web portal URL.
 4. Install Power BI Desktop for Report Server (the version must match the server) on the VM or on PTAIT09 for authoring.
@@ -73,6 +73,7 @@ Harness operations (runs per day, completion rate, rounds per run, gate wait tim
 
 ## Open decisions (Paxton)
 1. **SQL Server edition for the catalog.** With a Premium key, the report server database must be on SQL Server **Standard or Enterprise** (Microsoft Learn, "Reporting Services features supported by editions"). Do we have a SQL Server Standard or Enterprise license, or does the Premium entitlement cover it for this use? Express and Developer editions are not allowed with a Premium key.
-2. **Windows Server license** for the VM: which key or volume license?
+2. **Windows Server activation.** Media is settled: the Windows Server 2022 Standard/Datacenter volume-licence ISO on terranas01. Still needed: the activation key (MAK or KMS) that goes with that volume licence. Reference it by name only.
+   - SQL Server media on the share does not help with decision 1. The share has `MS SQL Server 2012 SP1.7z` and `_old\MS SQL Server 2008 R2 Express.7z`, and Report Server requires SQL Server 2014 SP3 or later; Express is not allowed with a Premium key.
 3. **Who opens it from outside the LAN, and how.** Report Server signs users in with Windows auth (NTLM/Kerberos), which does not pass through our Caddy and oauth2-proxy pattern. Microsoft's supported external path is Entra application proxy (needs Entra ID P1). The alternative is LAN and VPN only. Phase 4 waits on this.
 4. **Data scope.** Should Langfuse traces be included (large), or start with runs, queue, spend and fleet? Should QuickBooks and finance data stay out (CFO1 / CT111) until a separate finance spec?
