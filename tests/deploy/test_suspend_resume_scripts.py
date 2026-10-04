@@ -261,14 +261,17 @@ def test_every_suspend_resume_step_is_gated_on_the_input() -> None:
 def test_suspend_mode_order_and_resume_guard() -> None:
     steps = _deploy_steps(_workflow_doc())
     # Suspend mode: set drain -> suspend -> short zero-active wait -> deploy
-    # -> verifies -> resume -> clear drain.  The drain clear keeps its
-    # pre-fc-H4b place ahead of the rollback block.
+    # -> verifies -> [failure: rollback -> verify rollback] -> resume -> clear
+    # drain.  The rollback restarts the service, so it must come BEFORE the
+    # resume (its restart would kill the runs just put back) and before the
+    # drain clear (no launches may start under it).
     assert _step_index(steps, "Set drain") < _step_index(steps, "Suspend active runs")
     assert _step_index(steps, "Suspend active runs") < _step_index(steps, "suspended runs to stop")
     assert _step_index(steps, "suspended runs to stop") < _step_index(steps, "Deploy (bytes-safe")
-    assert _step_index(steps, "Deploy (bytes-safe") < _step_index(steps, "Resume suspended runs")
+    assert _step_index(steps, "Deploy (bytes-safe") < _step_index(steps, "Automatic rollback")
+    assert _step_index(steps, "Automatic rollback") < _step_index(steps, "Verify the rollback")
+    assert _step_index(steps, "Verify the rollback") < _step_index(steps, "Resume suspended runs")
     assert _step_index(steps, "Resume suspended runs") < _step_index(steps, "Clear drain")
-    assert _step_index(steps, "Clear drain") < _step_index(steps, "Automatic rollback")
 
     resume = next(step for step in steps if "resume_runs.py" in step.get("run", ""))
     # always() so the automatic-rollback path resumes too, and whenever the
@@ -281,6 +284,35 @@ def test_suspend_mode_order_and_resume_guard() -> None:
     rollback = steps[_step_index(steps, "Automatic rollback")]
     assert "failure()" in rollback["if"]
     assert "steps.deploy.outcome" in rollback["if"]
+
+
+def test_verify_steps_wait_and_check_the_commit_not_the_version() -> None:
+    """Run 37162090599 (b6f51f9): one-shot /api/meta + version-keyed rollback."""
+    doc = _workflow_doc()
+    steps = _deploy_steps(doc)
+    assert doc["jobs"]["deploy"]["env"]["EXPECTED_COMMIT"] == "${{ needs.preflight.outputs.sha }}"
+    # No step may probe /api/meta with a one-shot curl any more.
+    assert not any("curl" in step.get("run", "") and "/api/meta" in step.get("run", "") for step in steps)
+    meta = steps[_step_index(steps, "Verify GET /api/meta answers")]
+    assert "verify_meta.py" in meta["run"]
+    assert '--expect-commit "$EXPECTED_COMMIT"' in meta["run"]
+    assert "--timeout-seconds 90" in meta["run"] and "--interval-seconds 5" in meta["run"]
+    installed = steps[_step_index(steps, "Verify installed lh_harness version and build commit")]
+    assert "lh_harness.build_info" in installed["run"] and "$EXPECTED_COMMIT" in installed["run"]
+    verify_rollback = steps[_step_index(steps, "Verify the rollback")]
+    assert "steps.rollback.outcome == 'success'" in verify_rollback["if"]
+    assert '--expect-commit "$prev_commit"' in verify_rollback["run"]
+    assert "CT110_DEPLOY_ROLLBACK_FAILED" in verify_rollback["run"]
+    report = steps[_step_index(steps, "Report rolled-back outcome")]
+    assert "steps.verify_rollback.outcome == 'success'" in report["if"]
+    assert "COMMIT_UNVERIFIED" in report["run"]
+
+    build = doc["jobs"]["build"]["steps"]
+    stamp = build[_step_index(build, "Stamp the build commit")]
+    assert "src/lh_harness/_build_info.json" in stamp["run"]
+    assert _step_index(build, "Stamp the build commit") < _step_index(build, "Build wheel")
+    check = build[_step_index(build, "build commit match preflight")]
+    assert "lh_harness/_build_info.json" in check["run"]
 
 
 def test_wait_mode_and_existing_guards_are_unchanged() -> None:

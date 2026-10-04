@@ -38,6 +38,7 @@ def build_meta(
     drain: dict[str, Any] | None = None,
     launcher_stalled: bool = False,
     launcher_stall_cycles: int | None = None,
+    build: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the stable handshake payload used by both clients."""
 
@@ -89,4 +90,9 @@ def build_meta(
     # window without a second call.
     if drain is not None:
         result["drain"] = drain
+    # Build identity (``{"version": str, "commit": str|None}``): the deploy
+    # verifies the restarted service reports the target commit here, because
+    # the package version does not change between commits.
+    if build is not None:
+        result["build"] = build
     return result

@@ -21,6 +21,8 @@ node_modules/
 # Vite builds the Web bundle into the package. It is never committed; the
 # release workflow builds it before packaging.
 src/lh_harness/_frontend/
+# Build identity written by the deploy build job (src/lh_harness/build_info.py).
+src/lh_harness/_build_info.json
 
 # package-lock.json is the authority used by CI; bun may be used locally but
 # its lockfile is not committed so the two cannot drift.

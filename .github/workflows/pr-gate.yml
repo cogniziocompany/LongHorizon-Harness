@@ -1,9 +1,108 @@
 name: PR Gate
-on: pull_request
+
+# Why this gate is self-contained (2026-10-04).  The previous stub called
+#   cogniziocompany/cognizioware-mcp-tools/.github/workflows/pr-gate.yml@main
+# and never ran a single job: all 48 runs from 2026-09-18 to 2026-10-04 ended
+# "failure" with zero jobs and no log.  LongHorizon-Harness is a PUBLIC repo
+# (a fork of AMAP-ML/LongHorizon-Harness) while cognizioware-mcp-tools is
+# PRIVATE with Actions access "none", and GitHub never lets a public repo call
+# a reusable workflow that lives in a private repo, so every run failed at
+# startup.  The gate's build/test/secret-scan jobs are inlined here with the
+# same commands (build: pip install -e .; test: pytest; gitleaks pinned
+# v8.24.3, blocking).  The shared gate's classify/auto-merge jobs are not
+# carried over: they need write tokens, and nothing in this repo auto-merges.
+#
+# Every job runs on ubuntu-latest (GitHub-hosted), never on the LAN runner:
+# workflow code from a PR must not execute inside the LAN.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  gate:
-    uses: cogniziocompany/cognizioware-mcp-tools/.github/workflows/pr-gate.yml@main
-    with:
-      build_cmd: 'pip install -e .'
-      test_cmd: 'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src pytest -p no:cacheprovider'
-    permissions: {contents: read, pull-requests: write, issues: write}
+  test:
+    name: build + test (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # pyyaml: the workflow-wiring tests (tests/deploy, tests/test_deploy_node_targets.py)
+      # importorskip it; without it they would silently skip.
+      - name: Build (pip install -e .)
+        run: python -m pip install -e '.[test]' pyyaml
+
+      - name: Test (the badge means tests ran)
+        run: |
+          set -o pipefail
+          mkdir -p .pr-gate
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -p no:cacheprovider -q -rf \
+            --junitxml=.pr-gate/pytest-junit.xml 2>&1 | tee .pr-gate/test-output.log
+
+      - name: Upload test report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: .pr-gate/
+          retention-days: 14
+          if-no-files-found: warn
+
+  secret-scan:
+    name: secret-scan (gitleaks, blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (full history for a PR-scoped scan)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve scan range (PR commits only, not repo history)
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          base="origin/${PR_BASE_REF:-main}"
+          mb="$(git merge-base "$base" HEAD 2>/dev/null || true)"
+          range="${mb:+${mb}..HEAD}"
+          range="${range:--1}"
+          echo "scan range: ${range}"
+          echo "PRG_SCAN_RANGE=${range}" >> "$GITHUB_ENV"
+
+      - name: Install pinned gitleaks
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/gitleaks.tgz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          mkdir -p .pr-gate
+          tar -xzf /tmp/gitleaks.tgz -C .pr-gate gitleaks
+          .pr-gate/gitleaks version
+
+      - name: gitleaks detect (BLOCKING - a leak turns the job red)
+        run: |
+          set -euo pipefail
+          .pr-gate/gitleaks detect --source . --redact --exit-code 1 \
+            --report-path .pr-gate/gitleaks-report.json \
+            --log-opts="${PRG_SCAN_RANGE}"
+
+      - name: Upload gitleaks report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: .pr-gate/gitleaks-report.json
+          retention-days: 14
+          if-no-files-found: warn

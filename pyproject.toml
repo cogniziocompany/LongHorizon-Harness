@@ -43,6 +43,7 @@ packages = ["src/lh_harness"]
 # missing path silently, so a checkout without a Node toolchain still installs.
 artifacts = [
     "/src/lh_harness/_frontend/web/dist/**",
+    "/src/lh_harness/_build_info.json",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -56,6 +57,7 @@ include = [
 # Ship the built assets so `pip install <sdist>` yields a wheel with the Web UI.
 artifacts = [
     "/src/lh_harness/_frontend/web/dist/**",
+    "/src/lh_harness/_build_info.json",
 ]
 
 [tool.pytest.ini_options]
