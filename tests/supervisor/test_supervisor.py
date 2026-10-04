@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -128,8 +129,15 @@ def test_websocket_pushes_supervisor_lifecycle_without_role_events(monkeypatch, 
 def test_web_create_and_resume_forward_idempotency_key(monkeypatch, tmp_path: Path) -> None:
     process = FakeProcess()
     launches: list[object] = []
+    real_popen = subprocess.Popen
 
     def launch(*args, **kwargs):
+        # The patch target is the shared ``subprocess`` module, so the
+        # workspace-park git calls made when a run settles (TASK 260) land
+        # here too.  Count only worker launches; let everything else run.
+        argv = args[0] if args else kwargs.get("args")
+        if "--supervised" not in list(argv or []):
+            return real_popen(*args, **kwargs)
         launches.append(True)
         return process
 
