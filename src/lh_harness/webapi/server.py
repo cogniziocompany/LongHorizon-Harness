@@ -1132,6 +1132,7 @@ def create_app(
     probe_open_pr: "Callable[[Path, str], str | None] | None" = probe_open_pr_gh,
     caller_configs: dict[str, dict[str, Any]] | None = None,
     ask_runtime: Any = None,
+    settings_runtime: Any = None,
 ) -> FastAPI:
     """Create an API app over a live shared state or a historical runs root.
 
@@ -2685,6 +2686,21 @@ def create_app(
     # rest of the API (events, runs list, queue).
     app.add_middleware(GZipMiddleware, minimum_size=512, compresslevel=5)
 
+    # Embedded settings store: admin settings screen and key restriction view
+    # (/api/admin/*). Admins only; secret values are never returned.
+    from ..config import PROJECT_CONFIG_PATH as _SETTINGS_PROJECT_CONFIG
+    from .settings_routes import register_settings_routes
+
+    register_settings_routes(
+        app,
+        token=token,
+        bearer_matches=_bearer_matches,
+        settings_runtime=settings_runtime,
+        caller_specs=caller_specs,
+        ask_runtime=ask_runtime,
+        project_config_path=_runs_root_config_path(runs_root) or _SETTINGS_PROJECT_CONFIG,
+    )
+
     if _STATIC_DIR.is_dir():
         # Starlette's FileResponse delegates MIME detection to Python.  A
         # Windows registry entry can incorrectly map JavaScript to text/plain,
@@ -2699,6 +2715,12 @@ def create_app(
         @app.get("/runs/{run_id}", include_in_schema=False)
         @app.get("/runs/{run_id}/{rest:path}", include_in_schema=False)
         def _run_page(run_id: str, rest: str = "") -> FileResponse:
+            return FileResponse(index_html, media_type="text/html")
+
+        # The admin screens (/admin, /admin/keys, /admin/audit) are app pages too.
+        @app.get("/admin", include_in_schema=False)
+        @app.get("/admin/{rest:path}", include_in_schema=False)
+        def _admin_page(rest: str = "") -> FileResponse:
             return FileResponse(index_html, media_type="text/html")
 
         app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="dashboard-static")

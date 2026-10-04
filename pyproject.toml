@@ -17,6 +17,8 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "websockets>=12",
+    # Embedded settings store: AES-256-GCM for secret values at rest.
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]

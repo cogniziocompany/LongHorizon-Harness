@@ -18,7 +18,7 @@ import os
 from typing import Mapping, MutableMapping
 
 SAFE_GIT_CONFIG = ("-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null")
-DENY_ENV_PREFIXES = ("LH_HARNESS_CALLER_", "LH_HARNESS_ASK_")
+DENY_ENV_PREFIXES = ("LH_HARNESS_CALLER_", "LH_HARNESS_ASK_", "LH_HARNESS_SETTINGS_")
 DENY_ENV_NAMES = ("LH_HARNESS_WEB_TOKEN",)
 SECRET_ENV_PREFIXES = ("LH_HARNESS_CALLER_",)
 SECRET_ENV_NAMES = ("LH_HARNESS_WEB_TOKEN",)

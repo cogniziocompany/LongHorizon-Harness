@@ -530,6 +530,13 @@ def main(argv: list[str] | None = None) -> int:
     install_seq_logging()
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv[:1] == ["web"]:
+        # Embedded settings store: DB values win over the environment, so they
+        # must be in place before anything (argparse defaults included) reads
+        # LH_HARNESS_WEB_TOKEN or other settings.
+        from .settings_store import apply_startup_settings
+
+        apply_startup_settings()
     run_defaults: dict[str, object] = {}
     config_error: ProjectConfigError | None = None
     if raw_argv[:1] == ["run"]:
@@ -839,6 +846,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Bearer token for remote/API access (also LH_HARNESS_WEB_TOKEN).",
     )
 
+    settings_parser = add_command("settings", "Manage the embedded settings store (import, list)")
+    settings_actions = settings_parser.add_subparsers(dest="settings_command")
+    settings_import = settings_actions.add_parser(
+        "import",
+        help="One-shot import of NAME=value lines from an env file (prints names only)",
+        epilog=_EPILOG,
+        formatter_class=_HelpFormatter,
+    )
+    settings_import.add_argument("--env-file", required=True, help="Path of the env file to import.")
+    settings_import.add_argument("--actor", default="import", help="Name recorded in the audit log.")
+    settings_actions.add_parser(
+        "list",
+        help="List stored settings (names and metadata; never secret values)",
+        epilog=_EPILOG,
+        formatter_class=_HelpFormatter,
+    )
+
     add_command("doctor", "Check the local environment and report computer-use plugin state")
 
     plugin_parser = add_command("plugin", "Install or remove computer-use plugins")
@@ -916,6 +940,11 @@ def main(argv: list[str] | None = None) -> int:
         return _dashboard_command(args)
     if args.command == "web":
         return _web_command(args)
+    if args.command == "settings":
+        if not args.settings_command:
+            settings_parser.print_help()
+            return 2
+        return _settings_command(args)
     if args.command == "doctor":
         return _doctor_command()
     if args.command == "plugin":
@@ -930,6 +959,35 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.print_help()
     return 2
+
+
+def _settings_command(args: argparse.Namespace) -> int:
+    """`lh-harness settings import|list`. Never prints a value."""
+    from .settings_store import KEY_ENV, SettingsError, open_from_environment
+
+    try:
+        store = open_from_environment()
+    except SettingsError as exc:
+        print(f"settings store unusable: {exc}", file=sys.stderr)
+        return 1
+    if store is None:
+        print(f"{KEY_ENV} is not set; the settings store needs it (and optionally LH_HARNESS_SETTINGS_DB)", file=sys.stderr)
+        return 1
+    if args.settings_command == "import":
+        try:
+            report = store.import_env_file(args.env_file, args.actor)
+        except OSError as exc:
+            print(f"cannot read {args.env_file}: {exc.strerror or exc}", file=sys.stderr)
+            return 1
+        for item in report:
+            print(f"{item['name']}: {item['outcome']}")
+        imported = sum(1 for item in report if item["outcome"].startswith("imported"))
+        print(f"{imported} imported into {store.path}. Remove the imported values from {args.env_file} after checking the service starts.")
+        return 0
+    for meta in store.list_metadata():
+        kind = "secret" if meta["secret"] else "plain"
+        print(f"{meta['name']}: {kind}, {meta['length']} chars, set by {meta['updated_by']} at {meta['updated_at']}")
+    return 0
 
 
 def _doctor_command() -> int:
