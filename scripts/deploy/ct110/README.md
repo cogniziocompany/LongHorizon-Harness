@@ -38,18 +38,30 @@ install, credentials, registration — is `scripts/deploy/node/README.md`.
 | Stage | Where | What |
 | --- | --- | --- |
 | preflight | runner | `preflight.py`: ref resolves to a sha; a `vX.Y.Z` tag matches `pyproject.toml` version; default-branch tip has no red/in-flight checks |
-| build | runner | npm Web bundle + `python -m build --wheel`; wheel version and bundled Web UI verified |
+| build | runner | npm Web bundle + the target sha stamped into `src/lh_harness/_build_info.json` + `uv build --wheel`; wheel version, build commit and bundled Web UI verified |
 | drain | runner | `set_drain.py --enable`: POST `/api/queue/drain` stops NEW queue launches (TASK 242); live runs finish untouched, and the flag survives the restart so a failed verify leaves CT110 drained rather than refilling the slots |
 | suspend | runner | `suspend_runs.py` (fc-H4b, `active_runs=suspend` only): POST `/api/maintenance/suspend` stops every ACTIVE run and parks it in a persisted manifest |
 | wait | runner | `wait_zero_active.py`: counted consecutive zero-active polls of `GET /api/runs` — with `active_runs=suspend` a fixed 10-minute timeout (only the suspend stops have to land); with `active_runs=wait`, `wait_timeout_minutes` as before |
 | deploy | runner → PVE → CT110 | `run_on_ct110.sh` pushes bytes (sha256-verified at both hops) and runs `ct110_deploy.sh deploy` |
-| verify | runner / CT110 | `systemctl is-active` == active; installed `lh_harness.__version__` == target; `GET /api/meta` == 200 AND `meta.drain.enabled == true` (the restarted service must come back drained) |
-| resume runs | runner | `resume_runs.py` (fc-H4b, `active_runs=suspend` only): POST `/api/maintenance/resume` puts every parked run back (`mode=continue`) and polls `GET /api/runs` until each is ACTIVE again — runs BEFORE the drain clears, on the success path and the automatic-rollback path alike (fails by name if a run never comes back) |
+| verify | runner / CT110 | `systemctl is-active` == active; installed `lh_harness.__version__` == target AND installed build commit (`python -m lh_harness.build_info`) == target sha; `verify_meta.py`: `GET /api/meta` polled up to 90 s in 5 s steps until 200, then `meta.build.commit` == target sha (the RESTARTED process is the new code); `meta.drain.enabled == true` (the restarted service must come back drained) |
+| rollback | runner → CT110 | automatic on any failure AFTER the deploy step has started (a skipped deploy step — wheel download, SSH key staging, zero-active wait — aborts the run with NO service restart). Reinstalls the pre-deploy wheel identified BY SHA256 (copied aside when the deploy started), then verifies like the deploy: wheel sha256 and (if the old build has one) build commit inside CT110, and the bounded `/api/meta` wait with `meta.build.commit` == the pre-deploy commit. Runs BEFORE resume and drain clear, so its restart never kills resumed runs or fresh launches. Loud sentinel if the rollback or its verify fails |
+| resume runs | runner | `resume_runs.py` (fc-H4b, `active_runs=suspend` only): POST `/api/maintenance/resume` puts every parked run back (`mode=continue`) and polls `GET /api/runs` until each is ACTIVE again — runs BEFORE the drain clears, on the success path and (after the rollback) on the failure path alike (fails by name if a run never comes back) |
 | resume | runner | `set_drain.py --disable`: clears the drain and verifies `meta.drain.enabled == false` — runs whenever the flag was set (success or failure path), so a failed deploy never leaves the queue frozen |
-| rollback | runner → CT110 | automatic on any failure AFTER the deploy step has started (a skipped deploy step — wheel download, SSH key staging, zero-active wait — aborts the run with NO service restart); loud sentinel if the rollback itself fails |
 
-Greppable terminal markers: `CT110_DEPLOY_OK`, `CT110_DEPLOY_FAILED_ROLLBACK_OK`,
-`CT110_DEPLOY_ROLLBACK_FAILED` (page-worthy: host is on an unknown version).
+Greppable terminal markers: `CT110_DEPLOY_OK`; on a failed deploy one of
+`CT110_DEPLOY_FAILED_ROLLBACK_OK` (the service reports the pre-deploy commit),
+`CT110_DEPLOY_FAILED_ROLLBACK_COMMIT_UNVERIFIED` (pre-deploy wheel bytes
+restored and the service answers, but that build predates build info, so its
+commit cannot be read back), `CT110_DEPLOY_FAILED_NOTHING_INSTALLED` (the
+deploy aborted before installing); and `CT110_DEPLOY_ROLLBACK_FAILED`
+(page-worthy: the pre-deploy build was NOT restored or did not verify).
+
+**Why the build commit, not the version (2026-10-03, run 37162090599,
+b6f51f9).** Every build is version 0.1.7. The old verify called `/api/meta`
+once, 1.3 s after the restart, got curl exit 7 (nothing listening yet) and
+failed; the rollback then reinstalled `wheels/lh_harness-0.1.7-py3-none-any.whl`
+— which the same deploy had just overwritten with the NEW wheel — and
+reported `CT110_DEPLOY_FAILED_ROLLBACK_OK`. The new code kept running.
 
 ## Paid-for lessons encoded here — do not strip them
 
@@ -133,13 +145,18 @@ in-flight round at all.
   checkout, and the in-repo `packaging/lh-harness.service` (which points at a
   repo-local `.venv`) does NOT match the live unit. Reconcile that drift in
   its own change; this deploy preserves the live shape.
-- **Rollback source.** The pre-deploy version is recorded to
-  `/home/harness/deploy/state/previous_version`, and every deployed wheel is
-  archived under `/home/harness/deploy/wheels/` for future rollbacks. The
-  very first CI deploy cannot roll back further than the wheel archive it
-  finds (today: none) — its rollback would fail loudly by design. Seed the
-  archive with the currently-live wheel if a first-run rollback path is
-  wanted.
+- **Rollback source.** Before installing, the deploy records the live
+  build to `/home/harness/deploy/state/` (`previous_version`,
+  `previous_commit` — empty for builds that predate build info —
+  `previous_wheel_sha256` from pip's `direct_url.json`) and copies the
+  archived wheel whose sha256 matches into `state/rollback/`. Deployed wheels
+  are archived per build under `/home/harness/deploy/wheels/by-commit/<sha>/`,
+  so a same-version build can never overwrite an older one (the legacy flat
+  `wheels/lh_harness-<version>-py3-none-any.whl` files are still searched by
+  sha256). If no archived wheel matches the live install, the deploy warns and
+  its rollback fails loudly (rc=3) instead of installing something else.
+  `state/install_started` marks that the install began; without it rollback
+  exits 5 ("nothing to roll back").
 - **Host naming.** CT110 is LXC 110 on the PVE host `corsairai300`, web API
   on `http://192.168.21.168:8799` (docs + live host match). Overridable via
   environment variables below.
@@ -192,6 +209,9 @@ branch you dispatch on.
 
 On the PVE host: `pct exec 110 -- bash`, then inspect
 `journalctl -u lh-harness.service -n 200`, reinstall the previous wheel from
-`/home/harness/deploy/wheels/` (or rebuild it), `systemctl restart
+`/home/harness/deploy/state/rollback/` (the pre-deploy bytes; its sha256 is
+in `state/previous_wheel_sha256`) or `/home/harness/deploy/wheels/by-commit/<sha>/`
+with `pip install --force-reinstall --no-deps` (or rebuild it), `systemctl restart
 lh-harness.service`, and confirm `systemctl is-active` +
-`curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8799/api/meta`.
+`curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8799/api/meta`
+(its `build.commit` names the running commit).

@@ -48,6 +48,7 @@ from ..caller_auth import (
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
 from ..overseer_state import resolve_overseer_root
 from . import mcp_jsonrpc as mcp_protocol
+from ..build_info import build_info
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import (
@@ -1297,6 +1298,9 @@ def create_app(
             await launcher.stop()
 
     app = FastAPI(title="LongHorizon-Harness Web API", version="1", lifespan=_lifespan)
+    # Read the build identity once, at startup: /api/meta must describe the
+    # code this process loaded, not a wheel installed underneath it later.
+    build_info()
     app.state.registry = registry
     app.state.queue_store = queue_store
     app.state.auth_token = token
@@ -1419,6 +1423,7 @@ def create_app(
                 "fleet_mcp_tools": queue_store is not None,
             },
             drain=drain,
+            build=build_info(),
             mcp_gateway_alias="lhharness",
             agents=catalogue["agents"],
             models=catalogue["models"],

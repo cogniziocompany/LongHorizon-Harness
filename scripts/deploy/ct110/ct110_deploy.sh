@@ -15,14 +15,24 @@
 #      error in this script also yields 2 — so the caller MUST print captured
 #      stderr before interpreting rc=2.  Every rc=2 path here writes its
 #      reason to stderr.
-#   3  rollback impossible (no recorded previous version / no archived wheel)
-#   4  post-(re)install verify failed (service not active / version mismatch)
+#   3  rollback impossible (no recorded previous state / no copy of the
+#      pre-deploy wheel was found when the deploy started)
+#   4  post-(re)install verify failed (service not active / version or
+#      build-commit mismatch)
+#   5  rollback NOT NEEDED: the deploy never reached the install step, so the
+#      pre-deploy build is untouched (rollback mode only)
 #
 # Modes:
-#   deploy    — hold check -> idle recheck -> record previous version ->
-#               pip install staged wheel -> restart service -> verify
-#   rollback  — reinstall the archived wheel for the recorded previous
-#               version -> restart -> verify.  Deliberately SKIPS hold/idle
+#   deploy    — hold check -> idle recheck -> record the pre-deploy build
+#               (version, build commit, wheel sha256) and keep a copy of its
+#               wheel -> pip install staged wheel -> restart service -> verify
+#               version AND build commit (LH_EXPECTED_COMMIT)
+#   rollback  — reinstall the pre-deploy wheel copied aside by THIS deploy
+#               (matched by sha256, not by version: every build is 0.1.7, so
+#               a version-named archive file is overwritten by the new wheel —
+#               the 2026-10-03 b6f51f9 "rollback" reinstalled the new code)
+#               -> restart -> verify version, wheel sha256 and, when the old
+#               build carried one, its commit.  Deliberately SKIPS hold/idle
 #               checks: rollback only runs after a failed deploy, when the
 #               service was already restarted and the window was already
 #               zero-active; blocking recovery behind the hold file that
@@ -45,6 +55,8 @@ VENV="${LH_VENV:-/home/harness/venv}"                 # live venv per the runnin
 SERVICE="${LH_SERVICE:-lh-harness.service}"
 API_URL="${LH_API_URL:-http://127.0.0.1:8799}"
 EXPECTED_VERSION="${LH_EXPECTED_VERSION:-}"
+EXPECTED_COMMIT="${LH_EXPECTED_COMMIT:-}"               # full sha the wheel was built from
+ROLLBACK_DIR="$STATE_DIR/rollback"                     # the pre-deploy wheel, copied aside
 
 # ASSUMPTION (unverifiable from this repo — the 2026-09-18 DEPLOY-HOLD
 # mechanism lived in PTAIT09-only files): the hold file path.  We honour the
@@ -74,9 +86,9 @@ check_hold() {
 # unit file itself (today the token is ALSO inline there — a host-side
 # hygiene issue tracked separately, do not propagate it anywhere).
 api_token() {
-  local tok=""
-  if [[ -f /home/harness/.lh-harness-secrets.env ]]; then
-    tok="$(grep -E '^LH_HARNESS_WEB_TOKEN=' /home/harness/.lh-harness-secrets.env | tail -n 1 | cut -d= -f2- | tr -d "\"'")"
+  local tok="" secrets_file="${LH_SECRETS_FILE:-/home/harness/.lh-harness-secrets.env}"
+  if [[ -f "$secrets_file" ]]; then
+    tok="$(grep -E '^LH_HARNESS_WEB_TOKEN=' "$secrets_file" | tail -n 1 | cut -d= -f2- | tr -d "\"'")"
   fi
   if [[ -z "$tok" && -f /etc/systemd/system/lh-harness.service ]]; then
     tok="$(grep -oE 'LH_HARNESS_WEB_TOKEN=[^"]+' /etc/systemd/system/lh-harness.service | tail -n 1 | cut -d= -f2-)"
@@ -128,6 +140,81 @@ installed_version() {
   "$VENV/bin/python" -c 'import lh_harness; print(lh_harness.__version__)'
 }
 
+# Commit the installed wheel was built from (src/lh_harness/build_info.py).
+# Empty for builds that predate build info: "unknown", never a guess.
+installed_commit() {
+  "$VENV/bin/python" -m lh_harness.build_info 2>/dev/null || true
+}
+
+# sha256 of the wheel file pip installed (pip records it in direct_url.json).
+installed_wheel_sha() {
+  "$VENV/bin/python" - <<'PY' 2>/dev/null || true
+import json
+from importlib.metadata import distribution
+text = distribution("lh-harness").read_text("direct_url.json") or "{}"
+print(json.loads(text).get("archive_info", {}).get("hashes", {}).get("sha256", ""))
+PY
+}
+
+# Print the path of a wheel under the archive (or the previous rollback copy)
+# whose sha256 is $1; nothing when none matches.
+find_wheel_by_sha() {
+  local want="$1" f
+  [[ -n "$want" ]] || return 0
+  while IFS= read -r -d '' f; do
+    if [[ "$(sha256sum "$f" | awk '{print $1}')" == "$want" ]]; then
+      printf '%s' "$f"
+      return 0
+    fi
+  done < <(find "$WHEEL_ARCHIVE" "$ROLLBACK_DIR" -type f -name 'lh_harness-*.whl' -print0 2>/dev/null)
+}
+
+# Record the build that is live BEFORE the install and copy its wheel aside,
+# so rollback restores exactly those bytes.
+record_previous() {
+  local prev prev_commit prev_sha prev_wheel tmp
+  # awk reads ALL of pip's output (no early `exit`): closing the pipe early
+  # makes pip die with rc=120 (broken pipe), which pipefail turns fatal.
+  prev="$("$VENV/bin/pip" show lh-harness 2>/dev/null | awk '/^Version:/ && !v {v=$2} END {print v}')"
+  [[ -n "$prev" ]] || die "cannot determine the currently installed lh-harness version in $VENV"
+  prev_commit="$(installed_commit)"
+  prev_sha="$(installed_wheel_sha)"
+  printf '%s\n' "$prev" > "$STATE_DIR/previous_version"
+  printf '%s\n' "$prev_commit" > "$STATE_DIR/previous_commit"
+  printf '%s\n' "$prev_sha" > "$STATE_DIR/previous_wheel_sha256"
+  prev_wheel="$(find_wheel_by_sha "$prev_sha")"
+  if [[ -n "$prev_wheel" ]]; then
+    tmp="$(mktemp -d "$STATE_DIR/rollback.new.XXXXXX")"
+    cp -f "$prev_wheel" "$tmp/"
+    rm -rf "$ROLLBACK_DIR"
+    mv "$tmp" "$ROLLBACK_DIR"
+    log "previous build recorded: version=$prev commit=${prev_commit:-unknown} wheel_sha256=$prev_sha (rollback copy: $(basename "$prev_wheel"))"
+  else
+    rm -rf "$ROLLBACK_DIR"
+    echo "WARNING: no archived wheel matches the installed sha256 '${prev_sha:-unknown}'; a rollback of this deploy will be impossible (rc=3)" >&2
+    log "previous build recorded: version=$prev commit=${prev_commit:-unknown} wheel_sha256=${prev_sha:-unknown} (NO rollback copy)"
+  fi
+}
+
+# Archive a deployed wheel under a per-build directory so a later deploy of
+# the same version can never overwrite it.
+archive_wheel() {
+  local wheel="$1" key
+  key="${EXPECTED_COMMIT:-sha256-$(sha256sum "$wheel" | awk '{print substr($1,1,16)}')}"
+  mkdir -p "$WHEEL_ARCHIVE/by-commit/$key"
+  cp -f "$wheel" "$WHEEL_ARCHIVE/by-commit/$key/"
+}
+
+verify_commit() {  # verify_commit <expected-or-empty>
+  local want="$1" got
+  [[ -n "$want" ]] || return 0
+  got="$(installed_commit)"
+  if [[ "$got" != "$want" ]]; then
+    echo "post-install verify: installed build commit is '${got:-unknown}', expected $want" >&2
+    return 4
+  fi
+}
+
 staged_wheel() {
   local matches
   matches=( "$DEPLOY_DIR"/lh_harness-*-py3-none-any.whl )
@@ -147,13 +234,7 @@ install_wheel() {
   "$VENV/bin/pip" install --upgrade "$wheel"
   "$VENV/bin/pip" install --force-reinstall --no-deps "$wheel"
   want="$(sha256sum "$wheel" | awk '{print $1}')"
-  got="$("$VENV/bin/python" - <<'PY'
-import json
-from importlib.metadata import distribution
-text = distribution("lh-harness").read_text("direct_url.json") or "{}"
-print(json.loads(text).get("archive_info", {}).get("hashes", {}).get("sha256", ""))
-PY
-)"
+  got="$(installed_wheel_sha)"
   if [[ "$got" != "$want" ]]; then
     echo "post-install verify: installed wheel sha256 is '${got:-unknown}', staged wheel is $want" >&2
     return 4
@@ -176,46 +257,56 @@ restart_and_verify() {
 case "$MODE" in
   deploy)
     [[ -n "$EXPECTED_VERSION" ]] || die "LH_EXPECTED_VERSION is required for deploy"
+    mkdir -p "$WHEEL_ARCHIVE" "$STATE_DIR"
+    # Cleared first: a deploy that aborts below (hold, idle recheck) leaves
+    # the host untouched, and rollback must say so instead of reinstalling.
+    rm -f "$STATE_DIR/install_started"
     check_hold
     check_idle
 
-    prev="$("$VENV/bin/pip" show lh-harness 2>/dev/null | awk '/^Version:/{print $2; exit}')"
-    [[ -n "$prev" ]] || die "cannot determine the currently installed lh-harness version in $VENV"
-    mkdir -p "$WHEEL_ARCHIVE" "$STATE_DIR"
     # Recorded BEFORE the install; rollback reads exactly this.
-    printf '%s\n' "$prev" > "$STATE_DIR/previous_version"
-    log "previous version recorded: $prev"
+    record_previous
 
     wheel="$(staged_wheel)"
-    log "installing $(basename "$wheel") into $VENV"
+    touch "$STATE_DIR/install_started"
+    log "installing $(basename "$wheel") into $VENV (expected commit ${EXPECTED_COMMIT:-not given})"
     install_wheel "$wheel"
+    # Archive per build so a FUTURE deploy can find these bytes by sha256
+    # (a flat lh_harness-<version>.whl is overwritten by every same-version build).
+    archive_wheel "$wheel"
 
     got="$(restart_and_verify "$EXPECTED_VERSION")"
-    # Archive the wheel we just installed so a FUTURE deploy's rollback has a
-    # wheel to return to even after this one ages out of the artifact store.
-    cp -f "$wheel" "$WHEEL_ARCHIVE/"
-    log "CT110_DEPLOY_INNER_OK version=$got previous=$prev"
+    verify_commit "$EXPECTED_COMMIT"
+    printf '%s\n' "${EXPECTED_COMMIT:-}" > "$STATE_DIR/deployed_commit"
+    log "CT110_DEPLOY_INNER_OK version=$got commit=${EXPECTED_COMMIT:-unknown} previous=$(cat "$STATE_DIR/previous_version") previous_commit=$(cat "$STATE_DIR/previous_commit" 2>/dev/null | grep . || echo unknown)"
     ;;
 
   rollback)
+    if [[ ! -f "$STATE_DIR/install_started" ]]; then
+      log "CT110_ROLLBACK_NOT_NEEDED: the deploy never reached the install step; the pre-deploy build was not touched"
+      exit 5
+    fi
     [[ -f "$STATE_DIR/previous_version" ]] || {
       echo "rollback: no recorded previous version at $STATE_DIR/previous_version" >&2; exit 3; }
     prev="$(cat "$STATE_DIR/previous_version")"
+    prev_commit="$(cat "$STATE_DIR/previous_commit" 2>/dev/null || true)"
+    prev_sha="$(cat "$STATE_DIR/previous_wheel_sha256" 2>/dev/null || true)"
     [[ -n "$prev" ]] || { echo "rollback: $STATE_DIR/previous_version is empty" >&2; exit 3; }
+    [[ -n "$prev_sha" ]] || {
+      echo "rollback: the pre-deploy wheel sha256 is unknown (pip recorded none), so the pre-deploy bytes cannot be identified" >&2; exit 3; }
     wheel=""
-    # The archive keeps the full local version (lh_harness-0.1.7+a0a067e-py3-none-any.whl),
-    # so match "<prev>-py3..." and "<prev>+<local>-py3..." as well as the old pattern.
-    for candidate in "$WHEEL_ARCHIVE"/lh_harness-"$prev"-py3-none-any.whl \
-                     "$WHEEL_ARCHIVE"/lh_harness-"$prev"+*-py3-none-any.whl \
-                     "$WHEEL_ARCHIVE"/lh_harness-"$prev"-*-py3-none-any.whl; do
+    for candidate in "$ROLLBACK_DIR"/lh_harness-*-py3-none-any.whl; do
       [[ -f "$candidate" ]] && wheel="$candidate" && break
     done
     [[ -n "$wheel" ]] || {
-      echo "rollback: no archived wheel for version $prev under $WHEEL_ARCHIVE" >&2; exit 3; }
-    log "rolling back to $prev from $(basename "$wheel")"
+      echo "rollback: no copy of the pre-deploy wheel (sha256 $prev_sha) was found when the deploy started; nothing safe to reinstall" >&2; exit 3; }
+    [[ "$(sha256sum "$wheel" | awk '{print $1}')" == "$prev_sha" ]] || {
+      echo "rollback: $wheel does not match the pre-deploy sha256 $prev_sha; refusing to install it" >&2; exit 3; }
+    log "rolling back to $prev (commit ${prev_commit:-unknown}, wheel sha256 $prev_sha) from $(basename "$wheel")"
     install_wheel "$wheel"
     got="$(restart_and_verify "$prev")"
-    log "CT110_ROLLBACK_INNER_OK restored=$got"
+    verify_commit "$prev_commit"
+    log "CT110_ROLLBACK_INNER_OK restored=$got commit=${prev_commit:-unknown} wheel_sha256=$prev_sha"
     ;;
 
   units)

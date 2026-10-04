@@ -168,13 +168,31 @@ jobs:
       - name: Verify the Web bundle was produced
         run: test -f src/lh_harness/_frontend/web/dist/index.html
 
+      # Every build is the same pyproject version, so the version cannot tell
+      # two deploys apart (b6f51f9 / run 37162090599).  Stamp the commit into
+      # the package; GET /api/meta reports it as meta.build.commit and the
+      # deploy verifies the RESTARTED service runs exactly this commit.
+      - name: Stamp the build commit into the package
+        env:
+          EXPECTED_COMMIT: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          if [ "$head" != "$EXPECTED_COMMIT" ]; then
+            echo "::error::checkout is $head, preflight resolved $EXPECTED_COMMIT"
+            exit 1
+          fi
+          printf '{"commit": "%s"}\n' "$EXPECTED_COMMIT" > src/lh_harness/_build_info.json
+          cat src/lh_harness/_build_info.json
+
       - name: Build wheel
         run: |
           uv build --wheel
 
-      - name: Verify wheel version matches preflight expectation
+      - name: Verify wheel version and build commit match preflight expectation
         env:
           EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
+          EXPECTED_COMMIT: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
           wheel="$(ls dist/lh_harness-*-py3-none-any.whl)"
@@ -183,13 +201,16 @@ jobs:
             "lh_harness-${EXPECTED_VERSION}-"*) ;;
             *) echo "::error::wheel version does not match expected $EXPECTED_VERSION"; exit 1 ;;
           esac
-          python - "$wheel" <<'PY'
-          import sys, zipfile
+          python - "$wheel" "$EXPECTED_COMMIT" <<'PY'
+          import json, sys, zipfile
           with zipfile.ZipFile(sys.argv[1]) as zf:
               names = zf.namelist()
-          assert any(n.endswith("_frontend/web/dist/index.html") for n in names), \
-              "wheel is missing the Web bundle"
-          print("wheel carries the Web bundle")
+              assert any(n.endswith("_frontend/web/dist/index.html") for n in names), \
+                  "wheel is missing the Web bundle"
+              assert "lh_harness/_build_info.json" in names, "wheel is missing _build_info.json"
+              commit = json.loads(zf.read("lh_harness/_build_info.json")).get("commit")
+          assert commit == sys.argv[2], f"wheel build commit {commit!r} != {sys.argv[2]!r}"
+          print(f"wheel carries the Web bundle and build commit {commit}")
           PY
 
       - name: Upload wheel
@@ -210,6 +231,9 @@ jobs:
     env:
       TARGET_NODE: ${{ inputs.target == 'ct111' && 'ct111' || 'ct110' }}
       EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
+      # The commit the restarted service must report (meta.build.commit): the
+      # version alone cannot tell builds apart.
+      EXPECTED_COMMIT: ${{ needs.preflight.outputs.sha }}
       # Secret NAME = <CT110|CT111>_API_TOKEN / _PVE_SSH_KEY (see TARGETS in
       # the header).  For ct110 these are exactly secrets.CT110_API_TOKEN and
       # secrets.CT110_PVE_SSH_KEY, as before.
@@ -317,27 +341,37 @@ jobs:
             exit 1
           fi
 
-      - name: Verify installed lh_harness.__version__ == deploy target
+      - name: Verify installed lh_harness version and build commit == deploy target
         if: ${{ !inputs.dry_run }}
         run: |
+          set -euo pipefail
           installed="$(scripts/deploy/ct110/run_on_ct110.sh exec /home/harness/venv/bin/python -c 'import lh_harness; print(lh_harness.__version__)')"
-          echo "installed: $installed / expected: $EXPECTED_VERSION"
+          echo "installed version: $installed / expected: $EXPECTED_VERSION"
           if [ "$installed" != "$EXPECTED_VERSION" ]; then
             echo "::error::installed version $installed != deploy target $EXPECTED_VERSION"
             exit 1
           fi
-
-      - name: Verify GET /api/meta returns 200
-        if: ${{ !inputs.dry_run }}
-        run: |
-          code="$(curl -s -o "$RUNNER_TEMP/meta.json" -w '%{http_code}' \
-            -H "Authorization: Bearer $CT110_API_TOKEN" "$CT110_WEB_URL/api/meta")"
-          echo "GET /api/meta -> HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "::error::/api/meta returned $code, expected 200"
+          commit="$(scripts/deploy/ct110/run_on_ct110.sh exec /home/harness/venv/bin/python -m lh_harness.build_info)"
+          echo "installed build commit: ${commit:-unknown} / expected: $EXPECTED_COMMIT"
+          if [ "$commit" != "$EXPECTED_COMMIT" ]; then
+            echo "::error::installed build commit ${commit:-unknown} != deploy target $EXPECTED_COMMIT"
             exit 1
           fi
-          grep -q '"service"' "$RUNNER_TEMP/meta.json"
+
+      # Bounded wait, then the commit check.  Run 37162090599 (b6f51f9) called
+      # /api/meta ONCE, 1.3 s after the restart, got curl exit 7 (nothing
+      # listening yet) and "rolled back".  verify_meta.py polls up to 90 s in
+      # 5 s steps and then requires meta.build.commit == the deployed sha, so
+      # the PROCESS answering is proven to be the new code.
+      - name: Verify GET /api/meta answers and runs the deployed commit (bounded wait)
+        id: verify_meta
+        if: ${{ !inputs.dry_run }}
+        run: |
+          python3 scripts/deploy/ct110/verify_meta.py \
+            --url "$CT110_WEB_URL" \
+            --expect-commit "$EXPECTED_COMMIT" \
+            --timeout-seconds 90 \
+            --interval-seconds 5
 
       - name: Verify drain survived the restart (task 242)
         if: ${{ !inputs.dry_run }}
@@ -355,10 +389,93 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: echo "CT110_DEPLOY_OK version=$EXPECTED_VERSION sha=${{ needs.preflight.outputs.sha }}"
 
+      # Automatic rollback.  Encodes lesson 3 twice over: the rollback also
+      # restarts the service, so it only runs after the deploy has actually
+      # STARTED — the deploy step ran and produced an outcome (`success` or
+      # `failure`; a step skipped by its `if` reports `skipped`).  A pre-deploy
+      # failure (wheel download, SSH key staging, zero-active wait) must abort
+      # the run with NO service restart: no window was confirmed and no deploy
+      # touched the host.  A failure at or after the deploy step still rolls
+      # back automatically — the service was already restarted inside a
+      # confirmed window, so restoring the previous build cannot widen the
+      # blast radius.
+      #
+      # It runs BEFORE the resume and drain-clear steps: its restart would
+      # kill runs the resume step had just put back, and a cleared drain would
+      # let new launches start under it.
+      #
+      # The inner rollback reinstalls the pre-deploy wheel BY SHA256 (copied
+      # aside when the deploy started) — not "the archived wheel for version
+      # X": every build is 0.1.7, so run 37162090599's rollback reinstalled
+      # the new wheel and reported success.  rc=5 = the deploy never reached
+      # the install step, so there is nothing to roll back.
+      - name: Automatic rollback to previous version
+        id: rollback
+        if: ${{ failure() && !inputs.dry_run && (steps.deploy.outcome == 'success' || steps.deploy.outcome == 'failure') }}
+        run: |
+          set +e
+          scripts/deploy/ct110/run_on_ct110.sh rollback
+          rc=$?
+          set -e
+          if [ "$rc" -eq 5 ]; then
+            echo "result=not_needed" >> "$GITHUB_OUTPUT"
+            echo "::warning::CT110_DEPLOY_FAILED_NOTHING_INSTALLED — the deploy never reached the install step; the pre-deploy build was not touched"
+            exit 0
+          fi
+          if [ "$rc" -ne 0 ]; then
+            # Fixed, greppable sentinel: this is the page-worthy state.
+            echo "::error::CT110_DEPLOY_ROLLBACK_FAILED rc=$rc — the pre-deploy build was NOT restored; CT110 may still run the new commit $EXPECTED_COMMIT; manual recovery required (scripts/deploy/ct110/README.md)"
+            echo "CT110_DEPLOY_ROLLBACK_FAILED rc=$rc"
+            exit 99
+          fi
+          echo "result=restored" >> "$GITHUB_OUTPUT"
+
+      # The rollback is verified the same way as the deploy: bounded
+      # /api/meta wait, then the running commit must be the pre-deploy one.
+      # A pre-deploy build that predates build info (no meta.build.commit) can
+      # only be proven by its wheel sha256 (checked inside CT110 by the
+      # rollback itself); the report then says "commit unverified", never
+      # "verified".
+      - name: Verify the rollback (bounded /api/meta wait, previous commit)
+        id: verify_rollback
+        if: ${{ failure() && !inputs.dry_run && steps.rollback.outcome == 'success' }}
+        env:
+          ROLLBACK_RESULT: ${{ steps.rollback.outputs.result }}
+        run: |
+          set -euo pipefail
+          state=/home/harness/deploy/state
+          prev_commit="$(scripts/deploy/ct110/run_on_ct110.sh exec cat "$state/previous_commit" 2>/dev/null || true)"
+          prev_sha="$(scripts/deploy/ct110/run_on_ct110.sh exec cat "$state/previous_wheel_sha256" 2>/dev/null || true)"
+          prev_commit="$(printf '%s' "$prev_commit" | tr -d '[:space:]')"
+          prev_sha="$(printf '%s' "$prev_sha" | tr -d '[:space:]')"
+          set +e
+          if [ "$ROLLBACK_RESULT" = "not_needed" ]; then
+            python3 scripts/deploy/ct110/verify_meta.py --url "$CT110_WEB_URL" \
+              --timeout-seconds 90 --interval-seconds 5
+            rc=$?; status="not_needed"
+          elif [ -n "$prev_commit" ]; then
+            python3 scripts/deploy/ct110/verify_meta.py --url "$CT110_WEB_URL" \
+              --expect-commit "$prev_commit" --timeout-seconds 90 --interval-seconds 5
+            rc=$?; status="restored_verified commit=$prev_commit"
+          else
+            python3 scripts/deploy/ct110/verify_meta.py --url "$CT110_WEB_URL" \
+              --timeout-seconds 90 --interval-seconds 5
+            rc=$?; status="restored_commit_unverified wheel_sha256=${prev_sha:-unknown}"
+          fi
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::CT110_DEPLOY_ROLLBACK_FAILED — rollback ran but the service did not verify ($status, verify rc=$rc); manual recovery required (scripts/deploy/ct110/README.md)"
+            echo "CT110_DEPLOY_ROLLBACK_FAILED verify_rc=$rc"
+            exit 99
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "rollback: $status"
+
       # fc-H4b: parked runs come back BEFORE the drain clears, on every path
       # that suspended them — the success path resumes them after verify,
-      # and a failed deploy (including the automatic rollback below) resumes
-      # them here so a suspend can never strand a run in the manifest.
+      # and a failed deploy resumes them here AFTER the automatic rollback
+      # above (whose restart would otherwise kill them again), so a suspend
+      # can never strand a run in the manifest.
       # Gate on "the suspend step ran" (outcome != 'skipped'), not on its
       # success: a suspend that stopped some runs and then failed must still
       # put them back. resume_runs.py exits 0 on an empty manifest.
@@ -372,43 +489,28 @@ jobs:
         if: ${{ !inputs.dry_run && always() && steps.set_drain.outcome == 'success' }}
         run: |
           # Always run once we have set the flag: the success path clears it
-          # after verify, and the failure path clears it before/around the
-          # rollback so a failed deploy never leaves CT110 permanently drained.
+          # after verify, and the failure path clears it after the rollback
+          # (no launches start under the rollback's restart) so a failed
+          # deploy never leaves CT110 permanently drained.
           python3 scripts/deploy/ct110/set_drain.py \
             --url "$CT110_WEB_URL" \
             --disable \
             --verify-state disabled
 
-      # Automatic rollback.  Encodes lesson 3 twice over: the rollback also
-      # restarts the service, so it only runs after the deploy has actually
-      # STARTED — the deploy step ran and produced an outcome (`success` or
-      # `failure`; a step skipped by its `if` reports `skipped`).  A pre-deploy
-      # failure (wheel download, SSH key staging, zero-active wait) must abort
-      # the run with NO service restart: no window was confirmed and no deploy
-      # touched the host.  A failure at or after the deploy step still rolls
-      # back automatically — the service was already restarted inside a
-      # confirmed window, so restoring the previous version cannot widen the
-      # blast radius.
-      - name: Automatic rollback to previous version
-        id: rollback
-        if: ${{ failure() && !inputs.dry_run && (steps.deploy.outcome == 'success' || steps.deploy.outcome == 'failure') }}
-        run: |
-          set +e
-          scripts/deploy/ct110/run_on_ct110.sh rollback
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            # Fixed, greppable sentinel: this is the page-worthy state.
-            echo "::error::CT110_DEPLOY_ROLLBACK_FAILED rc=$rc — CT110 is on an UNKNOWN version; manual recovery required (scripts/deploy/ct110/README.md)"
-            echo "CT110_DEPLOY_ROLLBACK_FAILED rc=$rc"
-            exit 99
-          fi
-          echo "::warning::CT110_DEPLOY_FAILED_ROLLBACK_OK — rolled back to the pre-deploy version"
-
       - name: Report rolled-back outcome
-        if: ${{ failure() && !inputs.dry_run && (steps.deploy.outcome == 'success' || steps.deploy.outcome == 'failure') && steps.rollback.outcome == 'success' }}
+        if: ${{ failure() && !inputs.dry_run && steps.verify_rollback.outcome == 'success' }}
+        env:
+          ROLLBACK_STATUS: ${{ steps.verify_rollback.outputs.status }}
         run: |
-          echo "CT110_DEPLOY_FAILED_ROLLBACK_OK version_restored"
+          case "$ROLLBACK_STATUS" in
+            restored_verified*)
+              echo "::warning::CT110_DEPLOY_FAILED_ROLLBACK_OK — $ROLLBACK_STATUS (the running service reports the pre-deploy commit)" ;;
+            restored_commit_unverified*)
+              echo "::warning::CT110_DEPLOY_FAILED_ROLLBACK_COMMIT_UNVERIFIED — $ROLLBACK_STATUS: the pre-deploy wheel bytes were reinstalled and the service answers, but that build predates build info, so /api/meta cannot confirm its commit" ;;
+            not_needed*)
+              echo "::warning::CT110_DEPLOY_FAILED_NOTHING_INSTALLED — the deploy never reached the install step; the pre-deploy build is still running" ;;
+          esac
+          echo "CT110_DEPLOY_FAILED rollback=$ROLLBACK_STATUS"
           exit 1
 
       - name: Deployment record
@@ -416,6 +518,8 @@ jobs:
         env:
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
           ROLLBACK_OUTCOME: ${{ steps.rollback.outcome || 'not-run' }}
+          ROLLBACK_STATUS: ${{ steps.verify_rollback.outputs.status || 'n/a' }}
+          META_COMMIT: ${{ steps.verify_meta.outputs.commit || 'not read' }}
         run: |
           {
             echo "## CT110 deploy — $(date -u +%FT%TZ)"
@@ -425,7 +529,8 @@ jobs:
             echo "- resolved sha: \`${{ needs.preflight.outputs.sha }}\`"
             echo "- expected version: \`$EXPECTED_VERSION\`"
             echo "- dry_run: ${{ inputs.dry_run }}"
-            echo "- deploy step: $DEPLOY_OUTCOME / rollback step: $ROLLBACK_OUTCOME"
+            echo "- expected commit: \`$EXPECTED_COMMIT\` / /api/meta reported: \`$META_COMMIT\`"
+            echo "- deploy step: $DEPLOY_OUTCOME / rollback step: $ROLLBACK_OUTCOME ($ROLLBACK_STATUS)"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # TASK 236: ship the overseer-sweep systemd units to CT110 as part of the
