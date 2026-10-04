@@ -28,6 +28,8 @@ import os
 import re
 import shutil
 import subprocess
+
+from .safe_subprocess import child_env, git_argv
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,10 +103,11 @@ def _git(repo: Path, *args: str) -> str:
 
     try:
         proc = subprocess.run(
-            ["git", "-C", str(repo), *args],
+            git_argv("-C", str(repo), *args),
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT,
+            env=child_env(),
         )
     except (subprocess.SubprocessError, OSError) as exc:
         raise WorkspaceBaseError(f"git is unavailable in workspace {repo}: {exc}") from exc
@@ -122,10 +125,11 @@ def _git_soft(repo: Path, *args: str) -> str | None:
 
     try:
         proc = subprocess.run(
-            ["git", "-C", str(repo), *args],
+            git_argv("-C", str(repo), *args),
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT,
+            env=child_env(),
         )
     except (subprocess.SubprocessError, OSError):
         return None
@@ -151,9 +155,9 @@ def probe_open_pr_gh(repo: Path, branch: str) -> str | None:
     gh = shutil.which("gh")
     if not gh:
         return None
-    env = os.environ.copy()
-    # Control-plane credentials must not be needed by, or leak into, the probe.
-    env.pop("LH_HARNESS_WEB_TOKEN", None)
+    # Control-plane credentials (web token, caller secrets, ask settings) must
+    # not be needed by, or leak into, the probe (task A3d review H-B).
+    env = child_env()
     try:
         proc = subprocess.run(
             [gh, "pr", "list", "--head", branch, "--state", "open",

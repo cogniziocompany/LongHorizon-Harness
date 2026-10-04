@@ -37,6 +37,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from ..safe_subprocess import SAFE_GIT_CONFIG, child_env
 from .redact import redact_text
 from .trace import RoleTrace
 
@@ -362,6 +363,7 @@ def _rev_parse_head(directory: Path) -> str:
         result = subprocess.run(
             [
                 "git",
+                *SAFE_GIT_CONFIG,
                 "-c",
                 f"safe.directory={directory}",
                 "-C",
@@ -374,6 +376,7 @@ def _rev_parse_head(directory: Path) -> str:
             text=True,
             timeout=_GIT_PROBE_TIMEOUT_SECONDS,
             check=False,
+            env=child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return ""

@@ -2313,7 +2313,13 @@ class RunSupervisor:
         # trusted.  The worker is launched with ``--no-dashboard`` and has no
         # legitimate need for this variable; retaining the rest of the
         # environment preserves provider/API-key compatibility.
-        worker_env = os.environ.copy()
+        # Task A3d (review H1): the harness caller HMAC secrets
+        # (LH_HARNESS_CALLER_*) and the ask-store settings (LH_HARNESS_ASK_*)
+        # are control-plane credentials too; scrub_worker_env drops them with
+        # the web token.
+        from ..ask_store import scrub_worker_env
+
+        worker_env = scrub_worker_env(dict(os.environ))
         # The worker changes cwd to its requested workspace.  Make the
         # supervisor's own package location absolute and first in PYTHONPATH
         # so a source-checkout launch does not lose a relative ``PYTHONPATH``
@@ -2323,7 +2329,6 @@ class RunSupervisor:
         worker_env["PYTHONPATH"] = package_root + (
             os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
         )
-        worker_env.pop("LH_HARNESS_WEB_TOKEN", None)
         # TASK 202 + 208: give the worker its own memory boundary so one run's
         # blowup cannot OOM-kill the shared service cgroup (and every other
         # live run with it).  The boundary is an RSS cap — a per-episode

@@ -15,6 +15,8 @@ import logging
 import os
 import re
 import subprocess
+
+from .safe_subprocess import child_env, git_argv
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -32,13 +34,13 @@ class WorkspaceParkError(RuntimeError):
 def _git(repo: Path, *args: str, check: bool = True, timeout: float = _GIT_TIMEOUT) -> subprocess.CompletedProcess[str]:
     """Run git in ``repo``; return the completed process."""
 
-    env = os.environ.copy()
+    env = child_env()
     env.setdefault("GIT_AUTHOR_NAME", "lh-harness")
     env.setdefault("GIT_AUTHOR_EMAIL", "lh-harness@example.invalid")
     env.setdefault("GIT_COMMITTER_NAME", "lh-harness")
     env.setdefault("GIT_COMMITTER_EMAIL", "lh-harness@example.invalid")
     proc = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        git_argv("-C", str(repo), *args),
         capture_output=True,
         text=True,
         env=env,

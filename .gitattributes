@@ -9,3 +9,5 @@ scripts/deploy/**/*.py text eol=lf
 # harness config), so they follow the same LF rule as the scripts.
 scripts/deploy/node/templates/* text eol=lf
 scripts/deploy/nodes.json text eol=lf
+# Task A3d: the apply forced command runs on a remote host under sh.
+scripts/ask-apply/* text eol=lf

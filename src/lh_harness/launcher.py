@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .safe_subprocess import child_env, git_argv
 from .config import PROJECT_CONFIG_PATH, load_run_defaults
 from .contention import ContentionGroup, detect_contention, groups_to_json
 from .queue import (
@@ -255,11 +256,14 @@ def _git_occupancy(repo: Path, *args: str) -> str | None:
     """Run one read-only git probe in ``repo``; None on any failure."""
 
     try:
+        # The workspace's .git/config belongs to the run: neutralise
+        # fsmonitor/hooks and pass no secrets (task A3d review H-B).
         proc = subprocess.run(
-            ["git", "-C", str(repo), *args],
+            git_argv("-C", str(repo), *args),
             capture_output=True,
             text=True,
             timeout=_GIT_OCCUPANCY_TIMEOUT,
+            env=child_env(),
         )
     except (subprocess.SubprocessError, OSError):
         return None

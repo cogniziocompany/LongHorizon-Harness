@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable
 
 from .adapters.base import AgentAdapter
 from .adapters.claude_permissions import is_git_internal_metadata_path
+from .safe_subprocess import git_argv
 from .agent_logs import (
     assistant_texts as decode_agent_assistant_texts,
     visible_output as decode_agent_visible_output,
@@ -2547,7 +2548,7 @@ def _round_zero_git(workspace_path: str, args: list[str], timeout: float = 10.0)
     """Run one read-only git query inside the workspace; ``None`` on any failure."""
     try:
         completed = subprocess.run(
-            ["git", "-C", workspace_path, *args],
+            git_argv("-C", workspace_path, *args),
             capture_output=True,
             text=True,
             timeout=timeout,
