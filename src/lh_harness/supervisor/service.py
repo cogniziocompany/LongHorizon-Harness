@@ -50,6 +50,7 @@ from .lifecycle import (
 from ..agent_registry import normalise_reasoning_effort, supports_reasoning_effort
 from .. import worker_isolation
 from ..workspace_park import park_workspace
+from ..run_outcome import OutcomeCache
 from ..types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
@@ -555,6 +556,11 @@ def _run_component_name(value: str) -> str | None:
     ):
         return None
     return value
+
+
+# Memo for the summary list's outcome fields (report.json is parsed once per
+# finished run, not on every poll).
+_OUTCOME_CACHE = OutcomeCache()
 
 
 def _summary_logs_dir(run_dir: Path) -> Path:
@@ -1726,8 +1732,22 @@ class RunSupervisor:
             status_name = str(status.get("status") or owner.get("status") or "idle")
             if statuses is not None and status_name not in statuses:
                 continue
+            logs_dir = _summary_logs_dir(Path(entry.path))
+            # Terminal runs only: how the run ended (report.json abort_reason /
+            # failure_reason, the supervisor's failure_reason, or the worker's
+            # "Stopped:" line), memoized per report so a poll stays cheap.
+            # Live rows keep their old shape.
+            outcome: dict[str, str] = {}
+            if canonical_lifecycle_status(status_name) in TERMINAL_STATUSES:
+                try:
+                    outcome = _OUTCOME_CACHE.get(
+                        Path(entry.path), logs_dir, status_name, status, _read_json
+                    )
+                except Exception:  # never let a bad report break the list
+                    outcome = {}
             items.append(
                 {
+                    **outcome,
                     "id": run_id,
                     "status": status_name,
                     "mtime": mtime,
@@ -1735,7 +1755,7 @@ class RunSupervisor:
                     "max_rounds": owner.get("max_rounds"),
                     "agent": owner.get("agent"),
                     "model": owner.get("model"),
-                    "log_dir": str(_summary_logs_dir(Path(entry.path))),
+                    "log_dir": str(logs_dir),
                     # First non-empty task line (<=120 chars) so cheap callers
                     # (Hydra's fleet list, fields=summary) keep a run label
                     # without downloading the full task text.
