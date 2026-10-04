@@ -574,3 +574,29 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .codex-workbench .ui-language-switch button:focus-visible { outline: 2px solid rgba(47, 111, 91, .35); outline-offset: 1px; }
 .approval-card.approval-linked { box-shadow: 0 0 0 2px rgba(242, 153, 74, .85); }
 .crash-screen { max-width: 640px; margin: 12vh auto; padding: 0 16px; color: #ddd; font-size: 13px; }.crash-screen h1 { font-size: 18px; }.crash-screen pre { white-space: pre-wrap; color: #f2b8b8; }.crash-screen button { padding: 7px 12px; border: 1px solid #555; border-radius: 6px; color: #eee; background: #353535; }
+
+
+/* Admin screens: embedded settings store, key restrictions, audit log. */
+.admin-shell { max-width: 1200px; margin: 0 auto; padding: 24px 16px; color: var(--ink); }
+.admin-header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-bottom: 12px; }
+.admin-header h1 { font-size: 20px; margin: 0; }
+.admin-back { color: var(--blue); font-size: 13px; }
+.admin-tabs { display: flex; gap: 6px; margin-left: auto; }
+.admin-tabs button, .admin-panel button { background: var(--panel-raised); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+.admin-tabs button.active { border-color: var(--line-strong); color: var(--blue); }
+.admin-panel button:disabled { opacity: .5; cursor: default; }
+.admin-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; overflow-x: auto; }
+.admin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.admin-table th, .admin-table td { text-align: left; vertical-align: top; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+.admin-muted { color: var(--muted); font-size: 12px; }
+.admin-badge { margin-left: 6px; font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--line-strong); color: var(--purple); }
+.admin-badge.warn { color: var(--amber); }
+.admin-error { color: var(--red); margin: 8px 0; font-size: 13px; }
+.admin-restart { color: var(--amber); margin-bottom: 10px; font-size: 13px; }
+.admin-edit-row label { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; font-size: 12px; color: var(--muted); }
+.admin-edit-row input, .admin-add input { background: var(--panel-soft); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; max-width: 520px; }
+.admin-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.admin-add { display: flex; gap: 8px; margin-top: 12px; }
+.admin-restrictions { margin: 0; display: grid; gap: 4px; }
+.admin-restrictions dt { color: var(--muted); font-size: 11px; text-transform: capitalize; }
+.admin-restrictions dd { margin: 0; word-break: break-word; }
