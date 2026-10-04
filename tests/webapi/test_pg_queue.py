@@ -32,6 +32,33 @@ def _db_url() -> str | None:
     return text or None
 
 
+@pytest.fixture(autouse=True)
+def _empty_queue_tables():
+    """Start every test on empty queue tables (the tests count rows).
+
+    Runs only with ``LH_HARNESS_DB_URL`` set, which must name a SCRATCH
+    database (same rule as test_pg_migrations.py).  The production database
+    name ``lh_harness`` is refused outright, so this can never empty the live
+    queue.
+    """
+    url = _db_url()
+    if not url:
+        yield
+        return
+    from urllib.parse import urlsplit
+
+    if urlsplit(url).path.lstrip("/") == "lh_harness":
+        pytest.skip("LH_HARNESS_DB_URL names the production database lh_harness; use a scratch database")
+    try:
+        store = PgQueueStore(url)  # applies the migrations
+        with store._txn() as txn:  # noqa: SLF001 - test-only reset
+            txn.execute("TRUNCATE harness.queue_events, harness.queue")
+        store._conn.close()  # noqa: SLF001
+    except Exception:
+        pass  # _require_backend skips the test when the backend is unreachable
+    yield
+
+
 def _require_backend(tmp_path: Path) -> PgQueueStore:
     url = _db_url()
     if not url:
