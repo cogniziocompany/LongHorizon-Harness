@@ -45,13 +45,15 @@ jobs:
         run: python -m pip install -e '.[test]' pyyaml
 
       # Several tests create throwaway git repos and commit into them; a
-      # GitHub-hosted runner has no git identity, so give the test job one.
+      # GitHub-hosted runner has no git identity.  Set it in the SYSTEM config
+      # (/etc/gitconfig): some tests clear os.environ (tests/overseer/
+      # test_tick_notify.py), which drops GIT_* variables and HOME alike.
+      - name: Git identity for test repos
+        run: |
+          sudo git config --system user.name pr-gate
+          sudo git config --system user.email pr-gate@users.noreply.github.com
+
       - name: Test (the badge means tests ran)
-        env:
-          GIT_AUTHOR_NAME: pr-gate
-          GIT_AUTHOR_EMAIL: pr-gate@users.noreply.github.com
-          GIT_COMMITTER_NAME: pr-gate
-          GIT_COMMITTER_EMAIL: pr-gate@users.noreply.github.com
         run: |
           set -o pipefail
           mkdir -p .pr-gate
