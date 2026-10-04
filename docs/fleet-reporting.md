@@ -188,3 +188,37 @@ unset.
 
 Event payloads are intentionally trimmed to summary fields only; they never
 contain transcripts or thinking.
+
+## Fleet channel (fc-H3): fleet-admin reaches the node
+
+fleet-admin cannot open connections to harness nodes, so the web service
+dials out instead. It opens one TLS WebSocket to
+`wss://<host of LH_HARNESS_FLEET_URL>/harness/channel` and serves allow-listed
+API calls over it. The server side is fleet-admin's `src/channel.js` (task
+fc-F1). The client is `src/lh_harness/fleet/channel.py`.
+
+- **Off by default.** It starts only in the web service (`lh-harness web`),
+  only when `LH_HARNESS_FLEET_URL` and `LH_HARNESS_FLEET_KEY` are set, and only
+  when `LH_HARNESS_FLEET_CHANNEL` is not `0`. The node name is the reporter's
+  (`LH_HARNESS_FLEET_NODE`, else the hostname).
+- **Handshake:** the headers are `X-Fleet-Host`, `X-Fleet-Ts` and
+  `X-Fleet-Signature` (hex HMAC-SHA256 of the device key over
+  `"<host>.<ts>"`). Every connect signs a fresh timestamp. fleet-admin allows
+  60 s of clock skew, so keep the node clock in NTP sync.
+- **Served calls:** GET `/api/meta`, `/api/queue`, `/api/runs`,
+  `/api/runs/latest`, `/api/runs/{id}/{snapshot,events,status,latest}`; POST
+  `/api/runs/{id}/{stop,resume,abort,instructions,time_limit}`. Anything else
+  answers 403 `{"error":"not allowed"}`. Calls go to the service's own
+  loopback address with its bearer (`LH_HARNESS_WEB_TOKEN`). The request
+  timeout is 30 s (504) and the response cap is 4 MB (413).
+- **Caller scoping:** when a `[callers]` table is configured, the run-control
+  POSTs also need a caller identity. Set `LH_HARNESS_FLEET_CHANNEL_CALLER` to
+  the `[callers]` entry the channel signs as. That entry needs
+  `rest_run_control = true`, and its secret comes from its own `secret_env`.
+  Without this, proxied POSTs answer 401 or 403 while GETs still work.
+- **Keep-alive and reconnect:** the node answers `{"kind":"ping"}` with a
+  pong and sends its own ping every 20 s. After 60 s without any frame it
+  reconnects. Reconnects back off exponentially from 1 s to 60 s, with jitter.
+- **Visibility:** `/api/meta` carries `fleet_channel_connected`,
+  `fleet_channel_since` (ISO time of the last connect or disconnect) and
+  `fleet_channel_last_error`.
