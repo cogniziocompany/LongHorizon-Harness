@@ -1,15 +1,17 @@
 #!/bin/sh
 # lh-apply-env-var FILE VARIABLE  -- task A3d, the remote end of apply_ask_secret.
 #
-# Installed on the TARGET host and pinned as an ssh forced command, one key
-# per target, so the harness key can write exactly one variable in one file:
+# Installed root:root 0755 as /usr/local/sbin/lh-apply-env-var on the TARGET
+# host and pinned as the forced command of one key (see docs/ask-store.md):
 #
-#   command="/usr/local/sbin/lh-apply-env-var /opt/cognizioware-mcp-tools/mcp-tools.env GITHUB_MCP_TOKEN",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... lh-harness-ask-apply
+#   restrict,from="192.168.21.168",command="/usr/local/sbin/lh-apply-env-var /opt/cognizioware-mcp-tools/mcp-tools.env GITHUB_MCP_TOKEN" ssh-ed25519 AAAA... lh-ask-vault
 #
 # The command the client asks for is ignored (sshd runs the forced command).
 # The value arrives on stdin as one line. It is never echoed, logged or put
 # on a command line: awk reads it from its environment. The file is replaced
-# atomically and keeps its mode and owner. Prints "ok <VARIABLE>" on success.
+# atomically (synced before the rename) and keeps its mode and owner. Both
+# "VAR=" and "export VAR=" lines are replaced; duplicates collapse into one.
+# Prints "ok <VARIABLE>" on success.
 set -eu
 umask 077
 
@@ -48,14 +50,23 @@ tmp=$(mktemp "$dir/.lh-apply.XXXXXX")
 trap 'rm -f "$tmp"' EXIT INT TERM
 
 LH_APPLY_VALUE=$value awk -v var="$var" '
-  BEGIN { v = ENVIRON["LH_APPLY_VALUE"]; done = 0; prefix = var "=" }
-  index($0, prefix) == 1 { if (!done) { print prefix v; done = 1 } ; next }
-  { print }
-  END { if (!done) print prefix v }
+  BEGIN { v = ENVIRON["LH_APPLY_VALUE"]; done = 0 }
+  {
+    line = $0; pre = ""
+    if (match(line, /^export[ \t]+/)) { pre = substr(line, 1, RLENGTH); line = substr(line, RLENGTH + 1) }
+    if (index(line, var "=") == 1) {
+      if (!done) { print pre var "=" v; done = 1 }
+      next
+    }
+    print $0
+  }
+  END { if (!done) print var "=" v }
 ' "$file" > "$tmp"
 
 chmod "$(stat -c '%a' "$file")" "$tmp"
 chown "$(stat -c '%u:%g' "$file")" "$tmp" 2>/dev/null || true
+sync "$tmp" 2>/dev/null || sync
 mv -f "$tmp" "$file"
+sync "$dir" 2>/dev/null || true
 trap - EXIT INT TERM
 echo "ok $var"

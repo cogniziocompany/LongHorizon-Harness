@@ -716,6 +716,10 @@ def list_open_asks(
     result = _list_open_asks_file(arguments, overseer_root=overseer_root)
     if live_rows is None and store_rows is None:
         return result
+    try:
+        _bounded_bool(arguments.get("include_closed"), field="include_closed", default=False)
+    except ValueError as exc:
+        return _bad_request(str(exc))
     live_rows = list(live_rows or [])
     if not result.get("ok"):
         if result.get("code") == 400:
@@ -758,15 +762,17 @@ def _merge_store_rows(
 ) -> dict[str, Any]:
     """Task A3d: live rows, then ask-store rows, then archive-file rows.
 
-    - A live row (GATE/BLOCKED) with a store entry shows the store's state,
-      fields and response; a store entry whose live row is gone is dropped.
+    - A live row (GATE/BLOCKED) is NEVER filtered by store state (review M3):
+      a web response is context only, so the row stays open, carries the
+      response and ``response_state`` "responded (context only), gate
+      pending". A store entry whose live row is gone is dropped.
     - A store row wins over an archive-file row with the same id.
     - Every row carries ``fields`` (declared or the D2 defaults) and
       ``response`` (secret fields as metadata only) plus its ``origin``.
     """
-    from .ask_store import default_fields, is_closed_state
+    from .ask_store import LIVE_RESPONDED_NOTE, default_fields, is_closed_state
 
-    include_closed = bool(arguments.get("include_closed")) is True
+    include_closed = _bounded_bool(arguments.get("include_closed"), field="include_closed", default=False)
     by_id = {row["id"]: row for row in store_rows}
     store_ids = set(by_id)
 
@@ -777,10 +783,11 @@ def _merge_store_rows(
             live_out.append(
                 {
                     **row,
-                    "state": stored["state"],
                     "fields": stored["fields"],
                     "response": stored["response"],
                     "origin": "live",
+                    "response_state": LIVE_RESPONDED_NOTE,
+                    "responded": stored["state"],
                 }
             )
         else:
@@ -795,7 +802,7 @@ def _merge_store_rows(
         if row.get("id") not in store_ids
     ]
     if not include_closed:
-        live_out = [row for row in live_out if not is_closed_state(row.get("state"))]
+        # Live rows are never filtered: the gate or blocked entry still waits.
         store_out = [row for row in store_out if not is_closed_state(row.get("state"))]
     rows = live_out + store_out + file_out
     file_open = int(result.get("open_rows") or 0) - sum(

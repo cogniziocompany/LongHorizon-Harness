@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import sys
 import time
 import urllib.error
@@ -38,10 +39,17 @@ def _secret_env(caller: str) -> str:
     return f"LH_HARNESS_CALLER_{caller.upper().replace('-', '_')}_SECRET"
 
 
-def build_arguments(arguments: dict, caller: str, secret: str, now: float | None = None) -> dict:
+def build_arguments(tool: str, arguments: dict, caller: str, secret: str, now: float | None = None) -> dict:
+    """Request-bound signature (task A3d review M2), identical to
+    lh_harness.caller_auth.ask_signature:
+    HMAC(secret, "<tool>|<caller>|<ts>|<nonce>|<sha256(canonical arguments)>")."""
     ts = str(int(time.time() if now is None else now))
-    sig = hmac.new(secret.encode(), f"{caller}:{ts}".encode(), hashlib.sha256).hexdigest()
-    return {**arguments, "caller": caller, "caller_ts": ts, "caller_sig": sig}
+    nonce = secrets.token_hex(16)
+    body = json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    digest = hashlib.sha256(body).hexdigest()
+    message = f"{tool}|{caller}|{ts}|{nonce}|{digest}".encode("utf-8")
+    sig = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+    return {**arguments, "caller": caller, "caller_ts": ts, "caller_nonce": nonce, "caller_sig": sig}
 
 
 def main(argv: list[str]) -> int:
@@ -66,7 +74,7 @@ def main(argv: list[str]) -> int:
         print("not set: " + ", ".join(missing), file=sys.stderr)
         return 2
     if tool != "list_open_asks":
-        arguments = build_arguments(arguments, caller, secret)
+        arguments = build_arguments(tool, arguments, caller, secret)
     body = json.dumps({"arguments": arguments}).encode()
     req = urllib.request.Request(
         f"{base}/api/mcp/fleet/{tool}",

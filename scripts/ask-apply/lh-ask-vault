@@ -1,0 +1,282 @@
+#!/usr/bin/python3
+"""lh-ask-vault - the separate-uid sealed store for open-asks secrets (task A3d).
+
+Installed root:root 0755 as /usr/local/sbin/lh-ask-vault and run ONLY as the
+dedicated vault user through one fixed sudo rule:
+
+    harness ALL=(lhasks) NOPASSWD: /usr/local/sbin/lh-ask-vault
+
+The harness service (and every harness worker, which shares its uid) can ask
+it to seal, clear or apply a secret, but there is no operation that returns a
+value. Stdlib only, and it imports nothing the harness uid can write.
+
+Configuration is a fixed file, /etc/lh-ask-vault/config.json (root:lhasks
+0640), never the caller's environment (sudo resets it anyway):
+
+    {"vault_dir": "/var/lib/lh-ask-vault/secrets",
+     "ssh_key": "/var/lib/lh-ask-vault/ssh/id_ed25519",
+     "known_hosts": "/var/lib/lh-ask-vault/ssh/known_hosts",
+     "ssh_dest": {"ct202-mcp-tools-env:GITHUB_MCP_TOKEN": "lhapply@<ct202-address>"},
+     "grants": {"fleet-admin": ["overseer:write"], "overseer": ["overseer", "overseer:apply"]}}
+
+Operations (exit 0 ok, 2 bad usage, 3 not found, 4 refused/failed):
+    check <worker_uid>        paths sealed from the worker uid?
+    grants                    print the grants JSON
+    seal <id> <field>         value on stdin (one line)
+    has <id> <field>
+    clear <id> <field>
+    apply <id> <field> <target>
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+CONFIG_PATH = "/etc/lh-ask-vault/config.json"
+ASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+FIELD_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+CALLER_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+SCOPES = {"overseer", "overseer:write", "overseer:apply"}
+DEST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*")
+MAX_SECRET = 4096
+REMOTE_COMMAND = "lh-apply-env-var"
+# Identical to lh_harness.config.ASK_APPLY_TARGETS (a test keeps them equal).
+ASK_APPLY_TARGETS = {
+    "ct202-mcp-tools-env:GITHUB_MCP_TOKEN": {
+        "kind": "ssh-env-file",
+        "file": "/opt/cognizioware-mcp-tools/mcp-tools.env",
+        "variable": "GITHUB_MCP_TOKEN",
+        "value_pattern": r"(github_pat_[A-Za-z0-9_]{20,255}|gh[pousr]_[A-Za-z0-9]{20,255})",
+    },
+}
+
+
+class Refused(Exception):
+    def __init__(self, message: str, code: int = 4) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def load_config(path: str = CONFIG_PATH) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise Refused(f"cannot read {path}: {exc.__class__.__name__}") from None
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("vault_dir"), str):
+        raise Refused(f"{path}: vault_dir is required")
+    cfg["_path"] = path
+    return cfg
+
+
+def _uid_groups(uid: int) -> set:
+    try:
+        entry = pwd.getpwuid(uid)
+    except KeyError:
+        return set()
+    try:
+        return set(os.getgrouplist(entry.pw_name, entry.pw_gid))
+    except OSError:
+        return {entry.pw_gid}
+
+
+def _allows(st: os.stat_result, uid: int, groups: set, bits: tuple) -> bool:
+    if st.st_uid == uid:
+        return bool(st.st_mode & bits[0])
+    if st.st_gid in groups:
+        return bool(st.st_mode & bits[1])
+    return bool(st.st_mode & bits[2])
+
+
+def access_by(path: str, uid: int, write: bool = False) -> bool:
+    """Could ``uid`` read (or write) ``path``? Fails closed on stat errors."""
+    if uid == 0:
+        return True
+    groups = _uid_groups(uid)
+    path = os.path.abspath(path)
+    parts = []
+    head = os.path.dirname(path)
+    while True:
+        parts.append(head)
+        nxt = os.path.dirname(head)
+        if nxt == head:
+            break
+        head = nxt
+    try:
+        for parent in reversed(parts):
+            if not _allows(os.stat(parent), uid, groups, (stat.S_IXUSR, stat.S_IXGRP, stat.S_IXOTH)):
+                return False
+        st = os.stat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    bits = (stat.S_IWUSR, stat.S_IWGRP, stat.S_IWOTH) if write else (stat.S_IRUSR, stat.S_IRGRP, stat.S_IROTH)
+    return _allows(st, uid, groups, bits)
+
+
+def op_check(cfg: dict, worker_uid: int, self_path: str) -> str:
+    problems = []
+    if worker_uid == os.getuid():
+        problems.append(f"the vault runs as the worker uid {worker_uid}")
+    for key in ("vault_dir", "ssh_key", "known_hosts"):
+        p = cfg.get(key)
+        if p and access_by(p, worker_uid):
+            problems.append(f"{key} {p} is readable by worker uid {worker_uid}")
+    if access_by(cfg["_path"], worker_uid):
+        problems.append(f"config {cfg['_path']} is readable by worker uid {worker_uid}")
+    for p in (cfg["_path"], self_path):
+        if access_by(p, worker_uid, write=True) or access_by(os.path.dirname(os.path.abspath(p)), worker_uid, write=True):
+            problems.append(f"{p} (or its directory) is writable by worker uid {worker_uid}")
+    if problems:
+        raise Refused("store readable by worker uid: " + "; ".join(problems))
+    return "ok"
+
+
+def op_grants(cfg: dict) -> str:
+    grants = cfg.get("grants") or {}
+    out = {}
+    if not isinstance(grants, dict):
+        raise Refused("grants must be an object")
+    for name, scopes in grants.items():
+        if not isinstance(name, str) or not CALLER_RE.fullmatch(name) or name == "anon":
+            raise Refused("bad caller name in grants")
+        if not isinstance(scopes, list) or not set(scopes) <= SCOPES:
+            raise Refused(f"bad scopes for {name}")
+        out[name] = sorted(set(scopes))
+    return json.dumps(out, sort_keys=True)
+
+
+def _secret_path(cfg: dict, ask_id: str, field: str) -> str:
+    if not ASK_ID_RE.fullmatch(ask_id) or not FIELD_RE.fullmatch(field):
+        raise Refused("bad id or field", 2)
+    return os.path.join(cfg["vault_dir"], ask_id, field)
+
+
+def op_seal(cfg: dict, ask_id: str, field: str, stdin) -> str:
+    path = _secret_path(cfg, ask_id, field)
+    value = stdin.readline().rstrip("\n")
+    if not value or len(value) > MAX_SECRET or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise Refused("refused: empty, too long or control characters")
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    os.chmod(cfg["vault_dir"], 0o700)
+    os.chmod(os.path.dirname(path), 0o700)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(value)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return "sealed"
+
+
+def op_has(cfg: dict, ask_id: str, field: str) -> str:
+    if not os.path.isfile(_secret_path(cfg, ask_id, field)):
+        raise Refused("not set", 3)
+    return "set"
+
+
+def op_clear(cfg: dict, ask_id: str, field: str) -> str:
+    try:
+        os.unlink(_secret_path(cfg, ask_id, field))
+    except FileNotFoundError:
+        raise Refused("not set", 3) from None
+    return "cleared"
+
+
+def _redact(text: str, value: str) -> str:
+    text = (text or "").replace(value, "[redacted]") if value else (text or "")
+    return " ".join(text.split())[:300]
+
+
+def ssh_argv(cfg: dict, target: str) -> list:
+    spec = ASK_APPLY_TARGETS[target]
+    dest = (cfg.get("ssh_dest") or {}).get(target, "")
+    if not isinstance(dest, str) or not DEST_RE.fullmatch(dest):
+        raise Refused(f"no plain user@host ssh_dest configured for {target}")
+    key = cfg.get("ssh_key")
+    if not isinstance(key, str) or not key.startswith("/"):
+        raise Refused("ssh_key must be an absolute path")
+    argv = ["/usr/bin/ssh", "-F", "/dev/null", "-i", key,
+            "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10"]
+    known = cfg.get("known_hosts")
+    if isinstance(known, str) and known.startswith("/"):
+        argv += ["-o", f"UserKnownHostsFile={known}"]
+    return argv + ["-T", dest, "--", REMOTE_COMMAND, spec["file"], spec["variable"]]
+
+
+def op_apply(cfg: dict, ask_id: str, field: str, target: str, run=subprocess.run) -> str:
+    if target not in ASK_APPLY_TARGETS:
+        raise Refused("target is not on the apply allow-list")
+    path = _secret_path(cfg, ask_id, field)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            value = fh.read()
+    except FileNotFoundError:
+        raise Refused("no sealed secret for this field") from None
+    if not re.fullmatch(ASK_APPLY_TARGETS[target]["value_pattern"], value):
+        raise Refused("the value does not match the target's format")
+    argv = ssh_argv(cfg, target)
+    try:
+        proc = run(argv, input=value + "\n", capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise Refused("ssh timed out after 60s") from None
+    except OSError as exc:
+        raise Refused(f"ssh could not start: {exc.strerror or exc}") from None
+    if proc.returncode != 0:
+        raise Refused(f"ssh exit {proc.returncode}: {_redact(proc.stderr, value)}")
+    os.unlink(path)
+    return "applied"
+
+
+def main(argv: list, cfg: dict | None = None, stdin=None, run=subprocess.run) -> int:
+    stdin = stdin if stdin is not None else sys.stdin
+    try:
+        if len(argv) < 2:
+            raise Refused("usage: lh-ask-vault <check|grants|seal|has|clear|apply> ...", 2)
+        op, args = argv[1], argv[2:]
+        cfg = cfg if cfg is not None else load_config()
+        arity = {"check": 1, "grants": 0, "seal": 2, "has": 2, "clear": 2, "apply": 3}
+        if op not in arity or len(args) != arity[op]:
+            raise Refused("bad operation or arguments", 2)
+        if op == "check":
+            out = op_check(cfg, int(args[0]), os.path.abspath(__file__))
+        elif op == "grants":
+            out = op_grants(cfg)
+        elif op == "seal":
+            out = op_seal(cfg, args[0], args[1], stdin)
+        elif op == "has":
+            out = op_has(cfg, *args)
+        elif op == "clear":
+            out = op_clear(cfg, *args)
+        else:
+            out = op_apply(cfg, *args, run=run)
+        print(out)
+        return 0
+    except Refused as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.code
+    except ValueError:
+        print("bad arguments", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    sys.exit(main(sys.argv))

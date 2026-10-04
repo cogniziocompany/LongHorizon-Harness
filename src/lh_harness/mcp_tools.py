@@ -28,6 +28,8 @@ from .caller_auth import (
     ask_caller_specs,
     ask_scope_allowed,
     emit_caller_audit,
+    strip_ask_signature,
+    verify_ask_request,
     caller_configs_or_defaults,
     emit_refusal_audit,
     enqueue_rate_violation,
@@ -322,6 +324,11 @@ def _fields_param() -> dict[str, Any]:
                 "type": {"type": "string", "enum": ["body", "secret"]},
                 "label": {"type": "string", "maxLength": 120},
                 "required": {"type": "boolean"},
+                "apply_target": {
+                    "type": "string",
+                    "description": "Secret fields only: the allow-listed target apply_ask_secret may write this value to.",
+                    "enum": sorted(ASK_APPLY_TARGETS),
+                },
             },
             "required": ["name", "type"],
         },
@@ -557,9 +564,7 @@ def dispatch(
     request_token: str | None,
     caller_configs: dict[str, dict[str, Any]] | None = None,
     overseer_root: str | None = None,
-    ask_grants: dict[str, list[str]] | None = None,
-    ask_root: str | None = None,
-    ask_apply_writer: Any = None,
+    ask_runtime: Any = None,
 ) -> dict[str, Any]:
     """Run one MCP tool call and return a JSON-RPC style result.
 
@@ -590,20 +595,16 @@ def dispatch(
     if tool_name not in _KNOWN_TOOLS:
         return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
 
-    if ask_root is None:
-        ask_root = _runs_root(registry, supervisor) or getattr(queue_store, "runs_root", None)
-        ask_root = str(ask_root) if ask_root else None
-
-    # Task A3d: ask-store tools. Always identity-checked and scope-gated,
-    # independent of whether [callers] scoping is ON for the other tools.
+    # Task A3d: ask-store tools. Always identity-checked (request-bound
+    # signature) and scope-gated, independent of whether [callers] scoping is
+    # ON for the other tools.
     if tool_name in ASK_TOOL_SCOPES:
         return _dispatch_ask_tool(
             tool_name,
             arguments,
             caller_configs=caller_configs,
-            ask_grants=ask_grants,
-            ask_root=ask_root,
-            writer=ask_apply_writer,
+            runtime=ask_runtime,
+            audit_root=_runs_root(registry, supervisor) or getattr(queue_store, "runs_root", None),
             seed_lookup=lambda ask_id: _ask_seed(
                 ask_id,
                 overseer_root=overseer_root,
@@ -638,7 +639,7 @@ def dispatch(
                     registry=registry,
                     supervisor=supervisor,
                     queue_store=queue_store,
-                    ask_root=ask_root,
+                    ask_runtime=ask_runtime,
                 )
             return handler(arguments, overseer_root=overseer_root)
         # Unreachable while _KNOWN_TOOLS == _SCOPING_ELIGIBLE_TOOLS | the
@@ -735,7 +736,7 @@ def _overseer_list_open_asks(
     registry: Any = None,
     supervisor: Any = None,
     queue_store: Any = None,
-    ask_root: str | None = None,
+    ask_runtime: Any = None,
 ) -> dict[str, Any]:
     from .overseer_state import list_open_asks, live_open_ask_rows
 
@@ -746,11 +747,11 @@ def _overseer_list_open_asks(
             _blocked_queue_entries(queue_store),
         )
     store_rows = None
-    if ask_root:
+    if ask_runtime is not None and getattr(ask_runtime, "store_root", None):
         from .ask_store import AskStore
 
         try:
-            store_rows = AskStore(ask_root).public_rows()
+            store_rows = AskStore(ask_runtime.store_root).public_rows()
         except OSError:
             store_rows = None
     return list_open_asks(
@@ -801,32 +802,34 @@ def _dispatch_ask_tool(
     arguments: dict[str, Any],
     *,
     caller_configs: dict[str, dict[str, Any]] | None,
-    ask_grants: dict[str, list[str]] | None,
-    ask_root: str | None,
-    writer: Any,
+    runtime: Any,
+    audit_root: Any,
     seed_lookup: Any,
 ) -> dict[str, Any]:
-    from .ask_store import (
-        AskStore,
-        AskStoreError,
-        validate_ask_id,
-        validate_columns,
-        validate_fields,
-    )
+    from .ask_store import AskStoreError, validate_ask_id, validate_columns, validate_fields
+
+    audit_root = str(audit_root) if audit_root else None
+    scope = ASK_TOOL_SCOPES[tool_name]
+
+    def audit(**event: Any) -> None:
+        emit_caller_audit(audit_root, {"tool": tool_name, "scope": scope, **event})
 
     if not isinstance(arguments, dict):
         return {"ok": False, "error": "arguments must be an object", "code": 400}
-    specs = ask_caller_specs(caller_configs, ask_grants)
-    caller = resolve_mcp_caller(arguments, specs)
-    arguments = strip_caller_arguments(arguments)
-    scope = ASK_TOOL_SCOPES[tool_name]
+    if runtime is None:
+        return {"ok": False, "error": "ask tools are not configured on this node", "code": 503}
+    if runtime.disabled_reason:
+        return {"ok": False, "error": runtime.disabled_reason, "code": 503}
+    grants = runtime.grants
+    specs = ask_caller_specs(caller_configs, grants)
+    caller, reason = verify_ask_request(tool_name, arguments, specs, runtime.nonces)
+    claimed = arguments.get("caller")
+    arguments = strip_ask_signature(arguments)
     if caller == ANON_CALLER:
-        return {"ok": False, "error": "invalid or missing caller identity", "code": 401}
-    if not ask_scope_allowed(caller, scope, ask_grants):
-        emit_caller_audit(
-            ask_root,
-            {"caller": caller, "tool": tool_name, "scope": scope, "decision": "denied"},
-        )
+        audit(caller=str(claimed)[:32] if isinstance(claimed, str) else None, decision="unauthenticated", reason=reason)
+        return {"ok": False, "error": f"invalid or missing caller identity ({reason})", "code": 401}
+    if not ask_scope_allowed(caller, scope, grants):
+        audit(caller=caller, decision="denied")
         return {
             "ok": False,
             "error": f"caller {caller!r} lacks scope {scope!r} for {tool_name}",
@@ -835,23 +838,19 @@ def _dispatch_ask_tool(
     unknown = sorted(set(arguments) - _ASK_TOOL_KEYS[tool_name])
     if unknown:
         return {"ok": False, "error": "unknown field(s): " + ", ".join(unknown), "code": 400}
-    if not ask_root:
-        return {"ok": False, "error": "the ask store requires a configured runs root", "code": 501}
-    store = AskStore(ask_root)
     try:
+        store = runtime.store()
         if tool_name == "raise_open_ask":
             columns = validate_columns(arguments, require_ask=True)
             fields = validate_fields(arguments["fields"]) if arguments.get("fields") else None
             ask_id = validate_ask_id(arguments.get("id"))
             if seed_lookup(ask_id) is not None:
                 raise AskStoreError(f"ask {ask_id!r} already exists as a live or archive row", 409)
-            row = store.raise_ask(ask_id, columns, fields, actor=caller)
-            return {"ok": True, "row": row}
+            return {"ok": True, "row": store.raise_ask(ask_id, columns, fields, actor=caller)}
         if tool_name == "declare_ask_fields":
             ask_id = validate_ask_id(arguments.get("id"))
             fields = validate_fields(arguments.get("fields"))
-            row = store.declare_fields(ask_id, fields, actor=caller, seed=seed_lookup(ask_id))
-            return {"ok": True, "row": row}
+            return {"ok": True, "row": store.declare_fields(ask_id, fields, actor=caller, seed=seed_lookup(ask_id))}
         if tool_name == "respond_open_ask":
             ask_id = validate_ask_id(arguments.get("id"))
             row = store.respond(
@@ -863,36 +862,22 @@ def _dispatch_ask_tool(
             return {"ok": True, "row": row}
         if tool_name == "clear_ask_secret":
             row = store.clear_secret(
-                validate_ask_id(arguments.get("id")),
-                str(arguments.get("field") or ""),
-                arguments.get("actor"),
+                validate_ask_id(arguments.get("id")), arguments.get("field"), arguments.get("actor")
             )
             return {"ok": True, "row": row}
         # apply_ask_secret
         target = arguments.get("target")
         if not isinstance(target, str) or target not in ASK_APPLY_TARGETS:
-            emit_caller_audit(
-                ask_root,
-                {"caller": caller, "tool": tool_name, "target": str(target)[:128], "decision": "denied"},
-            )
+            audit(caller=caller, target=str(target)[:128], decision="denied")
             return {"ok": False, "error": f"target {str(target)[:128]!r} is not on the apply allow-list", "code": 403}
         try:
             result = store.apply_secret(
-                validate_ask_id(arguments.get("id")),
-                str(arguments.get("field") or ""),
-                target,
-                actor=caller,
-                writer=writer,
+                validate_ask_id(arguments.get("id")), arguments.get("field"), target, actor=caller
             )
         except AskStoreError as exc:
-            emit_caller_audit(
-                ask_root,
-                {"caller": caller, "tool": tool_name, "target": target, "decision": "failed", "code": exc.code},
-            )
+            audit(caller=caller, target=target, decision="failed", code=exc.code)
             raise
-        emit_caller_audit(
-            ask_root, {"caller": caller, "tool": tool_name, "target": target, "decision": "applied"}
-        )
+        audit(caller=caller, target=target, decision="applied")
         return {"ok": True, **result}
     except AskStoreError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}

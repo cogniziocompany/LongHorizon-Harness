@@ -238,6 +238,103 @@ def ask_caller_specs(
     return specs
 
 
+# --------------------------------------------------- ask-tool request signing --
+# Task A3d review (M2): the task-174 HMAC covers only ``caller:ts`` and accepts
+# +-300 s with no nonce, so a sniffed signature can be replayed with ANY body
+# for five minutes. Ask tools use a request-bound scheme instead:
+#
+#   caller_sig = HMAC-SHA256(secret, "<tool>|<caller>|<ts>|<nonce>|<sha256(body)>")
+#
+# where body is the tool arguments without the four caller fields, serialized
+# canonically (sorted keys, no spaces, UTF-8, non-ASCII kept). Each nonce is
+# accepted once per window, a stamp may be at most 300 s old and at most 30 s
+# in the future. The old scheme stays for every non-ask tool.
+ASK_SIG_FIELDS = ("caller", "caller_ts", "caller_nonce", "caller_sig")
+ASK_MAX_PAST_SECONDS = 300
+ASK_MAX_FUTURE_SECONDS = 30
+_NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
+_NONCE_CACHE_MAX = 20_000
+
+
+def canonical_body(arguments: dict[str, Any]) -> bytes:
+    """Canonical JSON of the tool arguments (caller fields excluded)."""
+    body = {k: v for k, v in arguments.items() if k not in ASK_SIG_FIELDS}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def ask_signature(tool: str, caller: str, ts: str, nonce: str, arguments: dict[str, Any], secret: str) -> str:
+    digest = hashlib.sha256(canonical_body(arguments)).hexdigest()
+    message = f"{tool}|{caller}|{ts}|{nonce}|{digest}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+class NonceCache:
+    """Used (caller, nonce) pairs for the signature window, per process.
+
+    Fails closed: when full of unexpired entries a new nonce is refused, so a
+    flood cannot evict entries and reopen a replay.
+    """
+
+    def __init__(self, max_entries: int = _NONCE_CACHE_MAX) -> None:
+        self._seen: dict[tuple[str, str], float] = {}
+        self._max = max_entries
+        import threading
+
+        self._lock = threading.Lock()
+
+    def use(self, caller: str, nonce: str, now: float) -> bool:
+        with self._lock:
+            if len(self._seen) >= self._max:
+                self._seen = {k: exp for k, exp in self._seen.items() if exp > now}
+                if len(self._seen) >= self._max:
+                    return False
+            key = (caller, nonce)
+            if key in self._seen and self._seen[key] > now:
+                return False
+            self._seen[key] = now + ASK_MAX_PAST_SECONDS + ASK_MAX_FUTURE_SECONDS
+            return True
+
+
+def verify_ask_request(
+    tool: str,
+    arguments: dict[str, Any],
+    specs: dict[str, dict[str, Any]],
+    nonces: NonceCache,
+    *,
+    now: float | None = None,
+) -> tuple[str, str]:
+    """Return ``(caller, reason)``; caller is ``anon`` with a reason on failure."""
+    current = time.time() if now is None else now
+    caller = arguments.get("caller")
+    ts = canonical_timestamp(arguments.get("caller_ts"))
+    nonce = arguments.get("caller_nonce")
+    sig = arguments.get("caller_sig")
+    if not isinstance(caller, str) or not _CALLER_NAME_RE.fullmatch(caller) or caller == ANON_CALLER:
+        return ANON_CALLER, "missing or malformed caller"
+    if ts is None:
+        return ANON_CALLER, "missing or malformed caller_ts"
+    if not isinstance(nonce, str) or not _NONCE_RE.fullmatch(nonce):
+        return ANON_CALLER, "missing or malformed caller_nonce"
+    if not isinstance(sig, str) or not sig or len(sig) > _MAX_SIGNATURE_CHARS:
+        return ANON_CALLER, "missing caller_sig"
+    age = current - int(ts)
+    if age > ASK_MAX_PAST_SECONDS or age < -ASK_MAX_FUTURE_SECONDS:
+        return ANON_CALLER, "caller_ts outside the accepted window"
+    secret = _secret_for(specs.get(caller))
+    if not secret:
+        return ANON_CALLER, "unknown caller"
+    expected = ask_signature(tool, caller, ts, nonce, arguments, secret)
+    if not hmac.compare_digest(expected, sig.strip().lower()):
+        return ANON_CALLER, "bad signature"
+    if not nonces.use(caller, nonce, current):
+        return ANON_CALLER, "nonce already used"
+    return caller, ""
+
+
+def strip_ask_signature(arguments: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in arguments.items() if k not in ASK_SIG_FIELDS}
+
+
 def ask_scope_allowed(caller: str, scope: str, grants: dict[str, list[str]] | None) -> bool:
     """True only when ``[asks.grants]`` gives ``caller`` exactly ``scope``."""
     if caller == ANON_CALLER:
@@ -444,8 +541,14 @@ def header_names() -> dict[str, str]:
 __all__ = [
     "ANON_CALLER",
     "CALLER_ARGUMENT_KEYS",
+    "ASK_SIG_FIELDS",
+    "NonceCache",
     "ask_caller_specs",
     "ask_scope_allowed",
+    "ask_signature",
+    "canonical_body",
+    "strip_ask_signature",
+    "verify_ask_request",
     "REST_RUN_CONTROL_TOOL",
     "RESOLVE_TOOL",
     "caller_configs_or_defaults",

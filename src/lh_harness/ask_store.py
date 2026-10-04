@@ -4,37 +4,44 @@ Spec: ``docs/handoffs/open-asks-web-responses-2026-09-30.md`` (PR #99).
 ``queue/OPEN-ASKS.md`` is retired; asks the overseer raises, and the web
 responses Paxton gives to any open-asks row, live here instead.
 
-Layout under the harness state root (the runs root, next to ``queue/``)::
+Two parts, kept apart on purpose:
 
-    asks/<id>.json                 seven columns + fields + response + history
-    asks/.locks/<id>.lock          per-ask flock
-    asks-secrets/<id>/<field>      one sealed secret per file (dir 0700, file 0600)
+- The ask records (``<store>/asks/<id>.json``: seven columns, fields,
+  response metadata, history). No secret value is ever in them.
+- The sealed secrets, behind a *vault*. In production the vault is
+  ``scripts/ask-apply/lh-ask-vault`` running as a separate uid through one
+  fixed sudo command (:class:`HelperVault`): the harness process can seal,
+  clear and apply a secret but can never read one back, and the ssh key and
+  the grants live where harness workers (same uid as the service) cannot
+  read them. :class:`LocalVault` keeps secrets in a local directory; it exists
+  for tests, and :func:`load_ask_runtime` refuses to enable the secret tools
+  with it whenever the directory is readable by the uid workers run as.
 
-Security rules this module enforces (and the tests pin):
+Security rules (pinned by tests): a secret value never appears in a record, a
+tool result, an error, a log line or ``history``; record writes are atomic
+under a per-ask lock; ``apply_ask_secret`` writes only to a target on the
+static allow-list (``config.ASK_APPLY_TARGETS``) that the field itself
+declared, and returns ``{applied, target, at}`` only.
 
-- A secret VALUE is written only to ``asks-secrets/``. It never appears in
-  ``asks/*.json``, a tool result, an error message, a log line or ``history``;
-  everything else sees metadata only (``set_at``, ``set_by``, ``length``).
-- Every write is atomic (temp file + ``os.replace``) under the ask's lock.
-- ``apply_ask_secret`` (:func:`apply_secret`) writes only to a target on the
-  static allow-list in ``config.ASK_APPLY_TARGETS``, after the value matched
-  that target's format, and returns ``{applied, target, at}`` only.
-
-State rules (Paxton D3): a submit closes the row immediately with
-attribution; a submit to a closed row reopens it first (history keeps both
-steps) and closes it again; a failed apply reopens the row with the reason in
-``evidence``. That is the only automatic reopen.
+State rules (Paxton D3): a submit closes a stored ask with attribution; a
+submit to a closed ask reopens it first (history keeps both steps) and closes
+it again; a failed apply reopens it with the reason in ``evidence``. A
+response to a live GATE/BLOCKED row is context only and never hides it.
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
+import pwd
 import re
+import shlex
+import stat
 import subprocess
 import tempfile
-import time
+from dataclasses import dataclass, field as dc_field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -46,12 +53,15 @@ except ImportError:  # pragma: no cover
 
 from .config import ASK_APPLY_TARGETS
 
-ASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-FIELD_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-KIND_RE = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
+logger = logging.getLogger(__name__)
+
+ASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+FIELD_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+KIND_RE = re.compile(r"[A-Z][A-Z0-9_-]{0,31}")
 # Ids the live derivation owns (gate-<run>-<approval>, blocked-<queue_id>).
 LIVE_ID_PREFIXES = ("gate-", "blocked-")
 CLOSED_PREFIXES = ("closed", "answered", "done", "resolved", "superseded")
+LIVE_RESPONDED_NOTE = "responded (context only), gate pending"
 
 MAX_FIELDS = 8
 MAX_LABEL_CHARS = 120
@@ -65,13 +75,27 @@ _COLUMN_LIMITS = {
     "recommended": 2000,
     "default_if_silent": 1000,
 }
-APPLY_TIMEOUT_SECONDS = 60
-SSH_KEY_ENV = "LH_HARNESS_ASK_APPLY_SSH_KEY"
-SSH_KNOWN_HOSTS_ENV = "LH_HARNESS_ASK_APPLY_KNOWN_HOSTS"
-_SSH_DEST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*$|^[A-Za-z0-9][A-Za-z0-9.-]*$")
-# The remote end is a forced command (scripts/ask-apply/lh-apply-env-var); the
-# requested command is only a label for it and never carries the value.
-REMOTE_COMMAND = "lh-apply-env-var"
+HELPER_TIMEOUT_SECONDS = 90
+SECRETS_DISABLED_PREFIX = "disabled: "
+
+# Token shapes that must go in a secret field, never a body field.
+_TOKEN_SHAPES = re.compile(
+    r"(github_pat_[A-Za-z0-9_]{20,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bsk-[A-Za-z0-9_-]{20,}"
+    r"|\bAKIA[0-9A-Z]{16}\b|\bxox[abpr]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
+)
+
+# Environment names that must never reach a harness worker (review H1).
+WORKER_ENV_DENY_PREFIXES = ("LH_HARNESS_CALLER_", "LH_HARNESS_ASK_")
+WORKER_ENV_DENY_NAMES = ("LH_HARNESS_WEB_TOKEN",)
+
+
+def scrub_worker_env(env: dict[str, str]) -> dict[str, str]:
+    """Copy of ``env`` without control-plane credentials or ask-store settings."""
+    return {
+        k: v
+        for k, v in env.items()
+        if k not in WORKER_ENV_DENY_NAMES and not k.startswith(WORKER_ENV_DENY_PREFIXES)
+    }
 
 
 class AskStoreError(ValueError):
@@ -83,7 +107,7 @@ class AskStoreError(ValueError):
 
 
 class AskApplyError(RuntimeError):
-    """The deterministic writer could not apply a secret (reason has no value)."""
+    """The vault could not seal/clear/apply (the reason never has a value)."""
 
 
 def now_iso() -> str:
@@ -94,8 +118,16 @@ def is_closed_state(state: Any) -> bool:
     return str(state or "").strip().lower().lstrip("*").startswith(CLOSED_PREFIXES)
 
 
+def is_live_id(ask_id: Any) -> bool:
+    return isinstance(ask_id, str) and ask_id.startswith(LIVE_ID_PREFIXES)
+
+
 def default_fields(kind: Any) -> list[dict[str, Any]]:
-    """D2 defaults: one body field, plus one secret field for CREDENTIAL asks."""
+    """D2 defaults: one body field, plus one secret field for CREDENTIAL asks.
+
+    The default secret field declares no apply target, so it can be stored
+    but not applied until the overseer declares the field with a target.
+    """
     fields: list[dict[str, Any]] = [
         {"name": "response", "type": "body", "label": "Response", "required": False}
     ]
@@ -114,10 +146,20 @@ def _no_controls(text: str, *, allow_newlines: bool) -> bool:
     return True
 
 
+def looks_like_token(text: str) -> bool:
+    return bool(_TOKEN_SHAPES.search(text or ""))
+
+
 def validate_ask_id(value: Any) -> str:
-    if not isinstance(value, str) or not ASK_ID_RE.match(value.strip()):
+    if not isinstance(value, str) or not ASK_ID_RE.fullmatch(value.strip()):
         raise AskStoreError("id must match " + ASK_ID_RE.pattern, 400)
     return value.strip()
+
+
+def validate_field_name(value: Any) -> str:
+    if not isinstance(value, str) or not FIELD_NAME_RE.fullmatch(value):
+        raise AskStoreError("field must match " + FIELD_NAME_RE.pattern, 400)
+    return value
 
 
 def validate_actor(value: Any) -> str:
@@ -140,11 +182,11 @@ def validate_fields(value: Any) -> list[dict[str, Any]]:
     for item in value:
         if not isinstance(item, dict):
             raise AskStoreError("each field must be an object", 400)
-        unknown = set(item) - {"name", "type", "label", "required"}
+        unknown = set(item) - {"name", "type", "label", "required", "apply_target"}
         if unknown:
             raise AskStoreError("unknown field key(s): " + ", ".join(sorted(unknown)), 400)
         name = item.get("name")
-        if not isinstance(name, str) or not FIELD_NAME_RE.match(name):
+        if not isinstance(name, str) or not FIELD_NAME_RE.fullmatch(name):
             raise AskStoreError("field name must match " + FIELD_NAME_RE.pattern, 400)
         if name in seen:
             raise AskStoreError(f"duplicate field name {name!r}", 400)
@@ -158,14 +200,22 @@ def validate_fields(value: Any) -> list[dict[str, Any]]:
         required = item.get("required", False)
         if not isinstance(required, bool):
             raise AskStoreError(f"field {name!r}: required must be true or false", 400)
-        out.append({"name": name, "type": ftype, "label": label.strip() or name, "required": required})
+        spec: dict[str, Any] = {"name": name, "type": ftype, "label": label.strip() or name, "required": required}
+        target = item.get("apply_target")
+        if target not in (None, ""):
+            if ftype != "secret":
+                raise AskStoreError(f"field {name!r}: only a secret field can declare apply_target", 400)
+            if not isinstance(target, str) or target not in ASK_APPLY_TARGETS:
+                raise AskStoreError(f"field {name!r}: apply_target is not on the apply allow-list", 400)
+            spec["apply_target"] = target
+        out.append(spec)
     return out
 
 
 def validate_columns(arguments: dict[str, Any], *, require_ask: bool) -> dict[str, str]:
     cols: dict[str, str] = {}
     kind = arguments.get("kind")
-    if not isinstance(kind, str) or not KIND_RE.match(kind.strip()):
+    if not isinstance(kind, str) or not KIND_RE.fullmatch(kind.strip()):
         raise AskStoreError("kind must match " + KIND_RE.pattern + " (e.g. CREDENTIAL, DECISION)", 400)
     cols["kind"] = kind.strip()
     for name, limit in _COLUMN_LIMITS.items():
@@ -188,6 +238,10 @@ def _validate_body(name: str, value: Any) -> str:
         raise AskStoreError(f"field {name!r} must be a string", 400)
     if len(value) > MAX_BODY_CHARS or "\x00" in value:
         raise AskStoreError(f"field {name!r} must be at most {MAX_BODY_CHARS} characters without NUL", 400)
+    if looks_like_token(value):
+        raise AskStoreError(
+            f"field {name!r} looks like it contains a secret token; put it in a secret field instead", 422
+        )
     return value
 
 
@@ -203,26 +257,320 @@ def _validate_secret(name: str, value: Any) -> str:
     return value
 
 
-class AskStore:
-    """JSON-file ask store with sealed secrets (see module docstring)."""
+def _redact(text: str, value: str | None) -> str:
+    text = (text or "").strip()
+    if value:
+        text = text.replace(value, "[redacted]")
+    text = " ".join(text.split())
+    return text[:300]
 
-    def __init__(self, root: str | Path) -> None:
+
+# ---------------------------------------------------------------------- vaults --
+class LocalVault:
+    """Secrets in a local directory (dirs 0700, files 0600).
+
+    For tests and development. Production uses :class:`HelperVault`;
+    :func:`load_ask_runtime` keeps the secret tools disabled with a local
+    vault whose directory the worker uid can read.
+    """
+
+    def __init__(self, root: str | Path, writer: Callable[[str, dict[str, str], str], None] | None = None) -> None:
+        self.root = Path(root)
+        self.writer = writer
+
+    def _path(self, ask_id: str, field: str) -> Path:
+        return self.root / validate_ask_id(ask_id) / validate_field_name(field)
+
+    def seal(self, ask_id: str, field: str, value: str) -> None:
+        path = self._path(ask_id, field)
+        self.root.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.root, 0o700)
+        path.parent.mkdir(exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(value)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+
+    def has(self, ask_id: str, field: str) -> bool:
+        return self._path(ask_id, field).is_file()
+
+    def clear(self, ask_id: str, field: str) -> bool:
+        try:
+            self._path(ask_id, field).unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def apply(self, ask_id: str, field: str, target: str) -> None:
+        spec = ASK_APPLY_TARGETS[target]
+        path = self._path(ask_id, field)
+        if not path.is_file():
+            raise AskApplyError("no sealed secret for this field")
+        value = path.read_text(encoding="utf-8")
+        if not re.fullmatch(spec["value_pattern"], value):
+            raise AskApplyError("the value does not match the target's format")
+        if self.writer is None:
+            raise AskApplyError("this vault cannot apply (use the separate-uid helper)")
+        try:
+            self.writer(target, spec, value)
+        except AskApplyError as exc:
+            raise AskApplyError(_redact(str(exc), value)) from None
+        except Exception as exc:  # noqa: BLE001
+            raise AskApplyError(_redact(f"{type(exc).__name__}: {exc}", value)) from None
+        path.unlink()
+
+
+class HelperVault:
+    """The separate-uid helper (``scripts/ask-apply/lh-ask-vault``) via one fixed command.
+
+    ``command`` is e.g. ``["/usr/bin/sudo", "-n", "-u", "lhasks",
+    "/usr/local/sbin/lh-ask-vault"]``. Values travel on stdin only; the helper
+    never prints a value, so this process never holds one after sealing.
+    """
+
+    def __init__(self, command: list[str], run: Callable[..., Any] = subprocess.run) -> None:
+        self.command = list(command)
+        self._run = run
+
+    def call(self, *args: str, stdin: str | None = None) -> tuple[int, str, str]:
+        try:
+            proc = self._run(
+                [*self.command, *args],
+                input=stdin if stdin is not None else "",
+                capture_output=True,
+                text=True,
+                timeout=HELPER_TIMEOUT_SECONDS,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"},
+            )
+        except subprocess.TimeoutExpired:
+            raise AskApplyError(f"vault helper timed out after {HELPER_TIMEOUT_SECONDS}s") from None
+        except OSError as exc:
+            raise AskApplyError(f"vault helper could not start: {exc.strerror or exc}") from None
+        return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+
+    def _ok(self, rc: int, err: str, value: str | None = None) -> None:
+        if rc != 0:
+            raise AskApplyError(f"vault helper exit {rc}: {_redact(err, value)}")
+
+    def seal(self, ask_id: str, field: str, value: str) -> None:
+        rc, _out, err = self.call("seal", validate_ask_id(ask_id), validate_field_name(field), stdin=value + "\n")
+        self._ok(rc, err, value)
+
+    def has(self, ask_id: str, field: str) -> bool:
+        rc, _out, err = self.call("has", validate_ask_id(ask_id), validate_field_name(field))
+        if rc == 3:
+            return False
+        self._ok(rc, err)
+        return True
+
+    def clear(self, ask_id: str, field: str) -> bool:
+        rc, _out, err = self.call("clear", validate_ask_id(ask_id), validate_field_name(field))
+        if rc == 3:
+            return False
+        self._ok(rc, err)
+        return True
+
+    def apply(self, ask_id: str, field: str, target: str) -> None:
+        rc, _out, err = self.call("apply", validate_ask_id(ask_id), validate_field_name(field), target)
+        self._ok(rc, err)
+
+    def grants(self) -> dict[str, list[str]]:
+        rc, out, err = self.call("grants")
+        self._ok(rc, err)
+        data = json.loads(out)
+        if not isinstance(data, dict):
+            raise AskApplyError("vault helper returned malformed grants")
+        return {str(k): [str(s) for s in v] for k, v in data.items() if isinstance(v, list)}
+
+    def check(self, worker_uid: int) -> str | None:
+        """None when the helper's paths are sealed from ``worker_uid``, else a reason."""
+        rc, out, err = self.call("check", str(int(worker_uid)))
+        if rc == 0:
+            return None
+        return _redact(err or out, None) or f"vault helper check exit {rc}"
+
+
+# ------------------------------------------------------------- the self-check --
+def _uid_groups(uid: int) -> set[int]:
+    try:
+        entry = pwd.getpwuid(uid)
+    except KeyError:
+        return set()
+    try:
+        return set(os.getgrouplist(entry.pw_name, entry.pw_gid))
+    except OSError:
+        return {entry.pw_gid}
+
+
+def readable_by(path: str | Path, uid: int) -> bool:
+    """True when ``uid`` could read ``path`` (and search every parent).
+
+    A path this process cannot stat counts as readable (cannot prove
+    otherwise), so the check fails closed.
+    """
+    if uid == 0:
+        return True
+    groups = _uid_groups(uid)
+    target = Path(path).absolute()
+
+    def allows(st: os.stat_result, bits: tuple[int, int, int]) -> bool:
+        if st.st_uid == uid:
+            return bool(st.st_mode & bits[0])
+        if st.st_gid in groups:
+            return bool(st.st_mode & bits[1])
+        return bool(st.st_mode & bits[2])
+
+    try:
+        for parent in list(target.parents)[::-1]:
+            if not allows(os.stat(parent), (stat.S_IXUSR, stat.S_IXGRP, stat.S_IXOTH)):
+                return False
+        st = os.stat(target)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return allows(st, (stat.S_IRUSR, stat.S_IRGRP, stat.S_IROTH))
+
+
+def _make_non_dumpable() -> bool:
+    """PR_SET_DUMPABLE=0: same-uid workers can no longer read this process's
+    /proc/<pid>/environ (caller secrets) or ptrace it."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.prctl(4, 0, 0, 0, 0) == 0  # PR_SET_DUMPABLE = 4
+    except Exception:  # pragma: no cover - non-Linux
+        return False
+
+
+@dataclass
+class AskRuntime:
+    """Everything the ask tools need, resolved once at app start."""
+
+    store_root: str | None
+    grants: dict[str, list[str]] = dc_field(default_factory=dict)
+    vault: Any = None
+    disabled_reason: str | None = None  # all ask tools off (bad config)
+    secrets_disabled_reason: str | None = None  # secret tools off (self-check)
+    nonces: Any = None
+
+    def __post_init__(self) -> None:
+        if self.nonces is None:
+            from .caller_auth import NonceCache
+
+            self.nonces = NonceCache()
+
+    def store(self) -> "AskStore":
+        if not self.store_root:
+            raise AskStoreError("the ask store requires a configured store directory", 501)
+        return AskStore(self.store_root, vault=self.vault, secrets_disabled_reason=self.secrets_disabled_reason)
+
+
+def load_ask_runtime(runs_root: str | Path | None, env: dict[str, str] | None = None) -> AskRuntime:
+    """Resolve the ask runtime from the environment (names only, see docs/ask-store.md).
+
+    - ``LH_HARNESS_ASK_STORE_DIR``: ask records (no secrets); default the runs root.
+    - ``LH_HARNESS_ASK_VAULT_CMD``: the fixed helper command (production).
+      Grants then come from the helper; its ``check`` must pass.
+    - Otherwise a local vault (``LH_HARNESS_ASK_VAULT_DIR``, default
+      ``<runs_root>/asks-secrets``) and grants from ``LH_HARNESS_ASK_GRANTS_FILE``
+      or ``[asks]`` in the project config. The secret tools stay disabled while
+      any of those paths is readable by the worker uid.
+    - ``LH_HARNESS_WORKER_UID``: the uid workers run as (default: ours).
+
+    Never raises: problems disable the ask tools and are logged.
+    """
+    from .config import PROJECT_CONFIG_PATH, ProjectConfigError, load_ask_grants
+
+    env = dict(os.environ if env is None else env)
+    store_root = env.get("LH_HARNESS_ASK_STORE_DIR") or (str(runs_root) if runs_root else None)
+    try:
+        worker_uid = int(env.get("LH_HARNESS_WORKER_UID") or os.getuid())
+    except ValueError:
+        return AskRuntime(store_root, disabled_reason="disabled: LH_HARNESS_WORKER_UID is not a number")
+
+    helper_cmd = (env.get("LH_HARNESS_ASK_VAULT_CMD") or "").strip()
+    if helper_cmd:
+        command = shlex.split(helper_cmd)
+        if not command or not command[0].startswith("/"):
+            return AskRuntime(store_root, disabled_reason="disabled: LH_HARNESS_ASK_VAULT_CMD must start with an absolute path")
+        vault = HelperVault(command)
+        try:
+            grants = vault.grants()
+            reason = vault.check(worker_uid)
+        except (AskApplyError, ValueError) as exc:
+            return AskRuntime(store_root, vault=vault, disabled_reason=f"disabled: vault helper unusable: {exc}")
+        if reason is None and not _make_non_dumpable():
+            reason = "could not make the service non-dumpable; workers could read its environment"
+        return AskRuntime(
+            store_root,
+            grants=grants,
+            vault=vault,
+            secrets_disabled_reason=(SECRETS_DISABLED_PREFIX + reason) if reason else None,
+        )
+
+    grants_file = env.get("LH_HARNESS_ASK_GRANTS_FILE")
+    if grants_file:
+        grants_path = Path(grants_file)
+    else:
+        candidate = Path(runs_root) / ".lh-harness" / "config.toml" if runs_root else None
+        grants_path = candidate if candidate is not None and candidate.is_file() else PROJECT_CONFIG_PATH
+    try:
+        grants = load_ask_grants(grants_path)
+    except ProjectConfigError as exc:
+        reason = f"disabled: bad [asks] in {grants_path}: {exc}"
+        logger.error("ask tools %s", reason)
+        return AskRuntime(store_root, disabled_reason=reason)
+    vault_dir = env.get("LH_HARNESS_ASK_VAULT_DIR") or (str(Path(runs_root) / "asks-secrets") if runs_root else None)
+    vault = LocalVault(vault_dir) if vault_dir else None
+    secrets_reason = None
+    checked = [p for p in (vault_dir, str(grants_path) if grants_file else None) if p]
+    for path in checked:
+        if readable_by(path, worker_uid) or (not Path(path).exists() and readable_by(Path(path).parent, worker_uid)):
+            secrets_reason = f"disabled: store readable by worker uid {worker_uid} ({path})"
+            break
+    if vault is None:
+        secrets_reason = "disabled: no vault configured"
+    if secrets_reason:
+        logger.warning("ask secret tools %s", secrets_reason)
+    return AskRuntime(store_root, grants=grants, vault=vault, secrets_disabled_reason=secrets_reason)
+
+
+# ----------------------------------------------------------------------- store --
+class AskStore:
+    """JSON-file ask records; secrets go through ``vault`` (see module docstring)."""
+
+    def __init__(self, root: str | Path, vault: Any = None, secrets_disabled_reason: str | None = None) -> None:
         self.root = Path(root)
         self.asks_dir = self.root / "asks"
-        self.secrets_dir = self.root / "asks-secrets"
         self.locks_dir = self.asks_dir / ".locks"
+        self.vault = vault if vault is not None else LocalVault(self.root / "asks-secrets")
+        self.secrets_disabled_reason = secrets_disabled_reason
 
     # -------------------------------------------------------------- plumbing --
+    def _require_secrets(self) -> None:
+        if self.secrets_disabled_reason:
+            raise AskStoreError(self.secrets_disabled_reason, 503)
+
     def _ensure_dirs(self) -> None:
-        for path in (self.asks_dir, self.locks_dir, self.secrets_dir):
+        for path in (self.asks_dir, self.locks_dir):
             path.mkdir(parents=True, exist_ok=True)
             os.chmod(path, 0o700)
 
     @contextlib.contextmanager
     def _locked(self, ask_id: str) -> Iterator[None]:
         self._ensure_dirs()
-        lock_path = self.locks_dir / f"{ask_id}.lock"
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(self.locks_dir / f"{ask_id}.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             if fcntl is not None:
                 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -235,9 +583,6 @@ class AskStore:
 
     def _record_path(self, ask_id: str) -> Path:
         return self.asks_dir / f"{ask_id}.json"
-
-    def _secret_path(self, ask_id: str, field: str) -> Path:
-        return self.secrets_dir / ask_id / field
 
     @staticmethod
     def _atomic_write(path: Path, data: str) -> None:
@@ -266,22 +611,6 @@ class AskStore:
         record["history"] = record.get("history", [])[-MAX_HISTORY:]
         self._atomic_write(self._record_path(record["id"]), json.dumps(record, indent=2, sort_keys=True))
 
-    def _seal(self, ask_id: str, field: str, value: str) -> None:
-        ask_dir = self.secrets_dir / ask_id
-        ask_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(ask_dir, 0o700)
-        path = self._secret_path(ask_id, field)
-        self._atomic_write(path, value)
-        os.chmod(path, 0o600)
-
-    def _unseal_delete(self, ask_id: str, field: str) -> bool:
-        path = self._secret_path(ask_id, field)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            return False
-        return True
-
     @staticmethod
     def _history(record: dict[str, Any], actor: str, action: str, field_names: list[str], **extra: Any) -> None:
         entry: dict[str, Any] = {"at": now_iso(), "actor": actor, "action": action, "field_names": field_names}
@@ -294,7 +623,7 @@ class AskStore:
 
     @staticmethod
     def _new_record(seed: dict[str, Any], origin: str) -> dict[str, Any]:
-        record = {
+        return {
             "id": seed["id"],
             "ask": str(seed.get("ask") or ""),
             "kind": str(seed.get("kind") or ""),
@@ -308,7 +637,12 @@ class AskStore:
             "history": [],
             "created_at": now_iso(),
         }
-        return record
+
+    def _secret_field(self, record: dict[str, Any], field: str, ask_id: str) -> dict[str, Any]:
+        spec = {f["name"]: f for f in self.effective_fields(record)}.get(field)
+        if spec is None or spec["type"] != "secret":
+            raise AskStoreError(f"{field!r} is not a secret field of {ask_id!r}", 400)
+        return spec
 
     # ------------------------------------------------------------- read side --
     def get(self, ask_id: str) -> dict[str, Any] | None:
@@ -364,7 +698,7 @@ class AskStore:
     # ------------------------------------------------------------ write side --
     def raise_ask(self, ask_id: str, columns: dict[str, str], fields: list[dict[str, Any]] | None, actor: str) -> dict[str, Any]:
         ask_id = validate_ask_id(ask_id)
-        if ask_id.startswith(LIVE_ID_PREFIXES):
+        if is_live_id(ask_id):
             raise AskStoreError("ids starting gate- or blocked- belong to live rows", 400)
         with self._locked(ask_id):
             if self._load(ask_id) is not None:
@@ -389,18 +723,23 @@ class AskStore:
         ask_id = validate_ask_id(ask_id)
         with self._locked(ask_id):
             record = self._get_or_seed(ask_id, seed)
-            new_names = {f["name"]: f["type"] for f in fields}
+            new_types = {f["name"]: f["type"] for f in fields}
             response = record.setdefault("response", {})
             for old in self.effective_fields(record):
                 # A secret field that disappears (or turns into a body) takes
-                # its sealed value with it: no orphaned secret files.
-                if old["type"] == "secret" and new_names.get(old["name"]) != "secret":
-                    self._unseal_delete(ask_id, old["name"])
+                # its sealed value with it: no orphaned secrets.
+                if old["type"] == "secret" and new_types.get(old["name"]) != "secret":
+                    if response.get(old["name"]) is not None:
+                        self._require_secrets()
+                        try:
+                            self.vault.clear(ask_id, old["name"])
+                        except AskApplyError as exc:
+                            raise AskStoreError(f"could not clear the sealed secret: {exc}", 502) from None
                     response.pop(old["name"], None)
-                elif old["name"] not in new_names:
+                elif old["name"] not in new_types:
                     response.pop(old["name"], None)
             record["fields"] = fields
-            self._history(record, actor, "declare_fields", sorted(new_names))
+            self._history(record, actor, "declare_fields", sorted(new_types))
             self._save(record)
             return self.public_row(record)
 
@@ -423,49 +762,61 @@ class AskStore:
                     bodies[name] = _validate_body(name, "" if value is None else value)
                 elif value not in (None, ""):
                     secrets_in[name] = _validate_secret(name, value)
+            if secrets_in:
+                self._require_secrets()
             response = record.setdefault("response", {})
-            projected = {**{k: v for k, v in response.items()}, **bodies}
+            projected = {**response, **bodies}
             for name in secrets_in:
                 projected[name] = {"set": True}
-            has_value = any(
-                (bool(projected.get(n)) if f["type"] == "secret" else bool(str(projected.get(n) or "").strip()))
-                for n, f in fields.items()
-            )
-            if not has_value:
+
+            def filled(name: str, f: dict[str, Any]) -> bool:
+                v = projected.get(name)
+                return bool(v) if f["type"] == "secret" else bool(str(v or "").strip())
+
+            if not any(filled(n, f) for n, f in fields.items()):
                 raise AskStoreError("nothing to submit: every field is empty", 422)
-            missing = [
-                n for n, f in fields.items()
-                if f.get("required") and not (projected.get(n) if f["type"] == "secret" else str(projected.get(n) or "").strip())
-            ]
+            missing = [n for n, f in fields.items() if f.get("required") and not filled(n, f)]
             if missing:
                 raise AskStoreError("required field(s) empty: " + ", ".join(missing), 422)
+            # Seal first: a vault failure leaves the record untouched.
+            for name, value in secrets_in.items():
+                try:
+                    self.vault.seal(ask_id, name, value)
+                except AskApplyError as exc:
+                    raise AskStoreError(f"could not seal {name!r}: {_redact(str(exc), value)}", 502) from None
             changed = sorted(set(bodies) | set(secrets_in))
-            if is_closed_state(record.get("state")):
-                # D3: an edit to a closed row reopens it, then the submit
+            live = is_live_id(ask_id)
+            if is_closed_state(record.get("state")) and not live:
+                # D3: an edit to a closed ask reopens it, then the submit
                 # closes it again with the new attribution.
                 record["state"] = "OPEN"
                 self._history(record, actor, "reopen", changed)
             for name, text in bodies.items():
                 response[name] = text
             for name, value in secrets_in.items():
-                self._seal(ask_id, name, value)
                 response[name] = {"set_at": now_iso(), "set_by": actor, "length": len(value), "sealed": True}
-            record["state"] = f"CLOSED {now_iso()} by {actor} (web)"
+            stamp = f"CLOSED {now_iso()} by {actor} (web)"
+            # A live row is context only: its stored state records who
+            # answered, but the live gate/blocked row itself stays open.
+            record["state"] = stamp
             self._history(record, actor, "respond", changed)
             self._save(record)
             return self.public_row(record)
 
     def clear_secret(self, ask_id: str, field: str, actor: str) -> dict[str, Any]:
         ask_id = validate_ask_id(ask_id)
+        field = validate_field_name(field)
         actor = validate_actor(actor)
+        self._require_secrets()
         with self._locked(ask_id):
             record = self._load(ask_id)
             if record is None:
                 raise AskStoreError(f"ask {ask_id!r} not found", 404)
-            spec = {f["name"]: f for f in self.effective_fields(record)}.get(field)
-            if spec is None or spec["type"] != "secret":
-                raise AskStoreError(f"{field!r} is not a secret field of {ask_id!r}", 400)
-            removed = self._unseal_delete(ask_id, field)
+            self._secret_field(record, field, ask_id)
+            try:
+                removed = self.vault.clear(ask_id, field)
+            except AskApplyError as exc:
+                raise AskStoreError(f"could not clear the sealed secret: {exc}", 502) from None
             had_meta = (record.get("response") or {}).pop(field, None) is not None
             if not removed and not had_meta:
                 raise AskStoreError(f"secret {field!r} is not set", 404)
@@ -474,46 +825,35 @@ class AskStore:
             return self.public_row(record)
 
     # ----------------------------------------------------------------- apply --
-    def apply_secret(
-        self,
-        ask_id: str,
-        field: str,
-        target: str,
-        actor: str,
-        writer: Callable[[str, dict[str, str], str], None] | None = None,
-    ) -> dict[str, Any]:
-        """Apply one sealed secret to an allow-listed target (D1 + D3).
+    def apply_secret(self, ask_id: str, field: str, target: Any, actor: str) -> dict[str, Any]:
+        """Apply one sealed secret to its declared, allow-listed target (D1 + D3).
 
-        Raises AskStoreError for refusals that must NOT change the row
-        (unknown target, unknown ask or field). Any failure after that point
-        reopens the row with the reason in ``evidence`` and raises
-        AskStoreError with that reason; the value is never in the message.
+        Refusals that must NOT change the row raise AskStoreError: target not
+        on the allow-list (403), unknown ask/field (404/400), the field
+        declaring no or another target (409), secret tools disabled (503).
+        Any vault failure after that reopens the row with the reason in
+        ``evidence``; the value is never in the message.
         """
         ask_id = validate_ask_id(ask_id)
-        spec = ASK_APPLY_TARGETS.get(target) if isinstance(target, str) else None
-        if spec is None:
-            raise AskStoreError(f"target {target!r} is not on the apply allow-list", 403)
-        writer = writer or ssh_env_file_writer
+        field = validate_field_name(field)
+        if not isinstance(target, str) or target not in ASK_APPLY_TARGETS:
+            raise AskStoreError(f"target {str(target)[:128]!r} is not on the apply allow-list", 403)
+        self._require_secrets()
         with self._locked(ask_id):
             record = self._load(ask_id)
             if record is None:
                 raise AskStoreError(f"ask {ask_id!r} not found", 404)
-            fspec = {f["name"]: f for f in self.effective_fields(record)}.get(field)
-            if fspec is None or fspec["type"] != "secret":
-                raise AskStoreError(f"{field!r} is not a secret field of {ask_id!r}", 400)
-            value: str | None = None
+            spec = self._secret_field(record, field, ask_id)
+            declared = spec.get("apply_target")
+            if declared != target:
+                raise AskStoreError(
+                    f"field {field!r} declares apply_target {declared!r}; refusing {target!r}", 409
+                )
             try:
-                path = self._secret_path(ask_id, field)
-                if not path.is_file():
-                    raise AskApplyError("no sealed secret for this field")
-                value = path.read_text(encoding="utf-8")
-                if not re.fullmatch(spec["value_pattern"], value):
-                    raise AskApplyError("the value does not match the target's format")
-                writer(target, spec, value)
+                self.vault.apply(ask_id, field, target)
             except Exception as exc:  # noqa: BLE001 - every failure reopens
-                reason = _redact(str(exc) if isinstance(exc, AskApplyError) else type(exc).__name__ + ": " + str(exc), value)
-                at = now_iso()
-                note = f"apply failed {at}: {target} {reason}"
+                reason = _redact(str(exc) if isinstance(exc, AskApplyError) else f"{type(exc).__name__}: {exc}", None)
+                note = f"apply failed {now_iso()}: {target} {reason}"
                 evidence = (record.get("evidence") or "").strip()
                 evidence = (evidence + " | " + note) if evidence else note
                 record["evidence"] = evidence[-_COLUMN_LIMITS["evidence"]:]
@@ -522,10 +862,9 @@ class AskStore:
                 self._save(record)
                 raise AskStoreError(f"apply failed: {target} {reason}", 502) from None
             at = now_iso()
-            # Applied: the sealed copy has done its job and is deleted, so the
-            # plaintext lives only at the target from here on.
-            self._unseal_delete(ask_id, field)
-            meta = (record.setdefault("response", {}).get(field) or {})
+            # Applied: the vault deleted its sealed copy; the plaintext lives
+            # only at the target from here on.
+            meta = record.setdefault("response", {}).get(field) or {}
             meta.update({"applied_at": at, "applied_target": target, "sealed": False})
             record["response"][field] = meta
             self._history(record, actor, "apply", [field], target=target)
@@ -533,67 +872,19 @@ class AskStore:
             return {"applied": True, "target": target, "at": at}
 
 
-def _redact(text: str, value: str | None) -> str:
-    text = (text or "").strip()
-    if value:
-        text = text.replace(value, "[redacted]")
-    text = " ".join(text.split())
-    return text[:300]
-
-
-def ssh_env_file_writer(
-    target: str,
-    spec: dict[str, str],
-    value: str,
-    *,
-    run: Callable[..., Any] = subprocess.run,
-    env: dict[str, str] | None = None,
-) -> None:
-    """Write ``value`` to an env-file variable on a remote host over ssh.
-
-    The value travels on stdin only, never in argv or the environment of a
-    local process. The remote side is a forced command
-    (``scripts/ask-apply/lh-apply-env-var``) pinned to one file and one
-    variable in ``authorized_keys``, so this key can do nothing else.
-    """
-    env = dict(os.environ if env is None else env)
-    dest = (env.get(spec["host_env"]) or "").strip()
-    if not dest:
-        raise AskApplyError(f"{spec['host_env']} is not set")
-    if not _SSH_DEST_RE.match(dest):
-        raise AskApplyError(f"{spec['host_env']} is not a plain user@host")
-    key = (env.get(SSH_KEY_ENV) or "").strip()
-    if not key:
-        raise AskApplyError(f"{SSH_KEY_ENV} is not set")
-    argv = [
-        "ssh",
-        "-i", key,
-        "-o", "BatchMode=yes",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "StrictHostKeyChecking=yes",
-        "-o", "ConnectTimeout=10",
-    ]
-    known = (env.get(SSH_KNOWN_HOSTS_ENV) or "").strip()
-    if known:
-        argv += ["-o", f"UserKnownHostsFile={known}"]
-    argv += ["-T", dest, "--", REMOTE_COMMAND, spec["file"], spec["variable"]]
-    try:
-        proc = run(argv, input=value + "\n", capture_output=True, text=True, timeout=APPLY_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        raise AskApplyError(f"ssh timed out after {APPLY_TIMEOUT_SECONDS}s") from None
-    except OSError as exc:
-        raise AskApplyError(f"ssh could not start: {exc.strerror or exc}") from None
-    if proc.returncode != 0:
-        raise AskApplyError(f"ssh exit {proc.returncode}: {_redact(proc.stderr or '', value)}")
-
-
 __all__ = [
     "AskApplyError",
+    "AskRuntime",
     "AskStore",
     "AskStoreError",
+    "HelperVault",
+    "LocalVault",
     "default_fields",
     "is_closed_state",
-    "ssh_env_file_writer",
+    "load_ask_runtime",
+    "looks_like_token",
+    "readable_by",
+    "scrub_worker_env",
     "validate_actor",
     "validate_ask_id",
     "validate_columns",
