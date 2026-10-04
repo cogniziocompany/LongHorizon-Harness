@@ -177,6 +177,7 @@ _QUEUE_CAPACITY_KEYS = {
     "key_health_url",
     "poll_seconds",
     "max_retries",
+    "quota_backoff_minutes",
 }
 _STRING_KEYS = {
     "model",
@@ -323,6 +324,10 @@ auditor = 300
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
 # max_retries = 2       # maximum number of retry attempts for failed entries
+# quota_backoff_minutes = [30, 90]  # wait before retrying a provider quota /
+#                       # rate-limit (429) failure: 1st retry, 2nd retry, ...
+#                       # (later retries reuse the last value). A reset time in
+#                       # the provider error wins when it is later.
 
 # [queue]
 # observe = false       # shadow (observe) mode: the launcher computes the full
@@ -699,6 +704,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "key_health_url": "",
         "poll_seconds": 15,
         "max_retries": 2,
+        "quota_backoff_minutes": [30.0, 90.0],
     }
     if isinstance(capacity.get("kimi_max"), int):
         normalized_capacity["kimi_max"] = max(0, capacity["kimi_max"])
@@ -720,6 +726,22 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         # If present but not int, raise error
         if "max_retries" in capacity:
             raise ProjectConfigError("[queue.capacity].max_retries must be an integer")
+    if "quota_backoff_minutes" in capacity:
+        raw_backoff = capacity["quota_backoff_minutes"]
+        backoff_ok = (
+            isinstance(raw_backoff, list)
+            and bool(raw_backoff)
+            and all(
+                isinstance(item, (int, float)) and not isinstance(item, bool) and item >= 0
+                for item in raw_backoff
+            )
+        )
+        if not backoff_ok:
+            raise ProjectConfigError(
+                "[queue.capacity].quota_backoff_minutes must be a non-empty list of "
+                "non-negative numbers (minutes)"
+            )
+        normalized_capacity["quota_backoff_minutes"] = [float(item) for item in raw_backoff]
     database_url = queue.get("database_url", "")
     if not isinstance(database_url, str):
         raise ProjectConfigError("[queue].database_url must be a string")

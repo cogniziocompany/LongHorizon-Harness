@@ -13,10 +13,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,10 +26,12 @@ from .safe_subprocess import child_env, git_argv
 from .config import PROJECT_CONFIG_PATH, load_run_defaults
 from .contention import ContentionGroup, detect_contention, groups_to_json
 from .queue import (
+    DEFAULT_QUOTA_BACKOFF_MINUTES,
     QueueEntry,
     QueueStore,
     acquire_lease,
     default_queue_config,
+    normalize_quota_backoff_minutes,
     queue_config_from_config,
     read_lease,
 )
@@ -155,6 +159,22 @@ _NON_RETRYABLE_CAUSE_SIGNATURES = (
     "worker_cancelled",
 )
 
+# Provider quota / spend-limit exhaustion (provider_errors.py's "quota" kind
+# reports abort_reason=provider_quota).  Retryable, but only after a backoff:
+# see ``_quota_backoff``.  Tried before the generic retryable signatures so a
+# 429 that says "insufficient_quota" is labelled as quota, not rate limit.
+_QUOTA_CAUSE_SIGNATURES = (
+    "provider_quota",
+    "insufficient_quota",
+    "insufficient quota",
+    "quota exceeded",
+    "usage limit",
+)
+
+# Causes whose retry waits out the provider window instead of launching at
+# once (task: provider-quota retry backoff).
+_BACKOFF_CAUSES = frozenset({"provider_quota", "provider_rate_limit"})
+
 # Retryable causes, in the order they are tried: provider rate limiting,
 # episode timeouts (executor/auditor), stalled-episode detection, and
 # transport-class launch failures.
@@ -187,12 +207,100 @@ def _classify_failure_cause(text: str) -> str | None:
         return None
     if any(sig in lowered for sig in _NON_RETRYABLE_CAUSE_SIGNATURES):
         return None
+    if any(sig in lowered for sig in _QUOTA_CAUSE_SIGNATURES):
+        return "provider_quota"
     for sig in _RETRYABLE_CAUSE_SIGNATURES:
         if sig in lowered:
             return "provider_rate_limit" if "rate" in sig or sig == "429" else (
                 "provider_stall" if "stall" in sig or "no_output" in sig else "episode_timeout"
             )
     return None
+
+
+# Provider reset hints inside a failure text.  Providers and gateways word it
+# differently; these are the shapes seen in practice: an HTTP-style
+# ``Retry-After: 120`` / ``retry-after-ms: 1500``, OpenAI-style "Please try
+# again in 1m30s", an explicit reset timestamp (``resets at
+# 2026-10-04T12:00:00Z`` / ``reset_at=1759579200``), and Claude Code's
+# ``usage limit reached|1759579200``.
+_DURATION_PART = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(ms|milliseconds?|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])",
+    re.I,
+)
+_RETRY_AFTER = re.compile(
+    r"retry[-_ ]?after(?P<ms>[-_ ]?ms)?[\"']?\s*[:=]?\s*(?P<value>\d+(?:\.\d+)?)"
+    r"\s*(?P<unit>ms|milliseconds?|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?(?![a-z])",
+    re.I,
+)
+_TRY_AGAIN_IN = re.compile(
+    r"try again in\s+(?P<spec>(?:\d+(?:\.\d+)?\s*(?:ms|milliseconds?|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])[\s,]*(?:and\s+)?)+)",
+    re.I,
+)
+_RESET_ISO = re.compile(
+    r"reset(?:s|_at|s_at|s at| at)?[\"']?\s*[:=]?\s*[\"']?"
+    r"(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)",
+    re.I,
+)
+_RESET_EPOCH = re.compile(
+    r"(?:reset(?:s|_at|s_at|s at| at)?[\"']?\s*[:=]?\s*[\"']?|usage limit reached\s*\|\s*)"
+    r"(?P<epoch>\d{10})(?:\.\d+)?\b",
+    re.I,
+)
+# A parsed reset further out than this is treated as garbage, not a wait.
+_MAX_RESET_HORIZON_SECONDS = 7 * 24 * 3600
+
+
+def _duration_seconds(value: float, unit: str | None) -> float:
+    unit = (unit or "s").lower()
+    if unit.startswith("ms") or unit.startswith("milli"):
+        return value / 1000.0
+    if unit.startswith("h"):
+        return value * 3600.0
+    if unit.startswith("m"):
+        return value * 60.0
+    return value
+
+
+def _parse_provider_reset(text: str, now: float) -> float | None:
+    """Return the latest provider reset time (epoch seconds) named in ``text``.
+
+    ``None`` when the text carries no usable hint.  Times in the past or more
+    than a week out are ignored.
+    """
+
+    if not text:
+        return None
+    candidates: list[float] = []
+    for match in _RETRY_AFTER.finditer(text):
+        value = float(match.group("value"))
+        unit = "ms" if match.group("ms") else match.group("unit")
+        candidates.append(now + _duration_seconds(value, unit))
+    for match in _TRY_AGAIN_IN.finditer(text):
+        total = sum(
+            _duration_seconds(float(part.group(1)), part.group(2))
+            for part in _DURATION_PART.finditer(match.group("spec"))
+        )
+        if total > 0:
+            candidates.append(now + total)
+    for match in _RESET_ISO.finditer(text):
+        raw = match.group("ts").replace(" ", "T")
+        if raw.endswith(("Z", "z")):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        candidates.append(parsed.timestamp())
+    for match in _RESET_EPOCH.finditer(text):
+        candidates.append(float(match.group("epoch")))
+    valid = [ts for ts in candidates if now < ts <= now + _MAX_RESET_HORIZON_SECONDS]
+    return max(valid) if valid else None
+
+
+def _format_utc(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _role_configs(
@@ -538,7 +646,9 @@ class Launcher:
                 # Once one entry has LAUNCHED this pass, any later pending
                 # entry in the same trio must be skipped with an up-to-date
                 # capacity reason.
-                skip_reason = self._capacity_reason(entry, capacities)
+                skip_reason = self._waiting_skip_reason(entry) or self._capacity_reason(
+                    entry, capacities
+                )
                 if skip_reason is None:
                     skip_reason = "launch batch already consumed capacity"
                 if self._observe:
@@ -730,6 +840,55 @@ class Launcher:
             return set()
         return maintenance_manifest_run_ids(runs_root)
 
+    def _waiting_skip_reason(self, entry: QueueEntry, now: float | None = None) -> str | None:
+        """Skip reason while a backoff retry waits out its provider window.
+
+        A retry of a quota / rate-limit failure carries ``not_before``; until
+        then the entry stays pending and is skipped with this reason.  The
+        skip is not an attempt: ``attempt`` only changes in ``requeue``.
+        """
+
+        not_before = getattr(entry, "not_before", None)
+        if not isinstance(not_before, (int, float)) or isinstance(not_before, bool):
+            return None
+        current = _now() if now is None else now
+        if not_before <= current:
+            return None
+        label = getattr(entry, "wait_reason", None) or "backoff"
+        return f"waiting: {label} until {_format_utc(float(not_before))}"
+
+    def _quota_backoff_minutes(self) -> list[float]:
+        capacity = self._config.get("capacity", {}) if isinstance(self._config, dict) else {}
+        configured = normalize_quota_backoff_minutes(
+            capacity.get("quota_backoff_minutes") if isinstance(capacity, dict) else None
+        )
+        return configured or list(DEFAULT_QUOTA_BACKOFF_MINUTES)
+
+    def _quota_backoff(
+        self, failed_entry: QueueEntry, cause: str, now: float | None = None
+    ) -> tuple[float, str] | None:
+        """``(not_before, label)`` for a quota / rate-limit retry, else None.
+
+        The wait is indexed by the failed attempt (attempt 1 failed -> the
+        first value, 30 min by default; attempt 2 -> the second, 90 min; any
+        later attempt reuses the last value).  When the provider error names a
+        reset time later than that, the reset time wins.  Every other cause
+        returns None and keeps today's immediate retry.
+        """
+
+        label = _classify_failure_cause(cause)
+        if label not in _BACKOFF_CAUSES:
+            return None
+        current = _now() if now is None else now
+        schedule = self._quota_backoff_minutes()
+        index = max(0, int(getattr(failed_entry, "attempt", 1) or 1) - 1)
+        minutes = schedule[min(index, len(schedule) - 1)]
+        not_before = current + minutes * 60.0
+        reset = _parse_provider_reset(cause, current)
+        if reset is not None and reset > not_before:
+            not_before = reset
+        return not_before, label
+
     def _capacity_reason(self, entry: QueueEntry, capacities: dict[str, int]) -> str | None:
         if capacities.get(entry.trio, 0) <= 0:
             return f"{entry.trio} at capacity"
@@ -771,6 +930,9 @@ class Launcher:
         drain_reason = self._drain_skip_reason()
         if drain_reason is not None:
             return drain_reason
+        waiting_reason = self._waiting_skip_reason(entry)
+        if waiting_reason is not None:
+            return waiting_reason
         capacity = self._config.get("capacity", {})
         if entry.trio == "kimi" and capacity.get("key_health_url"):
             min_healthy = int(capacity.get("min_healthy_keys", 2))
@@ -1377,18 +1539,32 @@ class Launcher:
         service event, never raised into the launcher tick.
         """
         try:
-            successor = self.queue_store.requeue(failed_entry.queue_id, cause)
+            backoff = self._quota_backoff(failed_entry, cause)
+            if backoff is None:
+                successor = self.queue_store.requeue(failed_entry.queue_id, cause)
+            else:
+                # Provider quota / rate limit: the successor waits out the
+                # window (``not_before``) instead of burning its attempt in
+                # the same one.  Waiting is a skip, not an attempt.
+                successor = self.queue_store.requeue(
+                    failed_entry.queue_id,
+                    cause,
+                    not_before=backoff[0],
+                    wait_reason=backoff[1],
+                )
             if successor is not None:
                 # Emit queue.requeued event
-                self._emit_service_event(
-                    "queue.requeued",
-                    {
-                        "original": failed_entry.queue_id,
-                        "successor": successor.queue_id,
-                        "cause": cause,
-                        "attempt": successor.attempt,
-                    },
-                )
+                payload: dict[str, Any] = {
+                    "original": failed_entry.queue_id,
+                    "successor": successor.queue_id,
+                    "cause": cause,
+                    "attempt": successor.attempt,
+                }
+                if backoff is not None:
+                    payload["not_before"] = backoff[0]
+                    payload["not_before_utc"] = _format_utc(backoff[0])
+                    payload["wait_reason"] = backoff[1]
+                self._emit_service_event("queue.requeued", payload)
         except ValueError as exc:
             # Log but don't fail the launcher tick
             self._emit_service_event(
