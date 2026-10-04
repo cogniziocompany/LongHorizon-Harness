@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """lh-ask-vault - the separate-uid sealed store for open-asks secrets (task A3d).
 
 Installed root:root 0755 as /usr/local/sbin/lh-ask-vault and run ONLY as the
@@ -6,30 +6,46 @@ dedicated vault user through one fixed sudo rule:
 
     harness ALL=(lhasks) NOPASSWD: /usr/local/sbin/lh-ask-vault
 
-The harness service (and every harness worker, which shares its uid) can ask
-it to seal, clear or apply a secret, but there is no operation that returns a
-value. Stdlib only, and it imports nothing the harness uid can write.
+Every harness worker runs as ``harness`` too, so anything this rule allows, a
+run can ask for. The helper therefore trusts nothing the caller says on the
+command line: every verb that touches a secret takes a SIGNED tool request on
+stdin and checks it itself, with its own copy of the caller secrets:
 
-Configuration is a fixed file, /etc/lh-ask-vault/config.json (root:lhasks
-0640), never the caller's environment (sudo resets it anyway):
+  - the HMAC over "<tool>|<caller>|<ts>|<nonce>|<sha256(canonical args)>",
+  - the timestamp window (300 s old, 30 s future),
+  - a one-time nonce, persisted under the vault (survives restarts),
+  - the caller's grant for the tool's scope,
+  - for apply: the target recorded IN THE VAULT when the secret was sealed
+    (taken from the signed respond request, i.e. what the person saw).
+
+Stdlib only, run with ``python3 -I`` (no user site, no PYTHON* env), and it
+imports nothing the harness uid can write. No operation returns a value.
+
+Configuration: /etc/lh-ask-vault/config.json (lhasks:lhasks 0600), never the
+caller's environment:
 
     {"vault_dir": "/var/lib/lh-ask-vault/secrets",
+     "state_dir": "/var/lib/lh-ask-vault/state",
      "ssh_key": "/var/lib/lh-ask-vault/ssh/id_ed25519",
      "known_hosts": "/var/lib/lh-ask-vault/ssh/known_hosts",
      "ssh_dest": {"ct202-mcp-tools-env:GITHUB_MCP_TOKEN": "lhapply@<ct202-address>"},
-     "grants": {"fleet-admin": ["overseer:write"], "overseer": ["overseer", "overseer:apply"]}}
+     "grants": {"fleet-admin": ["overseer:write"], "overseer": ["overseer", "overseer:apply"]},
+     "callers": {"fleet-admin": "<hmac secret>", "overseer": "<hmac secret>"}}
 
-Operations (exit 0 ok, 2 bad usage, 3 not found, 4 refused/failed):
-    check <worker_uid>        paths sealed from the worker uid?
-    grants                    print the grants JSON
-    seal <id> <field>         value on stdin (one line)
-    has <id> <field>
-    clear <id> <field>
-    apply <id> <field> <target>
+Verbs (exit 0 ok, 2 bad usage, 3 not found, 4 refused/failed, 5 unauthenticated):
+    check <worker_uid>   no secret readable/writable by the worker uid?
+    grants               print the grants JSON (no secrets)
+    status <id>          sealed fields of one ask with their recorded target (no values)
+    request              stdin {"tool": ..., "arguments": {...signed...}}:
+                         respond_open_ask -> seal the fields named in secret_targets
+                         clear_ask_secret -> delete one sealed field
+                         apply_ask_secret -> write it to its recorded target
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import pwd
@@ -38,15 +54,26 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 CONFIG_PATH = "/etc/lh-ask-vault/config.json"
 ASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 FIELD_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
 CALLER_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 SCOPES = {"overseer", "overseer:write", "overseer:apply"}
+TOOL_SCOPES = {
+    "respond_open_ask": "overseer:write",
+    "clear_ask_secret": "overseer:write",
+    "apply_ask_secret": "overseer:apply",
+}
+SIG_FIELDS = ("caller", "caller_ts", "caller_nonce", "caller_sig")
+MAX_PAST, MAX_FUTURE = 300, 30
 DEST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*")
 MAX_SECRET = 4096
+MAX_REQUEST = 256 * 1024
 REMOTE_COMMAND = "lh-apply-env-var"
+ACL_XATTRS = ("system.posix_acl_access", "system.posix_acl_default")
 # Identical to lh_harness.config.ASK_APPLY_TARGETS (a test keeps them equal).
 ASK_APPLY_TARGETS = {
     "ct202-mcp-tools-env:GITHUB_MCP_TOKEN": {
@@ -76,6 +103,7 @@ def load_config(path: str = CONFIG_PATH) -> dict:
     return cfg
 
 
+# ------------------------------------------------------------------ the check --
 def _uid_groups(uid: int) -> set:
     try:
         entry = pwd.getpwuid(uid)
@@ -87,6 +115,14 @@ def _uid_groups(uid: int) -> set:
         return {entry.pw_gid}
 
 
+def _has_acl(path: str) -> bool:
+    try:
+        names = os.listxattr(path, follow_symlinks=True)
+    except OSError:
+        return False
+    return any(n in names for n in ACL_XATTRS)
+
+
 def _allows(st: os.stat_result, uid: int, groups: set, bits: tuple) -> bool:
     if st.st_uid == uid:
         return bool(st.st_mode & bits[0])
@@ -96,27 +132,32 @@ def _allows(st: os.stat_result, uid: int, groups: set, bits: tuple) -> bool:
 
 
 def access_by(path: str, uid: int, write: bool = False) -> bool:
-    """Could ``uid`` read (or write) ``path``? Fails closed on stat errors."""
+    """Could ``uid`` read (or write) ``path``? Fails closed: an extended POSIX
+    ACL anywhere on the path, or a stat error, counts as access."""
     if uid == 0:
         return True
     groups = _uid_groups(uid)
     path = os.path.abspath(path)
-    parts = []
+    parents = []
     head = os.path.dirname(path)
     while True:
-        parts.append(head)
+        parents.append(head)
         nxt = os.path.dirname(head)
         if nxt == head:
             break
         head = nxt
     try:
-        for parent in reversed(parts):
+        for parent in reversed(parents):
+            if _has_acl(parent):
+                return True
             if not _allows(os.stat(parent), uid, groups, (stat.S_IXUSR, stat.S_IXGRP, stat.S_IXOTH)):
                 return False
         st = os.stat(path)
     except FileNotFoundError:
         return False
     except OSError:
+        return True
+    if _has_acl(path):
         return True
     bits = (stat.S_IWUSR, stat.S_IWGRP, stat.S_IWOTH) if write else (stat.S_IRUSR, stat.S_IRGRP, stat.S_IROTH)
     return _allows(st, uid, groups, bits)
@@ -126,7 +167,7 @@ def op_check(cfg: dict, worker_uid: int, self_path: str) -> str:
     problems = []
     if worker_uid == os.getuid():
         problems.append(f"the vault runs as the worker uid {worker_uid}")
-    for key in ("vault_dir", "ssh_key", "known_hosts"):
+    for key in ("vault_dir", "state_dir", "ssh_key", "known_hosts"):
         p = cfg.get(key)
         if p and access_by(p, worker_uid):
             problems.append(f"{key} {p} is readable by worker uid {worker_uid}")
@@ -135,12 +176,19 @@ def op_check(cfg: dict, worker_uid: int, self_path: str) -> str:
     for p in (cfg["_path"], self_path):
         if access_by(p, worker_uid, write=True) or access_by(os.path.dirname(os.path.abspath(p)), worker_uid, write=True):
             problems.append(f"{p} (or its directory) is writable by worker uid {worker_uid}")
+    if not isinstance(cfg.get("callers"), dict) or not cfg["callers"]:
+        problems.append("no caller secrets configured")
     if problems:
         raise Refused("store readable by worker uid: " + "; ".join(problems))
     return "ok"
 
 
+# --------------------------------------------------------------------- grants --
 def op_grants(cfg: dict) -> str:
+    return json.dumps(_grants(cfg), sort_keys=True)
+
+
+def _grants(cfg: dict) -> dict:
     grants = cfg.get("grants") or {}
     out = {}
     if not isinstance(grants, dict):
@@ -151,28 +199,91 @@ def op_grants(cfg: dict) -> str:
         if not isinstance(scopes, list) or not set(scopes) <= SCOPES:
             raise Refused(f"bad scopes for {name}")
         out[name] = sorted(set(scopes))
-    return json.dumps(out, sort_keys=True)
+    return out
 
 
-def _secret_path(cfg: dict, ask_id: str, field: str) -> str:
-    if not ASK_ID_RE.fullmatch(ask_id) or not FIELD_RE.fullmatch(field):
+# ------------------------------------------------------------- authentication --
+def canonical_body(arguments: dict) -> bytes:
+    body = {k: v for k, v in arguments.items() if k not in SIG_FIELDS}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def signature(tool: str, caller: str, ts: str, nonce: str, arguments: dict, secret: str) -> str:
+    digest = hashlib.sha256(canonical_body(arguments)).hexdigest()
+    return hmac.new(secret.encode("utf-8"), f"{tool}|{caller}|{ts}|{nonce}|{digest}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _state_dir(cfg: dict) -> str:
+    return cfg.get("state_dir") or os.path.join(os.path.dirname(os.path.abspath(cfg["vault_dir"])), "state")
+
+
+def _use_nonce(cfg: dict, caller: str, nonce: str, now: float) -> None:
+    """One-time nonce, persisted: an O_EXCL marker file per (caller, nonce)."""
+    nonce_dir = os.path.join(_state_dir(cfg), "nonces")
+    os.makedirs(nonce_dir, mode=0o700, exist_ok=True)
+    try:
+        for name in os.listdir(nonce_dir):
+            p = os.path.join(nonce_dir, name)
+            try:
+                if os.stat(p).st_mtime < now - (MAX_PAST + MAX_FUTURE + 60):
+                    os.unlink(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    marker = os.path.join(nonce_dir, hashlib.sha256(f"{caller}|{nonce}".encode()).hexdigest())
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise Refused("nonce already used", 5) from None
+    os.close(fd)
+
+
+def authenticate(cfg: dict, tool: str, arguments: dict, now: float | None = None) -> str:
+    """Return the verified caller holding ``tool``'s scope, or raise Refused(code 5)."""
+    now = time.time() if now is None else now
+    if tool not in TOOL_SCOPES:
+        raise Refused("tool not handled by the vault", 2)
+    caller = arguments.get("caller")
+    ts = arguments.get("caller_ts")
+    nonce = arguments.get("caller_nonce")
+    sig = arguments.get("caller_sig")
+    if not isinstance(caller, str) or not CALLER_RE.fullmatch(caller):
+        raise Refused("missing or malformed caller", 5)
+    if not isinstance(ts, str) or not ts.isdigit() or len(ts) > 20:
+        raise Refused("missing or malformed caller_ts", 5)
+    if not isinstance(nonce, str) or not NONCE_RE.fullmatch(nonce):
+        raise Refused("missing or malformed caller_nonce", 5)
+    if not isinstance(sig, str) or not sig or len(sig) > 128:
+        raise Refused("missing caller_sig", 5)
+    age = now - int(ts)
+    if age > MAX_PAST or age < -MAX_FUTURE:
+        raise Refused("caller_ts outside the accepted window", 5)
+    secret = (cfg.get("callers") or {}).get(caller)
+    if not isinstance(secret, str) or not secret:
+        raise Refused("unknown caller", 5)
+    if not hmac.compare_digest(signature(tool, caller, ts, nonce, arguments, secret), sig.strip().lower()):
+        raise Refused("bad signature", 5)
+    if TOOL_SCOPES[tool] not in _grants(cfg).get(caller, []):
+        raise Refused(f"caller {caller} lacks scope {TOOL_SCOPES[tool]}", 5)
+    _use_nonce(cfg, caller, nonce, now)
+    return caller
+
+
+# ------------------------------------------------------------------- the vault --
+def _paths(cfg: dict, ask_id, field) -> tuple:
+    if not isinstance(ask_id, str) or not ASK_ID_RE.fullmatch(ask_id) or not isinstance(field, str) or not FIELD_RE.fullmatch(field):
         raise Refused("bad id or field", 2)
-    return os.path.join(cfg["vault_dir"], ask_id, field)
+    base = os.path.join(cfg["vault_dir"], ask_id, field)
+    return base, base + ".meta.json"
 
 
-def op_seal(cfg: dict, ask_id: str, field: str, stdin) -> str:
-    path = _secret_path(cfg, ask_id, field)
-    value = stdin.readline().rstrip("\n")
-    if not value or len(value) > MAX_SECRET or any(ord(c) < 32 or ord(c) == 127 for c in value):
-        raise Refused("refused: empty, too long or control characters")
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    os.chmod(cfg["vault_dir"], 0o700)
-    os.chmod(os.path.dirname(path), 0o700)
+def _atomic(path: str, data: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(value)
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -182,20 +293,62 @@ def op_seal(cfg: dict, ask_id: str, field: str, stdin) -> str:
         except OSError:
             pass
         raise
-    return "sealed"
 
 
-def op_has(cfg: dict, ask_id: str, field: str) -> str:
-    if not os.path.isfile(_secret_path(cfg, ask_id, field)):
-        raise Refused("not set", 3)
-    return "set"
+def op_status(cfg: dict, ask_id: str) -> str:
+    if not ASK_ID_RE.fullmatch(ask_id):
+        raise Refused("bad id", 2)
+    out = {}
+    d = os.path.join(cfg["vault_dir"], ask_id)
+    if os.path.isdir(d):
+        for name in sorted(os.listdir(d)):
+            if FIELD_RE.fullmatch(name) and os.path.isfile(os.path.join(d, name)):
+                meta = {}
+                try:
+                    with open(os.path.join(d, name + ".meta.json"), encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                except (OSError, ValueError):
+                    pass
+                out[name] = {"target": meta.get("target", ""), "set_at": meta.get("set_at"), "set_by": meta.get("set_by")}
+    return json.dumps(out, sort_keys=True)
 
 
-def op_clear(cfg: dict, ask_id: str, field: str) -> str:
+def _seal(cfg: dict, args: dict, caller: str) -> str:
+    ask_id = args.get("id")
+    fields = args.get("fields") or {}
+    targets = args.get("secret_targets") or {}
+    actor = args.get("actor")
+    if not isinstance(fields, dict) or not isinstance(targets, dict):
+        raise Refused("fields and secret_targets must be objects", 2)
+    sealed = []
+    for name, target in sorted(targets.items()):
+        value = fields.get(name)
+        if value in (None, ""):
+            continue
+        if not isinstance(value, str) or len(value) > MAX_SECRET or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise Refused(f"refused {name}: too long or control characters")
+        if target not in ("", None) and target not in ASK_APPLY_TARGETS:
+            raise Refused(f"refused {name}: target is not on the apply allow-list")
+        path, meta = _paths(cfg, ask_id, name)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        os.chmod(cfg["vault_dir"], 0o700)
+        os.chmod(os.path.dirname(path), 0o700)
+        _atomic(path, value)
+        _atomic(meta, json.dumps({"target": target or "", "set_at": int(time.time()), "set_by": actor if isinstance(actor, str) else caller}))
+        sealed.append(name)
+    return "sealed " + ",".join(sealed) if sealed else "nothing to seal"
+
+
+def _clear(cfg: dict, args: dict) -> str:
+    path, meta = _paths(cfg, args.get("id"), args.get("field"))
     try:
-        os.unlink(_secret_path(cfg, ask_id, field))
+        os.unlink(path)
     except FileNotFoundError:
         raise Refused("not set", 3) from None
+    try:
+        os.unlink(meta)
+    except FileNotFoundError:
+        pass
     return "cleared"
 
 
@@ -221,15 +374,25 @@ def ssh_argv(cfg: dict, target: str) -> list:
     return argv + ["-T", dest, "--", REMOTE_COMMAND, spec["file"], spec["variable"]]
 
 
-def op_apply(cfg: dict, ask_id: str, field: str, target: str, run=subprocess.run) -> str:
+def _apply(cfg: dict, args: dict, run=subprocess.run) -> str:
+    target = args.get("target")
     if target not in ASK_APPLY_TARGETS:
         raise Refused("target is not on the apply allow-list")
-    path = _secret_path(cfg, ask_id, field)
+    path, meta_path = _paths(cfg, args.get("id"), args.get("field"))
     try:
         with open(path, encoding="utf-8") as fh:
             value = fh.read()
     except FileNotFoundError:
-        raise Refused("no sealed secret for this field") from None
+        raise Refused("no sealed secret for this field", 3) from None
+    try:
+        with open(meta_path, encoding="utf-8") as fh:
+            recorded = json.load(fh).get("target", "")
+    except (OSError, ValueError):
+        recorded = ""
+    if not recorded:
+        raise Refused("no apply target was recorded when this secret was submitted")
+    if recorded != target:
+        raise Refused("target differs from the one recorded when this secret was submitted")
     if not re.fullmatch(ASK_APPLY_TARGETS[target]["value_pattern"], value):
         raise Refused("the value does not match the target's format")
     argv = ssh_argv(cfg, target)
@@ -242,31 +405,50 @@ def op_apply(cfg: dict, ask_id: str, field: str, target: str, run=subprocess.run
     if proc.returncode != 0:
         raise Refused(f"ssh exit {proc.returncode}: {_redact(proc.stderr, value)}")
     os.unlink(path)
+    try:
+        os.unlink(meta_path)
+    except FileNotFoundError:
+        pass
     return "applied"
+
+
+def op_request(cfg: dict, stdin, run=subprocess.run, now: float | None = None) -> str:
+    raw = stdin.read(MAX_REQUEST + 1)
+    if len(raw) > MAX_REQUEST:
+        raise Refused("request too large", 2)
+    try:
+        req = json.loads(raw)
+    except ValueError:
+        raise Refused("request is not JSON", 2) from None
+    if not isinstance(req, dict) or not isinstance(req.get("arguments"), dict) or not isinstance(req.get("tool"), str):
+        raise Refused("request must be {tool, arguments}", 2)
+    tool, args = req["tool"], req["arguments"]
+    caller = authenticate(cfg, tool, args, now=now)
+    if tool == "respond_open_ask":
+        return _seal(cfg, args, caller)
+    if tool == "clear_ask_secret":
+        return _clear(cfg, args)
+    return _apply(cfg, args, run=run)
 
 
 def main(argv: list, cfg: dict | None = None, stdin=None, run=subprocess.run) -> int:
     stdin = stdin if stdin is not None else sys.stdin
     try:
         if len(argv) < 2:
-            raise Refused("usage: lh-ask-vault <check|grants|seal|has|clear|apply> ...", 2)
+            raise Refused("usage: lh-ask-vault <check|grants|status|request> ...", 2)
         op, args = argv[1], argv[2:]
-        cfg = cfg if cfg is not None else load_config()
-        arity = {"check": 1, "grants": 0, "seal": 2, "has": 2, "clear": 2, "apply": 3}
+        arity = {"check": 1, "grants": 0, "status": 1, "request": 0}
         if op not in arity or len(args) != arity[op]:
             raise Refused("bad operation or arguments", 2)
+        cfg = cfg if cfg is not None else load_config()
         if op == "check":
             out = op_check(cfg, int(args[0]), os.path.abspath(__file__))
         elif op == "grants":
             out = op_grants(cfg)
-        elif op == "seal":
-            out = op_seal(cfg, args[0], args[1], stdin)
-        elif op == "has":
-            out = op_has(cfg, *args)
-        elif op == "clear":
-            out = op_clear(cfg, *args)
+        elif op == "status":
+            out = op_status(cfg, args[0])
         else:
-            out = op_apply(cfg, *args, run=run)
+            out = op_request(cfg, stdin, run=run)
         print(out)
         return 0
     except Refused as exc:

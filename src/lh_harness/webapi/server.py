@@ -2714,12 +2714,21 @@ def run_web_server(
 
     import uvicorn
 
+    from ..safe_subprocess import seal_process_environment
+
     token = _configured_token(auth_token)
     if not _is_loopback_host(host) and not token:
         raise ValueError(
             "refusing to expose the Web control API beyond localhost without "
             "LH_HARNESS_WEB_TOKEN (or --auth-token)"
         )
+    # Task A3d review H-B / M-A: the bearer and the caller HMAC secrets move
+    # from os.environ into memory (no child process inherits them) and the
+    # service becomes non-dumpable (a same-uid worker cannot read
+    # /proc/<pid>/environ or ptrace it). Unconditional, every start.
+    moved = seal_process_environment()
+    if moved:
+        logger.info("moved %d secret variable(s) out of the environment: %s", len(moved), ", ".join(moved))
 
     run_id = Path(log_dir).expanduser().resolve().parent.name if log_dir else None
     effective_root = None if log_dir else runs_root

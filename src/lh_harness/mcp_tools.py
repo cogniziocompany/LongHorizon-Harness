@@ -516,6 +516,11 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                     "description": "Map of field name to value (strings).",
                     "additionalProperties": {"type": "string"},
                 },
+                "secret_targets": {
+                    "type": "object",
+                    "description": "Every secret field submitted, mapped to the apply target shown to the person ('' when none). Recorded in the vault with the value.",
+                    "additionalProperties": {"type": "string"},
+                },
             },
         ),
         _tool_spec(
@@ -763,7 +768,7 @@ def _overseer_list_open_asks(
 _ASK_TOOL_KEYS: dict[str, set[str]] = {
     "raise_open_ask": {"id", "ask", "kind", "evidence", "recommended", "default_if_silent", "fields"},
     "declare_ask_fields": {"id", "fields"},
-    "respond_open_ask": {"id", "actor", "fields"},
+    "respond_open_ask": {"id", "actor", "fields", "secret_targets"},
     "clear_ask_secret": {"id", "field", "actor"},
     "apply_ask_secret": {"id", "field", "target"},
 }
@@ -824,6 +829,8 @@ def _dispatch_ask_tool(
     specs = ask_caller_specs(caller_configs, grants)
     caller, reason = verify_ask_request(tool_name, arguments, specs, runtime.nonces)
     claimed = arguments.get("caller")
+    # The helper vault re-verifies this exact signed request itself.
+    request = {"tool": tool_name, "arguments": dict(arguments)}
     arguments = strip_ask_signature(arguments)
     if caller == ANON_CALLER:
         audit(caller=str(claimed)[:32] if isinstance(claimed, str) else None, decision="unauthenticated", reason=reason)
@@ -858,11 +865,13 @@ def _dispatch_ask_tool(
                 arguments.get("actor"),
                 arguments.get("fields") if "fields" in arguments else {},
                 seed=None if store.get(ask_id) is not None else seed_lookup(ask_id),
+                secret_targets=arguments.get("secret_targets"),
+                request=request,
             )
             return {"ok": True, "row": row}
         if tool_name == "clear_ask_secret":
             row = store.clear_secret(
-                validate_ask_id(arguments.get("id")), arguments.get("field"), arguments.get("actor")
+                validate_ask_id(arguments.get("id")), arguments.get("field"), arguments.get("actor"), request=request
             )
             return {"ok": True, "row": row}
         # apply_ask_secret
@@ -872,7 +881,7 @@ def _dispatch_ask_tool(
             return {"ok": False, "error": f"target {str(target)[:128]!r} is not on the apply allow-list", "code": 403}
         try:
             result = store.apply_secret(
-                validate_ask_id(arguments.get("id")), arguments.get("field"), target, actor=caller
+                validate_ask_id(arguments.get("id")), arguments.get("field"), target, actor=caller, request=request
             )
         except AskStoreError as exc:
             audit(caller=caller, target=target, decision="failed", code=exc.code)

@@ -198,7 +198,7 @@ def test_respond_round_trip_never_returns_the_secret(tmp_path: Path) -> None:
     world = _World(tmp_path)
     value = _pat()
     _raise_cred(world)
-    resp = world.call("respond_open_ask", {"id": "cred-1", "actor": "paxton@example.com", "fields": {"response": "done", "secret": value}}, "fleet-admin")
+    resp = world.call("respond_open_ask", {"id": "cred-1", "actor": "paxton@example.com", "fields": {"response": "done", "secret": value}, "secret_targets": {"secret": TARGET}}, "fleet-admin")
     assert resp["ok"] and resp["row"]["state"].endswith("by paxton@example.com (web)")
     listed = world.asks(include_closed=True)
     assert value not in json.dumps([resp, listed, world.asks()])
@@ -212,7 +212,7 @@ def test_respond_round_trip_never_returns_the_secret(tmp_path: Path) -> None:
 def test_secret_tools_disabled_but_bodies_work(tmp_path: Path) -> None:
     world = _World(tmp_path, secrets_disabled="disabled: store readable by worker uid 1000 (/x)")
     _raise_cred(world)
-    r = world.call("respond_open_ask", {"id": "cred-1", "actor": "a@example.com", "fields": {"secret": _pat()}}, "fleet-admin")
+    r = world.call("respond_open_ask", {"id": "cred-1", "actor": "a@example.com", "fields": {"secret": _pat()}, "secret_targets": {"secret": TARGET}}, "fleet-admin")
     assert r["code"] == 503 and r["error"].startswith("disabled: store readable by worker uid")
     ok = world.call("respond_open_ask", {"id": "cred-1", "actor": "a@example.com", "fields": {"response": "note"}}, "fleet-admin")
     assert ok["ok"] is True
@@ -240,12 +240,12 @@ def test_include_closed_must_be_a_boolean(tmp_path: Path) -> None:
 def test_apply_off_list_and_mismatched_targets_refused(tmp_path: Path) -> None:
     world = _World(tmp_path, writer=lambda *a: pytest.fail("writer must not run"))
     _raise_cred(world)
-    world.call("respond_open_ask", {"id": "cred-1", "actor": "a@example.com", "fields": {"secret": _pat()}}, "fleet-admin")
+    world.call("respond_open_ask", {"id": "cred-1", "actor": "a@example.com", "fields": {"secret": _pat()}, "secret_targets": {"secret": TARGET}}, "fleet-admin")
     r = world.call("apply_ask_secret", {"id": "cred-1", "field": "secret", "target": "ct202-mcp-tools-env:LITELLM_MASTER_KEY"}, "overseer")
     assert r["code"] == 403
     # The D2 default secret field declares no target: apply refuses (409).
     world.call("raise_open_ask", {"id": "cred-2", "ask": "t", "kind": "CREDENTIAL"}, "overseer")
-    world.call("respond_open_ask", {"id": "cred-2", "actor": "a@example.com", "fields": {"secret": _pat()}}, "fleet-admin")
+    world.call("respond_open_ask", {"id": "cred-2", "actor": "a@example.com", "fields": {"secret": _pat()}, "secret_targets": {"secret": ""}}, "fleet-admin")
     assert world.call("apply_ask_secret", {"id": "cred-2", "field": "secret", "target": TARGET}, "overseer")["code"] == 409
     rows = {r["id"]: r for r in world.asks(include_closed=True)["rows"]}
     assert rows["cred-1"]["state"].startswith("CLOSED") and rows["cred-2"]["state"].startswith("CLOSED")
@@ -263,7 +263,7 @@ def test_apply_success_and_failure_through_dispatch(tmp_path: Path) -> None:
 
     world = _World(tmp_path, writer=writer)
     _raise_cred(world)
-    world.call("respond_open_ask", {"id": "cred-1", "actor": "a@example.com", "fields": {"secret": value}}, "fleet-admin")
+    world.call("respond_open_ask", {"id": "cred-1", "actor": "a@example.com", "fields": {"secret": value}, "secret_targets": {"secret": TARGET}}, "fleet-admin")
     failed = world.call("apply_ask_secret", {"id": "cred-1", "field": "secret", "target": TARGET}, "overseer")
     assert failed["code"] == 502 and value not in json.dumps(failed)
     row = next(r for r in world.asks()["rows"] if r["id"] == "cred-1")
@@ -279,7 +279,7 @@ def test_archive_row_copied_into_store_on_first_response(tmp_path: Path) -> None
     world = _World(tmp_path, gated=False)
     archive_row = next(r for r in world.asks()["rows"] if r["id"] == "279-gateway-github-token")
     assert archive_row["origin"] == "archive" and [f["name"] for f in archive_row["fields"]] == ["response", "secret"]
-    resp = world.call("respond_open_ask", {"id": "279-gateway-github-token", "actor": "p@example.com", "fields": {"secret": _pat()}}, "fleet-admin")
+    resp = world.call("respond_open_ask", {"id": "279-gateway-github-token", "actor": "p@example.com", "fields": {"secret": _pat()}, "secret_targets": {"secret": ""}}, "fleet-admin")
     assert resp["ok"] and resp["row"]["origin"] == "archive"
     assert "279-gateway-github-token" not in [r["id"] for r in world.asks()["rows"]]
     rows = [r for r in world.asks(include_closed=True)["rows"] if r["id"] == "279-gateway-github-token"]
@@ -373,3 +373,71 @@ def test_cross_language_signature_vector() -> None:
 
 
 VECTOR_SIG = "2078ce4ccb0136cb70e509a1a227885649683d96bb2b11df48015c8a2901993f"
+
+
+def test_declare_refuses_to_retarget_a_sealed_field_through_dispatch(tmp_path: Path) -> None:
+    world = _World(tmp_path)
+    _raise_cred(world)
+    world.call("respond_open_ask", {"id": "cred-1", "actor": "a@example.com", "fields": {"secret": _pat()}, "secret_targets": {"secret": TARGET}}, "fleet-admin")
+    r = world.call("declare_ask_fields", {"id": "cred-1", "fields": [{"name": "secret", "type": "secret"}]}, "overseer")
+    assert r["code"] == 409 and "sealed" in r["error"]
+
+
+def test_respond_with_a_stale_target_is_refused(tmp_path: Path) -> None:
+    world = _World(tmp_path)
+    _raise_cred(world)
+    stale = world.call("respond_open_ask", {"id": "cred-1", "actor": "a@example.com", "fields": {"secret": _pat()}, "secret_targets": {"secret": ""}}, "fleet-admin")
+    assert stale["code"] == 409
+    missing = world.call("respond_open_ask", {"id": "cred-1", "actor": "a@example.com", "fields": {"secret": _pat()}}, "fleet-admin")
+    assert missing["code"] == 400
+
+
+def test_dispatch_through_the_real_helper_end_to_end(tmp_path: Path) -> None:
+    """The service forwards the exact signed request and the helper (same
+    code that runs as the vault uid) re-verifies it, seals with the target the
+    person saw, and applies only as the overseer."""
+    import importlib.machinery
+    import importlib.util
+    import io
+
+    from lh_harness.ask_store import HelperVault
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "ask-apply" / "lh-ask-vault"
+    loader = importlib.machinery.SourceFileLoader("lh_ask_vault_e2e", str(script))
+    helper = importlib.util.module_from_spec(importlib.util.spec_from_loader("lh_ask_vault_e2e", loader))
+    loader.exec_module(helper)
+    (tmp_path / "hv").mkdir(mode=0o700)
+    cfg = {
+        "_path": str(tmp_path / "cfg.json"),
+        "vault_dir": str(tmp_path / "hv"),
+        "state_dir": str(tmp_path / "hstate"),
+        "ssh_key": "/k",
+        "ssh_dest": {TARGET: "lhapply@192.0.2.10"},
+        "grants": GRANTS,
+        "callers": {"fleet-admin": caller_secret("fleet-admin"), "overseer": caller_secret("overseer")},
+    }
+    sent: list[str] = []
+
+    def ssh(argv, **kw):
+        sent.append(kw["input"])
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    def run(argv, **kw):
+        out, err = io.StringIO(), io.StringIO()
+        import contextlib as _c
+
+        with _c.redirect_stdout(out), _c.redirect_stderr(err):
+            rc = helper.main(["lh-ask-vault", *argv[1:]], cfg=cfg, stdin=io.StringIO(kw.get("input") or ""), run=ssh)
+        return SimpleNamespace(returncode=rc, stdout=out.getvalue(), stderr=err.getvalue())
+
+    world = _World(tmp_path)
+    world.runtime.vault = HelperVault(["/usr/local/sbin/lh-ask-vault"], run=run)
+    value = _pat()
+    _raise_cred(world)
+    ok = world.call("respond_open_ask", {"id": "cred-1", "actor": "p@example.com", "fields": {"secret": value}, "secret_targets": {"secret": TARGET}}, "fleet-admin")
+    assert ok["ok"], ok
+    assert (tmp_path / "hv" / "cred-1" / "secret").read_text(encoding="utf-8") == value
+    assert not (tmp_path / "vault").exists()  # nothing sealed service-side
+    applied = world.call("apply_ask_secret", {"id": "cred-1", "field": "secret", "target": TARGET}, "overseer")
+    assert applied["ok"] is True and sent == [value + "\n"]
+    assert value not in json.dumps([ok, applied, world.asks(include_closed=True)])

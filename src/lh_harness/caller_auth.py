@@ -121,6 +121,20 @@ def _signature_matches(caller: str, ts: str, supplied: str, secret: str | None) 
     return hmac.compare_digest(expected, supplied.strip().lower())
 
 
+# Secrets moved out of os.environ at service startup (task A3d review H-B,
+# safe_subprocess.seal_process_environment): children never inherit them.
+_CAPTURED_SECRETS: dict[str, str] = {}
+
+
+def capture_secret(name: str, value: str) -> None:
+    if value:
+        _CAPTURED_SECRETS[name] = value
+
+
+def captured_secret(name: str) -> str | None:
+    return _CAPTURED_SECRETS.get(name) or os.environ.get(name) or None
+
+
 def _secret_for(spec: dict[str, Any] | None) -> str | None:
     """Read the caller's secret from the env var NAMED in config.
 
@@ -132,8 +146,7 @@ def _secret_for(spec: dict[str, Any] | None) -> str | None:
     env_name = str(spec.get("secret_env") or "").strip()
     if not env_name:
         return None
-    value = os.environ.get(env_name)
-    return value if value else None
+    return captured_secret(env_name)
 
 
 def _fresh(ts_text: str | None) -> str | None:
