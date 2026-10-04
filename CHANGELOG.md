@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Run list failure fields.** `GET /api/runs?fields=summary` rows of terminal
+  runs now carry `outcome` (the terminal lifecycle status, else report.json
+  `status`), `abort_reason` and `failure_reason` (`<abort_reason> |
+  <failure_reason>` from report.json plus the supervisor's `failure_reason`,
+  else a supervisor-generated report's `error`, else the worker's `Stopped:`
+  line). Both reasons are ASCII-only and at most 200 characters. Live rows are
+  unchanged (the keys are absent), so existing readers see the same shape.
+  report.json is parsed once per finished run (memoized on mtime/size).
+  Hydra's `list_fleet_runs` can now show why a run created outside the queue
+  failed. New module `src/lh_harness/run_outcome.py`.
+
 - **Experience layer (MSCE Phase 1).** Optional valued L1 trace persistence:
   one redacted JSONL record per managed round written to
   `role_orchestration/experience.jsonl` in the run dir at finalization,

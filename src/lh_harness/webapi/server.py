@@ -1001,6 +1001,12 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
     for field in ("agent", "model", "max_rounds", "prompt_language", "task_name"):
         if field in item:
             row[field] = item[field]
+    # How a finished run ended (terminal runs only; absent on live rows, so
+    # older readers see the same shape).  ASCII, at most 200 characters.
+    for field in ("outcome", "abort_reason", "failure_reason"):
+        value = item.get(field)
+        if isinstance(value, str) and value:
+            row[field] = value
     if isinstance(item.get("round"), int) and not isinstance(item.get("round"), bool):
         row["round"] = item["round"]
     return row
@@ -2013,7 +2019,10 @@ def create_app(
             fields=summary  - omit large per-run fields (``task``, ``task_summary``,
                               provenance blob, etc.) and return only ``id``,
                               ``status``, ``workspace``, ``updated_at`` and
-                              ``round``.
+                              ``round``, plus, for terminal runs only,
+                              ``outcome``, ``abort_reason`` and
+                              ``failure_reason`` (ASCII, <=200 chars; see
+                              ``lh_harness.run_outcome``).
             status=x,y,z    - comma-list filter; only runs whose lifecycle status is
                               exactly one of the given values are returned.
 
