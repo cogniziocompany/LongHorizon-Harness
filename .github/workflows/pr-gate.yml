@@ -44,7 +44,14 @@ jobs:
       - name: Build (pip install -e .)
         run: python -m pip install -e '.[test]' pyyaml
 
+      # Several tests create throwaway git repos and commit into them; a
+      # GitHub-hosted runner has no git identity, so give the test job one.
       - name: Test (the badge means tests ran)
+        env:
+          GIT_AUTHOR_NAME: pr-gate
+          GIT_AUTHOR_EMAIL: pr-gate@users.noreply.github.com
+          GIT_COMMITTER_NAME: pr-gate
+          GIT_COMMITTER_EMAIL: pr-gate@users.noreply.github.com
         run: |
           set -o pipefail
           mkdir -p .pr-gate
@@ -57,6 +64,9 @@ jobs:
         with:
           name: test-report
           path: .pr-gate/
+          # upload-artifact@v4 skips hidden paths unless told otherwise, and
+          # .pr-gate/ is one (the first run uploaded nothing).
+          include-hidden-files: true
           retention-days: 14
           if-no-files-found: warn
 
@@ -104,5 +114,6 @@ jobs:
         with:
           name: gitleaks-report
           path: .pr-gate/gitleaks-report.json
+          include-hidden-files: true
           retention-days: 14
           if-no-files-found: warn
