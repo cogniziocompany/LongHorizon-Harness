@@ -157,7 +157,13 @@ _NON_RETRYABLE_CAUSE_SIGNATURES = (
     "user_cancelled",
     "manager_blocked",
     "worker_cancelled",
+    # per-task wall-clock limit (fc-H2): the run was stopped on purpose
+    "time_limit",
 )
+
+# Failure cause recorded on a launched entry whose run the launcher stopped for
+# exceeding its wall-clock limit (task fc-H2).  Never requeued.
+TIME_LIMIT_CAUSE = "time_limit"
 
 # Provider quota / spend-limit exhaustion (provider_errors.py's "quota" kind
 # reports abort_reason=provider_quota).  Retryable, but only after a backoff:
@@ -762,6 +768,7 @@ class Launcher:
                 continue
             run_id = entry.run_id
             if run_id in active:
+                self._enforce_time_limit(entry)
                 continue
             status = self.supervisor.status(run_id)
             lifecycle = canonical_lifecycle_status(status.get("status"))
@@ -801,6 +808,10 @@ class Launcher:
                 )
             else:
                 cause = self._reconcile_failure_cause(run_id, f"run {run_status}")
+                if entry.failure_cause == TIME_LIMIT_CAUSE:
+                    # Stopped by _enforce_time_limit: the cause is the limit,
+                    # whatever the report says about the interrupted round.
+                    cause = f"{TIME_LIMIT_CAUSE} | {cause}"
                 updated = self.queue_store.mark_failed(
                     entry.queue_id, reason=cause[:_MAX_REASON_LEN]
                 )
@@ -822,6 +833,58 @@ class Launcher:
             if updated is not None:
                 updated.last_checked_at = _now()
                 self.queue_store.update(updated)
+
+    def _time_limit_minutes(self, entry: QueueEntry) -> int | None:
+        """The entry's own limit, else ``[queue] default_time_limit_minutes``."""
+
+        value = getattr(entry, "time_limit_minutes", None)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        default = self._config.get("default_time_limit_minutes")
+        if isinstance(default, int) and not isinstance(default, bool) and default > 0:
+            return default
+        return None
+
+    def _enforce_time_limit(self, entry: QueueEntry, now: float | None = None) -> bool:
+        """Stop an active run that has outlived its wall-clock limit (fc-H2).
+
+        Elapsed time is wall clock since ``launched_at``.  Once the limit is
+        passed the launcher stops the run, emits ``run.time_limit_exceeded``
+        and records ``failure_cause = "time_limit"`` on the still-launched
+        entry; the normal terminal pass then marks it failed with that cause,
+        which is never requeued.  Returns True when it stopped the run.
+        """
+
+        if entry.failure_cause == TIME_LIMIT_CAUSE:
+            return False  # already stopped; waiting for the run to go terminal
+        limit = self._time_limit_minutes(entry)
+        launched_at = entry.launched_at
+        if limit is None or not isinstance(launched_at, (int, float)) or not launched_at:
+            return False
+        current = _now() if now is None else now
+        elapsed = current - float(launched_at)
+        if elapsed <= limit * 60:
+            return False
+        run_id = str(entry.run_id)
+        stop_error: str | None = None
+        try:
+            self.supervisor.stop(run_id)
+        except Exception as exc:  # the run may have exited between checks
+            stop_error = str(exc)[:200]
+        elapsed_minutes = round(elapsed / 60.0, 1)
+        payload: dict[str, Any] = {
+            "queue_id": entry.queue_id,
+            "run_id": run_id,
+            "limit_minutes": limit,
+            "elapsed_minutes": elapsed_minutes,
+        }
+        if stop_error is not None:
+            payload["stop_error"] = stop_error
+        self._emit_run_event(run_id, "run.time_limit_exceeded", payload)
+        entry.failure_cause = TIME_LIMIT_CAUSE
+        entry.reason = f"time limit {limit} min exceeded after {elapsed_minutes} min; run stopped"
+        self.queue_store.update(entry)
+        return True
 
     def _read_run_report(self, run_id: str) -> dict[str, Any]:
         """Read the manager audit report for a run from durable storage."""

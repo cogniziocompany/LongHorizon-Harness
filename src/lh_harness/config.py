@@ -342,6 +342,12 @@ auditor = 300
 #                       # not on origin/main as an OCCUPIED workspace. Per-
 #                       # environment overseer override; active-run ownership
 #                       # always applies.
+# default_time_limit_minutes = 120
+#                       # Optional per-task wall-clock limit (1-1440 minutes
+#                       # from launch) for entries that set no
+#                       # time_limit_minutes of their own. Unset = no limit.
+#                       # The launcher stops an expired run and does not
+#                       # requeue it (failure cause time_limit).
 
 # MSCE experience levels L2/L3 (Paxton 2026-09-08): instance overrides for the
 # seeded defaults shipped in lh_harness.experience.seed. Read-only knowledge —
@@ -642,6 +648,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "observe",
         "occupancy_ignore_dirty",
         "database_url",
+        "default_time_limit_minutes",
     }
     if unknown_queue_keys:
         raise ProjectConfigError(f"unknown [queue] key(s): {_names(unknown_queue_keys)}")
@@ -745,6 +752,17 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     database_url = queue.get("database_url", "")
     if not isinstance(database_url, str):
         raise ProjectConfigError("[queue].database_url must be a string")
+    # Per-task wall-clock limit default (task fc-H2): applies to entries that
+    # carry no time_limit_minutes of their own. Unset = no limit.
+    default_time_limit = queue.get("default_time_limit_minutes")
+    if default_time_limit is not None and (
+        isinstance(default_time_limit, bool)
+        or not isinstance(default_time_limit, int)
+        or not 1 <= default_time_limit <= 1440
+    ):
+        raise ProjectConfigError(
+            "[queue].default_time_limit_minutes must be an integer between 1 and 1440"
+        )
     return {
         "trios": normalized_trios,
         "capacity": normalized_capacity,
@@ -752,6 +770,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "observe": observe,
         "occupancy_ignore_dirty": occupancy_ignore_dirty,
         "database_url": database_url.strip(),
+        "default_time_limit_minutes": default_time_limit,
     }
 
 

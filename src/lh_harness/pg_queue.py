@@ -57,6 +57,8 @@ _COLUMN_ATTEMPT = "attempt"
 _COLUMN_FAILURE_CAUSE = "failure_cause"
 _COLUMN_NOT_BEFORE = "not_before"
 _COLUMN_WAIT_REASON = "wait_reason"
+# Per-task wall-clock limit (task fc-H2, migration 006).
+_COLUMN_TIME_LIMIT_MINUTES = "time_limit_minutes"
 # ``requester`` (task 300) still has no column; see ``create``.
 _QUEUE_COLUMNS = (
     _COLUMN_QUEUE_ID,
@@ -84,6 +86,7 @@ _QUEUE_COLUMNS = (
     _COLUMN_FAILURE_CAUSE,
     _COLUMN_NOT_BEFORE,
     _COLUMN_WAIT_REASON,
+    _COLUMN_TIME_LIMIT_MINUTES,
 )
 
 # Same bound the file store applies in ``QueueStore.requeue``.
@@ -105,6 +108,9 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
     attempt = entry.attempt
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
         attempt = 1
+    time_limit = getattr(entry, "time_limit_minutes", None)
+    if isinstance(time_limit, bool) or not isinstance(time_limit, int) or time_limit < 1:
+        time_limit = None
     return [
         entry.queue_id,
         entry.name,
@@ -131,6 +137,7 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         entry.failure_cause,
         float(not_before) if not_before is not None else None,
         wait_reason,
+        time_limit,
     ]
 
 
@@ -643,6 +650,7 @@ class PgQueueStore:
             created_at=time.time(),
             updated_at=time.time(),
             dedup_key=None,  # retries must not collide with original dedup_key
+            time_limit_minutes=entry.time_limit_minutes,
             not_before=float(not_before) if not_before is not None else None,
             wait_reason=(
                 str(wait_reason)[:_MAX_WAIT_REASON_CHARS]

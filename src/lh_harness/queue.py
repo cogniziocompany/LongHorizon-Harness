@@ -106,8 +106,36 @@ KNOWN_REQUEST_KEYS = frozenset(
         "requested_by",
         "dedup_key",
         "requester",
+        "time_limit_minutes",
     }
 )
+
+# Per-task wall-clock limit (task fc-H2): minutes from launch after which the
+# launcher stops the run.  Optional; ``None`` means no limit.
+TIME_LIMIT_MIN_MINUTES = 1
+TIME_LIMIT_MAX_MINUTES = 1440
+
+
+def validate_time_limit_minutes(value: Any) -> int | None:
+    """``None`` or an int in 1..1440; anything else raises ValueError.
+
+    Shared by the enqueue body, ``[queue] default_time_limit_minutes`` and
+    ``POST /api/runs/{run_id}/time_limit``.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"time_limit_minutes must be an integer between {TIME_LIMIT_MIN_MINUTES} "
+            f"and {TIME_LIMIT_MAX_MINUTES} (or null)"
+        )
+    if not TIME_LIMIT_MIN_MINUTES <= value <= TIME_LIMIT_MAX_MINUTES:
+        raise ValueError(
+            f"time_limit_minutes must be between {TIME_LIMIT_MIN_MINUTES} and "
+            f"{TIME_LIMIT_MAX_MINUTES}"
+        )
+    return value
 
 
 class UnknownQueueFieldError(ValueError):
@@ -235,6 +263,10 @@ class QueueEntry:
     # Waiting is a launcher skip, never a new attempt.
     not_before: float | None = None
     wait_reason: str | None = None
+    # Per-task wall-clock limit (task fc-H2), minutes from ``launched_at``.
+    # ``None`` = no per-entry limit ([queue] default_time_limit_minutes may
+    # still apply in the launcher).
+    time_limit_minutes: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -273,6 +305,7 @@ class QueueEntry:
             "failure_cause",
             "not_before",
             "wait_reason",
+            "time_limit_minutes",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -698,6 +731,7 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "requested_by": requested_by,
         "dedup_key": _validate_dedup_key(body.get("dedup_key")),
         "requester": requester_block,
+        "time_limit_minutes": validate_time_limit_minutes(body.get("time_limit_minutes")),
     }
 
 
@@ -773,11 +807,17 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
     backoff = normalize_quota_backoff_minutes(capacity.get("quota_backoff_minutes"))
     if backoff is not None:
         normalized_capacity["quota_backoff_minutes"] = backoff
+    default_time_limit = queue.get("default_time_limit_minutes") if isinstance(queue, dict) else None
+    try:
+        default_time_limit = validate_time_limit_minutes(default_time_limit)
+    except ValueError:
+        default_time_limit = None
     return {
         "trios": normalized_trios,
         "capacity": normalized_capacity,
         "observe": observe,
         "occupancy_ignore_dirty": occupancy_ignore_dirty,
+        "default_time_limit_minutes": default_time_limit,
     }
 
 
@@ -1274,6 +1314,7 @@ class QueueStore:
             updated_at=_now(),
             dedup_key=None,  # retries must not collide with original dedup_key
             requester=entry.requester,  # the retry carries the same requester identity
+            time_limit_minutes=entry.time_limit_minutes,
             not_before=float(not_before) if not_before is not None else None,
             wait_reason=str(wait_reason)[:64] if (not_before is not None and wait_reason) else None,
         )
