@@ -49,10 +49,15 @@ _COLUMN_UPDATED_AT = "updated_at"
 _COLUMN_LAUNCHED_AT = "launched_at"
 _COLUMN_LAST_CHECKED_AT = "last_checked_at"
 _COLUMN_DEDUP_KEY = "dedup_key"
-# ``retry_of``/``attempt``/``failure_cause`` stay outside the column set: the
-# requeue feature is out of scope for task 233 and the file store's successor
-# round-trip already matches on the caller-facing fields (branch,
-# continue_branch, priority, dedup_key).
+# Retry lineage and provider-quota backoff (migration 005): persisted like the
+# file store persists them, so a requeued entry keeps its attempt count (the
+# max_retries cap) and its not_before window across a re-read.
+_COLUMN_RETRY_OF = "retry_of"
+_COLUMN_ATTEMPT = "attempt"
+_COLUMN_FAILURE_CAUSE = "failure_cause"
+_COLUMN_NOT_BEFORE = "not_before"
+_COLUMN_WAIT_REASON = "wait_reason"
+# ``requester`` (task 300) still has no column; see ``create``.
 _QUEUE_COLUMNS = (
     _COLUMN_QUEUE_ID,
     _COLUMN_NAME,
@@ -74,7 +79,106 @@ _QUEUE_COLUMNS = (
     _COLUMN_LAUNCHED_AT,
     _COLUMN_LAST_CHECKED_AT,
     _COLUMN_DEDUP_KEY,
+    _COLUMN_RETRY_OF,
+    _COLUMN_ATTEMPT,
+    _COLUMN_FAILURE_CAUSE,
+    _COLUMN_NOT_BEFORE,
+    _COLUMN_WAIT_REASON,
 )
+
+# Same bound the file store applies in ``QueueStore.requeue``.
+_MAX_WAIT_REASON_CHARS = 64
+
+
+def _entry_values(entry: QueueEntry) -> list[Any]:
+    """One row's values in ``_QUEUE_COLUMNS`` order (the single source for
+    INSERT and UPDATE, so a new column cannot be written by one and not the
+    other)."""
+    not_before = entry.not_before
+    if isinstance(not_before, bool) or not isinstance(not_before, (int, float)):
+        not_before = None
+    wait_reason = entry.wait_reason
+    if not_before is None or not wait_reason:
+        wait_reason = None
+    else:
+        wait_reason = str(wait_reason)[:_MAX_WAIT_REASON_CHARS]
+    attempt = entry.attempt
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        attempt = 1
+    return [
+        entry.queue_id,
+        entry.name,
+        entry.task,
+        entry.workspace,
+        entry.max_rounds,
+        entry.trio,
+        entry.priority,
+        entry.requested_by,
+        entry.branch,
+        entry.continue_branch,
+        entry.base_check,
+        entry.status,
+        entry.run_id,
+        entry.reason,
+        json.dumps(entry.skip_reasons),
+        entry.created_at,
+        entry.updated_at,
+        entry.launched_at,
+        entry.last_checked_at,
+        entry.dedup_key,
+        entry.retry_of,
+        attempt,
+        entry.failure_cause,
+        float(not_before) if not_before is not None else None,
+        wait_reason,
+    ]
+
+
+class _Txn:
+    """One unit of work on the store's connection, shaped like the calls the
+    store makes (``execute`` / ``fetchone`` / ``fetchall`` / ``commit``).
+
+    psycopg 3 closes a connection at the end of ``with connection:`` and a
+    connection has no ``fetchall``, so the store's ``with self._txn() as txn``
+    blocks could never run against a real server (every PG test skipped at
+    ``counts()``).  This wrapper runs the block on a cursor, commits on a clean
+    exit (which also ends a read's implicit transaction, so the connection is
+    never left idle in transaction) and rolls back on an exception.
+    """
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+        self._cur: Any = None
+
+    def __enter__(self) -> "_Txn":
+        self._cur = self._conn.cursor()
+        return self
+
+    def execute(self, sql: str, params: Any = None) -> "_Txn":
+        self._cur.execute(sql, params)
+        return self
+
+    def fetchone(self) -> Any:
+        return self._cur.fetchone()
+
+    def fetchall(self) -> list[Any]:
+        return self._cur.fetchall()
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            try:
+                self._cur.close()
+            except Exception:
+                pass
+        return False
 
 
 class OperationalError(RuntimeError):
@@ -134,8 +238,8 @@ class PgQueueStore:
         self._conn = _pg_connect(database_url)
         self._migrate()
 
-    def _txn(self) -> Any:
-        return self._conn
+    def _txn(self) -> _Txn:
+        return _Txn(self._conn)
 
     def _migrate(self) -> None:
         """Apply the queue migrations idempotently on first connect.
@@ -233,28 +337,19 @@ class PgQueueStore:
         dedup_key = params.get("dedup_key")
         now = time.time()
         queue_id = f"q-{uuid.uuid4().hex[:16]}"
-        values: list[Any] = [
-            queue_id,
-            params["name"],
-            params["task"],
-            params["workspace"],
-            params["max_rounds"],
-            params["trio"],
-            params["priority"],
-            params["requested_by"],
-            params["branch"],
-            params["continue_branch"],
-            params["base_check"],
-            "pending",
-            None,
-            None,
-            json.dumps([]),
-            now,
-            now,
-            None,
-            None,
-            dedup_key,
-        ]
+        from .queue import QueueEntry  # lazy: see TYPE_CHECKING note
+
+        entry = QueueEntry.from_dict(
+            {
+                "queue_id": queue_id,
+                "created_at": now,
+                "updated_at": now,
+                "status": "pending",
+                **params,
+                "skip_reasons": [],
+            }
+        )
+        values = _entry_values(entry)
         if dedup_key:
             existing = self._find_non_terminal_by_dedup(dedup_key)
             if existing is not None:
@@ -268,49 +363,33 @@ class PgQueueStore:
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"could not create queue entry: {exc}") from exc
-        from .queue import QueueEntry  # lazy: see TYPE_CHECKING note
-
-        return QueueEntry.from_dict(
-            {
-                "queue_id": queue_id,
-                "created_at": now,
-                "updated_at": now,
-                "status": "pending",
-                **params,
-                "skip_reasons": [],
-            }
-        )
+        return entry
 
     def _find_non_terminal_by_dedup(self, dedup_key: str) -> QueueEntry | None:
         """Return the non-terminal entry currently holding ``dedup_key``, if any.
 
         A non-terminal entry is one whose dedup key stays "in use" -- pending,
-        launched, or blocked (see ``_NON_TERMINAL_STATUS`` in queue.py).
+        launched, or blocked (see ``_NON_TERMINAL_STATUS`` in queue.py).  The
+        whole row is read, so the caller gets the same complete entry the file
+        store returns (a partial ``QueueEntry`` cannot even be constructed).
         """
-        from .queue import QueueEntry  # lazy: see TYPE_CHECKING note
+        from .queue import _NON_TERMINAL_STATUS  # lazy: see TYPE_CHECKING note
 
         try:
             with self._txn() as txn:
                 txn.execute(
-                    "SELECT queue_id, status FROM harness.queue "
-                    "WHERE dedup_key = %s AND status IN (%s, %s, %s)",
+                    f"SELECT {_comma_select(_QUEUE_COLUMNS)} FROM harness.queue "
+                    "WHERE dedup_key = %s AND status IN (%s, %s, %s) "
+                    "ORDER BY created_at",
                     (dedup_key, "pending", "launched", "blocked"),
                 )
                 rows = txn.fetchall()
         except Exception as exc:
             raise OperationalError(f"could not look up dedup entry: {exc}") from exc
-        from .queue import _NON_TERMINAL_STATUS  # lazy: see TYPE_CHECKING note
-
         for row in rows:
-            if row[1] in _NON_TERMINAL_STATUS:
-                return QueueEntry.from_dict(
-                    {
-                        "queue_id": row[0],
-                        "status": row[1],
-                        "dedup_key": dedup_key,
-                        "skip_reasons": [],
-                    }
-                )
+            entry = self._row_to_entry(row)
+            if entry is not None and entry.status in _NON_TERMINAL_STATUS:
+                return entry
         return None
 
     # -- list / get -----------------------------------------------------------
@@ -355,6 +434,8 @@ class PgQueueStore:
         if column == "skip_reasons":
             if value is None:
                 return []
+            if isinstance(value, list):  # psycopg decodes JSONB itself
+                return value
             try:
                 parsed = json.loads(value)
             except (json.JSONDecodeError, TypeError):
@@ -362,31 +443,12 @@ class PgQueueStore:
             return parsed if isinstance(parsed, list) else []
         if column in {"max_rounds", "priority", "created_at", "updated_at", "launched_at", "last_checked_at"}:
             return value if value is not None else 0.0
+        if column == "attempt":
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else 1
         return value
 
     def _write(self, entry: QueueEntry) -> None:
-        values: list[Any] = [
-            entry.queue_id,
-            entry.name,
-            entry.task,
-            entry.workspace,
-            entry.max_rounds,
-            entry.trio,
-            entry.priority,
-            entry.requested_by,
-            entry.branch,
-            entry.continue_branch,
-            entry.base_check,
-            entry.status,
-            entry.run_id,
-            entry.reason,
-            json.dumps(entry.skip_reasons),
-            entry.created_at,
-            entry.updated_at,
-            entry.launched_at,
-            entry.last_checked_at,
-            entry.dedup_key,
-        ]
+        values = _entry_values(entry)
         try:
             with self._txn() as txn:
                 txn.execute(
@@ -520,11 +582,11 @@ class PgQueueStore:
         Args:
             queue_id: The ID of the failed entry to retry
             cause: The failure cause that triggered the retry
-            not_before: Accepted for parity with ``QueueStore.requeue``.  Like
-                ``retry_of``/``attempt``, it has no column yet: it rides only in
-                the ``queue_events`` payload, so the Postgres backend does not
-                enforce the provider-quota backoff until a migration adds it.
-            wait_reason: See ``not_before``.
+            not_before: Optional epoch seconds before which the launcher must
+                not launch the successor (provider-quota backoff); persisted
+                in the ``not_before`` column (migration 005)
+            wait_reason: Optional label for the wait (``wait_reason`` column,
+                at most 64 characters, kept only together with ``not_before``)
 
         Returns:
             The new successor QueueEntry, or None if the original entry not found
@@ -569,6 +631,10 @@ class PgQueueStore:
             trio=entry.trio,
             priority=entry.priority,
             requested_by=entry.requested_by,
+            # Like the file store (task 233): a retried continuation task
+            # stays a continuation task.
+            branch=entry.branch,
+            continue_branch=entry.continue_branch,
             base_check=entry.base_check,
             status="pending",
             retry_of=entry.queue_id,
@@ -578,34 +644,17 @@ class PgQueueStore:
             updated_at=time.time(),
             dedup_key=None,  # retries must not collide with original dedup_key
             not_before=float(not_before) if not_before is not None else None,
-            wait_reason=str(wait_reason)[:64] if (not_before is not None and wait_reason) else None,
+            wait_reason=(
+                str(wait_reason)[:_MAX_WAIT_REASON_CHARS]
+                if (not_before is not None and wait_reason)
+                else None
+            ),
         )
 
         # Insert the successor entry and an audit event
         try:
             with self._txn() as txn:
-                values: list[Any] = [
-                    successor.queue_id,
-                    successor.name,
-                    successor.task,
-                    successor.workspace,
-                    successor.max_rounds,
-                    successor.trio,
-                    successor.priority,
-                    successor.requested_by,
-                    successor.branch,
-                    successor.continue_branch,
-                    successor.base_check,
-                    successor.status,
-                    successor.run_id,
-                    successor.reason,
-                    json.dumps(successor.skip_reasons),
-                    successor.created_at,
-                    successor.updated_at,
-                    successor.launched_at,
-                    successor.last_checked_at,
-                    successor.dedup_key,
-                ]
+                values = _entry_values(successor)
                 txn.execute(
                     "INSERT INTO harness.queue (" + ", ".join(_QUEUE_COLUMNS) + ") VALUES (" + ", ".join(["%s"] * len(_QUEUE_COLUMNS)) + ")",
                     values,
