@@ -216,6 +216,35 @@ def strip_caller_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in arguments.items() if key not in CALLER_ARGUMENT_KEYS}
 
 
+def ask_caller_specs(
+    caller_configs: dict[str, dict[str, Any]] | None,
+    grants: dict[str, list[str]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Caller table used to verify ask-store tool callers (task A3d).
+
+    Ask tools ALWAYS verify the HMAC identity, even while task-174 ``[callers]``
+    scoping is OFF. A configured caller keeps its ``secret_env``; a caller that
+    appears only in ``[asks.grants]`` uses the conventional env name
+    ``LH_HARNESS_CALLER_<NAME>_SECRET``. ``anon`` is always present and empty.
+    """
+    from .config import _caller_secret_env
+
+    specs: dict[str, dict[str, Any]] = {
+        name: dict(spec) for name, spec in (caller_configs or {}).items()
+    }
+    for name in grants or {}:
+        specs.setdefault(name, {"secret_env": _caller_secret_env(name), "tools": []})
+    specs[ANON_CALLER] = {"secret_env": "", "tools": []}
+    return specs
+
+
+def ask_scope_allowed(caller: str, scope: str, grants: dict[str, list[str]] | None) -> bool:
+    """True only when ``[asks.grants]`` gives ``caller`` exactly ``scope``."""
+    if caller == ANON_CALLER:
+        return False
+    return scope in ((grants or {}).get(caller) or [])
+
+
 def tool_allowed(caller: str, tool: str, specs: dict[str, dict[str, Any]]) -> bool:
     """Return True only when ``tool`` is on ``caller``'s configured allowlist."""
     if caller == ANON_CALLER:
@@ -415,6 +444,8 @@ def header_names() -> dict[str, str]:
 __all__ = [
     "ANON_CALLER",
     "CALLER_ARGUMENT_KEYS",
+    "ask_caller_specs",
+    "ask_scope_allowed",
     "REST_RUN_CONTROL_TOOL",
     "RESOLVE_TOOL",
     "caller_configs_or_defaults",

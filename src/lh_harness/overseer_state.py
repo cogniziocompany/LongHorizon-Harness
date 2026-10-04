@@ -698,8 +698,13 @@ def list_open_asks(
     *,
     overseer_root: str | Path | None = None,
     live_rows: list[dict[str, str]] | None = None,
+    store_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return open asks: live rows first, then rows from ``queue/OPEN-ASKS.md``.
+
+    ``store_rows`` (task A3d) are the public rows of the CT110 ask store; when
+    given they are merged between the live and the archive rows (see
+    :func:`_merge_store_rows`). ``None`` keeps the A3b behaviour.
 
     ``live_rows`` (task A3) come from :func:`live_open_ask_rows`.  ``None``
     means no live state is wired and keeps the file-only behaviour, where a
@@ -709,8 +714,9 @@ def list_open_asks(
     ``include_closed: true`` to see closed/answered/superseded rows too.
     """
     result = _list_open_asks_file(arguments, overseer_root=overseer_root)
-    if live_rows is None:
+    if live_rows is None and store_rows is None:
         return result
+    live_rows = list(live_rows or [])
     if not result.get("ok"):
         if result.get("code") == 400:
             return result
@@ -733,11 +739,77 @@ def list_open_asks(
         )
     except ValueError as exc:
         return _bad_request(str(exc))
+    if store_rows is not None:
+        return _merge_store_rows(result, live_rows, store_rows, arguments, limit)
     rows = list(live_rows) + list(result.get("rows") or [])
     result["rows"] = rows[:limit]
     result["live_rows"] = len(live_rows)
     result["total_rows"] = int(result.get("total_rows") or 0) + len(live_rows)
     result["open_rows"] = int(result.get("open_rows") or 0) + len(live_rows)
+    return result
+
+
+def _merge_store_rows(
+    result: dict[str, Any],
+    live_rows: list[dict[str, str]],
+    store_rows: list[dict[str, Any]],
+    arguments: dict[str, Any],
+    limit: int,
+) -> dict[str, Any]:
+    """Task A3d: live rows, then ask-store rows, then archive-file rows.
+
+    - A live row (GATE/BLOCKED) with a store entry shows the store's state,
+      fields and response; a store entry whose live row is gone is dropped.
+    - A store row wins over an archive-file row with the same id.
+    - Every row carries ``fields`` (declared or the D2 defaults) and
+      ``response`` (secret fields as metadata only) plus its ``origin``.
+    """
+    from .ask_store import default_fields, is_closed_state
+
+    include_closed = bool(arguments.get("include_closed")) is True
+    by_id = {row["id"]: row for row in store_rows}
+    store_ids = set(by_id)
+
+    live_out: list[dict[str, Any]] = []
+    for row in live_rows:
+        stored = by_id.pop(row["id"], None)
+        if stored is not None:
+            live_out.append(
+                {
+                    **row,
+                    "state": stored["state"],
+                    "fields": stored["fields"],
+                    "response": stored["response"],
+                    "origin": "live",
+                }
+            )
+        else:
+            live_out.append({**row, "fields": default_fields(row.get("kind")), "response": {}, "origin": "live"})
+    # A live-origin entry whose gate/blocked entry no longer exists is dropped.
+    store_out = [dict(row) for row in by_id.values() if row.get("origin") != "live"]
+    file_rows = list(result.get("rows") or [])
+    overridden = [row for row in file_rows if row.get("id") in store_ids]
+    file_out = [
+        {**row, "fields": default_fields(row.get("kind")), "response": {}, "origin": "archive"}
+        for row in file_rows
+        if row.get("id") not in store_ids
+    ]
+    if not include_closed:
+        live_out = [row for row in live_out if not is_closed_state(row.get("state"))]
+        store_out = [row for row in store_out if not is_closed_state(row.get("state"))]
+    rows = live_out + store_out + file_out
+    file_open = int(result.get("open_rows") or 0) - sum(
+        1 for row in overridden if not is_closed_state(row.get("state"))
+    )
+    result["rows"] = rows[:limit]
+    result["live_rows"] = len(live_out)
+    result["store_rows"] = len(store_out)
+    result["total_rows"] = int(result.get("total_rows") or 0) - len(overridden) + len(live_rows) + len(
+        [row for row in store_rows if row.get("origin") != "live"]
+    )
+    result["open_rows"] = max(file_open, 0) + sum(
+        1 for row in live_out + store_out if not is_closed_state(row.get("state"))
+    )
     return result
 
 

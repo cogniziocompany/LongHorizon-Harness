@@ -290,6 +290,27 @@ def _load_caller_specs(
         return caller_configs_or_defaults(None)
 
 
+def _load_ask_grants(runs_root: str | Path | None) -> dict[str, list[str]]:
+    """Return ``[asks.grants]`` (task A3d) from the same config chain.
+
+    Any failure -- no file, no table, a malformed table -- yields ``{}``: no
+    caller holds an ask scope, so every ask-store write is refused (fail
+    closed). Reads (list_open_asks) are unaffected.
+    """
+    try:
+        from ..config import PROJECT_CONFIG_PATH, load_ask_grants
+    except ImportError:  # pragma: no cover - config always present in-tree
+        return {}
+    try:
+        if runs_root is not None:
+            config_path = _runs_root_config_path(runs_root)
+            if config_path is not None and Path(config_path).is_file():
+                return load_ask_grants(config_path)
+        return load_ask_grants(PROJECT_CONFIG_PATH)
+    except Exception:
+        return {}
+
+
 def _decode_ws_token_protocol(value: str) -> str | None:
     """Decode one bounded, URL-safe WebSocket auth protocol value."""
 
@@ -1130,6 +1151,7 @@ def create_app(
     bind_host: str = "127.0.0.1",
     probe_open_pr: "Callable[[Path, str], str | None] | None" = probe_open_pr_gh,
     caller_configs: dict[str, dict[str, Any]] | None = None,
+    ask_grants: dict[str, list[str]] | None = None,
 ) -> FastAPI:
     """Create an API app over a live shared state or a historical runs root.
 
@@ -1167,6 +1189,8 @@ def create_app(
         caller_specs = _load_caller_specs(runs_root)
     else:
         caller_specs = caller_configs_or_defaults(caller_configs)
+    # Task A3d: ask-store scopes. Injected tables (tests) skip the lookup.
+    ask_scope_grants = _load_ask_grants(runs_root) if ask_grants is None else dict(ask_grants)
 
     def _tools_manifest_for_scoping() -> list[dict[str, Any]]:
         """Manifest for this app: scoped hint when scoping is ON (task 174)."""
@@ -1839,6 +1863,8 @@ def create_app(
             # without identity enforcement, matching the REST routes.
             caller_configs=caller_specs,
             overseer_root=str(overseer_root) if overseer_root is not None else None,
+            ask_grants=ask_scope_grants,
+            ask_root=str(runs_root) if runs_root is not None else None,
         )
 
     @app.post("/api/mcp/fleet/{tool_name}")

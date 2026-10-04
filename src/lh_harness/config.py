@@ -57,7 +57,7 @@ _RUN_KEYS = {
 # NOT a run default — it never lands on HarnessConfig and never changes the
 # run flow); [run] and [queue] drive run defaults; [callers] carries the
 # per-caller tool scoping and budget ceilings (task 174).
-_TOP_LEVEL_KEYS = {"run", "queue", "experience", "callers"}
+_TOP_LEVEL_KEYS = {"run", "queue", "experience", "callers", "asks"}
 _QUEUE_TRIOS = {"kimi", "qwen"}
 # Trios a config MAY define but that are never filled in by default. ``orfree``
 # runs every role on an OpenRouter free model through the gateway (two keys,
@@ -91,8 +91,35 @@ _OVERSEER_TOOL_NAMES = frozenset(
         "get_handoff",
     }
 )
+# Task A3d: the writable open-asks store tools. Each is gated on ONE scope,
+# granted per caller in [asks.grants] (never by the task-174 ``tools`` lists,
+# and never by default): a verified caller identity (HMAC over caller+ts) is
+# required for every call, whether or not [callers] scoping is ON.
+ASK_SCOPES = ("overseer", "overseer:write", "overseer:apply")
+ASK_TOOL_SCOPES: dict[str, str] = {
+    "raise_open_ask": "overseer",
+    "declare_ask_fields": "overseer",
+    "respond_open_ask": "overseer:write",
+    "clear_ask_secret": "overseer:write",
+    "apply_ask_secret": "overseer:apply",
+}
+_ASK_TOOL_NAMES = frozenset(ASK_TOOL_SCOPES)
+# Task A3d (D1): the STATIC allow-list of places ``apply_ask_secret`` may write
+# a sealed secret to. It lives in code on purpose: adding a target is a
+# reviewed PR, never a config edit. Each entry names the env VARIABLE holding
+# the ssh destination (name only), the file and the variable written, and the
+# format the value must match before anything is sent.
+ASK_APPLY_TARGETS: dict[str, dict[str, str]] = {
+    "ct202-mcp-tools-env:GITHUB_MCP_TOKEN": {
+        "kind": "ssh-env-file",
+        "host_env": "LH_HARNESS_ASK_APPLY_CT202_SSH",
+        "file": "/opt/cognizioware-mcp-tools/mcp-tools.env",
+        "variable": "GITHUB_MCP_TOKEN",
+        "value_pattern": r"(github_pat_[A-Za-z0-9_]{20,255}|gh[pousr]_[A-Za-z0-9]{20,255})",
+    },
+}
 # The full dispatcher surface: unknown-tool 404 decisions use this set.
-_MCP_DISPATCH_TOOL_NAMES = _MCP_TOOL_NAMES | _OVERSEER_TOOL_NAMES
+_MCP_DISPATCH_TOOL_NAMES = _MCP_TOOL_NAMES | _OVERSEER_TOOL_NAMES | _ASK_TOOL_NAMES
 _CALLER_KEYS = {
     "secret_env",
     "tools",
@@ -356,6 +383,16 @@ auditor = 300
 #
 # [callers.hydra]
 # secret_env = "LH_HARNESS_CALLER_HYDRA_SECRET"
+
+# Writable open-asks store (task A3d). Nobody may write until a caller is
+# granted a scope here; the table does NOT turn on [callers] scoping. Each
+# caller signs with LH_HARNESS_CALLER_<NAME>_SECRET (env NAME only).
+#   overseer        raise_open_ask, declare_ask_fields
+#   overseer:write  respond_open_ask, clear_ask_secret (fleet-admin only)
+#   overseer:apply  apply_ask_secret (the overseer's caller only)
+# [asks.grants]
+# "fleet-admin" = ["overseer:write"]
+# overseer = ["overseer", "overseer:apply"]
 """
 
 
@@ -401,7 +438,45 @@ def load_run_defaults(path: str | Path = PROJECT_CONFIG_PATH) -> dict[str, Any]:
     if isinstance(queue, dict):
         result["queue"] = _flatten_queue_table(queue)
     result["callers"] = _flatten_callers_table(payload.get("callers", {}), source)
+    result["ask_grants"] = _flatten_asks_table(payload.get("asks", {}), source)
     return result
+
+
+def _flatten_asks_table(asks: Any, source: Path) -> dict[str, list[str]]:
+    """Validate ``[asks]`` (task A3d) and return ``{caller: [scope, ...]}``.
+
+    Only ``[asks.grants]`` is accepted. Grants are explicit: there are no
+    default grants, so a deployment without the table refuses every ask-store
+    write (fail closed). Defining ``[asks]`` does NOT turn on task-174
+    ``[callers]`` scoping for the other tools.
+    """
+    if not isinstance(asks, dict):
+        raise ProjectConfigError(f"[asks] in {source} must be a TOML table")
+    unknown = set(asks) - {"grants"}
+    if unknown:
+        raise ProjectConfigError(f"unknown [asks] key(s): {_names(unknown)}")
+    grants = asks.get("grants", {})
+    if not isinstance(grants, dict):
+        raise ProjectConfigError("[asks.grants] must be a TOML table")
+    result: dict[str, list[str]] = {}
+    for name, scopes in grants.items():
+        if name == _RESERVED_CALLER or not isinstance(name, str) or not _CALLER_NAME_RE.match(name):
+            raise ProjectConfigError(f"[asks.grants] caller name {name!r} is not allowed")
+        if not isinstance(scopes, list) or not all(isinstance(s, str) for s in scopes):
+            raise ProjectConfigError(f"asks.grants.{name} must be an array of scope names")
+        bad = set(scopes) - set(ASK_SCOPES)
+        if bad:
+            raise ProjectConfigError(f"asks.grants.{name}: unknown scope(s): {_names(bad)}")
+        result[name] = sorted(set(scopes))
+    return result
+
+
+def load_ask_grants(path: str | Path = PROJECT_CONFIG_PATH) -> dict[str, list[str]]:
+    """Return the ``[asks.grants]`` table, or ``{}`` (nobody may write)."""
+    source = Path(path)
+    if not source.is_file():
+        return {}
+    return load_run_defaults(source)["ask_grants"]
 
 
 def config_defines_callers(path: str | Path) -> bool:

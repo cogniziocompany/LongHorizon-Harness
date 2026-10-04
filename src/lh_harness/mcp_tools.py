@@ -25,6 +25,9 @@ from typing import Any
 from .caller_auth import (
     ANON_CALLER,
     RESOLVE_TOOL,
+    ask_caller_specs,
+    ask_scope_allowed,
+    emit_caller_audit,
     caller_configs_or_defaults,
     emit_refusal_audit,
     enqueue_rate_violation,
@@ -34,6 +37,7 @@ from .caller_auth import (
     tool_allowed,
 )
 from .config import _MCP_DISPATCH_TOOL_NAMES as _KNOWN_TOOLS
+from .config import ASK_APPLY_TARGETS, ASK_TOOL_SCOPES
 from .config import _MCP_TOOL_NAMES as _SCOPING_ELIGIBLE_TOOLS
 from .contention import detect_contention, groups_to_json
 from .workspace_identity import resolve_many
@@ -173,12 +177,50 @@ query substring. The ledger is the written record of what the scheduled
 overseer observed and decided, tick by tick, up to the cutover.
 """
 
-_LIST_OPEN_ASKS_DESCRIPTION = """List rows from the overseer open-asks register.
+_LIST_OPEN_ASKS_DESCRIPTION = """List what waits on Paxton: the open-asks rows.
 
-Returns the table from queue/OPEN-ASKS.md as it stood at export time, one row
-per thing the overseer was genuinely waiting on Paxton to decide. By default
-only rows that are still open are returned; pass include_closed=true to see
-the answered/closed rows too.
+Live rows first (one per pending gate, one per blocked queue entry), then the
+CT110 ask store (asks raised with raise_open_ask and every row someone
+responded to), then the archived queue/OPEN-ASKS.md rows. Each row carries
+its response fields and the saved response; secret fields show metadata only
+(set_at, set_by, length), never a value. By default only open rows are
+returned; pass include_closed=true to see the answered/closed rows too.
+"""
+
+# Task A3d: the writable CT110 ask store. Every one of these tools needs a
+# verified caller (HMAC caller/caller_ts/caller_sig) holding the tool's scope
+# in [asks.grants]; nothing is granted by default.
+_RAISE_OPEN_ASK_DESCRIPTION = """Raise a new open ask in the CT110 ask store (scope: overseer).
+
+Use this for anything that waits on Paxton and is not a gate or a blocked
+queue entry (those are derived live). Give the seven columns (id, ask, kind,
+evidence, recommended, default_if_silent; state starts OPEN) and optionally
+fields. Without fields the row gets one body field 'response', plus one secret
+field 'secret' when kind is CREDENTIAL.
+"""
+
+_DECLARE_ASK_FIELDS_DESCRIPTION = """Set or replace the response fields of an ask (scope: overseer).
+
+fields is a list of {name, type: body|secret, label, required}. Works on store
+asks, live GATE/BLOCKED rows and archive rows (copied into the store on first
+write). Removing a secret field deletes its sealed value.
+"""
+
+_RESPOND_OPEN_ASK_DESCRIPTION = """Submit a response to an ask (scope: overseer:write, fleet-admin only).
+
+{id, actor, fields: {name: value}}. Body values are stored, secret values are
+sealed on CT110 and only ever reported as metadata. The row closes at once as
+'CLOSED <ts> by <actor> (web)'; a submit to a closed row reopens it first.
+A response to a GATE row never resolves the gate.
+"""
+
+_CLEAR_ASK_SECRET_DESCRIPTION = """Delete one sealed secret of an ask (scope: overseer:write)."""
+
+_APPLY_ASK_SECRET_DESCRIPTION = """Apply a sealed secret to an allow-listed target (scope: overseer:apply).
+
+{id, field, target}. target must be on the static allow-list (today only
+ct202-mcp-tools-env:GITHUB_MCP_TOKEN). Returns {applied, target, at} and
+never the value. A failure reopens the ask with the reason in evidence.
 """
 
 _GET_HANDOFF_DESCRIPTION = """Return an operator handoff written during the overseer era.
@@ -264,6 +306,26 @@ def _requester_param() -> dict[str, Any]:
             "session_ref": {"type": "string", "description": "Optional; when absent and session_id looks like a UUID/hex, the first 6 hex chars are derived."},
             "notify": {"type": "string", "description": "Optional free-form string, where updates should go (e.g. 'handoff:/tmp/x.md', 'sendmessage:overseer1', 'open-asks', 'none'). Default 'none'. <=512 chars.", "maxLength": 512},
         },
+    }
+
+
+def _fields_param() -> dict[str, Any]:
+    """Schema for an ask's declared response fields (task A3d)."""
+    return {
+        "type": "array",
+        "description": "Response fields: [{name, type: body|secret, label, required}].",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$"},
+                "type": {"type": "string", "enum": ["body", "secret"]},
+                "label": {"type": "string", "maxLength": 120},
+                "required": {"type": "boolean"},
+            },
+            "required": ["name", "type"],
+        },
+        "maxItems": 8,
     }
 
 
@@ -416,6 +478,62 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
             },
         ),
         _tool_spec(
+            "raise_open_ask",
+            _RAISE_OPEN_ASK_DESCRIPTION,
+            {
+                "id": _string_param("New ask id, [A-Za-z0-9][A-Za-z0-9._-]{0,127}; not gate-/blocked-.", required=True),
+                "ask": _string_param("What is being asked (markdown).", required=True),
+                "kind": _string_param("Upper-case kind, e.g. CREDENTIAL or DECISION.", required=True),
+                "evidence": _string_param("Links and facts behind the ask."),
+                "recommended": _string_param("The overseer's recommendation."),
+                "default_if_silent": _string_param("What happens if nobody answers."),
+                "fields": _fields_param(),
+            },
+        ),
+        _tool_spec(
+            "declare_ask_fields",
+            _DECLARE_ASK_FIELDS_DESCRIPTION,
+            {
+                "id": _string_param("Ask id.", required=True),
+                "fields": _fields_param(),
+            },
+        ),
+        _tool_spec(
+            "respond_open_ask",
+            _RESPOND_OPEN_ASK_DESCRIPTION,
+            {
+                "id": _string_param("Ask id.", required=True),
+                "actor": _string_param("SSO e-mail of the person submitting.", required=True),
+                "fields": {
+                    "type": "object",
+                    "description": "Map of field name to value (strings).",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+        ),
+        _tool_spec(
+            "clear_ask_secret",
+            _CLEAR_ASK_SECRET_DESCRIPTION,
+            {
+                "id": _string_param("Ask id.", required=True),
+                "field": _string_param("Secret field name.", required=True),
+                "actor": _string_param("SSO e-mail of the person clearing it.", required=True),
+            },
+        ),
+        _tool_spec(
+            "apply_ask_secret",
+            _APPLY_ASK_SECRET_DESCRIPTION,
+            {
+                "id": _string_param("Ask id.", required=True),
+                "field": _string_param("Secret field name.", required=True),
+                "target": {
+                    "type": "string",
+                    "description": "Allow-listed target name.",
+                    "enum": sorted(ASK_APPLY_TARGETS),
+                },
+            },
+        ),
+        _tool_spec(
             "get_handoff",
             _GET_HANDOFF_DESCRIPTION,
             {
@@ -439,6 +557,9 @@ def dispatch(
     request_token: str | None,
     caller_configs: dict[str, dict[str, Any]] | None = None,
     overseer_root: str | None = None,
+    ask_grants: dict[str, list[str]] | None = None,
+    ask_root: str | None = None,
+    ask_apply_writer: Any = None,
 ) -> dict[str, Any]:
     """Run one MCP tool call and return a JSON-RPC style result.
 
@@ -469,6 +590,29 @@ def dispatch(
     if tool_name not in _KNOWN_TOOLS:
         return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
 
+    if ask_root is None:
+        ask_root = _runs_root(registry, supervisor) or getattr(queue_store, "runs_root", None)
+        ask_root = str(ask_root) if ask_root else None
+
+    # Task A3d: ask-store tools. Always identity-checked and scope-gated,
+    # independent of whether [callers] scoping is ON for the other tools.
+    if tool_name in ASK_TOOL_SCOPES:
+        return _dispatch_ask_tool(
+            tool_name,
+            arguments,
+            caller_configs=caller_configs,
+            ask_grants=ask_grants,
+            ask_root=ask_root,
+            writer=ask_apply_writer,
+            seed_lookup=lambda ask_id: _ask_seed(
+                ask_id,
+                overseer_root=overseer_root,
+                registry=registry,
+                supervisor=supervisor,
+                queue_store=queue_store,
+            ),
+        )
+
     # Task 235: the read-only overseer-state tools are called from the
     # authenticated overseer session, which carries no caller identity block.
     # They are not scoping-eligible (config keeps them out of ``tools``
@@ -494,6 +638,7 @@ def dispatch(
                     registry=registry,
                     supervisor=supervisor,
                     queue_store=queue_store,
+                    ask_root=ask_root,
                 )
             return handler(arguments, overseer_root=overseer_root)
         # Unreachable while _KNOWN_TOOLS == _SCOPING_ELIGIBLE_TOOLS | the
@@ -590,6 +735,7 @@ def _overseer_list_open_asks(
     registry: Any = None,
     supervisor: Any = None,
     queue_store: Any = None,
+    ask_root: str | None = None,
 ) -> dict[str, Any]:
     from .overseer_state import list_open_asks, live_open_ask_rows
 
@@ -599,7 +745,157 @@ def _overseer_list_open_asks(
             _gated_approvals(registry, supervisor),
             _blocked_queue_entries(queue_store),
         )
-    return list_open_asks(arguments, overseer_root=overseer_root, live_rows=live_rows)
+    store_rows = None
+    if ask_root:
+        from .ask_store import AskStore
+
+        try:
+            store_rows = AskStore(ask_root).public_rows()
+        except OSError:
+            store_rows = None
+    return list_open_asks(
+        arguments, overseer_root=overseer_root, live_rows=live_rows, store_rows=store_rows
+    )
+
+
+# Allowed argument keys per ask tool (after the caller fields are stripped).
+_ASK_TOOL_KEYS: dict[str, set[str]] = {
+    "raise_open_ask": {"id", "ask", "kind", "evidence", "recommended", "default_if_silent", "fields"},
+    "declare_ask_fields": {"id", "fields"},
+    "respond_open_ask": {"id", "actor", "fields"},
+    "clear_ask_secret": {"id", "field", "actor"},
+    "apply_ask_secret": {"id", "field", "target"},
+}
+
+
+def _ask_seed(
+    ask_id: Any,
+    *,
+    overseer_root: str | None,
+    registry: Any,
+    supervisor: Any,
+    queue_store: Any,
+) -> tuple[dict[str, Any], str] | None:
+    """Find a live or archive row to copy into the store on its first write."""
+    from .overseer_state import _list_open_asks_file, live_open_ask_rows
+
+    if not isinstance(ask_id, str):
+        return None
+    if ask_id.startswith(("gate-", "blocked-")):
+        rows = live_open_ask_rows(
+            _gated_approvals(registry, supervisor), _blocked_queue_entries(queue_store)
+        )
+        for row in rows:
+            if row["id"] == ask_id:
+                return dict(row), "live"
+        return None
+    archive = _list_open_asks_file({"include_closed": True, "limit": 500}, overseer_root=overseer_root)
+    for row in archive.get("rows") or [] if archive.get("ok") else []:
+        if row.get("id") == ask_id:
+            return dict(row), "archive"
+    return None
+
+
+def _dispatch_ask_tool(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    caller_configs: dict[str, dict[str, Any]] | None,
+    ask_grants: dict[str, list[str]] | None,
+    ask_root: str | None,
+    writer: Any,
+    seed_lookup: Any,
+) -> dict[str, Any]:
+    from .ask_store import (
+        AskStore,
+        AskStoreError,
+        validate_ask_id,
+        validate_columns,
+        validate_fields,
+    )
+
+    if not isinstance(arguments, dict):
+        return {"ok": False, "error": "arguments must be an object", "code": 400}
+    specs = ask_caller_specs(caller_configs, ask_grants)
+    caller = resolve_mcp_caller(arguments, specs)
+    arguments = strip_caller_arguments(arguments)
+    scope = ASK_TOOL_SCOPES[tool_name]
+    if caller == ANON_CALLER:
+        return {"ok": False, "error": "invalid or missing caller identity", "code": 401}
+    if not ask_scope_allowed(caller, scope, ask_grants):
+        emit_caller_audit(
+            ask_root,
+            {"caller": caller, "tool": tool_name, "scope": scope, "decision": "denied"},
+        )
+        return {
+            "ok": False,
+            "error": f"caller {caller!r} lacks scope {scope!r} for {tool_name}",
+            "code": 403,
+        }
+    unknown = sorted(set(arguments) - _ASK_TOOL_KEYS[tool_name])
+    if unknown:
+        return {"ok": False, "error": "unknown field(s): " + ", ".join(unknown), "code": 400}
+    if not ask_root:
+        return {"ok": False, "error": "the ask store requires a configured runs root", "code": 501}
+    store = AskStore(ask_root)
+    try:
+        if tool_name == "raise_open_ask":
+            columns = validate_columns(arguments, require_ask=True)
+            fields = validate_fields(arguments["fields"]) if arguments.get("fields") else None
+            ask_id = validate_ask_id(arguments.get("id"))
+            if seed_lookup(ask_id) is not None:
+                raise AskStoreError(f"ask {ask_id!r} already exists as a live or archive row", 409)
+            row = store.raise_ask(ask_id, columns, fields, actor=caller)
+            return {"ok": True, "row": row}
+        if tool_name == "declare_ask_fields":
+            ask_id = validate_ask_id(arguments.get("id"))
+            fields = validate_fields(arguments.get("fields"))
+            row = store.declare_fields(ask_id, fields, actor=caller, seed=seed_lookup(ask_id))
+            return {"ok": True, "row": row}
+        if tool_name == "respond_open_ask":
+            ask_id = validate_ask_id(arguments.get("id"))
+            row = store.respond(
+                ask_id,
+                arguments.get("actor"),
+                arguments.get("fields") if "fields" in arguments else {},
+                seed=None if store.get(ask_id) is not None else seed_lookup(ask_id),
+            )
+            return {"ok": True, "row": row}
+        if tool_name == "clear_ask_secret":
+            row = store.clear_secret(
+                validate_ask_id(arguments.get("id")),
+                str(arguments.get("field") or ""),
+                arguments.get("actor"),
+            )
+            return {"ok": True, "row": row}
+        # apply_ask_secret
+        target = arguments.get("target")
+        if not isinstance(target, str) or target not in ASK_APPLY_TARGETS:
+            emit_caller_audit(
+                ask_root,
+                {"caller": caller, "tool": tool_name, "target": str(target)[:128], "decision": "denied"},
+            )
+            return {"ok": False, "error": f"target {str(target)[:128]!r} is not on the apply allow-list", "code": 403}
+        try:
+            result = store.apply_secret(
+                validate_ask_id(arguments.get("id")),
+                str(arguments.get("field") or ""),
+                target,
+                actor=caller,
+                writer=writer,
+            )
+        except AskStoreError as exc:
+            emit_caller_audit(
+                ask_root,
+                {"caller": caller, "tool": tool_name, "target": target, "decision": "failed", "code": exc.code},
+            )
+            raise
+        emit_caller_audit(
+            ask_root, {"caller": caller, "tool": tool_name, "target": target, "decision": "applied"}
+        )
+        return {"ok": True, **result}
+    except AskStoreError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
 
 
 # A gate sweep never needs more runs than this per call.

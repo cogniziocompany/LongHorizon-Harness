@@ -78,6 +78,12 @@ def test_mcp_fleet_tools_manifest(client_fixture: Any = None) -> None:
             "read_ledger",
             "list_open_asks",
             "get_handoff",
+            # Task A3d: the writable ask store (scope-gated).
+            "raise_open_ask",
+            "declare_ask_fields",
+            "respond_open_ask",
+            "clear_ask_secret",
+            "apply_ask_secret",
         }
         enqueue = next(tool for tool in data["tools"] if tool["name"] == "harness_enqueue_task")
         assert "kimi" in enqueue["description"]

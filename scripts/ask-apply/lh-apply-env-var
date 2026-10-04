@@ -1,0 +1,61 @@
+#!/bin/sh
+# lh-apply-env-var FILE VARIABLE  -- task A3d, the remote end of apply_ask_secret.
+#
+# Installed on the TARGET host and pinned as an ssh forced command, one key
+# per target, so the harness key can write exactly one variable in one file:
+#
+#   command="/usr/local/sbin/lh-apply-env-var /opt/cognizioware-mcp-tools/mcp-tools.env GITHUB_MCP_TOKEN",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... lh-harness-ask-apply
+#
+# The command the client asks for is ignored (sshd runs the forced command).
+# The value arrives on stdin as one line. It is never echoed, logged or put
+# on a command line: awk reads it from its environment. The file is replaced
+# atomically and keeps its mode and owner. Prints "ok <VARIABLE>" on success.
+set -eu
+umask 077
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: lh-apply-env-var FILE VARIABLE (value on stdin)" >&2
+  exit 2
+fi
+file=$1
+var=$2
+
+case "$var" in
+  ''|[0-9]*|*[!A-Z0-9_]*) echo "refused: bad variable name" >&2; exit 2 ;;
+esac
+case "$file" in
+  /*) ;;
+  *) echo "refused: file must be an absolute path" >&2; exit 2 ;;
+esac
+if [ ! -f "$file" ]; then
+  echo "refused: target file does not exist" >&2
+  exit 3
+fi
+
+value=
+IFS= read -r value || true
+if [ -z "$value" ]; then
+  echo "refused: empty value" >&2
+  exit 4
+fi
+# Env-file safe characters only: no whitespace, quotes, $, backslash or #.
+case "$value" in
+  *[!A-Za-z0-9_.:/+=@~-]*) echo "refused: value has characters an env file cannot hold" >&2; exit 4 ;;
+esac
+
+dir=$(dirname "$file")
+tmp=$(mktemp "$dir/.lh-apply.XXXXXX")
+trap 'rm -f "$tmp"' EXIT INT TERM
+
+LH_APPLY_VALUE=$value awk -v var="$var" '
+  BEGIN { v = ENVIRON["LH_APPLY_VALUE"]; done = 0; prefix = var "=" }
+  index($0, prefix) == 1 { if (!done) { print prefix v; done = 1 } ; next }
+  { print }
+  END { if (!done) print prefix v }
+' "$file" > "$tmp"
+
+chmod "$(stat -c '%a' "$file")" "$tmp"
+chown "$(stat -c '%u:%g' "$file")" "$tmp" 2>/dev/null || true
+mv -f "$tmp" "$file"
+trap - EXIT INT TERM
+echo "ok $var"
