@@ -38,6 +38,7 @@ MIGRATION_FILES = (
     "002_harness_queue_events.sql",
     "003_harness_queue_continuation.sql",
     "005_harness_queue_retry_backoff.sql",
+    "006_harness_queue_time_limit.sql",
 )
 
 

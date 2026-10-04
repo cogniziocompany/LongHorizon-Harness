@@ -385,6 +385,10 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                     "Idempotent-enqueue key: same non-terminal key resolves to one queue entry, launched at most once.",
                 ),
                 "base_check": _string_param("Optional base commit/branch check guard.", required=False),
+                "time_limit_minutes": _optional_integer_param(
+                    "Optional wall-clock limit in minutes (1-1440) from launch; the launcher stops the run "
+                    "when it is exceeded and does not requeue it (task fc-H2)."
+                ),
                 # With scoping ON the stamp wins (task 174); the field stays in
                 # the schema because the store's own contract (task 233)
                 # requires it -- the value a client passes is overridden, never
@@ -1047,6 +1051,8 @@ def _enqueue(
             required=True,
         ),
         "dedup_key": _bounded(arguments.get("dedup_key"), field="dedup_key", max_chars=256),
+        # fc-H2: validated by the store (int 1..1440 or omitted).
+        "time_limit_minutes": arguments.get("time_limit_minutes"),
     }
     # Task 300: the requester block is passed through verbatim (validated by the
     # store) and stamped with the verified caller.  ``arguments["requester"]``

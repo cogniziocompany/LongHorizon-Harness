@@ -223,6 +223,51 @@ The `queue.requeued` service event carries `not_before`, `not_before_utc` and
 `max_retries` cap exactly like the file store. Rows written before 005 read as
 attempt 1 with the other four fields unset.
 
+### Per-task wall-clock limit (`time_limit_minutes`, task fc-H2)
+
+An entry may carry `time_limit_minutes` (integer 1-1440, optional). The
+project config may set a default for entries without one:
+
+```toml
+[queue]
+default_time_limit_minutes = 120   # unset = no limit
+```
+
+The limit is wall clock from `launched_at`, including time spent waiting on a
+gate or parked by a maintenance suspend. On every pass, for each launched
+entry whose run is still active, the launcher compares `now - launched_at`
+with the limit. Once it is exceeded the launcher:
+
+1. calls `supervisor.stop(run_id)` (SIGTERM, same as `POST /api/runs/{id}/stop`);
+2. appends `run.time_limit_exceeded` `{queue_id, run_id, limit_minutes,
+   elapsed_minutes}` to the run's event log (and the fleet reporter);
+3. sets `failure_cause = "time_limit"` and a `reason` on the entry.
+
+When the stopped run is terminal, the normal reconcile marks the entry
+`failed` with a reason starting `time_limit | ...`. `time_limit` is a
+non-retryable cause: no successor is created. If the run completed its audit
+before it stopped (`completion_satisfied`), the entry is `done` as usual.
+A retry successor of some other failure inherits the original entry's limit.
+
+Change or clear the limit of a running task with
+`POST /api/runs/{run_id}/time_limit`:
+
+```json
+{"minutes": 90, "rationale": "needs one more audit round"}
+```
+
+`minutes` is an integer 1-1440 or `null` (clears the entry's own limit; the
+config default, if any, still applies). `rationale` is required (at least 10
+characters) and is recorded in the run's `run.time_limit_set` event. The route
+uses the same caller check as `stop`; it answers 404 when no queue entry
+launched the run and 422 for a bad value. `GET /api/runs/{id}/latest` and
+`GET /api/runs/latest` report the effective limit as
+`time_limit: {minutes, expires_at, remaining_seconds}` (or `null`).
+
+The Postgres backend stores the field in the `time_limit_minutes` column
+added by `006_harness_queue_time_limit.sql` (idempotent `ADD COLUMN IF NOT
+EXISTS`; existing rows read back as no limit).
+
 ## The optional `orfree` trio (OpenRouter free models)
 
 `kimi` and `qwen` always exist. `orfree` exists only on a node whose `config.toml` defines it; an
@@ -348,6 +393,7 @@ visible to any caller with the bearer token through `GET /api/queue`.
 | `failure_cause` | `str \| None` | `None` | cause of failure that triggered retry | Store, via `mark_failed` / `requeue` |
 | `not_before` | `float \| None` | `None` | epoch seconds; the launcher does not launch the entry before it (provider-quota backoff, see *Retries and provider-quota backoff*) | Launcher, via `requeue` |
 | `wait_reason` | `str \| None` | `None` | why the entry waits (`provider_quota` / `provider_rate_limit`); set only together with `not_before` | Launcher, via `requeue` |
+| `time_limit_minutes` | `int \| None` | `None` | wall-clock limit in minutes (1-1440) from `launched_at`; see *Per-task wall-clock limit* | Caller, at enqueue, or `POST /api/runs/{id}/time_limit` |
 
 There is no dedicated `done_at`/`failed_at` field. The terminal time of an entry
 is the `updated_at` value at the moment `mark_done` or `mark_failed` runs (both
@@ -355,10 +401,11 @@ go through `update`, `queue.py:406`–`409`); the terminal cause is in `reason`.
 
 ### Caller-supplied vs. service-owned
 
-A caller supplies ten input fields through the enqueue body: `name`, `task` (or
+A caller supplies eleven input fields through the enqueue body: `name`, `task` (or
 `task_file`), `workspace`, `trio` (or `roles`), `max_rounds`, `priority`,
-`base_check`, `requested_by`, `dedup_key`, and `requester`. Of these, `max_rounds`,
-`priority`, `base_check`, and `dedup_key` are optional; the rest are required
+`base_check`, `requested_by`, `dedup_key`, `requester`, and
+`time_limit_minutes`. Of these, `max_rounds`, `priority`, `base_check`,
+`dedup_key`, and `time_limit_minutes` are optional; the rest are required
 (`requested_by` may be omitted when a `requester` block is supplied and no
 verified caller is stamped; it is then derived as `name@host [session_ref]`).
 `task_file` and `roles` are alternative input keys for `task` and `trio`

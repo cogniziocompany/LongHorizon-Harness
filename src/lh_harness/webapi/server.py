@@ -67,6 +67,7 @@ from ..queue import (
     default_queue_config,
     queue_config_from_config,
     read_lease,
+    validate_time_limit_minutes,
     _select_queue_store,
 )
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
@@ -662,7 +663,10 @@ def _event_tailer(state: DashboardState, run_id: str) -> EventTailer:
     return EventTailer(state.role_dir / "events.jsonl", run_id=run_id)
 
 
-def _queue_run_map(queue_store: QueueStore | PgQueueStore | None) -> dict[str, dict[str, str | None]]:
+def _queue_run_map(
+    queue_store: QueueStore | PgQueueStore | None,
+    default_time_limit_minutes: int | None = None,
+) -> dict[str, dict[str, Any]]:
     """Map ``run_id`` -> ``{"queue_id", "name"}`` from durable queue entries.
 
     Runs carry no queue linkage of their own; the queue entry is the durable
@@ -672,7 +676,7 @@ def _queue_run_map(queue_store: QueueStore | PgQueueStore | None) -> dict[str, d
     the liveness response.
     """
 
-    mapping: dict[str, dict[str, str | None]] = {}
+    mapping: dict[str, dict[str, Any]] = {}
     if queue_store is None:
         return mapping
     try:
@@ -684,14 +688,38 @@ def _queue_run_map(queue_store: QueueStore | PgQueueStore | None) -> dict[str, d
         if not run_id:
             continue
         name = getattr(entry, "name", None)
+        minutes = getattr(entry, "time_limit_minutes", None)
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 1:
+            minutes = default_time_limit_minutes
         mapping.setdefault(
             str(run_id),
             {
                 "queue_id": str(getattr(entry, "queue_id", "") or "") or None,
                 "name": str(name) if name else None,
+                # fc-H2: effective wall-clock limit and the launch time it
+                # counts from (the launcher enforces it; /latest reports it).
+                "time_limit_minutes": minutes,
+                "launched_at": getattr(entry, "launched_at", None),
             },
         )
     return mapping
+
+
+def _time_limit_view(queue_link: dict[str, Any], now: float) -> dict[str, Any] | None:
+    """``{minutes, expires_at, remaining_seconds}`` for a limited run, else None."""
+
+    minutes = queue_link.get("time_limit_minutes")
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 1:
+        return None
+    launched_at = queue_link.get("launched_at")
+    if isinstance(launched_at, bool) or not isinstance(launched_at, (int, float)) or not launched_at:
+        return {"minutes": minutes, "expires_at": None, "remaining_seconds": None}
+    expires_at = float(launched_at) + minutes * 60
+    return {
+        "minutes": minutes,
+        "expires_at": expires_at,
+        "remaining_seconds": max(0.0, expires_at - now),
+    }
 
 
 def _latest_projection(
@@ -752,8 +780,8 @@ def _latest_projection(
         "last_event_age_seconds": last_event_age_seconds,
         "console_path": f"/runs/{run_id}",
         "now": now,
-        # Placeholder for task fc-H2; no time-limit logic lives in fc-H1a.
-        "time_limit": None,
+        # Task fc-H2: the queue entry's wall-clock limit, None when unlimited.
+        "time_limit": _time_limit_view(queue_link, now),
     }
 
 
@@ -2186,7 +2214,7 @@ def create_app(
         """
 
         now = time.time()
-        queue_map = _queue_run_map(queue_store)
+        queue_map = _queue_run_map(queue_store, queue_config.get("default_time_limit_minutes"))
         rows: list[dict[str, Any]] = []
         for item in registry.run_items_cheap():
             if not is_active_status(item.get("status")):
@@ -2212,7 +2240,12 @@ def create_app(
                     item["status"] = registry.supervisor.status(run_id).get("status") or ""
                 except Exception:
                     pass
-        row = _latest_projection(registry, item, _queue_run_map(queue_store), time.time())
+        row = _latest_projection(
+            registry,
+            item,
+            _queue_run_map(queue_store, queue_config.get("default_time_limit_minutes")),
+            time.time(),
+        )
         if row is None:
             raise HTTPException(status_code=404, detail="run not found")
         return row
@@ -2606,6 +2639,70 @@ def create_app(
             return {"ok": True, **supervisor.stop(run_id)}
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/time_limit")
+    def set_time_limit(
+        run_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        """Set or clear the wall-clock limit of the queue entry behind a run (fc-H2).
+
+        Body ``{"minutes": int 1..1440 | null, "rationale": str (>= 10 chars)}``;
+        ``null`` clears the per-entry limit. 404 when no queue entry launched
+        this run. The launcher enforces the new value on its next pass.
+        """
+
+        _run_control_caller(request)
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="time limits require a configured queue")
+        if "minutes" not in body:
+            raise HTTPException(status_code=422, detail="minutes is required (an integer or null)")
+        try:
+            minutes = validate_time_limit_minutes(body.get("minutes"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        rationale = body.get("rationale")
+        if not isinstance(rationale, str) or len(rationale.strip()) < 10:
+            raise HTTPException(status_code=422, detail="rationale is required (at least 10 characters)")
+        rationale = rationale.strip()[:1000]
+        matches = [entry for entry in queue_store.list() if entry.run_id == run_id]
+        if not matches:
+            raise HTTPException(status_code=404, detail="run has no queue entry")
+        entry = max(matches, key=lambda item: float(item.launched_at or 0.0))
+        previous = entry.time_limit_minutes
+        entry.time_limit_minutes = minutes
+        updated = queue_store.update(entry)
+        try:
+            role_dir = registry.supervisor._run_logs_dir(run_id) / "role_orchestration" if registry.supervisor is not None else None
+        except Exception:
+            role_dir = None
+        if role_dir is not None and role_dir.is_dir():
+            _append_jsonl(
+                role_dir / "events.jsonl",
+                {
+                    "schema_version": 2,
+                    "event_id": f"{run_id}:time-limit-{time.time():.6f}",
+                    "type": "run.time_limit_set",
+                    "ts": time.time(),
+                    "run_id": run_id,
+                    "payload": {
+                        "queue_id": updated.queue_id,
+                        "minutes": minutes,
+                        "previous_minutes": previous,
+                        "rationale": rationale,
+                    },
+                },
+            )
+        link = _queue_run_map(queue_store, queue_config.get("default_time_limit_minutes")).get(run_id) or {}
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "queue_id": updated.queue_id,
+            "time_limit_minutes": updated.time_limit_minutes,
+            "previous_minutes": previous,
+            "time_limit": _time_limit_view(link, time.time()),
+        }
 
     @app.post("/api/runs/{run_id}/resume")
     def resume(
