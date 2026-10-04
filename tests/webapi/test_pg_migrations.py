@@ -37,6 +37,7 @@ MIGRATION_FILES = (
     "001_harness_queue.sql",
     "002_harness_queue_events.sql",
     "003_harness_queue_continuation.sql",
+    "005_harness_queue_retry_backoff.sql",
 )
 
 
@@ -263,3 +264,38 @@ def test_002_reapplies_cleanly_alone(scratch_conn) -> None:
     before = _object_definitions(conn)
     _apply_migrations(conn)
     assert _object_definitions(conn) == before
+
+def test_005_retry_and_backoff_columns(scratch_conn) -> None:
+    """005: retry lineage and backoff columns with file-store defaults; a row
+    written before 005 reads attempt 1 and NULL for the rest."""
+    conn = scratch_conn
+    _apply_migrations(conn)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT column_name, data_type, column_default, is_nullable, character_maximum_length "
+        "FROM information_schema.columns "
+        "WHERE table_schema='harness' AND table_name='queue' "
+        "AND column_name IN ('retry_of','attempt','failure_cause','not_before','wait_reason') "
+        "ORDER BY column_name"
+    )
+    rows = {row[0]: row[1:] for row in cur.fetchall()}
+    assert rows == {
+        "attempt": ("integer", "1", "NO", None),
+        "failure_cause": ("text", None, "YES", None),
+        "not_before": ("double precision", None, "YES", None),
+        "retry_of": ("character varying", None, "YES", 128),
+        "wait_reason": ("character varying", None, "YES", 64),
+    }
+    cur.execute("SELECT to_regclass('harness.harness_queue_retry_of_idx')::text")
+    assert cur.fetchone()[0] == "harness.harness_queue_retry_of_idx"
+    # A pre-005-shaped insert (no new columns named) gets the defaults.
+    conn.execute(
+        "INSERT INTO harness.queue (queue_id, name, task, workspace, trio, requested_by) "
+        "VALUES ('q-old', 'n', 't', 'w', 'kimi', 'ci')"
+    )
+    cur.execute(
+        "SELECT retry_of, attempt, failure_cause, not_before, wait_reason "
+        "FROM harness.queue WHERE queue_id='q-old'"
+    )
+    assert cur.fetchone() == (None, 1, None, None, None)
+    conn.execute("DELETE FROM harness.queue WHERE queue_id='q-old'")

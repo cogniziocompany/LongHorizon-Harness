@@ -136,10 +136,12 @@ With `backend = "postgres"` the service stores queue entries through
 store; the file store stays the default and remains fully hermetic. Two
 prerequisites apply before `backend = "postgres"` can work:
 
-1. **Migrations 001 and 002 must exist first** — `migrations/001_harness_queue.sql`
-   (the `harness.queue` table) and `migrations/002_harness_queue_events.sql`
-   (the `harness.queue_events` audit log). `PgQueueStore` applies them
-   idempotently on first connect, but the files themselves must be present.
+1. **The migrations must exist first** — `migrations/001_harness_queue.sql`
+   (the `harness.queue` table), `migrations/002_harness_queue_events.sql`
+   (the `harness.queue_events` audit log), `003` (continuation columns) and
+   `005` (retry and backoff columns). `PgQueueStore` applies every
+   `migrations/*.sql` idempotently, in filename order, on first connect, but
+   the files themselves must be present.
 2. **`LH_HARNESS_DB_PASSWORD`** — the Postgres credential is supplied through
    this environment variable name (its value is set in the deployment
    environment only, never in config, a migration, a fixture, or a commit).
@@ -215,9 +217,11 @@ invalid tasks and missing workspaces are never retried.
   successor is launchable at once, as before.
 
 The `queue.requeued` service event carries `not_before`, `not_before_utc` and
-`wait_reason` when a backoff applies. The Postgres backend accepts the
-arguments but has no column for them yet (like `retry_of`/`attempt`), so it does
-not enforce the wait until a migration adds one.
+`wait_reason` when a backoff applies. The Postgres backend stores them, with
+`retry_of`, `attempt` and `failure_cause`, in the columns migration
+`005_harness_queue_retry_backoff.sql` adds, so it enforces the wait and the
+`max_retries` cap exactly like the file store. Rows written before 005 read as
+attempt 1 with the other four fields unset.
 
 ## The optional `orfree` trio (OpenRouter free models)
 

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Postgres queue: retry and backoff columns.** Migration
+  `005_harness_queue_retry_backoff.sql` adds `retry_of`, `attempt`,
+  `failure_cause`, `not_before` and `wait_reason` to `harness.queue`, and
+  `PgQueueStore` writes and reads them like the file store: a requeued entry
+  keeps its lineage (the `max_retries` cap now trips through re-reads) and its
+  provider-quota wait (the launcher's `waiting:` skip works on Postgres). Also
+  fixed so the backend runs on a real psycopg 3 server at all: the store's
+  `with self._txn()` blocks now run on a cursor with commit/rollback (a
+  psycopg 3 connection closes at the end of `with conn:` and has no
+  `fetchall`), JSONB `skip_reasons` decoded by the driver are kept, a dedup hit
+  returns the full row, and a requeue carries `branch`/`continue_branch`.
+
 - **Experience layer (MSCE Phase 1).** Optional valued L1 trace persistence:
   one redacted JSONL record per managed round written to
   `role_orchestration/experience.jsonl` in the run dir at finalization,
