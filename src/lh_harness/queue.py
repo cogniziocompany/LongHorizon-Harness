@@ -228,6 +228,13 @@ class QueueEntry:
     retry_of: str | None = None
     attempt: int = 1
     failure_cause: str | None = None
+    # Provider-quota backoff: a retry of a quota / rate-limit failure is not
+    # launchable before ``not_before`` (epoch seconds); ``wait_reason`` names
+    # why (``provider_quota`` / ``provider_rate_limit``).  Both optional, both
+    # ``None`` on every other entry, so old JSON and old callers are unchanged.
+    # Waiting is a launcher skip, never a new attempt.
+    not_before: float | None = None
+    wait_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -264,6 +271,8 @@ class QueueEntry:
             "retry_of",
             "attempt",
             "failure_cause",
+            "not_before",
+            "wait_reason",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -743,6 +752,7 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "key_health_url": "",
         "poll_seconds": 15,
         "max_retries": 2,
+        "quota_backoff_minutes": list(DEFAULT_QUOTA_BACKOFF_MINUTES),
     }
     if isinstance(capacity.get("kimi_max"), int):
         normalized_capacity["kimi_max"] = max(0, capacity["kimi_max"])
@@ -760,12 +770,39 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         # `requeue` reads this so a configured cap actually bounds retries;
         # dropping it here would silently reset every deployment to the default.
         normalized_capacity["max_retries"] = max(0, capacity["max_retries"])
+    backoff = normalize_quota_backoff_minutes(capacity.get("quota_backoff_minutes"))
+    if backoff is not None:
+        normalized_capacity["quota_backoff_minutes"] = backoff
     return {
         "trios": normalized_trios,
         "capacity": normalized_capacity,
         "observe": observe,
         "occupancy_ignore_dirty": occupancy_ignore_dirty,
     }
+
+
+# Provider-quota retry backoff (minutes), indexed by the failed attempt: the
+# first retry waits 30 min, the second 90 min, any later one the last value.
+# A quota window is typically an hour or a few; retrying at once just burns
+# every attempt inside the same window.
+DEFAULT_QUOTA_BACKOFF_MINUTES: tuple[float, ...] = (30.0, 90.0)
+
+
+def normalize_quota_backoff_minutes(value: Any) -> list[float] | None:
+    """A non-empty list of non-negative minutes, or None when unusable."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        value = [value]
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    minutes: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or item < 0:
+            return None
+        minutes.append(float(item))
+    return minutes
 
 
 def default_queue_config() -> dict[str, Any]:
@@ -1166,12 +1203,22 @@ class QueueStore:
         entry.status = "pending"
         return self.update(entry)
 
-    def requeue(self, queue_id: str, cause: str) -> QueueEntry | None:
+    def requeue(
+        self,
+        queue_id: str,
+        cause: str,
+        *,
+        not_before: float | None = None,
+        wait_reason: str | None = None,
+    ) -> QueueEntry | None:
         """Create a successor pending entry for a failed entry.
 
         Args:
             queue_id: The ID of the failed entry to retry
             cause: The failure cause that triggered the retry
+            not_before: Optional epoch seconds before which the launcher must
+                not launch the successor (provider-quota backoff)
+            wait_reason: Optional label for the wait, shown in the skip reason
 
         Returns:
             The new successor QueueEntry, or None if the original entry not found
@@ -1227,6 +1274,8 @@ class QueueStore:
             updated_at=_now(),
             dedup_key=None,  # retries must not collide with original dedup_key
             requester=entry.requester,  # the retry carries the same requester identity
+            not_before=float(not_before) if not_before is not None else None,
+            wait_reason=str(wait_reason)[:64] if (not_before is not None and wait_reason) else None,
         )
 
         self._write(successor)

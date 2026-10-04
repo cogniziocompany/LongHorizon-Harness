@@ -187,9 +187,37 @@ Capacity is configured under `[queue.capacity]`:
 | `min_healthy_keys` | 2 | Healthy Ollama Cloud keys required before kimi launches |
 | `key_health_url` | `""` | URL that returns `{ "healthy_keys": [{"healthy": true}, ...] }` |
 | `poll_seconds` | 15 | Launcher poll interval |
+| `max_retries` | 2 | Retries after the first attempt (so 3 attempts in total) for a retryable failure |
+| `quota_backoff_minutes` | `[30, 90]` | How long a retry waits after a provider quota or rate-limit failure: the first value for the first retry, the second for the second, and the last value for any later retry |
 
 The launcher also skips any workspace that already has an active run, and it is
 idempotent across restarts (a launched entry is never launched again).
+
+### Retries and provider-quota backoff
+
+When a launched run (or the launch itself) fails for a retryable reason, the
+launcher creates one successor entry (`retry_of` = the failed entry,
+`attempt` + 1), up to `max_retries`. Human stops, `max_rounds` exhaustion,
+invalid tasks and missing workspaces are never retried.
+
+- **Provider quota / rate limit** (`provider_quota`, `provider_rate_limit`,
+  `429`, `rate limit`, `insufficient_quota`, `usage limit`): the successor gets
+  `not_before` = now + the backoff for that attempt (30 min, then 90 min by
+  default). If the provider error names a later reset time, that time is used
+  instead. Recognised shapes: `Retry-After: <s>`, `retry-after-ms: <ms>`, "try
+  again in 1m30s", `resets at <ISO time>`, `reset_at=<epoch>`, Claude Code's
+  `usage limit reached|<epoch>`. Until `not_before` the entry stays `pending`
+  and every pass skips it with `waiting: <wait_reason> until <UTC ISO time>`.
+  Waiting is not an attempt: `attempt` changes only when a successor is
+  created, so the total is still `max_retries + 1` attempts. Each attempt just
+  lands in a later quota window.
+- **Every other retryable failure** (stall, episode timeout, transport): the
+  successor is launchable at once, as before.
+
+The `queue.requeued` service event carries `not_before`, `not_before_utc` and
+`wait_reason` when a backoff applies. The Postgres backend accepts the
+arguments but has no column for them yet (like `retry_of`/`attempt`), so it does
+not enforce the wait until a migration adds one.
 
 ## The optional `orfree` trio (OpenRouter free models)
 
@@ -314,6 +342,8 @@ visible to any caller with the bearer token through `GET /api/queue`.
 | `retry_of` | `str \| None` | `None` | queue_id of the failed entry this is a retry of | Store, via `requeue` |
 | `attempt` | `int` | `1` | attempt number (1 for original entry) | Store, via `requeue` |
 | `failure_cause` | `str \| None` | `None` | cause of failure that triggered retry | Store, via `mark_failed` / `requeue` |
+| `not_before` | `float \| None` | `None` | epoch seconds; the launcher does not launch the entry before it (provider-quota backoff, see *Retries and provider-quota backoff*) | Launcher, via `requeue` |
+| `wait_reason` | `str \| None` | `None` | why the entry waits (`provider_quota` / `provider_rate_limit`); set only together with `not_before` | Launcher, via `requeue` |
 
 There is no dedicated `done_at`/`failed_at` field. The terminal time of an entry
 is the `updated_at` value at the moment `mark_done` or `mark_failed` runs (both

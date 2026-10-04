@@ -507,12 +507,24 @@ class PgQueueStore:
         entry.status = "pending"
         return self.update(entry)
 
-    def requeue(self, queue_id: str, cause: str) -> QueueEntry | None:
+    def requeue(
+        self,
+        queue_id: str,
+        cause: str,
+        *,
+        not_before: float | None = None,
+        wait_reason: str | None = None,
+    ) -> QueueEntry | None:
         """Create a successor pending entry for a failed entry.
 
         Args:
             queue_id: The ID of the failed entry to retry
             cause: The failure cause that triggered the retry
+            not_before: Accepted for parity with ``QueueStore.requeue``.  Like
+                ``retry_of``/``attempt``, it has no column yet: it rides only in
+                the ``queue_events`` payload, so the Postgres backend does not
+                enforce the provider-quota backoff until a migration adds it.
+            wait_reason: See ``not_before``.
 
         Returns:
             The new successor QueueEntry, or None if the original entry not found
@@ -564,7 +576,9 @@ class PgQueueStore:
             failure_cause=cause,
             created_at=time.time(),
             updated_at=time.time(),
-            dedup_key=None  # retries must not collide with original dedup_key
+            dedup_key=None,  # retries must not collide with original dedup_key
+            not_before=float(not_before) if not_before is not None else None,
+            wait_reason=str(wait_reason)[:64] if (not_before is not None and wait_reason) else None,
         )
 
         # Insert the successor entry and an audit event
