@@ -45,7 +45,7 @@ def test_migration_005_adds_the_five_columns_idempotently() -> None:
     assert "CREATE INDEX IF NOT EXISTS harness_queue_retry_of_idx" in sql
     # Runs after every earlier migration (PgQueueStore applies them by filename).
     names = sorted(p.name for p in REPO_MIGRATIONS.glob("*.sql"))
-    assert names[-1] == path.name
+    assert all(name < path.name for name in names if name[:3] < "005")
 
 
 def test_store_column_list_and_row_values_cover_the_new_fields() -> None:
@@ -334,3 +334,33 @@ def test_live_old_rows_get_attempt_1_after_the_migration() -> None:
     assert (read.retry_of, read.attempt, read.failure_cause, read.not_before, read.wait_reason) == (
         None, 1, None, None, None,
     )
+
+
+# --- fc-H2: per-task wall-clock limit (migration 006) -----------------------
+
+
+def test_migration_006_adds_time_limit_column_idempotently() -> None:
+    path = REPO_MIGRATIONS / "006_harness_queue_time_limit.sql"
+    sql = path.read_text(encoding="utf-8")
+    assert "ADD COLUMN IF NOT EXISTS time_limit_minutes INTEGER" in sql
+    names = sorted(p.name for p in REPO_MIGRATIONS.glob("*.sql"))
+    assert names.index(path.name) > names.index("005_harness_queue_retry_backoff.sql")
+
+
+def test_time_limit_round_trips_through_the_pg_store(fake_store) -> None:
+    store, conn = fake_store
+    entry = store.create(
+        {"name": "limited", "task": "t", "workspace": "/w", "trio": "kimi",
+         "requested_by": "ci", "time_limit_minutes": 45}
+    )
+    row = dict(zip(pg_queue._QUEUE_COLUMNS, conn.rows[entry.queue_id]))
+    assert row["time_limit_minutes"] == 45
+    assert store.get(entry.queue_id).time_limit_minutes == 45
+    store.mark_failed(entry.queue_id, "provider_quota | run failed")
+    successor = store.requeue(entry.queue_id, "provider_quota")
+    assert store.get(successor.queue_id).time_limit_minutes == 45
+    unlimited = store.create(
+        {"name": "open", "task": "t", "workspace": "/w", "trio": "kimi", "requested_by": "ci"}
+    )
+    assert dict(zip(pg_queue._QUEUE_COLUMNS, conn.rows[unlimited.queue_id]))["time_limit_minutes"] is None
+    assert store.get(unlimited.queue_id).time_limit_minutes is None

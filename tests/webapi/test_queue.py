@@ -259,7 +259,13 @@ def test_api_queue_status_filter(tmp_path: Path) -> None:
 
 def test_default_queue_config_shape() -> None:
     config = default_queue_config()
-    assert set(config) == {"trios", "capacity", "observe", "occupancy_ignore_dirty"}
+    assert set(config) == {
+        "trios",
+        "capacity",
+        "observe",
+        "occupancy_ignore_dirty",
+        "default_time_limit_minutes",
+    }
     assert set(config["trios"]) == {"kimi", "qwen"}
     assert config["capacity"]["kimi_max"] == 3
     assert config["capacity"]["qwen_max"] == 1
@@ -271,6 +277,8 @@ def test_default_queue_config_shape() -> None:
     # upstream-less unpushed branches count as occupied unless the overseer
     # flips the per-environment override.
     assert config["occupancy_ignore_dirty"] is False
+    # No per-task wall-clock limit unless configured (task fc-H2).
+    assert config["default_time_limit_minutes"] is None
 
 
 def test_queue_config_from_project_config() -> None:
