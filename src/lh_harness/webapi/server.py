@@ -37,8 +37,11 @@ from ..caller_auth import (
     ANON_CALLER,
     RESOLVE_TOOL,
     caller_configs_or_defaults,
+    captured_secret,
+    compute_signature,
     emit_refusal_audit,
     enqueue_rate_violation,
+    header_names,
     may_delete_entry,
     resolve_rest_caller,
     rounds_clamp_violation,
@@ -60,6 +63,7 @@ from ..supervisor.lifecycle import (
 )
 from ..supervisor.control_bus import CommandConflict, RevisionConflict, _append_jsonl, _atomic_bytes_write
 from ..fleet import get_reporter
+from ..fleet.channel import get_channel, loopback_api_base, start_channel, stop_channel
 from ..queue import (
     PgQueueStore,
     QueueStore,
@@ -943,6 +947,48 @@ def _maybe_start_fleet_reporter(
         reporter.register_heartbeat(_heartbeat)
 
 
+def _maybe_start_fleet_channel(
+    token: str | None,
+    bind_host: str,
+    bind_port: int,
+    caller_specs: dict[str, dict[str, Any]] | None,
+) -> bool:
+    """Start the fleet channel (fc-H3) when configured; True when it runs.
+
+    Off by default: it needs LH_HARNESS_FLEET_URL and LH_HARNESS_FLEET_KEY and
+    LH_HARNESS_FLEET_CHANNEL not "0". Proxied calls reach this process's own
+    API with the service bearer. When [callers] scoping is on, the run-control
+    routes also need a caller identity: LH_HARNESS_FLEET_CHANNEL_CALLER names
+    the [callers] entry the channel signs as (its secret comes from that
+    entry's secret_env, never from here).
+    """
+
+    caller_name = (os.environ.get("LH_HARNESS_FLEET_CHANNEL_CALLER") or "").strip()
+    caller_headers = None
+    spec = (caller_specs or {}).get(caller_name) if caller_name else None
+    if spec is not None:
+        secret_env = str(spec.get("secret_env") or "").strip()
+        names = header_names()
+
+        def caller_headers() -> dict[str, str]:
+            secret = captured_secret(secret_env) if secret_env else None
+            if not secret:
+                return {}
+            ts = str(int(time.time()))
+            return {
+                names["caller"]: caller_name,
+                names["timestamp"]: ts,
+                names["signature"]: compute_signature(caller_name, ts, secret),
+            }
+
+    channel = start_channel(
+        api_base=loopback_api_base(bind_host, bind_port),
+        token=token,
+        caller_headers=caller_headers,
+    )
+    return channel is not None
+
+
 def _stream_projection_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     """Track snapshot-only state that must wake connected Web clients."""
 
@@ -1139,6 +1185,7 @@ def create_app(
     caller_configs: dict[str, dict[str, Any]] | None = None,
     ask_runtime: Any = None,
     settings_runtime: Any = None,
+    bind_port: int | None = None,
 ) -> FastAPI:
     """Create an API app over a live shared state or a historical runs root.
 
@@ -1146,6 +1193,8 @@ def create_app(
     Launcher (task 195 deliverable 3): production POST /api/runs probes origin
     for a colliding OPEN PR with no flag or config.  Pass ``None`` only to
     disable the probe explicitly (tests and offline runs).
+    ``bind_port`` is passed only by the web service (``run_web``); it is what
+    starts the fleet channel (fc-H3), so embedded and test apps never dial out.
     ``supervisor`` accepts the real :class:`RunSupervisor` or any stand-in
     exposing the same surface (tests pass an in-memory fake so the launcher
     the app builds can be driven without spawning workers).
@@ -1325,6 +1374,8 @@ def create_app(
     app.state.allowed_origins = origins
     app.state.bind_host = bind_host
     _maybe_start_fleet_reporter(registry, supervisor, queue_store)
+    if bind_port is not None and _maybe_start_fleet_channel(token, bind_host, bind_port, caller_specs):
+        app.router.add_event_handler("shutdown", stop_channel)
     app.state.launcher = launcher
     if supervisor is not None:
         async def _shutdown_owned_workers() -> None:
@@ -1381,6 +1432,12 @@ def create_app(
     # Registration adds no auth surface: the middleware above guards /api/*.
     register_experience_api(app, registry, runs_root=registry.runs_root)
 
+    def _fleet_channel_state() -> dict[str, Any]:
+        channel = get_channel()
+        if channel is None:
+            return {"connected": False, "since": None, "last_error": None}
+        return channel.status()
+
     @app.get("/api/meta")
     def meta(request: Request) -> dict[str, Any]:
         return _meta_response(request, force_models=False)
@@ -1425,6 +1482,7 @@ def create_app(
             fleet_ever_succeeded=bool(fleet_state.get("ever_succeeded", False)),
             fleet_last_ok=fleet_state.get("last_ok"),
             fleet_last_error=fleet_state.get("last_error"),
+            fleet_channel=_fleet_channel_state(),
             launcher_stalled=launcher_stalled,
             launcher_stall_cycles=launcher_stall_cycles,
             capabilities={
@@ -2778,6 +2836,7 @@ def run_web_server(
         auth_token=token,
         allowed_origins=allowed_origins,
         bind_host=host,
+        bind_port=port,
     )
     uvicorn.run(app, host=host, port=port, log_level="info")
     return 0

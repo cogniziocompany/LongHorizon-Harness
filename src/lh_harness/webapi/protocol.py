@@ -35,6 +35,7 @@ def build_meta(
     fleet_ever_succeeded: bool = False,
     fleet_last_ok: bool | None = None,
     fleet_last_error: str | None = None,
+    fleet_channel: dict[str, Any] | None = None,
     drain: dict[str, Any] | None = None,
     launcher_stalled: bool = False,
     launcher_stall_cycles: int | None = None,
@@ -71,6 +72,14 @@ def build_meta(
     result["fleet_ever_succeeded"] = bool(fleet_ever_succeeded)
     result["fleet_last_ok"] = fleet_last_ok
     result["fleet_last_error"] = fleet_last_error
+    # Fleet channel (fc-H3): the outbound WebSocket to fleet-admin.
+    # ``since`` is the ISO time of the last connect/disconnect (None before the
+    # first attempt); ``last_error`` the most recent failure, kept after a
+    # reconnect so a flapping channel stays visible.
+    channel = fleet_channel or {}
+    result["fleet_channel_connected"] = bool(channel.get("connected", False))
+    result["fleet_channel_since"] = channel.get("since")
+    result["fleet_channel_last_error"] = channel.get("last_error")
     # Launcher stall detector (task 230): the plain-flag surface the workbench
     # reads to see that the launcher has had N consecutive stalled cycles.
     # ``launcher_stall_cycles`` is None until at least one stalled cycle was

@@ -6,10 +6,10 @@ harness nodes, so on registration the node dials out to
 allow-listed API calls over that one connection (no inbound ports, no tunnel
 software).
 
-fc-H3a added configuration and the signed handshake (URL + headers); fc-H3b
-adds the allow-listed request dispatcher (``dispatch_request``). fc-H3c..e add
-the connection loop and the web-process wiring; until then nothing imports
-this module.
+fc-H3a added configuration and the signed handshake (URL + headers); fc-H3b..e
+add the allow-listed request dispatcher, the connection loop with capped
+exponential backoff, and the web-process wiring (``FleetChannel``,
+``start_channel``).
 
 Frames are JSON text. Down (server->node): {"id","kind":"http","method",
 "path","query","body"}; up (node->server): {"id","status","body"}. Either side
@@ -32,13 +32,16 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Mapping
+from datetime import datetime, timezone
+from typing import Any, Callable, Mapping
 from urllib.parse import urlencode, urlsplit
 
 logger = logging.getLogger(__name__)
@@ -251,3 +254,272 @@ async def dispatch_request(
     except asyncio.TimeoutError:
         status, body = 504, {"error": "timeout"}
     return {"id": request_id, "status": status, "body": body}
+
+
+# --- connection loop (fc-H3c/d) ----------------------------------------------
+
+PING_INTERVAL_SECONDS = 20.0
+BACKOFF_MIN_SECONDS = 1.0
+BACKOFF_MAX_SECONDS = 60.0
+_MAX_INFLIGHT = 8
+
+
+def backoff_delay(attempt: int, *, low: float = BACKOFF_MIN_SECONDS, high: float = BACKOFF_MAX_SECONDS) -> float:
+    """Capped exponential backoff with jitter: within [low, high]."""
+
+    ceiling = min(high, low * (2 ** max(0, attempt)))
+    return max(low, random.uniform(ceiling / 2, ceiling))
+
+
+def _ws_connect(url: str, headers: dict[str, str]) -> Any:
+    """``websockets`` client connect across the >=13 and legacy (12) APIs."""
+
+    options = {"max_size": _MAX_DOWN_FRAME_BYTES, "ping_interval": None, "open_timeout": 20}
+    try:
+        from websockets.asyncio.client import connect
+    except ImportError:  # websockets 12
+        from websockets.legacy.client import connect  # type: ignore[no-redef]
+
+        return connect(url, extra_headers=headers, **options)
+    return connect(url, additional_headers=headers, **options)
+
+
+def _iso(ts: float | None) -> str | None:
+    return None if ts is None else datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+class FleetChannel:
+    """Background client: dial fleet-admin, serve allow-listed calls, reconnect.
+
+    Runs its own asyncio loop in a daemon thread so the web server's loop is
+    never blocked. ``status()`` feeds /api/meta.
+    """
+
+    def __init__(
+        self,
+        config: ChannelConfig,
+        *,
+        api_base: str,
+        token: str | None = None,
+        caller_headers: Callable[[], dict[str, str]] | None = None,
+        ping_interval: float = PING_INTERVAL_SECONDS,
+        backoff_min: float = BACKOFF_MIN_SECONDS,
+        backoff_max: float = BACKOFF_MAX_SECONDS,
+        request_timeout: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
+        self.config = config
+        self.api_base = api_base
+        self._token = token
+        self._caller_headers = caller_headers
+        self.ping_interval = ping_interval
+        self.backoff_min = backoff_min
+        self.backoff_max = backoff_max
+        self.request_timeout = request_timeout
+        self._lock = threading.Lock()
+        self._connected = False
+        self._since: float | None = None
+        self._last_error: str | None = None
+        self.connects = 0
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop: asyncio.Event | None = None
+
+    # -- state ---------------------------------------------------------------
+
+    def status(self) -> dict[str, Any]:
+        """``{connected, since, last_error}``; ``since`` is the last state change."""
+
+        with self._lock:
+            return {"connected": self._connected, "since": _iso(self._since), "last_error": self._last_error}
+
+    def _set_state(self, connected: bool, error: str | None = None) -> None:
+        with self._lock:
+            if connected != self._connected or self._since is None:
+                self._since = time.time()
+            self._connected = connected
+            if connected:
+                self.connects += 1
+            if error is not None:
+                self._last_error = error[:300]
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._thread_main, name="lh-fleet-channel", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        loop, stop = self._loop, self._stop
+        if loop is not None and stop is not None:
+            try:
+                loop.call_soon_threadsafe(stop.set)
+            except RuntimeError:  # loop already closed
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def _thread_main(self) -> None:
+        try:
+            asyncio.run(self._main())
+        except Exception:  # pragma: no cover - the loop itself never raises
+            logger.exception("fleet channel thread crashed")
+
+    async def _main(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._stop = asyncio.Event()
+        attempt = 0
+        while not self._stop.is_set():
+            opened_at: float | None = None
+            try:
+                opened_at = await self._session()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._set_state(False, f"{type(exc).__name__}: {exc}")
+            else:
+                self._set_state(False)
+            if self._stop.is_set():
+                break
+            # A connection that stayed up resets the backoff; a node refused
+            # at the handshake (or dropped at once) keeps backing off.
+            if opened_at is not None and time.monotonic() - opened_at >= self.backoff_max:
+                attempt = 0
+            delay = backoff_delay(attempt, low=self.backoff_min, high=self.backoff_max)
+            attempt += 1
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+        self._set_state(False)
+
+    async def _session(self) -> float | None:
+        """One connection: returns when it closes (monotonic open time)."""
+
+        headers = handshake_headers(self.config.node, self.config.key)
+        async with _ws_connect(self.config.url, headers) as ws:
+            opened_at = time.monotonic()
+            self._set_state(True)
+            logger.info("fleet channel connected to %s as %s", self.config.url, self.config.node)
+            send_lock = asyncio.Lock()
+            inflight = asyncio.Semaphore(_MAX_INFLIGHT)
+            last_seen = [time.monotonic()]
+            tasks: set[asyncio.Task[Any]] = set()
+
+            async def send(frame: dict[str, Any]) -> None:
+                text = json.dumps(frame, ensure_ascii=False, separators=(",", ":"))
+                if len(text.encode("utf-8")) > _MAX_FRAME_BYTES:
+                    text = json.dumps({"id": frame.get("id"), "status": 413, "body": {"error": "response body over 4 MB"}})
+                async with send_lock:
+                    await ws.send(text)
+
+            async def serve(frame: dict[str, Any]) -> None:
+                async with inflight:
+                    reply = await self.handle_request(frame)
+                try:
+                    await send(reply)
+                except Exception:
+                    pass  # the reader sees the close and ends the session
+
+            async def pinger() -> None:
+                while True:
+                    await asyncio.sleep(self.ping_interval)
+                    if time.monotonic() - last_seen[0] > 3 * self.ping_interval:
+                        self._set_state(True, "no frame from fleet-admin for 3 ping intervals; reconnecting")
+                        await ws.close()
+                        return
+                    await send({"kind": "ping", "ts": int(time.time())})
+
+            async def stopper() -> None:
+                assert self._stop is not None
+                await self._stop.wait()
+                await ws.close()
+
+            background = [asyncio.create_task(pinger()), asyncio.create_task(stopper())]
+            try:
+                async for message in ws:
+                    last_seen[0] = time.monotonic()
+                    try:
+                        frame = json.loads(message)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(frame, dict):
+                        continue
+                    kind = frame.get("kind")
+                    if kind == "ping":
+                        await send({"kind": "pong", "ts": frame.get("ts")})
+                    elif kind == "http":
+                        task = asyncio.create_task(serve(frame))
+                        tasks.add(task)
+                        task.add_done_callback(tasks.discard)
+            finally:
+                for task in [*background, *tasks]:
+                    task.cancel()
+            return opened_at
+
+    async def handle_request(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Answer one ``kind: http`` frame with the service bearer (+ caller)."""
+
+        headers: dict[str, str] = {}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        if self._caller_headers is not None:
+            try:
+                headers.update(self._caller_headers())
+            except Exception:
+                logger.exception("fleet channel caller headers failed")
+        return await dispatch_request(frame, api_base=self.api_base, headers=headers, timeout=self.request_timeout)
+
+
+# --- web-process wiring (fc-H3e) ---------------------------------------------
+
+_CHANNEL: FleetChannel | None = None
+_CHANNEL_LOCK = threading.Lock()
+
+
+def get_channel() -> FleetChannel | None:
+    return _CHANNEL
+
+
+def loopback_api_base(bind_host: str, port: int) -> str:
+    """URL of this process's own web API as seen from inside the node."""
+
+    host = (bind_host or "").strip() or "127.0.0.1"
+    if host in {"0.0.0.0", "::", "localhost"}:
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{int(port)}"
+
+
+def start_channel(
+    *,
+    api_base: str,
+    token: str | None,
+    caller_headers: Callable[[], dict[str, str]] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> FleetChannel | None:
+    """Start the process-wide channel when configured; None when it is off.
+
+    Off unless LH_HARNESS_FLEET_URL is set, LH_HARNESS_FLEET_CHANNEL is not
+    "0" and LH_HARNESS_FLEET_KEY is present (``load_config``). Idempotent.
+    """
+
+    global _CHANNEL
+    config = load_config(env)
+    if config is None:
+        return None
+    with _CHANNEL_LOCK:
+        if _CHANNEL is None:
+            _CHANNEL = FleetChannel(config, api_base=api_base, token=token, caller_headers=caller_headers)
+            _CHANNEL.start()
+        return _CHANNEL
+
+
+def stop_channel() -> None:
+    global _CHANNEL
+    with _CHANNEL_LOCK:
+        channel, _CHANNEL = _CHANNEL, None
+    if channel is not None:
+        channel.stop()
