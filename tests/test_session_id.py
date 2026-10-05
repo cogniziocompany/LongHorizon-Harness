@@ -92,6 +92,25 @@ def test_episode_env_contains_session_tag(role: str) -> None:
     assert f",lh-session/{expected_session}" in header
 
 
+def test_episode_env_sets_the_run_as_the_proxy_session() -> None:
+    # Langfuse v4: the session must ride on every generation, so the run id is
+    # sent as LiteLLM's session header, one "Name: value" header per line.
+    adapter = ClaudeCodeAdapter(role="cli_executor", run_id="run-1")
+    lines = adapter.episode_env("round_002_cli_executor_raw_trajectory")["ANTHROPIC_CUSTOM_HEADERS"].split("\n")
+    assert len(lines) == 2
+    assert lines[0].startswith("x-litellm-tags: lh-run/run-1,")
+    assert lines[1] == "x-litellm-session-id: run-1"
+    # The caller shell-quotes the value; the newline must survive a POSIX shell.
+    import shlex
+    import subprocess
+
+    value = "\n".join(lines)
+    echoed = subprocess.run(
+        ["sh", "-c", f"V={shlex.quote(value)} sh -c 'printf %s \"$V\"'"], capture_output=True, text=True
+    ).stdout
+    assert echoed == value
+
+
 def test_episode_env_empty_without_run_id() -> None:
     adapter = ClaudeCodeAdapter(role="manager")
     assert adapter.episode_env("round_001_manager_raw_trajectory") == {}

@@ -220,7 +220,14 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         if not session_id or session_id == "unknown":
             return {}
         tags = f"lh-run/{self.run_id},{_extract_round_tag(label)},{self.role},lh-session/{session_id}"
-        return {"ANTHROPIC_CUSTOM_HEADERS": f"x-litellm-tags: {tags}"}
+        # Langfuse v4 aggregates and filters on the observation, so the run must
+        # be a real session on every cost-bearing generation, not only a tag.
+        # LiteLLM maps x-litellm-session-id to the Langfuse session (one session
+        # per harness run; the episode stays in the lh-session/ tag). Headers
+        # are newline-separated, one "Name: value" per line.
+        return {
+            "ANTHROPIC_CUSTOM_HEADERS": f"x-litellm-tags: {tags}\nx-litellm-session-id: {self.run_id}"
+        }
 
     def episode_session_id(self, label: str) -> str:
         """Derived session id used to join a run's episodes in the proxy logs."""
