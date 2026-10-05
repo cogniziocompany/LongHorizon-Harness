@@ -139,3 +139,44 @@ def test_guard_rejection_does_not_hide_agent_error_records():
     failure = classify_agent_runtime_failure(result)
     assert failure is not None
     assert failure.abort_reason == "provider_provider_error"
+
+
+def test_499_no_body_is_a_first_byte_timeout():
+    """A 499 with no body means no first byte from the router in 60 s.
+
+    Nothing failed upstream: the caller hung up while the request was still
+    queued behind a busy lane or waiting on a slow first token. It must not
+    be reported as a generic provider error.
+    """
+
+    result = EpisodeResult(
+        status="error",
+        error="Agent provider API Error: 499 status code (no body)",
+    )
+
+    failure = classify_agent_runtime_failure(result)
+    assert failure is not None
+    assert failure.kind == "first_byte_timeout"
+    assert failure.abort_reason == "provider_first_byte_timeout"
+    assert "No first byte from router in 60 s" in failure.user_message
+
+
+def test_first_byte_timeout_is_requeued_by_the_launcher():
+    """The launcher treats provider_first_byte_timeout as retryable."""
+
+    from lh_harness.launcher import _classify_failure_cause
+
+    cause = _classify_failure_cause(
+        "provider_first_byte_timeout | Agent provider API Error: 499 status code (no body)"
+    )
+    assert cause == "episode_timeout"
+
+
+def test_rate_limit_keeps_precedence_over_499():
+    """A message carrying both 429 and 499 stays a rate limit."""
+
+    result = EpisodeResult(status="error", error="429 too many requests (after 499)")
+
+    failure = classify_agent_runtime_failure(result)
+    assert failure is not None
+    assert failure.abort_reason == "provider_rate_limit"
