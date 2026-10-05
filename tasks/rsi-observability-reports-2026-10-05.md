@@ -30,7 +30,7 @@ spec_status: ready-for-dev
 - Every new `rpt.*` view gets `GRANT SELECT ... TO pbi_reader` and a row count in `rpt.sync_status`.
 - Secrets by name only, in CT202 `mcp-tools.env` (or a dedicated `*.env` for write secrets). Never in the repo, the task text, a PR body or a log.
 - **Langfuse quota (task 169):** reading the public API does not ingest events, but pace it. Incremental cursor by `timestamp`, at most one page sweep per sync, and a daily aggregate rather than raw observations.
-- Do not add new Langfuse **ingestion** outside Phase 2, which restores it deliberately.
+- Do not add new Langfuse **ingestion** as part of this task.
 - Tests for every module: fixtures, no network. Plus a check that every query against the reporting DB touches `rpt.*`/`stage.*` only.
 
 ## Phase 0 — commit the publisher, fix what is fake
@@ -57,21 +57,25 @@ Views, at least:
 
 **STOP GATE 1:** for 5 sampled runs, the round and episode counts in `rpt.*` equal what the CT110 run pages show.
 
-## Phase 2 — Langfuse Cloud (project cognizioware-vlab, US region)
-**Unblocked 2026-10-05:** Paxton supplied the key pair. It is on CT202 in `mcp-tools.env` as `LANGFUSE_REPORTING_PUBLIC_KEY` / `LANGFUSE_REPORTING_SECRET_KEY` / `LANGFUSE_REPORTING_HOST`. The source file is on PTAIT09 under `.secrets` (`languse-cloud-key-cognizioware-vlab.txt`).
+## Phase 2 — Langfuse Cloud (org cognizio.company, US region, Hobby plan)
+**CORRECTION 2026-10-05 (Paxton's screenshots):** an earlier revision of this section said nothing was being ingested. That was wrong. Langfuse keys are **per project**, and the org has several projects:
 
-**Inventory, 2026-10-05 (planning session):** the project is nearly empty.
-- Traces 0, observations 0, scores 0, sessions 0, prompts 0. Weekly metrics since 2026-08-31 are all zero.
-- One dataset, `trms-qa-agent-evals`: 16 active eval cases for the n8n TRMS QA Testing Agent, created 2026-07-13, with 0 dataset runs.
-- So nothing is arriving in this project.
+| Project | State | Notes |
+|---|---|---|
+| `lh-harness` (id `cmtf8t8bi03r0ad0debhnthc0`) | **Live.** About 2,000 observations a day: `litellm:lh-harness` generations plus `guardrail` spans | Fed by the per-key logging on the LiteLLM `lh-harness` key. This is the harness's data. |
+| West Hive Capital project (hive-portal) | **Live.** About 320 observations: `hive-orchestrator`, `llm-step-0`, `eval:tool-calling` (tags `case:…`, `model:…`) | Fed by the app's own SDK. On 2026-10-03/04 every orchestrator call failed with an Ollama weekly-usage-limit `RateLimitError`. |
+| `cognizioware-vlab` | Empty: 0 traces. One dataset, `trms-qa-agent-evals` (16 cases, 0 runs) | The only project a reporting key exists for so far. |
 
-**Phase 2 therefore starts with ingestion.** This is the one phase allowed to add it:
-- Re-point the per-key Langfuse logging on `lh-harness` at this project (`infrastructure/scripts/set-perkey-langfuse.sh` in mcp-tools). Per-key only, never a global callback.
-- Apply task 169's sampling so the 50,000-event free tier is not burned again. Get the sample rate from Paxton through OPEN-ASKS before switching it on.
+Why the earlier check was wrong: the Langfuse keys on the LiteLLM key are stored encrypted (`litellm_enc::…`), and the 401 came from testing with the ciphertext.
 
-Background:
-- The per-key logging credentials on the LiteLLM keys `lh-harness` and `n8n-dev-pipeline-orchestrator` return 401 (stale keys, or keys for another project).
-- `langfuse-mcp` has no stored key.
+**Keys.**
+- On CT202 (`mcp-tools.env`): `LANGFUSE_REPORTING_PUBLIC_KEY` / `LANGFUSE_REPORTING_SECRET_KEY` / `LANGFUSE_REPORTING_HOST`, for `cognizioware-vlab`.
+- **Needed from Paxton:** one read key pair per live project, for `lh-harness` and for the West Hive project (Project settings → API Keys). Name them `LANGFUSE_REPORTING_<PROJECT>_PUBLIC_KEY` / `_SECRET_KEY`.
+- reporting-sync must take a list of projects, not one.
+
+**Quota.** At about 2,000 observations a day, `lh-harness` alone uses the 50,000-event Hobby allowance in about 25 days. Task 169's sampling is still required. Get the rate from Paxton through OPEN-ASKS.
+
+**Langfuse v4 deadline, 2026-11-16:** see `tasks/devspecops1-upstream-audit-2026-10-05.md` (work item 1). Phase 2's reporting queries must use v4-compatible API endpoints from the start.
 
 1. **Inventory first.** Before designing tables, write the counts of traces, observations, scores, sessions, datasets and prompts, the date span, and the top trace names and tags into the PR. Today's known tagging is `lh-run/<run_id>`, `round_N` and `<role>`, from the Claude Code adapter.
 2. Stage tables:
@@ -136,6 +140,6 @@ What exists: the `cognizioware-qa` repo (QA runtime + Mission Control). It has `
 
 ## Bridge and overseer
 - The overseer queues phases 0 to 5 as separate runs, in order. Each run's PR names its STOP GATE evidence.
-- Phase 2 is unblocked (keys on CT202). Its sampling rate needs Paxton's answer first.
+- Phase 2 needs read keys for the two live Langfuse projects and a sampling rate from Paxton.
 - Phase 6 starts with the design-only run.
 - Questions for Paxton go through OPEN-ASKS, not chat.
