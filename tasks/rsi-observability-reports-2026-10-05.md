@@ -30,7 +30,7 @@ spec_status: ready-for-dev
 - Every new `rpt.*` view gets `GRANT SELECT ... TO pbi_reader` and a row count in `rpt.sync_status`.
 - Secrets by name only, in CT202 `mcp-tools.env` (or a dedicated `*.env` for write secrets). Never in the repo, the task text, a PR body or a log.
 - **Langfuse quota (task 169):** reading the public API does not ingest events, but pace it. Incremental cursor by `timestamp`, at most one page sweep per sync, and a daily aggregate rather than raw observations.
-- Do not add new Langfuse **ingestion** as part of this task.
+- Do not add new Langfuse **ingestion** outside Phase 2, which restores it deliberately.
 - Tests for every module: fixtures, no network. Plus a check that every query against the reporting DB touches `rpt.*`/`stage.*` only.
 
 ## Phase 0 — commit the publisher, fix what is fake
@@ -58,8 +58,19 @@ Views, at least:
 **STOP GATE 1:** for 5 sampled runs, the round and episode counts in `rpt.*` equal what the CT110 run pages show.
 
 ## Phase 2 — Langfuse Cloud (project cognizioware-vlab, US region)
-**Needs from Paxton:** a Langfuse API key pair for the project, saved on PTAIT09 as `C:\Users\PaxtonTait\.secrets\langfuse-cognizioware-vlab-keys.txt` and set on CT202 as `LANGFUSE_REPORTING_PUBLIC_KEY` / `LANGFUSE_REPORTING_SECRET_KEY`.
-- The per-key logging credentials on the LiteLLM `lh-harness` key are not usable: verified 2026-10-05, they return 401.
+**Unblocked 2026-10-05:** Paxton supplied the key pair. It is on CT202 in `mcp-tools.env` as `LANGFUSE_REPORTING_PUBLIC_KEY` / `LANGFUSE_REPORTING_SECRET_KEY` / `LANGFUSE_REPORTING_HOST`. The source file is on PTAIT09 under `.secrets` (`languse-cloud-key-cognizioware-vlab.txt`).
+
+**Inventory, 2026-10-05 (planning session):** the project is nearly empty.
+- Traces 0, observations 0, scores 0, sessions 0, prompts 0. Weekly metrics since 2026-08-31 are all zero.
+- One dataset, `trms-qa-agent-evals`: 16 active eval cases for the n8n TRMS QA Testing Agent, created 2026-07-13, with 0 dataset runs.
+- So nothing is arriving in this project.
+
+**Phase 2 therefore starts with ingestion.** This is the one phase allowed to add it:
+- Re-point the per-key Langfuse logging on `lh-harness` at this project (`infrastructure/scripts/set-perkey-langfuse.sh` in mcp-tools). Per-key only, never a global callback.
+- Apply task 169's sampling so the 50,000-event free tier is not burned again. Get the sample rate from Paxton through OPEN-ASKS before switching it on.
+
+Background:
+- The per-key logging credentials on the LiteLLM keys `lh-harness` and `n8n-dev-pipeline-orchestrator` return 401 (stale keys, or keys for another project).
 - `langfuse-mcp` has no stored key.
 
 1. **Inventory first.** Before designing tables, write the counts of traces, observations, scores, sessions, datasets and prompts, the date span, and the top trace names and tags into the PR. Today's known tagging is `lh-run/<run_id>`, `round_N` and `<role>`, from the Claude Code adapter.
@@ -104,7 +115,27 @@ Views:
 
 **STOP GATE 5:** every report renders with live data (CSV export over the ReportServer URL returns rows). The fleet tab shows the new sections. Paxton signs off on one screenshot per report.
 
+## Phase 6 — cognizioware-qa as the auditor of the QA loop (Paxton, 2026-10-05)
+**Ask:** "cognizioware-qa is considered the auditor in our QA loop. All the data points needed to achieve our goals should be recorded from these, and we should get in a pattern of using cognizioware-qa to validate before external-team display or approval of your, or a team of sessions', work."
+
+What exists: the `cognizioware-qa` repo (QA runtime + Mission Control). It has `qa_runs` / `qa_run_steps` tables with pass/fail scores and a 0-5 rating per step, a Playwright runner, and acceptance suites (`oidc-`, `billing-`, `fleet-`, `litellm-`, `overseer-acceptance`). mcp-tools also has the `qa-run-mcp` gateway service.
+
+1. **Plan first (its own run, design only).** Write `design/qa-auditor-loop.md` in cognizioware-qa covering:
+   - which work types must pass a cognizioware-qa run before they are shown to Paxton or an external team (harness run PRs, deploys, session handoffs);
+   - which suite covers each type, and where coverage is missing;
+   - the verdict contract: pass / fail / not-covered, with an evidence link;
+   - how a harness run or a Claude session requests a QA run (`qa-run-mcp`) and where the verdict is written back (PR comment, queue entry, OPEN-ASKS row).
+2. **Record every data point.** A reporting-sync module for `qa_runs` / `qa_run_steps` (stage tables), and these views:
+   - `rpt.qa_runs_daily`;
+   - `rpt.qa_verdict_by_work_item`;
+   - `rpt.rsi_qa_first_pass`: the share of work items that pass QA on the first attempt, over time. This is the quality signal an independent auditor gives the RSI loop.
+3. **The gate.** A work item is "ready for approval" only with a passing cognizioware-qa verdict attached, or an explicit `not-covered` with the gap filed. The enforcement point and exceptions come from the design in step 1. Do not block deploys with it until Paxton approves the design.
+4. **Reports.** Add "QA Auditor" to `/Fleet/RSI` in Power BI and to the fleet Reports tab.
+
+**STOP GATE 6:** Paxton approves the design. Three real work items show a recorded QA verdict in `rpt.qa_verdict_by_work_item`, and the report shows them.
+
 ## Bridge and overseer
 - The overseer queues phases 0 to 5 as separate runs, in order. Each run's PR names its STOP GATE evidence.
-- Phase 2 is blocked until the Langfuse key pair exists. Run Phases 1 and 3 in the meantime.
+- Phase 2 is unblocked (keys on CT202). Its sampling rate needs Paxton's answer first.
+- Phase 6 starts with the design-only run.
 - Questions for Paxton go through OPEN-ASKS, not chat.
