@@ -73,6 +73,17 @@ _CLASSIFIERS: tuple[tuple[str, re.Pattern[str], str], ...] = (
         ),
         "Provider 网络连接失败",
     ),
+    # HTTP 499 ("client closed request") has no body: the caller gave up
+    # after 60 s without a first byte from the router (lane busy or slow
+    # first token). Nothing failed upstream, so name it honestly. The
+    # resulting abort_reason, provider_first_byte_timeout, matches the
+    # launcher's retryable "timeout" signature, so the entry is requeued
+    # instead of staying failed as a generic provider_error.
+    (
+        "first_byte_timeout",
+        re.compile(r"\b499\b", re.I),
+        "No first byte from router in 60 s (lane busy or slow first token)",
+    ),
 )
 
 
