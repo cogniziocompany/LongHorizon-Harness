@@ -59,7 +59,18 @@ Rules:
 
 | Source | Access path (read-only) | Status |
 |---|---|---|
-| **Seq (OpenTelemetry logs and traces)**: `https://seq.easybutt0n.ai`. Every mcp-tools service exports OTLP there (`OTEL_EXPORTER_OTLP_ENDPOINT=https://seq.easybutt0n.ai/ingest/otlp`, `OTEL_SERVICE_NAME` per service); powerplatform logs via `pino-seq`. | Seq HTTP API with a **read-only API key**. Aggregate in Seq with its query API (`select count(*) … group by service.name, @Level, time(1h)`), never by pulling raw events. Incremental by time window. | **BLOCKED: needs a Seq API key with Read permission** (Seq → Settings → API Keys). Anonymous reads return 401; the only Seq key in the estate is the ingest key. Store as `SEQ_REPORTING_API_KEY` in CT202 `mcp-tools.env`. |
+| **Seq (OpenTelemetry logs)**: `https://seq.easybutt0n.ai`. Every mcp-tools service exports OTLP there (`OTEL_EXPORTER_OTLP_ENDPOINT=https://seq.easybutt0n.ai/ingest/otlp`, `OTEL_SERVICE_NAME` per service); powerplatform logs via `pino-seq`. | Seq HTTP API (`/api/data` for aggregates) with a read key, `SEQ_REPORTING_URL` / `SEQ_REPORTING_API_KEY` in CT202 `mcp-tools.env`. Aggregate in Seq, never pull raw events; incremental by time window. | **Unblocked 2026-10-05.** Findings below. |
+
+**Seq inventory (2026-10-05):**
+- **Volume and retention:** about 675,000 events retained, 2026-06-08 to now. About 33,000 a day across 25 named services.
+- **Logs only.** There are **no OTel spans** in the last 7 days. `fact_span_hourly` stays empty until services export traces; record that as a finding, don't fake it.
+- **Level names differ by source:** `INFO`/`WARN`/`ERROR` from OTel, `Information` from pino. `fact_log_hourly` normalises them to Serilog levels.
+- **pino request logs:** about 2,750 events a day have no `service.name`. They are pino request logs with `hostname`, `method`, `path`, `status` and `ms`. Map `hostname` to a service via `dim_service`, and add `fact_http_hourly` (hour × service × path template × status class, count, p50/p95 ms).
+- **Notable now:**
+  - `kb-mcp` and `kb-mcp-uat` log about 57 ERROR a day each;
+  - `monday-mcp`, `ops-status-mcp` and `qa-run-mcp` about 23 ERROR a day each;
+  - `fleet-admin` logs 2,290 WARN a day;
+  - `ops-control-center` is about 73% of all volume (24k INFO a day).
 | **powerplatform eval and boundary data**: Postgres in the prod stack on pve151 (`cognizioware-powerplatform-postgres-1`); dev/uat tiers on ptait07 CT pp-dev-uat | A dedicated **read-only role** `reporting_reader` with SELECT on `eval_runs`, `eval_candidates`, `boundary_traces` (columns without `payload`), `n8n_runs`. Network: allow only CT202's address. | Needs an operator step on pve151 (role + pg_hba + port). Never read `payload`. |
 | **Langfuse**: four projects. `lh-harness` (12.9k traces / 322k observations), `lh-harness-uat` (empty), `westhivecapital-hivemind` (1,393 traces, 1,128 `tool_call_checks` scores), `powerplatform-easybutt0n-ai` (prod, new), `powerplatform-uat-easybutt0n-ai`, `cognizioware-vlab` (one dataset) | Public API with each project's key, v4-compatible endpoints, daily aggregates. Keys: PTAIT09 `.secrets\languse-cloud-key-*.txt` → CT202 `mcp-tools.env` as `LANGFUSE_REPORTING_<PROJECT>_PUBLIC_KEY/_SECRET_KEY`. | Keys available |
 | **GitHub delivery data**: all org repos | GitHub API with a read-only token (Actions + PRs). Workflow runs and jobs, PR timelines, E2E gate annotations, `results.json` artifacts. | Needs a fine-grained read-only token as `GITHUB_REPORTING_TOKEN` |
