@@ -10,7 +10,8 @@ storage:
   Seeded today from :mod:`lh_harness.experience.seed` plus the instance's
   optional ``[experience]`` table; learned items supersede seeded ones when
   induction lands (not Phase 1). Every item is addressable by a stable id
-  and carries ``origin`` / ``seeded_at`` / ``source`` / ``superseded_*``.
+  and carries ``origin`` / ``seeded_at`` / ``source`` / ``superseded_*`` /
+  ``reused_count``.
 - ``GET /api/experience/policies`` — L2, paginated. Empty but addressable
   from day one; the response carries :data:`POLICY_ITEM_SCHEMA` so a UI can
   render against the collection's final shape instead of a placeholder.
@@ -142,7 +143,15 @@ def register_experience_api(
         # Records are redacted at write time by the capture pipeline; they are
         # redacted again here so the serve boundary never depends on who wrote
         # the ledger.
-        records = [redact_value(record) for record in read_trace_records(ledger)]
+        records = []
+        for record in read_trace_records(ledger):
+            item = redact_value(record)
+            if isinstance(item, dict):
+                # Same serve contract as L2/L3 items: every experience item
+                # carries its reuse count; 0 until reuse tracking lands
+                # (ledgers written before it does simply lack the field).
+                item.setdefault("reused_count", 0)
+            records.append(item)
         return {
             "run_id": run_id,
             "level": "L1",

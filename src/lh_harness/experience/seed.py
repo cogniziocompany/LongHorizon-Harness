@@ -14,10 +14,11 @@ seeded substrate for L2 and L3:
   the same shape a learned policy will take once induction lands (explicitly
   out of Phase 1 scope), so no later change has to redesign it.
 
-Every item carries ``origin`` (``"seeded"`` or ``"learned"``) and
-``seeded_at``. A learned (or config-supplied) item *supersedes* a seeded one
-without erasing the record of what was seeded: :func:`supersede` marks the
-original in place and the replacement lives under its own stable id.
+Every item carries ``origin`` (``"seeded"`` or ``"learned"``), ``seeded_at``
+and ``reused_count`` (an int >= 0, 0 until reuse tracking lands). A learned
+(or config-supplied) item *supersedes* a seeded one without erasing the
+record of what was seeded: :func:`supersede` marks the original in place and
+the replacement lives under its own stable id.
 
 An instance may extend or supersede the built-in L3 seeds through an optional
 ``[experience]`` table in its own ``.lh-harness/config.toml`` (see
@@ -73,6 +74,10 @@ POLICY_ITEM_SCHEMA: dict[str, str] = {
     "superseded_by": "id of the item replacing this one, or null",
     "superseded_at": "ISO-8601 timestamp of supersession, or null",
     "summary": "one-line statement of the generalized routine (<= 512 chars)",
+    "reused_count": (
+        "integer >= 0: how many recorded reuse events this item has "
+        "(times a later run/episode consumed it); 0 until reuse tracking lands"
+    ),
     "detail.statement": "the generalized routine in full",
     "detail.device_requirement": (
         "{host_kind, shell, requires: [...]} — the kind of device the routine "
@@ -520,9 +525,27 @@ def _finalize(raw: dict[str, Any], *, seeded_at: str, source: str) -> dict[str, 
         "superseded_by": raw.get("superseded_by"),
         "superseded_at": raw.get("superseded_at"),
         "summary": summary[:SUMMARY_MAX_CHARS],
+        "reused_count": _reused_count(raw.get("reused_count", 0)),
         "detail": raw.get("detail", {}),
     }
     return redact_value(item)
+
+
+def _reused_count(value: Any) -> int:
+    """Coerce a stored reuse count to the served contract: an int >= 0.
+
+    Reuse tracking (retrieval/induction recording events against an item) is
+    not implemented yet, so every item serves 0 today; this keeps the field
+    always present and well-typed from day one, so a later phase can count
+    real reuse without changing the API shape. A bogus stored value is a data
+    error, not a silent 0 — it raises, the same honesty rule as the supersede
+    helpers.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"reused_count must be an int, got {value!r}")
+    if value < 0:
+        raise ValueError(f"reused_count must be >= 0, got {value}")
+    return value
 
 
 def _read_toml_if_present(path: Path) -> dict[str, Any] | None:
