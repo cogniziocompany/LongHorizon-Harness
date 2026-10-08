@@ -186,6 +186,7 @@ Capacity is configured under `[queue.capacity]`:
 | `kimi_max` | 3 | Concurrent kimi runs allowed |
 | `qwen_max` | 1 | Concurrent qwen runs allowed (QA only, one at a time) |
 | `orfree_max` | 2 | Concurrent orfree runs allowed. Only used when `[queue.trios.orfree]` is defined (see below) |
+| `glm_max` | 1 | Concurrent glm runs allowed. Only used when `[queue.trios.glm]` is defined (see below) |
 | `min_healthy_keys` | 2 | Healthy Ollama Cloud keys required before kimi launches |
 | `key_health_url` | `""` | URL that returns `{ "healthy_keys": [{"healthy": true}, ...] }` |
 | `poll_seconds` | 15 | Launcher poll interval |
@@ -586,3 +587,20 @@ starts only when `LH_HARNESS_FLEET_URL` is set (`server.py:645`); with the env
 var unset the web server behaves exactly as before. (This is the queue-depth
 half of the liveness signal, delivered in commit `3efb79bd`; the launcher
 last-tick half is deferred to the migration plan §4 as new work.)
+
+## The optional `glm` trio (Ollama Cloud glm-5.3)
+
+Like `orfree`, `glm` exists only on a node whose `config.toml` defines it; elsewhere a `glm`
+entry stays pending with `glm at capacity`. It is the dev trio on the keyed Ollama Cloud
+`glm-5.3:cloud` model, separate from the `kimi` trio (which on CT110 runs the synthetic
+provider and must not be changed).
+
+```toml
+[queue.trios.glm]
+agent = "claude_code"
+model = "glm-5.3:cloud"
+mcp_profile = "ops"
+
+[queue.capacity]
+glm_max = 1
+```
