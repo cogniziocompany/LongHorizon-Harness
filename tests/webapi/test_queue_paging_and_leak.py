@@ -140,3 +140,25 @@ def test_state_registry_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert any(state is not None for state in opened)
     assert len(registry._states) <= 4
     assert "base" in registry._states  # the base run is pinned
+
+
+def test_mcp_list_queue_summary_default_and_single_entry(tmp_path: Path) -> None:
+    from lh_harness.mcp_tools import _list_queue
+    from lh_harness.queue import QueueStore
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    client = TestClient(create_app(runs_root=root))
+    qid = _enqueue(client, "mcp-one", task="y" * 900)
+    _enqueue(client, "mcp-two", trio="qwen")
+    store = QueueStore(root)
+    page = _list_queue({}, queue_store=store)
+    assert page["ok"] and page["view"] == "summary" and page["total"] == 2
+    assert all("task" not in e for e in page["entries"])
+    one = _list_queue({"queue_id": qid}, queue_store=store)
+    assert one["entry"]["task"] == "y" * 900
+    legacy = _list_queue({"view": "full"}, queue_store=store)
+    assert all("task" in e for e in legacy["entries"]) and "next_cursor" not in legacy
+    by_trio = _list_queue({"trio": "qwen", "limit": "1"}, queue_store=store)
+    assert [e["name"] for e in by_trio["entries"]] == ["mcp-two"]
+    assert _list_queue({"limit": "x"}, queue_store=store)["code"] == 422

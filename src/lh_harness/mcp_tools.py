@@ -117,8 +117,11 @@ Rules:
 
 _LIST_QUEUE_DESCRIPTION = """List harness queue entries and their statuses.
 
-Returns pending, launched, done, and failed entries with counts and skip
-reasons. Hydra and chat clients can use this to show the current backlog.
+Returns a SUMMARY page by default (newest first, 50 entries): every field except the
+task text, which is replaced by task_preview (first 200 chars) and task_bytes, plus
+counts. Filter with status (comma list), name (substring) and trio; page with limit
+(max 500) and after (the next_cursor of the previous page). Pass queue_id to get one
+full entry including its task text, or view=full for the legacy full listing.
 """
 
 _RUN_STATUS_DESCRIPTION = """Return the current status of a harness run.
@@ -405,7 +408,13 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
             "harness_list_queue",
             _LIST_QUEUE_DESCRIPTION,
             {
-                "status": _string_param("Filter by status: pending, launched, done, failed.", required=False),
+                "status": _string_param("Filter by status (comma list): pending, launched, done, failed, blocked.", required=False),
+                "name": _string_param("Only entries whose name contains this text (case-insensitive).", required=False),
+                "trio": _string_param("Only entries for this trio (e.g. qwen, kimi, glm).", required=False),
+                "limit": _string_param("Page size, 1-500 (default 50).", required=False),
+                "after": _string_param("Cursor from the previous page's next_cursor.", required=False),
+                "queue_id": _string_param("Return this one entry in full (task text included).", required=False),
+                "view": _string_param("summary (default) or full (legacy: every entry with task text).", required=False),
             },
         ),
         _tool_spec(
@@ -1083,21 +1092,61 @@ def _enqueue(
 def _list_queue(arguments: dict[str, Any], *, queue_store: Any) -> dict[str, Any]:
     if queue_store is None:
         return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
-    status = _bounded(arguments.get("status"), field="status", max_chars=32) or None
-    entries = queue_store.list()
-    # The status set is canonical in queue.py; "blocked" is a fifth, non-terminal
-    # queue state (the PC queue's parked state) surfaced here as its own group.
     from .queue import _VALID_STATUS
+    from .webapi.server import _queue_entry_summary
 
+    queue_id = _bounded(arguments.get("queue_id"), field="queue_id", max_chars=80) or None
+    if queue_id:
+        entry = queue_store.get(queue_id)
+        if entry is None:
+            return {"ok": False, "error": "queue entry not found", "code": 404}
+        return {"ok": True, "entry": entry.to_dict()}
+    view = (_bounded(arguments.get("view"), field="view", max_chars=16) or "summary").lower()
+    status_raw = _bounded(arguments.get("status"), field="status", max_chars=80) or None
+    name = (_bounded(arguments.get("name"), field="name", max_chars=200) or "").lower()
+    trio = _bounded(arguments.get("trio"), field="trio", max_chars=64) or None
+    after = _bounded(arguments.get("after"), field="after", max_chars=200) or None
+    try:
+        limit = max(1, min(500, int(_bounded(arguments.get("limit"), field="limit", max_chars=6) or 50)))
+    except ValueError:
+        return {"ok": False, "error": "limit must be an integer 1-500", "code": 422}
     valid_statuses = set(_VALID_STATUS)
-    filtered = entries
-    if status is not None and status in valid_statuses:
-        filtered = [item for item in entries if item.status == status]
-    result: dict[str, Any] = {
-        "ok": True,
-        "entries": [item.to_dict() for item in filtered],
-        "counts": queue_store.counts(),
-    }
+    entries = queue_store.list()
+    if view == "full" and not any((name, trio, after, arguments.get("limit"))):
+        # Legacy contract: every matching entry with its task text.
+        filtered = entries
+        if status_raw is not None and status_raw in valid_statuses:
+            filtered = [item for item in entries if item.status == status_raw]
+        result: dict[str, Any] = {"ok": True, "entries": [item.to_dict() for item in filtered], "counts": queue_store.counts()}
+    else:
+        wanted = {s.strip() for s in status_raw.split(",")} & valid_statuses if status_raw else None
+        filtered = [
+            item for item in entries
+            if (wanted is None or item.status in wanted)
+            and (not name or name in (item.name or "").lower())
+            and (trio is None or (item.trio or "") == trio)
+        ]
+        filtered.sort(key=lambda item: (float(item.created_at or 0), item.queue_id), reverse=True)
+        if after:
+            try:
+                ts_raw, cursor_id = after.split(",", 1)
+                key = (float(ts_raw), cursor_id)
+            except ValueError:
+                return {"ok": False, "error": "after must be '<created_at>,<queue_id>'", "code": 422}
+            filtered = [item for item in filtered if (float(item.created_at or 0), item.queue_id) < key]
+        page = filtered[:limit]
+        next_cursor = None
+        if len(filtered) > limit and page:
+            next_cursor = f"{float(page[-1].created_at or 0)!r},{page[-1].queue_id}"
+        summary = view != "full"
+        result = {
+            "ok": True,
+            "entries": [_queue_entry_summary(item) if summary else item.to_dict() for item in page],
+            "counts": queue_store.counts(),
+            "total": len(filtered),
+            "next_cursor": next_cursor,
+            "view": "summary" if summary else "full",
+        }
     contentions = _read_contentions(queue_store.runs_root)
     if contentions:
         result["contentions"] = contentions
