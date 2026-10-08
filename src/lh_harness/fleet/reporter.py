@@ -10,6 +10,7 @@ device ``/checkin`` endpoint.
 
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
 import hmac
@@ -22,10 +23,11 @@ import stat
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,26 @@ _MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
 # well under any plausible proxy body limit for the heartbeat route.
 _MAX_ACTIVE_RUNS_PER_HEARTBEAT = 200
 _MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
+# Over the inline cap a run file is no longer skipped: it is uploaded as a
+# sequence of independently gzip-compressed base64 chunks (one POST per chunk)
+# so the whole transcript still reaches fleet-admin.  Two settings bound that
+# path (both live in the settings DB catalog; ``apply_startup_settings`` copies
+# DB values over the environment at service start, so ``os.environ`` is the
+# read path like every other LH_HARNESS_* option):
+# - ``LH_HARNESS_MAX_ARTIFACT_BYTES``: inline cap; default keeps the historic
+#   8 MB behavior byte-identical until configured.
+# - ``LH_HARNESS_MAX_TRANSCRIPT_BYTES``: absolute hard cap for the chunked
+#   path; anything larger keeps the old ``{truncated: true}`` marker.
+_MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
+_ENV_MAX_ARTIFACT_BYTES = "LH_HARNESS_MAX_ARTIFACT_BYTES"
+_ENV_MAX_TRANSCRIPT_BYTES = "LH_HARNESS_MAX_TRANSCRIPT_BYTES"
+# Raw bytes per chunk.  At 512 KiB the gzip+base64 envelope stays under the
+# 1 MB JSON control-body limit of every JSON ingest route.
+_UPLOAD_CHUNK_BYTES = 512 * 1024
+# Server route that consumes chunked artifact/transcript uploads.
+# This must match ``/api/runs/{run_id}/rounds/{round_index}/artifact-chunks``
+# in ``src/lh_harness/webapi/server.py``.
+_CHUNK_ENDPOINT = "/api/runs/{run_id}/rounds/{round_index}/artifact-chunks"
 _TRAJECTORY_ROLES = (
     "manager",
     "executor",
@@ -345,9 +367,67 @@ class FleetReporter:
         trajectories: list[dict[str, Any]],
         report: dict[str, Any] | None = None,
     ) -> None:
-        """Enqueue a complete round content payload."""
+        """Enqueue a complete round content payload.
+
+        Content dicts produced by the chunked path carry only the upload
+        metadata plus a private ``_chunk_source`` key (the local file path).
+        That key is stripped from the inline payload here and its file is
+        re-read slice by slice: one gzip+base64 envelope is produced, queued,
+        and released before the next slice is read, so neither the transcript
+        nor all chunk envelopes ever exist in the reporter process at once.
+        Chunks target the same
+        ``/api/runs/{run_id}/rounds/{round_index}/artifact-chunks`` route the
+        webapi server exposes so the round body stays small and no single
+        request approaches the ingest body limit.
+        """
         if not self._enabled:
             return
+        for kind, items, name_key in (
+            ("artifact", artifacts, "name"),
+            ("trajectory", trajectories, "file"),
+        ):
+            for item in items:
+                content = item.get("content") if isinstance(item, dict) else None
+                if not isinstance(content, dict):
+                    continue
+                source = content.pop("_chunk_source", None)
+                if not source:
+                    continue
+                envelope_base: dict[str, Any] = {
+                    "run_id": run_id,
+                    "runId": run_id,
+                    "round": round_index,
+                    "kind": kind,
+                    "name": item.get(name_key),
+                    "bytes": content.get("bytes"),
+                    "sha256": content.get("sha256"),
+                    "encoding": content.get("encoding"),
+                    "chunk_count": content.get("chunks"),
+                }
+                if kind == "trajectory":
+                    envelope_base["role"] = item.get("role")
+                emitted = 0
+                for index, data in enumerate(_iter_chunk_payloads(source)):
+                    envelope = dict(envelope_base)
+                    envelope["chunk_index"] = index
+                    envelope["data"] = data
+                    self._post_chunk_envelope(run_id, round_index, envelope)
+                    # Release the chunk body before the next slice is read so
+                    # only one envelope is alive at a time.
+                    emitted = index + 1
+                    envelope = None
+                    data = None
+                expected = content.get("chunks")
+                if isinstance(expected, int) and emitted != expected:
+                    logger.warning(
+                        "<ORGANIZATION_OCKAH_50> reporter chunk upload for %s round %d emitted "
+                        "%d of %d chunks for %s; the file changed during upload",
+                        run_id,
+                        round_index,
+                        emitted,
+                        expected,
+                        item.get(name_key),
+                    )
         body = {
             "run_id": run_id,
             "runId": run_id,
@@ -359,6 +439,20 @@ class FleetReporter:
         if report is not None:
             body["report"] = report
         self._post("/harness/rounds", body, gzip_body=True)
+
+    def _post_chunk_envelope(self, run_id: str, round_index: int, envelope: dict[str, Any]) -> None:
+        """Queue one chunk envelope POST to the server's artifact-chunk route.
+
+        Sent with ``gzip_body=False``: the envelope's chunk payload is already
+        individually gzipped inside the JSON, so a second compression layer
+        would only burn CPU.
+        """
+
+        endpoint = _CHUNK_ENDPOINT.format(
+            run_id=urllib.parse.quote(str(run_id), safe=""),
+            round_index=round_index,
+        )
+        self._post(endpoint, envelope, gzip_body=False)
 
     def register_heartbeat(
         self,
@@ -656,6 +750,118 @@ def _json_default(value: object) -> Any:
     return str(value)
 
 
+def _bounded_int_setting(name: str, default: int) -> int:
+    """Read an integer byte bound from the environment.
+
+    ``apply_startup_settings`` copies settings-DB values over the environment
+    at service start, so this is the settings-DB read path used by every other
+    ``LH_HARNESS_*`` option.  Missing, unparsable, or absurd values fall back
+    to ``default`` so a bad setting can never disable the bound.
+    """
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("ignoring unparsable %s=%r; using default %d", name, raw, default)
+        return default
+    if not 1 <= value <= 1024 * 1024 * 1024:
+        logger.warning("ignoring out-of-range %s=%r; using default %d", name, raw, default)
+        return default
+    return value
+
+
+def _chunk_upload_content(path: Path) -> dict[str, Any]:
+    """Read ``path`` in bounded slices and build the chunked-upload metadata record.
+
+    No chunk payload is buffered here.  This pass walks the file in
+    ``_UPLOAD_CHUNK_BYTES`` slices to compute ``bytes``/``sha256``/``chunks``
+    incrementally — every chunk envelope must carry the full-file digest to
+    satisfy the artifact-chunk route — and attaches a private ``_chunk_source``
+    key with the local path.  The payloads themselves are streamed one slice at
+    a time by ``_iter_chunk_payloads`` during ``queue_round_content``, which
+    pops ``_chunk_source`` so it is never serialized into the round body, so
+    the whole transcript never accumulates in the reporter process.
+
+    The receiver still reassembles by concatenating per-chunk decompressions
+    and verifies ``sha256`` over the result.
+    """
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return {}
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return {}
+        digest = hashlib.sha256()
+        read_total = 0
+        chunks = 0
+        while True:
+            slice_bytes = os.read(fd, _UPLOAD_CHUNK_BYTES)
+            if not slice_bytes:
+                break
+            digest.update(slice_bytes)
+            read_total += len(slice_bytes)
+            chunks += 1
+        if read_total == 0:
+            return {}
+        return {
+            "chunked": True,
+            "bytes": read_total,
+            "sha256": digest.hexdigest(),
+            "encoding": "gzip+base64",
+            "chunks": chunks,
+            "_chunk_source": str(path),
+        }
+    except OSError:
+        return {}
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _iter_chunk_payloads(path: Path | str) -> Iterator[str]:
+    """Stream ``path`` and yield one gzip+base64 chunk payload at a time.
+
+    The file is opened ``O_RDONLY|O_NOFOLLOW`` with the same regular-file and
+    single-link checks as ``_chunk_upload_content`` and read in bounded
+    ``_UPLOAD_CHUNK_BYTES`` slices; each slice is compressed and encoded
+    individually and yielded before the next slice is read, so only one raw
+    slice, one compressed body, and one encoded payload exist in memory at any
+    time.  An open or read failure ends the stream early;
+    ``queue_round_content`` logs the resulting shortfall against the chunk
+    count the metadata pass computed.
+    """
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return
+        while True:
+            try:
+                slice_bytes = os.read(fd, _UPLOAD_CHUNK_BYTES)
+            except OSError:
+                return
+            if not slice_bytes:
+                return
+            yield base64.b64encode(gzip.compress(slice_bytes)).decode("ascii")
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _safe_read_text(path: Any, max_bytes: int = _MAX_ARTIFACT_BYTES) -> dict[str, Any]:
     """Read a local file through no-follow, returning content or a truncation marker.
 
@@ -725,10 +931,16 @@ def _collect_round_content(
 
     All filesystem access is routed through ``safe_run_rounds`` / ``safe_run_role``
     boundary helpers so the walk never escapes the validated run directory.  Each
-    artifact or trajectory is capped at ``_MAX_ARTIFACT_BYTES``; larger files are
-    represented by an explicit ``{truncated: true, bytes: N}`` marker.
+    artifact or trajectory up to the configured inline cap
+    (``LH_HARNESS_MAX_ARTIFACT_BYTES``, default ``_MAX_ARTIFACT_BYTES``) is read
+    inline.  Larger files up to the hard cap (``LH_HARNESS_MAX_TRANSCRIPT_BYTES``,
+    default ``_MAX_TRANSCRIPT_BYTES``) upload as gzip+base64 chunk records instead
+    of being dropped; beyond the hard cap they keep the explicit
+    ``{truncated: true, bytes: N}`` marker.
     """
 
+    inline_cap = _bounded_int_setting(_ENV_MAX_ARTIFACT_BYTES, _MAX_ARTIFACT_BYTES)
+    hard_cap = _bounded_int_setting(_ENV_MAX_TRANSCRIPT_BYTES, _MAX_TRANSCRIPT_BYTES)
     artifacts: list[dict[str, Any]] = []
     trajectories: list[dict[str, Any]] = []
     try:
@@ -770,7 +982,15 @@ def _collect_round_content(
             target.relative_to(resolved_round)
         except (ValueError, OSError, RuntimeError):
             continue
-        content = _safe_read_text(target, max_bytes=_MAX_ARTIFACT_BYTES)
+        content = _safe_read_text(target, max_bytes=inline_cap)
+        if (
+            content.get("truncated")
+            and isinstance(content.get("bytes"), int)
+            and content["bytes"] <= hard_cap
+        ):
+            uploaded = _chunk_upload_content(target)
+            if uploaded:
+                content = uploaded
         if not content:
             continue
         for role in _TRAJECTORY_ROLES:

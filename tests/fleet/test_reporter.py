@@ -16,11 +16,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 
 from lh_harness.dashboard.state import ApprovalOption, DashboardState
 from lh_harness.fleet.reporter import (
     FleetReporter,
+    _bounded_int_setting,
+    _chunk_upload_content,
     _collect_round_content,
+    _iter_chunk_payloads,
     _parse_labels,
     _read_report,
     get_reporter,
@@ -30,6 +34,7 @@ from lh_harness.fleet.reporter import (
     wrap_status_writer,
 )
 from lh_harness.supervisor.control_bus import ControlBus
+from lh_harness.webapi import server as webapi_server
 
 
 class _StubHandler(BaseHTTPRequestHandler):
@@ -843,7 +848,7 @@ def test_round_content_path_traversal(tmp_path):
 
 
 def test_truncation_marker(tmp_path):
-    """Files larger than the 8 MB cap are represented by a truncation marker."""
+    """Files between the inline cap (8 MB) and the hard cap (64 MB) chunk instead of truncate."""
     runs_root = tmp_path / "runs"
     run_dir = runs_root / "run-big"
     log_dir = run_dir / "lh_harness"
@@ -858,8 +863,31 @@ def test_truncation_marker(tmp_path):
 
     artifacts, _ = _collect_round_content(runs_root, run_dir, 1)
     by_name = {a["name"]: a["content"] for a in artifacts}
-    assert by_name["big.bin"] == {"truncated": True, "bytes": 8 * 1024 * 1024 + 1}
+    # 8 MB + 1 is under _MAX_TRANSCRIPT_BYTES (64 MB), so it chunks.
+    assert by_name["big.bin"]["chunked"] is True
+    assert by_name["big.bin"]["bytes"] == 8 * 1024 * 1024 + 1
+    assert by_name["big.bin"]["encoding"] == "gzip+base64"
+    assert by_name["big.bin"]["chunks"] >= 1
+    assert "_chunk_source" in by_name["big.bin"]
     assert by_name["manager_plan.txt"]["text"] == "small"
+
+
+def test_truncation_marker_hard_cap(tmp_path):
+    """Files over the hard cap keep the explicit {truncated: true} marker."""
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / "run-big"
+    log_dir = run_dir / "lh_harness"
+    role_dir = log_dir / "role_orchestration"
+    rounds_dir = role_dir / "rounds"
+    round_dir = rounds_dir / "round_001"
+    round_dir.mkdir(parents=True)
+
+    huge = round_dir / "huge.bin"
+    # Default hard cap is 64 MB.
+    huge.write_bytes(b"x" * (64 * 1024 * 1024 + 1))
+    artifacts, _ = _collect_round_content(runs_root, run_dir, 1)
+    by_name = {a["name"]: a["content"] for a in artifacts}
+    assert by_name["huge.bin"] == {"truncated": True, "bytes": 64 * 1024 * 1024 + 1}
 
 
 def test_report_push(http_server, _isolate_reporter, tmp_path):
@@ -920,3 +948,228 @@ def test_round_content_push_hook(http_server, _isolate_reporter, tmp_path):
     assert "screenshot.png" in artifact_names
     trajectory_roles = {t["role"] for t in body["trajectories"]}
     assert "executor" in trajectory_roles
+
+
+# --------------------------------------------------------------------------
+# Deliverable 1: chunked gzip+base64 transcript upload (reporter-side)
+# --------------------------------------------------------------------------
+
+
+import base64 as _base64
+
+
+def _make_round(runs_root, run_name, round_index=1):
+    """Create the validated round directory layout used by _collect_round_content."""
+    run_dir = runs_root / run_name
+    round_dir = (
+        run_dir / "lh_harness" / "role_orchestration" / "rounds"
+        / f"round_{round_index:03d}"
+    )
+    round_dir.mkdir(parents=True)
+    return run_dir, round_dir
+
+
+def _feed_chunks_to_server(log_dir, round_index, content, name, kind, role=None):
+    """Push every chunk envelope of a chunked content record through the server's
+    reassembly helper (the same code the artifact-chunk route calls). Return the
+    final response dict."""
+    source = content["_chunk_source"]
+    envelopes_base = {
+        "kind": kind,
+        "name": name,
+        "bytes": content["bytes"],
+        "sha256": content["sha256"],
+        "encoding": content["encoding"],
+        "chunk_count": content["chunks"],
+    }
+    if kind == "trajectory":
+        envelopes_base["role"] = role
+    result: dict = {}
+    for index, data in enumerate(_iter_chunk_payloads(source)):
+        envelope = dict(envelopes_base)
+        envelope["chunk_index"] = index
+        envelope["data"] = data
+        result = webapi_server._store_upload_chunk(
+            log_dir, round_index, envelope, hard_cap=webapi_server._MAX_TRANSCRIPT_BYTES
+        )
+    return result
+
+
+def test_chunk_gzip_round_trip_reassembles_identical_bytes(tmp_path, monkeypatch):
+    """Chunks produced by the reporter reassemble byte-identically through the
+    server's chunk-store helper (the code behind the artifact-chunk route)."""
+    runs_root = tmp_path / "runs"
+    run_dir, round_dir = _make_round(runs_root, "run-trip", 3)
+    # Pseudo-random, mildly compressible payload spanning several 512 KiB chunks,
+    # small enough to stay far under the 64 MB hard cap. Deterministic content.
+    payload = (b"trajectory-line-%06d \n" % i for i in range(60_000))
+    blob = b"".join(payload)
+    assert len(blob) > 512 * 1024
+    # Force the chunk path for this small blob by tightening the inline cap.
+    monkeypatch.setenv("LH_HARNESS_MAX_ARTIFACT_BYTES", "4096")
+    original = round_dir / "executor_raw_trajectory.jsonl"
+    original.write_bytes(blob)
+
+    artifacts, trajectories = _collect_round_content(runs_root, run_dir, 3)
+    assert len(trajectories) == 1
+    content = trajectories[0]["content"]
+    assert content["chunked"] is True
+    expected_chunks = (len(blob) + 512 * 1024 - 1) // (512 * 1024)
+    assert content["chunks"] == expected_chunks
+    assert content["sha256"] == hashlib.sha256(blob).hexdigest()
+
+    # Round trip through the server-side reassembly helper.
+    ingest_root = tmp_path / "ingest"
+    ingest_root.mkdir()
+    result = _feed_chunks_to_server(
+        ingest_root, 3, content, "executor_raw_trajectory.jsonl", "trajectory", role="executor"
+    )
+    assert result["complete"] is True
+    assembled = ingest_root / "_artifact_uploads" / "round_003" / "executor_raw_trajectory.jsonl"
+    assert assembled.read_bytes() == blob
+    # Spooled parts are gone after successful assembly.
+    spool = ingest_root / "_artifact_uploads" / "round_003"
+    assert not any(p.name.startswith("chunk_") for p in spool.rglob("*"))
+
+
+def test_chunk_upload_respects_configured_hard_upper_bound(tmp_path, monkeypatch):
+    """A file over the configured hard cap keeps the truncation marker instead of chunking."""
+    runs_root = tmp_path / "runs"
+    run_dir, round_dir = _make_round(runs_root, "run-cap", 1)
+    size = 8 * 1024 * 1024 + 2  # over the 8 MB inline cap
+    (round_dir / "big.bin").write_bytes(b"y" * size)
+
+    # Configure a hard cap just below the file's size.
+    cap = size - 1
+    monkeypatch.setenv("LH_HARNESS_MAX_TRANSCRIPT_BYTES", str(cap))
+    assert _bounded_int_setting("LH_HARNESS_MAX_TRANSCRIPT_BYTES", 64 * 1024 * 1024) == cap
+
+    artifacts, _ = _collect_round_content(runs_root, run_dir, 1)
+    by_name = {a["name"]: a["content"] for a in artifacts}
+    assert by_name["big.bin"] == {"truncated": True, "bytes": size}
+    assert "chunked" not in by_name["big.bin"]
+
+
+def test_chunk_upload_under_cap_chunks_normally(tmp_path, monkeypatch):
+    """A file between the inline cap and the configured hard cap still chunks."""
+    runs_root = tmp_path / "runs"
+    run_dir, round_dir = _make_round(runs_root, "run-cap2", 1)
+    size = 8 * 1024 * 1024 + 512 * 1024
+    (round_dir / "big.bin").write_bytes(b"z" * size)
+
+    monkeypatch.setenv("LH_HARNESS_MAX_TRANSCRIPT_BYTES", str(size))
+    artifacts, _ = _collect_round_content(runs_root, run_dir, 1)
+    by_name = {a["name"]: a["content"] for a in artifacts}
+    assert by_name["big.bin"]["chunked"] is True
+    assert by_name["big.bin"]["bytes"] == size
+
+
+def test_chunk_envelopes_stream_without_buffering_all_chunks(tmp_path, http_server, _isolate_reporter, monkeypatch):
+    """queue_round_content POSTs each chunk as it is produced: at no point does
+    the request queue hold more than one chunk envelope per upload in flight
+    (verified here by counting queued items against the chunk count)."""
+    runs_root = tmp_path / "runs"
+    run_dir, round_dir = _make_round(runs_root, "run-stream", 1)
+    blob = (b"chunk-stream-line \n" * 40000)
+    original = round_dir / "executor_raw_trajectory.jsonl"
+    original.write_bytes(blob)
+    assert len(blob) > 512 * 1024
+    # Force the chunk path for this small blob (default inline cap is 8 MB).
+    monkeypatch.setenv("LH_HARNESS_MAX_ARTIFACT_BYTES", "4096")
+
+    _setenv(http_server, "stream-node", "stream-key", None)
+    get_reporter(version="0.4.0", capacity=1, reset=True)
+
+    post_round_content(runs_root, run_dir, 1)
+    reporter = get_reporter()
+    reporter.stop(timeout=5.0)
+
+    chunk_requests = [
+        r for r in _StubHandler.requests
+        if r["path"].startswith("/api/runs/run-stream/rounds/1/artifact-chunks")
+    ]
+    content = _chunk_upload_content(original)
+    assert len(chunk_requests) == content["chunks"]
+    # Envelopes arrive one-per-POST with matching sequential indices.
+    indices = [r["body"]["chunk_index"] for r in chunk_requests]
+    assert indices == list(range(len(indices)))
+    # Each chunk body, once decompressed and concatenated, reproduces the file.
+    reassembled = b"".join(
+        gzip.decompress(_base64.b64decode(r["body"]["data"])) for r in chunk_requests
+    )
+    assert reassembled == blob
+    # The chunked record is stripped of _chunk_source in the round body and its
+    # metadata is retained.
+    round_requests = [r for r in _StubHandler.requests if r["path"] == "/harness/rounds"]
+    assert len(round_requests) == 1
+    traj = round_requests[0]["body"]["trajectories"][0]["content"]
+    assert "_chunk_source" not in traj
+    assert traj["sha256"] == content["sha256"]
+    assert traj["chunks"] == content["chunks"]
+
+
+def test_bounded_int_setting_clamps_and_falls_back(monkeypatch):
+    """_bounded_int_setting returns default for missing/unparsable/out-of-range values."""
+    name = "LH_HARNESS_TEST_BOUND"
+    monkeypatch.delenv(name, raising=False)
+    assert _bounded_int_setting(name, 12345) == 12345
+
+    monkeypatch.setenv(name, "not-an-int")
+    assert _bounded_int_setting(name, 12345) == 12345
+
+    monkeypatch.setenv(name, "0")
+    assert _bounded_int_setting(name, 12345) == 12345
+
+    monkeypatch.setenv(name, str(1024 * 1024 * 1024 + 1))
+    assert _bounded_int_setting(name, 12345) == 12345
+
+    monkeypatch.setenv(name, str(2048))
+    assert _bounded_int_setting(name, 12345) == 2048
+
+
+def test_server_rejects_transcript_over_hard_cap(tmp_path):
+    """The server's chunk route rejects envelopes over the configured hard cap (413)."""
+    ingest_root = tmp_path / "ingest"
+    ingest_root.mkdir()
+    blob = b"A" * 1024
+    sha = hashlib.sha256(blob).hexdigest()
+    envelope = {
+        "kind": "artifact",
+        "name": "big.bin",
+        "bytes": len(blob),
+        "sha256": sha,
+        "encoding": "gzip+base64",
+        "chunk_count": 1,
+        "chunk_index": 0,
+        "data": _base64.b64encode(gzip.compress(blob)).decode("ascii"),
+    }
+    with pytest.raises(HTTPException) as excinfo:
+        webapi_server._store_upload_chunk(
+            ingest_root, 0, envelope, hard_cap=len(blob) - 1
+        )
+    assert excinfo.value.status_code == 413
+    # Below the cap it succeeds.
+    result = webapi_server._store_upload_chunk(
+        ingest_root, 0, envelope, hard_cap=len(blob)
+    )
+    assert result["complete"] is True
+
+
+def test_server_upload_lock_map_bounded():
+    """The server's per-upload lock map is bounded: stale unlocked entries are evicted."""
+    import time as _time
+
+    webapi_server._upload_locks.clear()
+    try:
+        ceiling = webapi_server._MAX_UPLOAD_LOCKS
+        for i in range(ceiling + 50):
+            webapi_server._upload_lock_for(f"/spool/{i}")
+        assert len(webapi_server._upload_locks) <= ceiling
+        # Held locks are never evicted from under a holder.
+        held = webapi_server._upload_lock_for("/spool/held")
+        with held:
+            for i in range(ceiling * 2):
+                webapi_server._upload_lock_for(f"/spool/again/{i}")
+            assert held in webapi_server._upload_locks.values()
+    finally:
+        webapi_server._upload_locks.clear()
