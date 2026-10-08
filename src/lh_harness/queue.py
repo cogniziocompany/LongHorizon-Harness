@@ -49,7 +49,7 @@ _NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
 # on an OpenRouter free model through the gateway; an entry enqueued for it on
 # a node whose config does not define it stays pending ("orfree at capacity").
 _REQUIRED_TRIOS = frozenset({"kimi", "qwen"})
-_OPTIONAL_TRIOS = frozenset({"orfree"})
+_OPTIONAL_TRIOS = frozenset({"orfree", "glm"})
 _VALID_TRIOS = _REQUIRED_TRIOS | _OPTIONAL_TRIOS
 
 # The requester identity block (task 300).  A JSON object on the entry body
@@ -782,6 +782,8 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         # Only consulted when [queue.trios.orfree] is defined: remaining
         # capacity is computed per CONFIGURED trio (launcher._remaining_capacity).
         "orfree_max": 2,
+        # Only consulted when [queue.trios.glm] is defined (Ollama Cloud glm-5.3).
+        "glm_max": 1,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
@@ -794,6 +796,8 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["qwen_max"] = max(0, capacity["qwen_max"])
     if isinstance(capacity.get("orfree_max"), int):
         normalized_capacity["orfree_max"] = max(0, capacity["orfree_max"])
+    if isinstance(capacity.get("glm_max"), int):
+        normalized_capacity["glm_max"] = max(0, capacity["glm_max"])
     if isinstance(capacity.get("min_healthy_keys"), int):
         normalized_capacity["min_healthy_keys"] = max(0, capacity["min_healthy_keys"])
     if isinstance(capacity.get("key_health_url"), str):
