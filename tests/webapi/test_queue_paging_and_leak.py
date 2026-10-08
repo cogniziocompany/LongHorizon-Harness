@@ -131,6 +131,7 @@ def test_state_registry_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     root = tmp_path / "runs"
     for i in range(10):
         (root / f"20261007T00000{i}Z_aaaaaaa{i}" / "lh_harness").mkdir(parents=True)
+        (root / f"20261007T00000{i}Z_aaaaaaa{i}" / "control").mkdir(parents=True)
     from lh_harness.dashboard.state import DashboardState
 
     base = DashboardState(tmp_path / "base", runs_root=root, control_enabled=False)
