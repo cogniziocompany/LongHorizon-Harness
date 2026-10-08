@@ -17,6 +17,7 @@ import threading
 from collections import OrderedDict
 import time
 import uuid
+import zlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable
@@ -117,6 +118,270 @@ _DASHBOARD_MIME_TYPES = {
 
 _MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 _MAX_CONTROL_BODY_BYTES = 1 * 1024 * 1024
+# Both byte bounds are configurable through the settings DB (catalog entries in
+# ``settings_store``); ``apply_startup_settings`` copies DB values over the
+# environment at service start, so ``os.environ`` is the read path.  Defaults
+# keep the historic behavior unchanged until an admin configures a value.
+_ENV_MAX_ARTIFACT_BYTES = "LH_HARNESS_MAX_ARTIFACT_BYTES"
+_ENV_MAX_TRANSCRIPT_BYTES = "LH_HARNESS_MAX_TRANSCRIPT_BYTES"
+# Hard cap for the chunked transcript upload path (reporter -> ingest): a run
+# file larger than this is never accepted, even in chunks.
+_MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
+# The reporter emits 512 KiB raw slices; the inflate ceiling is what the
+# receiver tolerates per chunk.  Chunk bodies fit inside
+# ``_MAX_CONTROL_BODY_BYTES`` (gzip+base64 of 512 KiB stays under 1 MB).
+_MAX_CHUNK_INFLATE_BYTES = 8 * 1024 * 1024
+_MAX_UPLOAD_CHUNKS = 4096
+_SAFE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,256}")
+_ROLE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _bounded_int_setting(name: str, default: int) -> int:
+    """Environment-backed integer bound (settings DB is applied to env at start).
+
+    Missing, unparsable, or absurd values fall back to ``default`` so a bad
+    setting can never disable a server-side bound.
+    """
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if not 1 <= value <= 1024 * 1024 * 1024:
+        return default
+    return value
+
+
+def _max_artifact_bytes() -> int:
+    return _bounded_int_setting(_ENV_MAX_ARTIFACT_BYTES, _MAX_ARTIFACT_BYTES)
+
+
+def _max_transcript_bytes() -> int:
+    return _bounded_int_setting(_ENV_MAX_TRANSCRIPT_BYTES, _MAX_TRANSCRIPT_BYTES)
+
+
+def _gunzip_bounded(data: bytes, limit: int) -> bytes | None:
+    """Inflate one gzip chunk with a hard output ceiling (zip-bomb guard)."""
+
+    try:
+        decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        out = decompressor.decompress(data, limit + 1)
+        if len(out) > limit or decompressor.unconsumed_tail:
+            return None
+        out += decompressor.flush(limit + 1 - len(out))
+        if len(out) > limit or decompressor.unused_data:
+            return None
+        return out
+    except zlib.error:
+        return None
+
+
+_upload_locks: dict[str, threading.Lock] = {}
+_upload_locks_guard = threading.Lock()
+# The map is keyed by spool path, so it grows once per distinct upload.  Bound
+# it: past the ceiling, unlocked entries are evicted until the map fits.  A
+# lock handed out by an in-flight call is still referenced by that caller, so
+# eviction never breaks mutual exclusion for live uploads (the lock object
+# stays alive and held); a same-key request racing the eviction simply builds
+# a fresh lock and serializes on the on-disk meta.json under the new one.
+_MAX_UPLOAD_LOCKS = 4096
+
+
+def _upload_lock_for(key: str) -> threading.Lock:
+    with _upload_locks_guard:
+        lock = _upload_locks.get(key)
+        if lock is None:
+            if len(_upload_locks) >= _MAX_UPLOAD_LOCKS:
+                for stale in [
+                    stale_key
+                    for stale_key, stale_lock in _upload_locks.items()
+                    if not stale_lock.locked()
+                ]:
+                    del _upload_locks[stale]
+                    if len(_upload_locks) < _MAX_UPLOAD_LOCKS:
+                        break
+            lock = threading.Lock()
+            _upload_locks[key] = lock
+        return lock
+
+
+def _store_upload_chunk(
+    log_dir: Path,
+    round_index: int,
+    envelope: Any,
+    *,
+    hard_cap: int,
+) -> dict[str, Any]:
+    """Spool one chunk of a chunked artifact upload to disk and assemble on completion.
+
+    Every chunk lands in a per-upload spool directory as it arrives (never more
+    than one chunk in memory); when the last missing chunk arrives the parts are
+    concatenated in index order into the assembled file with 64 KiB reads, the
+    sha256 of the assembled bytes is verified, and the spooled parts are removed.
+    The whole transcript is therefore never resident in the web process.
+    """
+
+    if not isinstance(envelope, dict):
+        raise HTTPException(status_code=400, detail="chunk envelope must be an object")
+    kind = envelope.get("kind")
+    if kind not in {"artifact", "trajectory"}:
+        raise HTTPException(status_code=400, detail="kind must be artifact or trajectory")
+    name = envelope.get("name")
+    if not isinstance(name, str) or not _SAFE_NAME_RE.fullmatch(name) or name in {".", ".."}:
+        raise HTTPException(status_code=400, detail="invalid artifact name")
+    role = envelope.get("role")
+    if kind == "trajectory":
+        if not isinstance(role, str) or not _ROLE_TOKEN_RE.fullmatch(role):
+            raise HTTPException(status_code=400, detail="invalid trajectory role")
+    elif role is not None:
+        raise HTTPException(status_code=400, detail="role is only valid for trajectories")
+    if envelope.get("encoding") != "gzip+base64":
+        raise HTTPException(status_code=400, detail="encoding must be gzip+base64")
+    sha256 = envelope.get("sha256")
+    if not isinstance(sha256, str) or not _SHA256_RE.fullmatch(sha256):
+        raise HTTPException(status_code=400, detail="sha256 must be 64 lowercase hex chars")
+    try:
+        total_bytes = int(envelope.get("bytes"))
+        chunk_count = int(envelope.get("chunk_count"))
+        chunk_index = int(envelope.get("chunk_index"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="bytes/chunk_count/chunk_index must be integers") from None
+    if total_bytes < 1 or total_bytes > hard_cap:
+        raise HTTPException(status_code=413, detail="transcript exceeds the configured upload cap")
+    if not 1 <= chunk_count <= _MAX_UPLOAD_CHUNKS or not 0 <= chunk_index < chunk_count:
+        raise HTTPException(status_code=400, detail="chunk index/count out of range")
+    data = envelope.get("data")
+    if not isinstance(data, str) or not data:
+        raise HTTPException(status_code=400, detail="chunk data must be base64 text")
+    try:
+        compressed = base64.b64decode(data.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError, binascii.Error):
+        raise HTTPException(status_code=400, detail="chunk data is not valid base64") from None
+    raw_chunk = _gunzip_bounded(compressed, _MAX_CHUNK_INFLATE_BYTES)
+    if raw_chunk is None:
+        raise HTTPException(status_code=413, detail="chunk inflates beyond the per-chunk cap")
+    if chunk_index < chunk_count - 1 and not raw_chunk:
+        raise HTTPException(status_code=400, detail="intermediate chunks must not be empty")
+
+    upload_root = Path(log_dir) / "_artifact_uploads" / f"round_{round_index:03d}"
+    spool = upload_root / f".upload-{sha256[:16]}"
+    lock = _upload_lock_for(str(spool))
+    with lock:
+        try:
+            resolved_root = Path(log_dir).resolve(strict=False)
+            spool.mkdir(parents=True, exist_ok=True)
+            resolved_spool = spool.resolve(strict=False)
+            resolved_spool.relative_to(resolved_root)
+            if resolved_spool.is_symlink() or upload_root.is_symlink():
+                raise OSError("spool path must not be a symlink")
+        except (OSError, RuntimeError, ValueError):
+            raise HTTPException(status_code=400, detail="upload target is not writable here") from None
+
+        meta_path = spool / "meta.json"
+        meta: dict[str, Any] = {}
+        if meta_path.exists():
+            try:
+                loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                loaded = None
+            if isinstance(loaded, dict):
+                meta = loaded
+        if meta:
+            for field, expected in (
+                ("sha256", sha256),
+                ("bytes", total_bytes),
+                ("chunk_count", chunk_count),
+                ("name", name),
+                ("kind", kind),
+            ):
+                if meta.get(field) != expected:
+                    raise HTTPException(status_code=409, detail=f"chunk envelope conflicts on {field}")
+        received: set[int] = {int(i) for i in meta.get("received", []) if isinstance(i, int)}
+
+        part_path = spool / f"chunk_{chunk_index:06d}.part"
+        try:
+            fd = os.open(part_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            try:
+                view = memoryview(raw_chunk)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            raise HTTPException(status_code=500, detail="failed to spool chunk") from None
+        received.add(chunk_index)
+
+        complete = len(received) == chunk_count
+        meta = {
+            "run_upload": True,
+            "kind": kind,
+            "role": role if kind == "trajectory" else None,
+            "name": name,
+            "bytes": total_bytes,
+            "sha256": sha256,
+            "chunk_count": chunk_count,
+            "received": sorted(received),
+            "complete": complete,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if not complete:
+            _write_meta(meta_path, meta)
+            return {"ok": True, "received": len(received), "complete": False}
+
+        assembled_path = upload_root / name
+        digest = hashlib.sha256()
+        assembled_size = 0
+        try:
+            out_fd = os.open(assembled_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            try:
+                for index in range(chunk_count):
+                    part = spool / f"chunk_{index:06d}.part"
+                    in_fd = os.open(part, os.O_RDONLY | os.O_NOFOLLOW)
+                    try:
+                        while True:
+                            buf = os.read(in_fd, 64 * 1024)
+                            if not buf:
+                                break
+                            digest.update(buf)
+                            assembled_size += len(buf)
+                            view = memoryview(buf)
+                            while view:
+                                view = view[os.write(out_fd, view) :]
+                    finally:
+                        os.close(in_fd)
+                os.fsync(out_fd)
+            finally:
+                os.close(out_fd)
+        except OSError:
+            raise HTTPException(status_code=500, detail="failed to assemble transcript") from None
+        if digest.hexdigest() != sha256 or assembled_size != total_bytes:
+            try:
+                assembled_path.unlink()
+            except OSError:
+                pass
+            _write_meta(meta_path, {**meta, "complete": False, "last_error": "sha256 mismatch"})
+            raise HTTPException(status_code=422, detail="assembled bytes failed the sha256 check")
+        # Assembly verified: drop this upload's own spool part files.
+        for index in range(chunk_count):
+            try:
+                (spool / f"chunk_{index:06d}.part").unlink()
+            except OSError:
+                pass
+        meta["assembled_at"] = meta["updated_at"]
+        _write_meta(meta_path, meta)
+        return {"ok": True, "received": len(received), "complete": True, "path": str(assembled_path)}
+
+
+def _write_meta(meta_path: Path, meta: dict[str, Any]) -> None:
+    tmp = meta_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, meta_path)
 
 # Agent-produced artifacts are untrusted.  Only a small, explicit raster
 # allow-list is rendered in the dashboard origin; everything else is a
@@ -2649,11 +2914,12 @@ def create_app(
         size = state_for_run.round_artifact_size(round_index, name)
         if size is None:
             raise HTTPException(status_code=404, detail="artifact not found")
-        if size > _MAX_ARTIFACT_BYTES:
+        max_bytes = _max_artifact_bytes()
+        if size > max_bytes:
             raise HTTPException(status_code=413, detail="artifact is too large")
         content = state_for_run.read_round_artifact(round_index, name)
         if content is None:
-            raise HTTPException(status_code=413 if size >= _MAX_ARTIFACT_BYTES else 404, detail="artifact changed during read")
+            raise HTTPException(status_code=413 if size >= max_bytes else 404, detail="artifact changed during read")
         return PlainTextResponse(
             content,
             headers={
@@ -2671,13 +2937,14 @@ def create_app(
         size = artifact_state.round_artifact_size(round_index, name)
         if size is None:
             raise HTTPException(status_code=404, detail="artifact not found") from None
-        if size > _MAX_ARTIFACT_BYTES:
+        max_bytes = _max_artifact_bytes()
+        if size > max_bytes:
             raise HTTPException(status_code=413, detail="artifact is too large")
         content = artifact_state.read_round_artifact_bytes(round_index, name)
         if content is None:
             # Never hand a path to FileResponse after a separate stat: the
             # worker can replace/grow the file during that window.
-            raise HTTPException(status_code=413 if size >= _MAX_ARTIFACT_BYTES else 404, detail="artifact changed during read")
+            raise HTTPException(status_code=413 if size >= max_bytes else 404, detail="artifact changed during read")
         suffix = target.suffix.lower()
         # Never let an agent-produced document execute in the dashboard
         # origin.  Only explicitly allow-listed raster formats are rendered
@@ -2699,6 +2966,26 @@ def create_app(
                 "Content-Security-Policy": content_security_policy,
                 "Content-Disposition": _artifact_content_disposition(disposition, name),
             },
+        )
+
+    @app.post("/api/runs/{run_id}/rounds/{round_index}/artifact-chunks")
+    async def artifact_chunk(run_id: str, round_index: int, request: Request) -> dict[str, Any]:
+        """Receive one chunk of a chunked (gzip+base64) artifact/transcript upload.
+
+        The fleet reporter emits these envelopes for run files over the inline
+        artifact cap, one POST per chunk.  Chunks are spooled to disk as they
+        arrive and assembled incrementally on completion; the web process never
+        holds a whole transcript in memory (the middleware already bounds this
+        body to ``_MAX_CONTROL_BODY_BYTES`` and each chunk inflates under
+        ``_MAX_CHUNK_INFLATE_BYTES``).  The configured hard cap
+        (``LH_HARNESS_MAX_TRANSCRIPT_BYTES``) is enforced before any write.
+        """
+        state_for_run = _state_or_404(registry, run_id)
+        envelope = await request.json()
+        if round_index < 0 or round_index > 999_999:
+            raise HTTPException(status_code=400, detail="round index out of range")
+        return _store_upload_chunk(
+            state_for_run.log_dir, round_index, envelope, hard_cap=_max_transcript_bytes()
         )
 
     @app.get("/api/runs/{run_id}/rounds/{round_index}/trajectory/{role}")
