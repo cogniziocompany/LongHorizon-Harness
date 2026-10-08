@@ -14,6 +14,7 @@ import mimetypes
 import os
 import re
 import threading
+from collections import OrderedDict
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -357,6 +358,30 @@ def _origin_allowed(origin: str | None, host: str, allowed_origins: set[str]) ->
     return parsed.netloc.lower().rstrip("/") == host.lower().rstrip("/")
 
 
+# Upper bounds for the web process's per-run in-memory state (2026-10-07 leak fix).
+_STATE_REGISTRY_MAX = int(os.environ.get("LH_HARNESS_STATE_REGISTRY_MAX", "64") or 64)
+_SNAPSHOT_CACHE_MAX = int(os.environ.get("LH_HARNESS_SNAPSHOT_CACHE_MAX", "64") or 64)
+
+
+_QUEUE_PAGE_DEFAULT = 100
+_QUEUE_PAGE_MAX = 500
+_QUEUE_PREVIEW_CHARS = 200
+_QUEUE_SKIP_REASONS_KEEP = 3
+
+
+def _queue_entry_summary(item: Any) -> dict[str, Any]:
+    """A queue entry without its task text: what a tick or a list view needs."""
+    data = item.to_dict()
+    task = data.pop("task", "") or ""
+    data["task_preview"] = task[:_QUEUE_PREVIEW_CHARS]
+    data["task_bytes"] = len(task.encode("utf-8"))
+    reasons = data.get("skip_reasons") or []
+    if len(reasons) > _QUEUE_SKIP_REASONS_KEEP:
+        data["skip_reasons"] = reasons[-_QUEUE_SKIP_REASONS_KEEP:]
+        data["skip_reasons_total"] = len(reasons)
+    return data
+
+
 class StateRegistry:
     """Resolve run ids without letting API paths escape the configured root."""
 
@@ -377,7 +402,13 @@ class StateRegistry:
         derived_run_id = state.current_run_id if run_id is None else ""
         self.base_run_id = run_id or derived_run_id or ("local" if self.runs_root is None else "")
         self.supervisor = supervisor
-        self._states: dict[str, DashboardState] = {self.base_run_id: state} if self.base_run_id else {}
+        # Bounded LRU (2026-10-07 leak fix): one DashboardState per run id used to
+        # live forever, so every run ever opened (1,000+ on CT110) stayed in
+        # memory with its read caches. The base run is pinned; other entries are
+        # evicted least-recently-used beyond ``_STATE_REGISTRY_MAX``.
+        self._states: OrderedDict[str, DashboardState] = OrderedDict()
+        if self.base_run_id:
+            self._states[self.base_run_id] = state
 
     def _refresh_control_capability(self, run_id: str, state: DashboardState) -> DashboardState:
         """Keep a cached DashboardState aligned with the live supervisor.
@@ -433,6 +464,7 @@ class StateRegistry:
                 return None
         if run_id in self._states:
             cached = self._states[run_id]
+            self._states.move_to_end(run_id)
             if self.runs_root is not None:
                 # The base DashboardState may have auto-selected a run during
                 # construction. Revalidate the cached path on every request;
@@ -461,7 +493,16 @@ class StateRegistry:
             control_enabled=False,
         )
         self._states[run_id] = state
+        self._evict_states()
         return self._refresh_control_capability(run_id, state)
+
+    def _evict_states(self) -> None:
+        """Drop least-recently-used states beyond the bound; the base run is pinned."""
+        excess = len(self._states) - _STATE_REGISTRY_MAX
+        if excess <= 0:
+            return
+        for key in [k for k in self._states if k != self.base_run_id][:excess]:
+            self._states.pop(key, None)
 
     def default_state(self) -> tuple[str, DashboardState]:
         if self.base_state.current_run_id:
@@ -1118,10 +1159,13 @@ def _snapshot_etag(snapshot: dict[str, Any]) -> str:
 class _SnapshotCache:
     """In-memory cache for per-run snapshots keyed by filesystem mtime+size."""
 
-    def __init__(self, ttl_seconds: float = 2.0) -> None:
+    def __init__(self, ttl_seconds: float = 2.0, max_entries: int | None = None) -> None:
         self._lock = threading.Lock()
-        self._data: dict[str, tuple[tuple[float, int, float], dict[str, Any]]] = {}
+        # Bounded LRU (2026-10-07 leak fix): the TTL used to be checked only on
+        # read, so expired snapshots were never removed.
+        self._data: OrderedDict[str, tuple[tuple[float, int, float], dict[str, Any]]] = OrderedDict()
         self._ttl = ttl_seconds
+        self._max_entries = max(1, int(max_entries if max_entries is not None else _SNAPSHOT_CACHE_MAX))
 
     def _signature(self, state: DashboardState, run_id: str) -> tuple[float, int, float]:
         events_path = state.role_dir / "events.jsonl"
@@ -1184,10 +1228,23 @@ class _SnapshotCache:
 
     def put(self, run_id: str, signature: tuple[float, int, float, str], snapshot: dict[str, Any]) -> None:
         with self._lock:
-            self._data[run_id] = (signature, snapshot)
+            now = time.monotonic()
             last_write = getattr(self, "_last_write", {})
-            last_write[run_id] = time.monotonic()
+            # Drop every expired entry, then bound the size (least recently written first).
+            for key in [k for k, ts in last_write.items() if now - ts > self._ttl and k != run_id]:
+                self._data.pop(key, None)
+                last_write.pop(key, None)
+            self._data[run_id] = (signature, snapshot)
+            self._data.move_to_end(run_id)
+            last_write[run_id] = now
+            while len(self._data) > self._max_entries:
+                oldest, _ = self._data.popitem(last=False)
+                last_write.pop(oldest, None)
             self._last_write = last_write
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
 
     def invalidate(self, run_id: str) -> None:
         with self._lock:
@@ -1861,7 +1918,24 @@ def create_app(
     def list_queue(
         request: Request,
         status: str | None = None,
+        view: str | None = Query(None),
+        limit: int | None = Query(None, ge=1, le=_QUEUE_PAGE_MAX),
+        after: str | None = Query(None, max_length=200),
+        since: float | None = Query(None),
+        name: str | None = Query(None, max_length=200),
+        trio: str | None = Query(None, max_length=64),
+        groups: str | None = Query(None),
     ) -> dict[str, Any]:
+        """List queue entries.
+
+        Default (no new parameters): the legacy ``{entries, groups, counts}`` shape with
+        full entries, so existing callers are unchanged.  Opt-in (2026-10-07, the CT110
+        leak fix): ``view=summary`` drops the task text (``task_preview`` + ``task_bytes``
+        instead) and trims ``skip_reasons``; ``limit``/``after`` page newest-first with a
+        ``next_cursor``; ``status`` (comma list), ``since``, ``name`` (substring) and
+        ``trio`` filter BEFORE serialising; ``groups=ids`` returns queue ids per status,
+        ``groups=0`` omits them.  ``GET /api/queue/{id}`` returns one full entry.
+        """
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
         _scoped_caller(request, "harness_list_queue")
@@ -1869,25 +1943,70 @@ def create_app(
         # The status set is canonical in queue.py; a "blocked" entry (the PC
         # queue's fifth state) is surfaced as its own group, not a failure.
         valid_statuses = {"pending", "launched", "done", "failed", "blocked"}
-        filtered = entries
+        wanted: set[str] | None = None
         if status is not None:
-            if status not in valid_statuses:
+            wanted = {s.strip() for s in status.split(",") if s.strip()}
+            bad = wanted - valid_statuses
+            if not wanted or bad:
                 raise HTTPException(status_code=422, detail=f"status must be one of: {', '.join(sorted(valid_statuses))}")
-            filtered = [item for item in entries if item.status == status]
-        groups: dict[str, list[dict[str, Any]]] = {
-            "pending": [],
-            "launched": [],
-            "done": [],
-            "failed": [],
-            "blocked": [],
-        }
-        for item in entries:
-            groups[item.status].append(item.to_dict())
-        return {
-            "entries": [item.to_dict() for item in filtered],
-            "groups": groups,
+        if view not in (None, "full", "summary"):
+            raise HTTPException(status_code=422, detail="view must be 'full' or 'summary'")
+        if groups not in (None, "1", "full", "ids", "0", "none"):
+            raise HTTPException(status_code=422, detail="groups must be one of: full, ids, 0")
+        new_api = any(v is not None for v in (view, limit, after, since, name, trio, groups))
+
+        filtered = [item for item in entries if wanted is None or item.status in wanted]
+        if not new_api:
+            legacy_groups: dict[str, list[dict[str, Any]]] = {s: [] for s in ("pending", "launched", "done", "failed", "blocked")}
+            for item in entries:
+                legacy_groups[item.status].append(item.to_dict())
+            return {
+                "entries": [item.to_dict() for item in filtered],
+                "groups": legacy_groups,
+                "counts": queue_store.counts(),
+            }
+
+        if since is not None:
+            filtered = [item for item in filtered if float(item.updated_at or item.created_at or 0) >= since]
+        if name:
+            needle = name.lower()
+            filtered = [item for item in filtered if needle in (item.name or "").lower()]
+        if trio:
+            filtered = [item for item in filtered if (item.trio or "") == trio]
+        # Newest first, stable on queue_id; the cursor is "<created_at>,<queue_id>".
+        filtered.sort(key=lambda item: (float(item.created_at or 0), item.queue_id), reverse=True)
+        if after:
+            try:
+                cursor_ts_raw, cursor_id = after.split(",", 1)
+                cursor_key = (float(cursor_ts_raw), cursor_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail="after must be '<created_at>,<queue_id>'") from exc
+            filtered = [item for item in filtered if (float(item.created_at or 0), item.queue_id) < cursor_key]
+        page_size = limit or _QUEUE_PAGE_DEFAULT
+        page = filtered[:page_size]
+        next_cursor = None
+        if len(filtered) > page_size and page:
+            last = page[-1]
+            next_cursor = f"{float(last.created_at or 0)!r},{last.queue_id}"
+        summary = view == "summary"
+        result: dict[str, Any] = {
+            "entries": [_queue_entry_summary(item) if summary else item.to_dict() for item in page],
             "counts": queue_store.counts(),
+            "total": len(filtered),
+            "next_cursor": next_cursor,
+            "view": "summary" if summary else "full",
         }
+        if groups in ("1", "full"):
+            full_groups: dict[str, list[dict[str, Any]]] = {s: [] for s in ("pending", "launched", "done", "failed", "blocked")}
+            for item in entries:
+                full_groups[item.status].append(_queue_entry_summary(item) if summary else item.to_dict())
+            result["groups"] = full_groups
+        elif groups == "ids":
+            id_groups: dict[str, list[str]] = {s: [] for s in ("pending", "launched", "done", "failed", "blocked")}
+            for item in entries:
+                id_groups[item.status].append(item.queue_id)
+            result["groups"] = id_groups
+        return result
 
     @app.delete("/api/queue/{queue_id}")
     def delete_queue_entry(queue_id: str, request: Request) -> dict[str, Any]:
@@ -2078,6 +2197,19 @@ def create_app(
             )
         records = queue_store.read_shadow_records(since=since_ts)
         return {"ok": True, "count": len(records), "events": records}
+
+    @app.get("/api/queue/{queue_id}")
+    def get_queue_entry(queue_id: str, request: Request) -> dict[str, Any]:
+        """One full queue entry (task text included) for callers paging with view=summary."""
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        _scoped_caller(request, "harness_list_queue")
+        if not re.fullmatch(r"q-[0-9a-f]{6,64}", queue_id or ""):
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        entry = queue_store.get(queue_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        return entry.to_dict()
 
     @app.get("/api/fleet/contentions")
     def fleet_contentions() -> dict[str, Any]:
