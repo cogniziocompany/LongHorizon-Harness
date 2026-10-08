@@ -57,6 +57,7 @@ from .types import (
     ManagedRound,
     RoleNextStep,
 )
+from .mcp_profiles import GRAPHIFY_PREAMBLE, gateway_configured
 from .supervisor.control_bus import (
     _append_jsonl as _append_jsonl_nofollow,
     _atomic_bytes_write,
@@ -224,6 +225,11 @@ async def _run_impl(
         except Exception:  # progress reporting must never break a run
             logger.debug("progress callback failed for %s", event, exc_info=True)
 
+    # Graphify registration (task: graphify in every run): the gateway-key
+    # presence is resolved once per run, not per round, so the prompt preamble
+    # stays stable for the run's lifetime.
+    gateway_tool_hint = GRAPHIFY_PREAMBLE if gateway_configured() else ""
+
     # Role binding is resolved once at startup so the main loop can stay focused
     # on state transitions instead of adapter fallback logic.
     manager_agent = manager_agent or agent
@@ -368,6 +374,7 @@ async def _run_impl(
             round_budget=gate.round_budget,
             language=config.prompt_language,
             max_history_chars=config.role_history_chars,
+            tool_hint=gateway_tool_hint,
         )
 
         # Messages sent while the round was already running (or while the run
@@ -657,6 +664,7 @@ async def _run_impl(
             related_auditor_reports=related_auditor_reports,
             workspace_path=config.workspace_path,
             language=config.prompt_language,
+            tool_hint=gateway_tool_hint,
         )
         _write_local(round_dir / "executor_prompt.txt", executor_prompt)
         await _write_remote_round_text(env, config, round_index, "executor_prompt.txt", executor_prompt)

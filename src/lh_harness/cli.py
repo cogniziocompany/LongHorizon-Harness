@@ -35,6 +35,7 @@ from .types import (
     EpisodeBudget,
     HarnessConfig,
 )
+from .mcp_profiles import gateway_configured, graphify_servers_for_task
 from .utils.agent_cli import probe_agent_cli
 from .workspace_guard import WORKSPACE_BASE_MODES
 from .supervisor.control_bus import (
@@ -2081,6 +2082,10 @@ def _run_command(args: argparse.Namespace) -> int:
                 run_id=run_id,
                 run_dir=run_dir,
                 allow_auditor_write_mcp=getattr(args, "allow_auditor_write_mcp", False),
+                task=task,
+                gateway_mcp_servers=(
+                    graphify_servers_for_task(task) if gateway_configured() else ()
+                ),
             )
         return agent_cache[key]
 
@@ -2563,6 +2568,8 @@ def _build_agent(
     run_id: str | None = None,
     run_dir: str | Path | None = None,
     allow_auditor_write_mcp: bool = False,
+    task: str = "",
+    gateway_mcp_servers: tuple[str, ...] = (),
 ):
     if name == "codex":
         from .adapters.codex import CodexAdapter
@@ -2576,6 +2583,7 @@ def _build_agent(
             add_dirs=mcp_add_dirs,
             hidden_paths=hidden_paths,
             reasoning_effort=reasoning_effort,
+            gateway_mcp_servers=gateway_mcp_servers,
         )
         if model is not None:
             kwargs["model"] = model
@@ -2601,6 +2609,7 @@ def _build_agent(
             run_id=run_id,
             run_dir=run_dir,
             allow_auditor_write_mcp=allow_auditor_write_mcp,
+            task=task,
         )
         if model is not None:
             kwargs["model"] = model

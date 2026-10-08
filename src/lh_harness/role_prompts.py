@@ -50,6 +50,7 @@ def build_role_manager_prompt(
     round_budget: int | None = None,
     language: str = "en",
     max_history_chars: int = 36_000,
+    tool_hint: str = "",
 ) -> str:
     lang = normalize_prompt_language(language)
     configured_budget = max(round_index, int(round_budget or round_index))
@@ -58,9 +59,10 @@ def build_role_manager_prompt(
         rounds, max_chars=max_history_chars, language=lang
     )
     harness_feedback = format_harness_feedback_context(rounds, max_chars=max_history_chars)
+    hint_line = f"\n{tool_hint.strip()}\n" if tool_hint.strip() else ""
     if lang == "en":
         return f"""\
-{MANAGER_INSTRUCTIONS[lang].strip()}
+{MANAGER_INSTRUCTIONS[lang].strip()}{hint_line}
 
 Original task:
 {task.rstrip()}
@@ -94,7 +96,7 @@ Round budget:
 Output only the next management result.
 """
     return f"""\
-{MANAGER_INSTRUCTIONS[lang].strip()}
+{MANAGER_INSTRUCTIONS[lang].strip()}{hint_line}
 
 原始任务:
 {task.rstrip()}
@@ -139,14 +141,16 @@ def build_role_executor_prompt(
     related_auditor_reports: str = "",
     workspace_path: str = "",
     language: str = "en",
+    tool_hint: str = "",
 ) -> str:
     lang = normalize_prompt_language(language)
     gui = next_step == MANAGER_NEXT_GUI
     role_name = "GUI/visual" if gui and lang == "en" else "CLI/non-GUI" if lang == "en" else "GUI/视觉" if gui else "CLI/非 GUI"
     role_instructions = GUI_EXECUTOR_INSTRUCTIONS[lang] if gui else CLI_EXECUTOR_INSTRUCTIONS[lang]
+    hint_line = f"\n{tool_hint.strip()}\n" if tool_hint.strip() else ""
     if lang == "en":
         return f"""\
-{role_instructions.strip()}
+{role_instructions.strip()}{hint_line}
 
 Original task:
 {task.rstrip()}
@@ -179,7 +183,7 @@ Related auditor reports selected by round id:
 Complete only this subtask. Treat audited state and the stable contract as the trusted semantic boundary. Do not repeat audited work or use suspect, violating, fabricated, untrusted, or deleted artifacts. If context is missing or another dominant task type is required, stop and report it; do not guess or globally replan.
 """
     return f"""\
-{role_instructions.strip()}
+{role_instructions.strip()}{hint_line}
 
 原始任务:
 {task.rstrip()}
