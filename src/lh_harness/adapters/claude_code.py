@@ -10,8 +10,11 @@ from typing import Any
 from ..agent_logs import visible_output as extract_claude_visible_output
 from ..agent_registry import normalise_reasoning_effort
 from ..mcp_profiles import (
+    GRAPHIFY_PROFILE,
+    gateway_configured,
     render_mcp_config,
     resolve_profile,
+    with_graphify,
 )
 from .claude_permissions import (
     ClaudeRole,
@@ -52,6 +55,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         run_id: str | None = None,
         run_dir: str | None = None,
         allow_auditor_write_mcp: bool = False,
+        task: str = "",
     ) -> None:
         policy = policy_for_role(role)
         effort = normalise_reasoning_effort(reasoning_effort)
@@ -88,18 +92,24 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         generated_mcp_path: str | None = None
         self.mcp_profile_resolved = {}
         self.mcp_profile_reason = ""
-        if run_id and run_dir and mcp_profile:
-            # Resolve and render a harness-owned per-role MCP config.  This
-            # happens at adapter construction time because the role does not
-            # change within a run.  The actual session header is injected per
-            # episode in run_episode below.
+        # Graphify registration (task: graphify in every run): a run with
+        # run_id/run_dir and a gateway key gets the graphify aliases merged
+        # into whatever profile it resolves, so every run that registers with
+        # fleet-admin carries the read-only graphify tools.  When no profile
+        # was requested, the built-in "graphify" profile is used.  An explicit
+        # mcp_config path still wins over the generated config, exactly as
+        # before.
+        if run_id and run_dir and gateway_configured():
+            profile_name = mcp_profile or GRAPHIFY_PROFILE
             try:
                 profile = resolve_profile(
                     role,
-                    role_profile=mcp_profile,
-                    run_profile=mcp_profile,
+                    role_profile=profile_name,
+                    run_profile=profile_name,
                     allow_auditor_write_mcp=allow_auditor_write_mcp,
                 )
+                if profile.name != "none":
+                    profile = with_graphify(profile, task)
                 rendered = render_mcp_config(
                     profile,
                     run_id=run_id,

@@ -8,6 +8,7 @@ import shlex
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH
 from ..agent_logs import visible_output as extract_codex_visible_output
 from ..agent_registry import normalise_reasoning_effort
+from ..mcp_profiles import _normalise_gateway_url, gateway_configured
 from ..utils.agent_cli import resolve_codex_binary
 from .cli_agent import CommandAgentAdapter
 
@@ -20,6 +21,11 @@ except ModuleNotFoundError:
 # target any OpenAI-compatible endpoint without editing ~/.codex/config.toml.
 _PROVIDER_ID = "lh_harness"
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
+
+# Graphify registration (task: graphify in every run).  The same server name
+# the Claude adapter uses for the generated gateway MCP config; a static
+# --codex-mcp-config entry with this name wins over the generated override.
+_GATEWAY_MCP_SERVER_NAME = "cognizioware"
 
 
 class CodexAdapter(CommandAgentAdapter):
@@ -36,6 +42,7 @@ class CodexAdapter(CommandAgentAdapter):
         sandbox_mode: str | None = None,
         hidden_paths: tuple[str, ...] = (),
         reasoning_effort: str | None = None,
+        gateway_mcp_servers: tuple[str, ...] = (),
     ) -> None:
         effort = normalise_reasoning_effort(reasoning_effort)
         env_parts: list[str] = []
@@ -77,9 +84,23 @@ class CodexAdapter(CommandAgentAdapter):
         # `[mcp_servers.*]` tables, replayed as `-c mcp_servers.<name>=...`
         # overrides because `--profile` only reads files inside $CODEX_HOME.
         mcp_config = mcp_config or os.getenv("LH_HARNESS_CODEX_MCP_CONFIG")
+        static_gateway_server = False
         if mcp_config:
             for override in mcp_server_overrides(mcp_config):
                 command_parts.extend(["-c", shlex.quote(override)])
+                static_gateway_server = static_gateway_server or override.startswith(
+                    f"mcp_servers.{_GATEWAY_MCP_SERVER_NAME}="
+                )
+
+        # Graphify registration (task: graphify in every run): every run gets
+        # the gateway graphify MCP server over the EXISTING gateway key.  The
+        # key value itself is only ever referenced by env-var name
+        # (bearer_token_env_var); it must never appear in argv, logs, or files.
+        # A static --codex-mcp-config server named "cognizioware" wins over the
+        # generated one.
+        if gateway_mcp_servers and gateway_configured() and not static_gateway_server:
+            override = _gateway_mcp_override(gateway_mcp_servers)
+            command_parts.extend(["-c", shlex.quote(override)])
 
         resolved_add_dirs = list(add_dirs or [])
         env_add_dirs = os.getenv("LH_HARNESS_CODEX_ADD_DIRS") or os.getenv("LH_HARNESS_MCP_ADD_DIRS")
@@ -145,6 +166,21 @@ def mcp_server_overrides(path: str) -> list[str]:
         for name, spec in servers.items()
         if isinstance(spec, dict) and spec and str(name).strip()
     ]
+
+
+def _gateway_mcp_override(gateway_mcp_servers: tuple[str, ...]) -> str:
+    """Build the `-c mcp_servers.cognizioware=...` override for graphify.
+
+    The override references the gateway key only through its env-var name.
+    """
+    url = _normalise_gateway_url(os.environ.get("LH_HARNESS_MCP_GATEWAY_URL"))
+    servers_header = ",".join(gateway_mcp_servers)
+    spec = {
+        "url": url,
+        "bearer_token_env_var": "LH_HARNESS_MCP_GATEWAY_KEY",
+        "http_headers": {"x-mcp-servers": servers_header},
+    }
+    return f"mcp_servers.{_GATEWAY_MCP_SERVER_NAME}={_toml_inline(spec)}"
 
 
 def _toml_inline(value) -> str:

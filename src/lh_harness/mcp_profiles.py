@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +21,26 @@ MCP_PROD_GATEWAY_URL = "https://litellm-gateway-api.cognizioware.com/mcp/"
 MCP_LAN_GATEWAY_URL = "http://192.168.21.161:4000/mcp/"
 
 _MCP_USER_PROFILES_FILE = "mcp_profiles.json"
+
+# Graphify registration (task: graphify in every run).  The graphify MCP server
+# already exists on the gateway behind aliases `graphify` (live) and
+# `graphifyuat` (UAT, e.g. CT204/CT100/chat-uat).  Every run that registers with
+# fleet-admin over the existing gateway key gets graphify added to its profile -
+# no new channel, no new key.
+GRAPHIFY_LIVE = "graphify"
+GRAPHIFY_UAT = "graphifyuat"
+# The built-in profile name used when a run has no explicit MCP profile.
+GRAPHIFY_PROFILE = "graphify"
+GRAPHIFY_PREAMBLE = (
+    "Before editing, query graphify (graphify-query_graph, or graphifyuat-* for "
+    "UAT targets) for the affected files."
+)
+
+# UAT-targeting task text: CT204, CT100, chat-uat, chat.uat.
+# Word-bounded so "CT2040" or "CT1000" never match.
+_GRAPHIFY_UAT_TASK_RE = re.compile(
+    r"(?i)(?<![0-9A-Za-z])(?:CT204|CT100|chat-uat|chat\.uat)(?![0-9A-Za-z])"
+)
 
 # Built-in profile aliases.  These are the gateway's real `general_settings.mcp_aliases`
 # (cognizioware-mcp-tools infrastructure/litellm-config.yaml, verified 2026-09-07) — dash-free
@@ -73,6 +95,11 @@ _BUILTINS: dict[str, dict[str, Any]] = {
         "description": "No gateway allow-list header; all configured servers permitted.",
         "servers": None,
         "read_only": False,
+    },
+    "graphify": {
+        "description": "Graphify read-only graph tooling on the gateway (live + UAT aliases).",
+        "servers": (GRAPHIFY_LIVE, GRAPHIFY_UAT),
+        "read_only": True,
     },
 }
 
@@ -430,6 +457,42 @@ def resolve_profile(
 def gateway_configured() -> bool:
     """Return whether a gateway key is configured."""
     return _gateway_key() is not None
+
+
+def graphify_servers_for_task(task: str) -> tuple[str, ...]:
+    """Return the graphify gateway aliases a task should request.
+
+    Every task gets the live ``graphify`` alias; tasks that target the UAT
+    environment (CT204, CT100, chat-uat / chat.uat) additionally get
+    ``graphifyuat``.  Matching is case-insensitive and word-bounded so e.g.
+    "CT2040" never matches CT204.
+    """
+    if _GRAPHIFY_UAT_TASK_RE.search(str(task or "")):
+        return (GRAPHIFY_LIVE, GRAPHIFY_UAT)
+    return (GRAPHIFY_LIVE,)
+
+
+def with_graphify(profile: McpProfile, task: str) -> McpProfile:
+    """Return ``profile`` with the task's graphify aliases added.
+
+    The "full" profile (``servers is None``) is returned unchanged: it already
+    permits every gateway server, so narrowing it would be a regression.
+    For the built-in ``graphify`` profile, the servers are replaced with the
+    per-task set (non-UAT tasks get only the live alias, UAT tasks get both).
+    For all other profiles, the live/UAT aliases are appended to the existing
+    allow-list while keeping original order and dropping duplicates.
+    Graphify is read-only, so ``read_only`` never changes.
+    """
+    if profile.servers is None:
+        return profile
+    desired = graphify_servers_for_task(task)
+    if profile.name == GRAPHIFY_PROFILE:
+        return dataclasses.replace(profile, servers=desired)
+    merged: list[str] = []
+    for name in (*profile.servers, *desired):
+        if name and name not in merged:
+            merged.append(name)
+    return dataclasses.replace(profile, servers=tuple(merged))
 
 
 def render_mcp_config(
