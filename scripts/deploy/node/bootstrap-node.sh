@@ -38,6 +38,12 @@
 #     never echoed; every other credential is an EMPTY placeholder an admin fills in.  The unit
 #     reads them through EnvironmentFile only - no Environment=NAME=value line (the CT110
 #     hygiene issue in scripts/deploy/ct110/README.md is not reproduced here).
+#   - Settings store (docs/settings-store.md): the service keeps its configuration and
+#     credentials in a SQLite DB it creates and migrates itself; only the four bootstrap
+#     variables stay in the environment.  The bootstrap generates
+#     LH_HARNESS_SETTINGS_KEY (fresh CT only) and seeds the node's configured
+#     defaults (templates/settings.ct111.txt, the CT110-DISK retention values) into
+#     the DB through the CLI's own `settings import` - never hard-coded in logic.
 #   - Templates checked out on Windows may carry CRLF; CRs are stripped on install.
 set -euo pipefail
 
@@ -60,6 +66,12 @@ UNIT_PATH="/etc/systemd/system/$SERVICE"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_TEMPLATE="$SCRIPT_DIR/templates/config.$NODE_ID.toml"
 UNIT_TEMPLATE="$SCRIPT_DIR/templates/lh-harness-node.service"
+# Node-default settings table (docs/settings-store.md "Moving from the env file"):
+# plain NAME=value rows the bootstrap imports into the settings DB exactly once.
+# For this node (ct111) the rows carry the CT110-DISK retention defaults sourced
+# from queued task q-a14cd599278c4235.
+SETTINGS_DEFAULTS_FILE="$SCRIPT_DIR/templates/settings.ct111.txt"
+SEED_ACTOR="${LH_NODE_SEED_ACTOR:-ct111-bootstrap}"
 
 log()   { echo "[bootstrap-node] $*"; }
 abort() { echo "ABORT: $*" >&2; exit 1; }
@@ -80,6 +92,7 @@ esac
 [[ "$PORT" =~ ^[0-9]+$ ]] || abort "LH_NODE_PORT '$PORT' is not a port number"
 [ -f "$CONFIG_TEMPLATE" ] || abort "no config template for node '$NODE_ID' ($CONFIG_TEMPLATE)"
 [ -f "$UNIT_TEMPLATE" ] || abort "unit template missing ($UNIT_TEMPLATE)"
+[ -f "$SETTINGS_DEFAULTS_FILE" ] || abort "settings defaults table missing ($SETTINGS_DEFAULTS_FILE)"
 
 # Value of NAME in the secrets file ('' when absent/empty).  Callers never print it.
 env_value() {
@@ -219,6 +232,22 @@ else
       echo "LH_HARNESS_FLEET_NODE=$NODE_ID"
       echo "LH_HARNESS_FLEET_KEY="
       echo "LH_HARNESS_FLEET_LABELS=kind=$NODE_ID,host=$(hostname)"
+      echo
+      echo "# Embedded settings store bootstrap (docs/settings-store.md)."
+      echo "# LH_HARNESS_SETTINGS_KEY is the only one generated here; the others are"
+      echo "# placeholders that the admin/owner fills in before the admin screen is used."
+      echo "# These four names are BOOTSTRAP variables and must stay in the environment;"
+      echo "# the store rejects attempts to put them into the DB."
+      echo "#"
+      echo "# Encryption key for the settings DB (>= 32 chars). Without it the store is off."
+      printf 'LH_HARNESS_SETTINGS_KEY=%s\n' "$("$VENV/bin/python" -c 'import secrets; print(secrets.token_hex(32))')"
+      echo "# Database path. Empty means the default for the service user:"
+      echo "#   ~/.lh-harness/settings.db  (created 0600, parent directory 0700)."
+      echo "LH_HARNESS_SETTINGS_DB="
+      echo "# Comma-separated SSO e-mails allowed into /settings. Empty = nobody (fail-closed)."
+      echo "LH_HARNESS_SETTINGS_ADMINS="
+      echo "# Secret the SSO edge sends as X-LH-Proxy-Auth. Empty = nobody."
+      echo "LH_HARNESS_SETTINGS_PROXY_AUTH="
     } > "$ENV_FILE.new"
   )
   chown "$HARNESS_USER:$HARNESS_USER" "$ENV_FILE.new"
@@ -228,6 +257,44 @@ fi
 chown "$HARNESS_USER:$HARNESS_USER" "$ENV_FILE"; chmod 600 "$ENV_FILE"
 [ -n "$(env_value LH_HARNESS_WEB_TOKEN)" ] \
   || abort "$ENV_FILE has no LH_HARNESS_WEB_TOKEN - the service refuses a LAN bind without it"
+[ -n "$(env_value LH_HARNESS_SETTINGS_KEY)" ] \
+  || abort "$ENV_FILE has no LH_HARNESS_SETTINGS_KEY - the settings store needs it (docs/settings-store.md)"
+
+# --- 6b. settings store (docs/settings-store.md) ------------------------------
+# The service keeps its configuration and credentials in a SQLite database it
+# creates and migrates itself (docs/settings-store.md); only the four bootstrap
+# variables stay in the environment.  What this section does, idempotently:
+#   1. generate LH_HARNESS_SETTINGS_KEY into the env file (fresh CT only);
+#   2. seed the node's DEFAULTS table rows (disk retention etc.) into the DB,
+#      the exact same `settings import` an admin would run on CT110 by hand;
+#   3. write the four bootstrap names into the unit's EnvironmentFile (already
+#      there from step 6; asserted at the end of the section).
+# A secret VALUE never appears in output: import and this script both print
+# names only, and the key was already written into the 600 file by step 6.
+SETTINGS_DB="$HARNESS_HOME/.lh-harness/settings.db"
+if [ ! -f "$SETTINGS_DB" ]; then
+  install -d -o "$HARNESS_USER" -g "$HARNESS_USER" -m 700 "$HARNESS_HOME/.lh-harness"
+  # The store needs the key in its environment; hand it over through `env`,
+  # never as a shell argument or in a log line.
+  log "importing the settings defaults table into $SETTINGS_DB (names only are printed)"
+  runuser -u "$HARNESS_USER" -- env \
+    LH_HARNESS_SETTINGS_DB="$SETTINGS_DB" \
+    LH_HARNESS_SETTINGS_KEY="$(env_value LH_HARNESS_SETTINGS_KEY)" \
+    "$VENV/bin/lh-harness" settings import --env-file "$SETTINGS_DEFAULTS_FILE" --actor "$SEED_ACTOR"
+  runuser -u "$HARNESS_USER" -- env \
+    LH_HARNESS_SETTINGS_DB="$SETTINGS_DB" \
+    LH_HARNESS_SETTINGS_KEY="$(env_value LH_HARNESS_SETTINGS_KEY)" \
+    "$VENV/bin/lh-harness" settings list >/dev/null
+  chown "$HARNESS_USER:$HARNESS_USER" "$SETTINGS_DB"; chmod 600 "$SETTINGS_DB"
+  chmod 700 "$HARNESS_HOME/.lh-harness"
+else
+  log "settings DB $SETTINGS_DB exists - left untouched"
+fi
+for name in LH_HARNESS_SETTINGS_KEY LH_HARNESS_SETTINGS_DB \
+            LH_HARNESS_SETTINGS_ADMINS LH_HARNESS_SETTINGS_PROXY_AUTH; do
+  grep -qE "^$name=" "$ENV_FILE" \
+    || log "NOTE: $name is not in $ENV_FILE yet - the settings store stays off until it is"
+done
 
 # --- 7. systemd unit ---------------------------------------------------------
 unit_new="$(mktemp)"

@@ -1,0 +1,29 @@
+# ct111 node-default settings table, imported once by bootstrap-node.sh into the
+# embedded settings DB (docs/settings-store.md "Moving from the env file").
+#
+# The harness service reads plain values from the DB at start; these rows configure
+# the CT110-DISK retention defaults sourced from queued task q-a14cd599278c4235.
+#
+# All values are non-secret configuration.  Do not add credential values here.
+
+# Run-folder pruning on the runs root.
+# Prune run folders older than this many days; failed-run reports are kept
+# regardless (the cleanup reads this boolean before removing a folder).
+LH_HARNESS_RETENTION_RUN_FOLDER_DAYS=14
+LH_HARNESS_RETENTION_KEEP_FAILED_REPORTS=true
+
+# Parked-worktree maintenance for workspaces created by the harness.
+# Remove parked worktrees idle longer than this many days; dirty worktrees are
+# only listed and never removed, so an operator can inspect them first.
+LH_HARNESS_RETENTION_PARKED_WORKTREE_IDLE_DAYS=7
+LH_HARNESS_RETENTION_PARKED_DIRTY_LIST_ONLY=true
+
+# Package-manager cache caps (GB).  The cleanup compares the cache directory's
+# size to this cap and trims oldest-first when it is exceeded.
+LH_HARNESS_RETENTION_NPM_CACHE_GB=4
+LH_HARNESS_RETENTION_PIP_CACHE_GB=4
+
+# Disk-usage thresholds for queue launches.  Percentages are integers.
+LH_HARNESS_DISK_WARN_PERCENT=80
+LH_HARNESS_DISK_PAUSE_PERCENT=90
+LH_HARNESS_DISK_RESUME_PERCENT=85
