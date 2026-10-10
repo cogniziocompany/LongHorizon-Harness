@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from lh_harness.launcher import Launcher
+from lh_harness.launcher import Launcher, maintenance_manifest_run_ids
 from lh_harness.queue import QueueStore, default_queue_config
 
 
@@ -451,3 +451,62 @@ def test_launcher_skips_unknown_profile_with_read_only_requirement(tmp_path: Pat
     assert updated.status == "launched"
     owner = supervisor.created[-1]["owner"]
     assert all(spec == {"agent": "claude_code", "model": "kimi-k3"} for spec in owner["role_configs"].values())
+
+
+def test_launcher_stale_suspend_manifest_never_revives_runs(tmp_path: Path) -> None:
+    """A manifest an OLDER suspend left behind (the 2026-10-08 residue: deploy
+    run 37737427710 was cancelled mid-window and its manifest outlived it)
+    still shields the parked run's queue entry from failed-reconciliation —
+    protection deliberately ignores suspend-id provenance, a safe
+    conservative default — but the launcher must never treat the stale file
+    as a source of work: reconciliation neither starts nor resumes anything
+    from a manifest whose suspend id is not the current one.  Revival is
+    id-keyed in POST /api/maintenance/resume only."""
+    root, store, supervisor = _fixture(tmp_path)
+    config = default_queue_config()
+    config["capacity"]["kimi_max"] = 1
+    launcher = Launcher(supervisor, store, queue_config=config, probe_open_pr=None)
+
+    supervisor.add_run("run-stale", "./w1", status="cancelled")
+    supervisor.add_run("run-lost", "./w2", status="cancelled")
+    parked = store.create(_base_entry(trio="kimi", priority=5, workspace="./w1"))
+    unprotected = store.create(_base_entry(trio="kimi", priority=4, workspace="./w2"))
+    store.mark_launched(parked.queue_id, "run-stale")
+    store.mark_launched(unprotected.queue_id, "run-lost")
+
+    stale_manifest = {
+        "suspend_id": "sus-20261008T054411Z-4c9cce84",
+        "reason": "deploy 37737427710 (cancelled mid-window)",
+        "created_at": 123.0,
+        "runs": [
+            {"run_id": "run-stale", "queue_id": parked.queue_id, "resume_epoch_before": 0}
+        ],
+    }
+    queue_dir = root / "queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    stale_path = queue_dir / "maintenance_manifest_sus-20261008T054411Z-4c9cce84.json"
+    stale_path.write_text(json.dumps(stale_manifest), encoding="utf-8")
+
+    # The ACTUAL reconciliation helper consumes the stale file (no test here
+    # reimplements it): the parked run id comes back through the production
+    # glob over maintenance_manifest_<suspend_id>.json.
+    assert maintenance_manifest_run_ids(root) == {"run-stale"}
+
+    asyncio.run(launcher.tick())
+
+    parked_entry = store.get(parked.queue_id)
+    unprotected_entry = store.get(unprotected.queue_id)
+    assert parked_entry is not None
+    assert unprotected_entry is not None
+    # It protects the entry it names (this would reconcile to failed if the
+    # suspend-id-keyed file were ignored, as pre-LHH-SUSPEND-TIMEOUT), ...
+    assert parked_entry.status == "launched"
+    # ... stays selective doing so (the control entry, named by no manifest,
+    # reconciles exactly as before), ...
+    assert unprotected_entry.status == "failed"
+    # ... and revives NOTHING: no run is started, the parked run stays
+    # terminal, and the stale manifest is left byte-for-byte intact for an
+    # id-keyed operator resume — reconciliation is read-only.
+    assert supervisor.created == []
+    assert supervisor.status("run-stale")["status"] == "cancelled"
+    assert json.loads(stale_path.read_text(encoding="utf-8")) == stale_manifest

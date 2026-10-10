@@ -31,8 +31,11 @@ from starlette.middleware.gzip import GZipMiddleware
 from ..dashboard.state import DashboardState
 from ..launcher import (
     Launcher,
+    clear_maintenance_launch_pause,
     maintenance_manifest_path,
+    read_maintenance_launch_pause,
     read_maintenance_manifest,
+    set_maintenance_launch_pause,
 )
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
 from ..caller_auth import (
@@ -632,6 +635,44 @@ _QUEUE_PAGE_DEFAULT = 100
 _QUEUE_PAGE_MAX = 500
 _QUEUE_PREVIEW_CHARS = 200
 _QUEUE_SKIP_REASONS_KEEP = 3
+
+# Async maintenance suspend timing (LHH-SUSPEND-TIMEOUT).  The 2026-10-08
+# deploy-ct110 failure (run 37737427710) was the OLD synchronous suspend
+# blocking a request thread on an unbounded per-run stop until the client's
+# 120 s timeout fired.  The async flow makes every wait bounded: each run
+# gets a safe-checkpoint grace after its stop request, and the whole job has
+# a hard deadline, after which it rolls back instead of waiting forever.
+# Both knobs are read per request so overrides take effect without a restart;
+# only the env var NAMES are documented here, never a deployment value, and
+# an unset or unparseable value keeps every deployment on the defaults.
+_ENV_SUSPEND_RUN_GRACE = "LH_HARNESS_SUSPEND_RUN_GRACE_SECONDS"
+_DEFAULT_SUSPEND_RUN_GRACE = 30.0
+_ENV_SUSPEND_DEADLINE = "LH_HARNESS_SUSPEND_DEADLINE_SECONDS"
+_DEFAULT_SUSPEND_DEADLINE = 120.0
+
+
+def _suspend_run_grace_seconds() -> float:
+    """Per-run safe-checkpoint grace from ``LH_HARNESS_SUSPEND_RUN_GRACE_SECONDS``."""
+
+    raw = (os.environ.get(_ENV_SUSPEND_RUN_GRACE) or "").strip()
+    if not raw:
+        return _DEFAULT_SUSPEND_RUN_GRACE
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _DEFAULT_SUSPEND_RUN_GRACE
+
+
+def _suspend_deadline_seconds() -> float:
+    """Overall suspend job deadline from ``LH_HARNESS_SUSPEND_DEADLINE_SECONDS``."""
+
+    raw = (os.environ.get(_ENV_SUSPEND_DEADLINE) or "").strip()
+    if not raw:
+        return _DEFAULT_SUSPEND_DEADLINE
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return _DEFAULT_SUSPEND_DEADLINE
 
 
 def _queue_entry_summary(item: Any) -> dict[str, Any]:
@@ -1988,15 +2029,26 @@ def create_app(
         return {"ok": True, "drain": state}
 
     # ------------------------------------------------------------------
-    # Maintenance suspend/resume (fc-H4a)
+    # Maintenance suspend/resume (fc-H4a; asynchronous since
+    # LHH-SUSPEND-TIMEOUT)
     #
-    # A deploy drains the queue, then POST /api/maintenance/suspend stops
-    # every ACTIVE run through the supervisor and records them in
-    # runs_root/queue/maintenance_manifest.json.  After the deploy,
-    # POST /api/maintenance/resume puts each parked run back with
-    # supervisor.resume(mode="continue") and deletes the manifest once every
-    # run is active again.  The launcher refuses to reconcile a parked run's
-    # queue entry to failed while the manifest lists it.
+    # A deploy drains the queue, then POST /api/maintenance/suspend pauses
+    # every ACTIVE run through the supervisor.  The flow is async: the POST
+    # sets the maintenance launch pause (launcher.py gate) synchronously,
+    # records a suspend id, and returns 202 at once — the 2026-10-08
+    # deploy-ct110 failure (run 37737427710) was the OLD synchronous handler
+    # blocking the request thread on per-run stops until the client's 120 s
+    # timeout fired mid-window.  GET /api/maintenance/suspend/{id} reports
+    # per-run state until every run is paused or the deadline passes.  Paused
+    # runs live in a manifest keyed by suspend id
+    # (runs_root/queue/maintenance_manifest_<id>.json), and
+    # POST /api/maintenance/resume consumes only the manifest of the suspend
+    # id it is given (or of the one suspend this process has open), never
+    # whatever file happens to exist — the incident mechanism was exactly a
+    # provenance-free resume reviving run 20261008T054411Z_4c9cce84 from an
+    # older suspend's stale manifest a day later.  The launcher refuses to
+    # reconcile a parked run's queue entry to failed while ANY manifest lists
+    # it (protection ignores provenance; revival requires it).
     #
     # These inherit the single bearer-token boundary that guards every /api/
     # route, exactly like POST /api/queue/drain above.
@@ -2008,24 +2060,133 @@ def create_app(
             root = registry.runs_root
         return Path(root) if root is not None else None
 
+    # In-memory suspend registry.  The manifest on disk is the durable cargo;
+    # the registry tracks live job state for GET status and id resolution.
+    _suspend_lock = threading.Lock()
+    _suspend_records: dict[str, dict[str, Any]] = {}
+    _SUSPEND_OPEN_STATES = ("running", "suspended")
+    # Client-supplied suspend ids feed a filename: refuse anything that is
+    # not a plain path-safe token.
+    _SUSPEND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+    def _suspend_open_record() -> dict[str, Any] | None:
+        with _suspend_lock:
+            open_records = [
+                rec for rec in _suspend_records.values() if rec["state"] in _SUSPEND_OPEN_STATES
+            ]
+        if not open_records:
+            return None
+        return sorted(open_records, key=lambda rec: float(rec["created_at"]))[-1]
+
+    def _resume_manifest_records(
+        records: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Resume each parked manifest record; return (results, remaining).
+
+        Runs already active count as success (idempotent replay); a failing
+        resume keeps its entry in ``remaining`` so the caller can persist it
+        for a retry.  Shared by the resume endpoint and the failed-suspend
+        cleanup so both apply exactly the same semantics.
+        """
+
+        results: list[dict[str, Any]] = []
+        remaining: list[dict[str, Any]] = []
+        for record in records:
+            run_id = record.get("run_id") if isinstance(record, dict) else None
+            if not run_id:
+                results.append({"run_id": run_id, "ok": False, "error": "manifest entry has no run_id"})
+                remaining.append(record)
+                continue
+            run_id = str(run_id)
+            try:
+                status = supervisor.status(run_id)
+                lifecycle = canonical_lifecycle_status(status.get("status"))
+            except Exception as exc:
+                results.append({"run_id": run_id, "ok": False, "error": str(exc)})
+                remaining.append(record)
+                continue
+            if lifecycle in ACTIVE_STATUSES:
+                results.append({"run_id": run_id, "ok": True, "error": None})
+                continue
+            try:
+                supervisor.resume(run_id, mode="continue")
+                results.append({"run_id": run_id, "ok": True, "error": None})
+            except (TypeError, ValueError, OSError, RevisionConflict, IdempotencyConflict) as exc:
+                results.append({"run_id": run_id, "ok": False, "error": str(exc)})
+                remaining.append(record)
+        return results, remaining
+
     @app.get("/api/maintenance")
     def get_maintenance() -> dict[str, Any]:
-        """Return the current maintenance manifest, or the empty shape."""
+        """Return every run parked by any suspend manifest, or the empty shape."""
 
         root = _maintenance_runs_root()
         if root is None:
             return {"runs": []}
-        return read_maintenance_manifest(root)
+        manifests: list[dict[str, Any]] = [read_maintenance_manifest(root)]
+        try:
+            for path in sorted((root / "queue").glob("maintenance_manifest_*.json")):
+                manifests.append(
+                    read_maintenance_manifest(root, path.stem.removeprefix("maintenance_manifest_"))
+                )
+        except OSError:
+            pass
+        parked: dict[str, dict[str, Any]] = {}
+        for data in manifests:
+            for item in data.get("runs", []):
+                if isinstance(item, dict) and item.get("run_id"):
+                    parked[str(item["run_id"])] = item
+        return {"runs": list(parked.values())}
 
-    @app.post("/api/maintenance/suspend")
+    @app.get("/api/maintenance/suspend/{suspend_id}")
+    def maintenance_suspend_status(suspend_id: str) -> dict[str, Any]:
+        """Per-run status of one suspend until all runs pause or the deadline passes."""
+
+        with _suspend_lock:
+            record = _suspend_records.get(suspend_id)
+            snapshot = (
+                None
+                if record is None
+                else {
+                    "ok": True,
+                    "suspend_id": record["id"],
+                    "state": record["state"],
+                    "reason": record["reason"],
+                    "created_at": record["created_at"],
+                    "finished_at": record["finished_at"],
+                    "grace_seconds": record["grace_seconds"],
+                    "deadline_seconds": record["deadline_seconds"],
+                    "deadline_at": record["deadline_at"],
+                    "runs": sorted(record["runs"].values(), key=lambda item: str(item["run_id"])),
+                    "errors": list(record["errors"]),
+                    "cleanup_done": record["cleanup_done"],
+                    "cleanup": list(record["cleanup"]),
+                }
+            )
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail=f"unknown suspend id: {suspend_id}")
+        root = _maintenance_runs_root()
+        if root is not None:
+            snapshot["launch_pause"] = read_maintenance_launch_pause(root)
+        return snapshot
+
+    @app.post("/api/maintenance/suspend", status_code=202)
     def maintenance_suspend(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
-        """Stop every active run and park it in the maintenance manifest.
+        """Begin an asynchronous suspend; return 202 with the suspend id at once.
 
         Refused with 409 unless the queue drain is already enabled: suspend is
         the second half of a deploy window, never a standalone kill switch.
-        Repeat calls merge into the existing manifest — entries are never
-        dropped, so a second suspend cannot orphan the first batch's resume
-        bookkeeping.
+        The maintenance launch pause is set synchronously in THIS handler
+        before any run is touched, so nothing new launches inside the window.
+        Every run pause happens in a background job: stop at the next safe
+        checkpoint, wait per run at most the configured grace
+        (LH_HARNESS_SUSPEND_RUN_GRACE_SECONDS), and bound the whole job by a
+        deadline (LH_HARNESS_SUSPEND_DEADLINE_SECONDS).  Any failure or
+        deadline expiry rolls back: exactly the runs THIS suspend paused are
+        resumed and the launch pause is cleared — idempotently, never leaving
+        a run stopped.  A second suspend while one is open is refused with
+        409: windows never overlap, so manifests never merge and one suspend
+        can only ever revive its own runs.
         """
 
         if queue_store is None:
@@ -2051,80 +2212,286 @@ def create_app(
                 detail="queue drain must be enabled before maintenance suspend",
             )
 
-        manifest = read_maintenance_manifest(root)
-        parked = [
-            item
-            for item in manifest.get("runs", [])
-            if isinstance(item, dict) and item.get("run_id")
-        ]
-        parked_ids = {str(item["run_id"]) for item in parked}
-        launched_by_run: dict[str, str] = {}
-        for entry in queue_store.list():
-            if entry.status == "launched" and entry.run_id:
-                launched_by_run[entry.run_id] = entry.queue_id
+        started_at = time.time()
+        grace_seconds = _suspend_run_grace_seconds()
+        deadline_seconds = _suspend_deadline_seconds()
+        suspend_id = (
+            f"sus-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(started_at))}-{uuid.uuid4().hex[:8]}"
+        )
 
-        stopped: list[dict[str, Any]] = []
-        errors: list[dict[str, Any]] = []
+        record: dict[str, Any] = {
+            "id": suspend_id,
+            "reason": reason,
+            "created_at": started_at,
+            "state": "running",
+            "grace_seconds": grace_seconds,
+            "deadline_seconds": deadline_seconds,
+            "deadline_at": started_at + deadline_seconds,
+            "runs": {},
+            "errors": [],
+            "cleanup_done": False,
+            "cleanup": [],
+            "finished_at": None,
+        }
+        # One locked section makes the open-window check, the launch-pause
+        # write, and the registration atomic: a refused second suspend never
+        # overwrites the open window's flag with its own id, and the
+        # background job only starts after the flag is durable.  Launch pause
+        # FIRST, synchronously, before any run pause begins, and fail-closed:
+        # never register a suspend whose launch gate could not be persisted.
+        with _suspend_lock:
+            open_ids = [
+                rec["id"] for rec in _suspend_records.values() if rec["state"] in _SUSPEND_OPEN_STATES
+            ]
+            if open_ids:
+                # The open window already holds the launch pause; refusing
+                # leaves it set (correct) and never drops its bookkeeping.
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"maintenance suspend already in progress: {open_ids[-1]}",
+                )
+            try:
+                set_maintenance_launch_pause(root, reason=reason, suspend_id=suspend_id)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"could not set maintenance launch pause: {exc}"
+                ) from exc
+            _suspend_records[suspend_id] = record
+
+        thread = threading.Thread(
+            target=_suspend_job,
+            args=(record, root),
+            name=f"lh-suspend-{suspend_id}",
+            daemon=True,
+        )
+        thread.start()
+        return {
+            "ok": True,
+            "suspend_id": suspend_id,
+            "state": "running",
+            "reason": reason,
+            "grace_seconds": grace_seconds,
+            "deadline_seconds": deadline_seconds,
+            "status_url": f"/api/maintenance/suspend/{suspend_id}",
+        }
+
+    def _suspend_job(record: dict[str, Any], root: Path) -> None:
+        """Background run-pausing job for one suspend (daemon thread).
+
+        Scans for active runs, requests a stop at the next safe checkpoint,
+        and waits per run at most the configured grace; the whole job is
+        bounded by the deadline.  On success the per-suspend-id manifest is
+        the durable record and the launch pause STAYS set for the deploy
+        window.  On any failure or deadline expiry the job rolls back:
+        resume exactly the runs it paused, clear the launch pause, and keep
+        any unresumable run in the manifest for an operator retry.
+        """
+
+        suspend_id = str(record["id"])
+        grace_seconds = float(record["grace_seconds"])
+        deadline_mono = time.monotonic() + float(record["deadline_seconds"])
+        launched_by_run: dict[str, str] = {}
         try:
-            run_items = supervisor.list_run_items()
+            for entry in queue_store.list():
+                if entry.status == "launched" and entry.run_id:
+                    launched_by_run[entry.run_id] = entry.queue_id
         except Exception:
-            run_items = []
-        for item in run_items or []:
-            run_id = item.get("id") if isinstance(item, dict) else None
-            if not run_id or str(run_id) in parked_ids:
-                continue
-            run_id = str(run_id)
+            launched_by_run = {}
+
+        paused: list[dict[str, Any]] = []
+        paused_ids: set[str] = set()
+        pending: dict[str, dict[str, Any]] = {}
+        stop_requested_at: dict[str, float] = {}
+        failed_run_ids: set[str] = set()
+        failed = False
+
+        def note_error(run_id: str | None, message: str) -> None:
+            with _suspend_lock:
+                record["errors"].append({"run_id": run_id, "error": message})
+
+        def mark_run(manifest_record: dict[str, Any], state: str, detail: str | None) -> None:
+            with _suspend_lock:
+                record["runs"][str(manifest_record["run_id"])] = {
+                    "run_id": manifest_record["run_id"],
+                    "queue_id": manifest_record.get("queue_id"),
+                    "resume_epoch_before": manifest_record.get("resume_epoch_before"),
+                    "state": state,
+                    "detail": detail,
+                }
+
+        while True:
+            if not pending and failed:
+                break
+            if time.monotonic() >= deadline_mono:
+                for run_id in list(pending):
+                    manifest_record = pending.pop(run_id)
+                    note_error(run_id, "suspend deadline passed before the run reached a safe checkpoint")
+                    mark_run(manifest_record, "active", "deadline passed; left running")
+                    failed = True
+                break
             try:
-                status = supervisor.status(run_id)
+                run_items = supervisor.list_run_items()
             except Exception as exc:
-                errors.append({"run_id": run_id, "error": str(exc)})
-                continue
-            if canonical_lifecycle_status(status.get("status")) not in ACTIVE_STATUSES:
-                continue
-            try:
-                epoch = resume_epoch(status) or resume_epoch(supervisor.owner(run_id))
-            except Exception:
-                epoch = 0
-            try:
-                supervisor.stop(run_id)
-            except Exception as exc:
-                # The run may have exited between the status read and the
-                # signal; leave it out of the manifest so resume never tries
-                # to revive a run suspend could not actually park.
-                errors.append({"run_id": run_id, "error": str(exc)})
-                continue
-            record = {
-                "run_id": run_id,
-                "queue_id": launched_by_run.get(run_id),
-                "resume_epoch_before": epoch,
-            }
-            stopped.append(record)
-            parked_ids.add(run_id)
+                note_error(None, f"could not list runs: {exc}")
+                failed = True
+                break
+            discovered = False
+            for item in run_items or []:
+                run_id = item.get("id") if isinstance(item, dict) else None
+                if not run_id:
+                    continue
+                run_id = str(run_id)
+                if run_id in paused_ids or run_id in pending or run_id in failed_run_ids:
+                    continue
+                try:
+                    status = supervisor.status(run_id)
+                except Exception as exc:
+                    note_error(run_id, f"could not read run status: {exc}")
+                    failed_run_ids.add(run_id)
+                    failed = True
+                    continue
+                if canonical_lifecycle_status(status.get("status")) not in ACTIVE_STATUSES:
+                    continue
+                discovered = True
+                try:
+                    epoch = resume_epoch(status) or resume_epoch(supervisor.owner(run_id))
+                except Exception:
+                    epoch = 0
+                try:
+                    supervisor.stop(run_id)
+                except Exception as exc:
+                    # The run may have exited between the status read and the
+                    # signal; that is benign — suspend only fails when the run
+                    # is STILL active afterwards (it escaped its stop).
+                    try:
+                        after = supervisor.status(run_id)
+                    except Exception:
+                        after = {}
+                    if canonical_lifecycle_status(after.get("status")) in ACTIVE_STATUSES:
+                        note_error(run_id, str(exc))
+                        failed_run_ids.add(run_id)
+                        failed = True
+                    continue
+                manifest_record = {
+                    "run_id": run_id,
+                    "queue_id": launched_by_run.get(run_id),
+                    "resume_epoch_before": epoch,
+                }
+                pending[run_id] = manifest_record
+                stop_requested_at[run_id] = time.monotonic()
+                mark_run(manifest_record, "stopping", None)
+            for run_id in list(pending):
+                try:
+                    status = supervisor.status(run_id)
+                    lifecycle = canonical_lifecycle_status(status.get("status"))
+                except Exception as exc:
+                    note_error(run_id, f"could not poll pausing run: {exc}")
+                    failed_run_ids.add(run_id)
+                    failed = True
+                    continue
+                if lifecycle in ACTIVE_STATUSES:
+                    if time.monotonic() - stop_requested_at[run_id] >= grace_seconds:
+                        manifest_record = pending.pop(run_id)
+                        note_error(
+                            run_id,
+                            f"safe-checkpoint grace {grace_seconds:.1f}s exceeded; leaving run active",
+                        )
+                        mark_run(manifest_record, "active", "grace period exceeded; left running")
+                        failed_run_ids.add(run_id)
+                        failed = True
+                    continue
+                manifest_record = pending.pop(run_id)
+                paused.append(manifest_record)
+                paused_ids.add(run_id)
+                mark_run(manifest_record, "paused", None)
+            if not pending and not discovered:
+                break
+            time.sleep(0.2)
 
         payload = {
-            "reason": reason if reason is not None else manifest.get("reason"),
-            "created_at": manifest.get("created_at") or time.time(),
-            "runs": parked + stopped,
+            "suspend_id": suspend_id,
+            "reason": record["reason"],
+            "created_at": record["created_at"],
+            "runs": paused,
         }
         try:
             _atomic_bytes_write(
-                maintenance_manifest_path(root),
+                maintenance_manifest_path(root, suspend_id),
                 json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"),
             )
         except OSError as exc:
-            raise HTTPException(
-                status_code=500, detail=f"could not persist maintenance manifest: {exc}"
-            ) from exc
-        return {"ok": True, "stopped": stopped, "errors": errors, "manifest": payload}
+            note_error(None, f"could not persist maintenance manifest: {exc}")
+            failed = True
+
+        with _suspend_lock:
+            record["finished_at"] = time.time()
+            record["state"] = "failed" if failed else "suspended"
+
+        if failed:
+            _suspend_cleanup(record, root, payload)
+
+    def _suspend_cleanup(record: dict[str, Any], root: Path, payload: dict[str, Any]) -> None:
+        """Roll back a failed suspend.
+
+        Resumes exactly the runs THIS suspend paused (its own manifest list —
+        nothing else is ever touched), then clears the launch pause.  Safe to
+        run twice: the guard flag short-circuits, and a replay would see every
+        run already active (counted as resumed).  Runs that refuse to resume
+        stay in this suspend's manifest with its id, so an operator can retry
+        via POST /api/maintenance/resume with the suspend id.
+        """
+
+        with _suspend_lock:
+            if record["cleanup_done"]:
+                return
+            record["cleanup_done"] = True
+        suspend_id = str(record["id"])
+        paused = [item for item in payload.get("runs", []) if isinstance(item, dict)]
+        results, remaining = _resume_manifest_records(paused)
+        with _suspend_lock:
+            record["cleanup"] = results
+            for item in results:
+                if item.get("ok") and record["runs"].get(str(item.get("run_id"))):
+                    record["runs"][str(item["run_id"])]["state"] = "resumed"
+        path = maintenance_manifest_path(root, suspend_id)
+        try:
+            if remaining:
+                _atomic_bytes_write(
+                    path,
+                    json.dumps({**payload, "runs": remaining}, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                )
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            with _suspend_lock:
+                record["errors"].append({"run_id": None, "error": f"could not update maintenance manifest during cleanup: {exc}"})
+        # Owner-checked under the suspend lock: a newer suspend stamps the
+        # flag under the same lock, so this check-and-clear can never race it,
+        # and a stale (own-id) flag is the only one ever removed here.
+        with _suspend_lock:
+            try:
+                clear_maintenance_launch_pause(root, if_suspend_id=suspend_id)
+            except OSError as exc:
+                record["errors"].append({"run_id": None, "error": f"could not clear maintenance launch pause: {exc}"})
 
     @app.post("/api/maintenance/resume")
-    def maintenance_resume() -> dict[str, Any]:
-        """Resume every run parked in the maintenance manifest.
+    def maintenance_resume(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        """Resume every run parked by one specific suspend id.
 
-        Each manifest run that reached a terminal status is resumed with
-        mode="continue"; runs already active count as success.  The manifest
-        is deleted only when every run resumed or was already active — a
-        failing resume keeps its entry so the operator can retry.
+        The suspend id comes from the request body, or — when omitted — from
+        the one suspend this process currently has open.  Without either, the
+        request is refused with 409: consuming whatever manifest file happens
+        to exist is the stale-manifest revival path (a 2026-10-08 day-later
+        resume revived run 20261008T054411Z_4c9cce84 from an older suspend's
+        manifest), and that path is now structurally closed.  Each manifest
+        run that reached a terminal status is resumed with mode="continue";
+        runs already active count as success, so a repeat resume is a safe
+        no-op.  The manifest is deleted only when every run resumed or was
+        already active — a failing resume keeps its entry for a retry.  The
+        maintenance launch pause is cleared on every accepted call, ending
+        the window — but only while the flag still names this suspend, so a
+        retry for an older window never tears down a newer suspend's flag.
+        The operator drain is a separate flag and untouched.
         """
 
         if queue_store is None:
@@ -2135,34 +2502,36 @@ def create_app(
         if root is None:
             raise HTTPException(status_code=501, detail="maintenance requires a configured runs root")
 
-        manifest = read_maintenance_manifest(root)
-        results: list[dict[str, Any]] = []
-        remaining: list[dict[str, Any]] = []
-        for record in manifest.get("runs", []):
-            run_id = record.get("run_id") if isinstance(record, dict) else None
-            if not run_id:
-                results.append({"run_id": run_id, "ok": False, "error": "manifest entry has no run_id"})
-                remaining.append(record)
-                continue
-            run_id = str(run_id)
-            try:
-                status = supervisor.status(run_id)
-                lifecycle = canonical_lifecycle_status(status.get("status"))
-            except Exception as exc:
-                results.append({"run_id": run_id, "ok": False, "error": str(exc)})
-                remaining.append(record)
-                continue
-            if lifecycle in ACTIVE_STATUSES:
-                results.append({"run_id": run_id, "ok": True, "error": None})
-                continue
-            try:
-                supervisor.resume(run_id, mode="continue")
-                results.append({"run_id": run_id, "ok": True, "error": None})
-            except (TypeError, ValueError, OSError, RevisionConflict, IdempotencyConflict) as exc:
-                results.append({"run_id": run_id, "ok": False, "error": str(exc)})
-                remaining.append(record)
+        sid = body.get("suspend_id")
+        if sid is not None and not isinstance(sid, str):
+            raise HTTPException(status_code=422, detail="suspend_id must be a string")
+        if sid is not None and not _SUSPEND_ID_RE.match(sid):
+            raise HTTPException(status_code=422, detail="suspend_id has an invalid form")
+        record: dict[str, Any] | None = None
+        if sid is None:
+            record = _suspend_open_record()
+            if record is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "resume requires a suspend_id: no suspend is open in this "
+                        "process, and provenance-free resume of whatever manifest "
+                        "exists is refused — stale manifests from older suspends "
+                        "must never revive runs"
+                    ),
+                )
+            sid = str(record["id"])
+        with _suspend_lock:
+            record = _suspend_records.get(sid)
+        if record is not None and record["state"] == "running":
+            raise HTTPException(
+                status_code=409, detail=f"suspend {sid} is still pausing runs"
+            )
 
-        path = maintenance_manifest_path(root)
+        manifest = read_maintenance_manifest(root, sid)
+        results, remaining = _resume_manifest_records(manifest.get("runs", []))
+
+        path = maintenance_manifest_path(root, sid)
         try:
             if remaining:
                 _atomic_bytes_write(
@@ -2177,7 +2546,17 @@ def create_app(
             raise HTTPException(
                 status_code=500, detail=f"could not update maintenance manifest: {exc}"
             ) from exc
-        return {"ok": not remaining, "runs": results}
+        try:
+            with _suspend_lock:
+                clear_maintenance_launch_pause(root, if_suspend_id=sid)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"could not clear maintenance launch pause: {exc}"
+            ) from exc
+        if record is not None and not remaining:
+            with _suspend_lock:
+                record["state"] = "resumed"
+        return {"ok": not remaining, "suspend_id": sid, "runs": results}
 
     @app.get("/api/queue")
     def list_queue(
