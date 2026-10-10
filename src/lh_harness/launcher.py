@@ -63,17 +63,39 @@ logger = logging.getLogger(__name__)
 # flag (``runs_root/queue/``); the launcher consults it so a maintenance-
 # stopped run is never reconciled to a failed queue entry while it waits for
 # its resume.
+#
+# LHH-SUSPEND-TIMEOUT (2026-10-08 incident, deploy-ct110 run 37737427710):
+# manifests are now written per suspend id
+# (``maintenance_manifest_<suspend_id>.json``) and resume may only consume the
+# manifest of the suspend id it was given (or of the suspend this process
+# currently has open).  The incident mechanism was a resume step consuming a
+# stale manifest from an older suspend and reviving run
+# 20261008T054411Z_4c9cce84 a day later; keying the manifest to the suspend id
+# makes that revival path structurally impossible.  The bare legacy name is
+# still honoured for reconciliation protection and tolerant reads so a
+# pre-upgrade manifest keeps protecting its parked runs, but nothing new is
+# ever written to it.
 MAINTENANCE_MANIFEST_NAME = "maintenance_manifest.json"
 
 
-def maintenance_manifest_path(runs_root: str | Path) -> Path:
-    """Path of the maintenance manifest inside the queue directory."""
+def maintenance_manifest_path(
+    runs_root: str | Path, suspend_id: str | None = None
+) -> Path:
+    """Path of a maintenance manifest inside the queue directory.
 
+    With ``suspend_id`` the path is keyed to that one suspend; without it the
+    legacy (pre-suspend-id) path is returned for tolerant readers.
+    """
+
+    if suspend_id:
+        return Path(runs_root) / "queue" / f"maintenance_manifest_{suspend_id}.json"
     return Path(runs_root) / "queue" / MAINTENANCE_MANIFEST_NAME
 
 
-def read_maintenance_manifest(runs_root: str | Path) -> dict[str, Any]:
-    """Read the maintenance manifest, tolerating absence and corruption.
+def read_maintenance_manifest(
+    runs_root: str | Path, suspend_id: str | None = None
+) -> dict[str, Any]:
+    """Read a maintenance manifest, tolerating absence and corruption.
 
     A missing or unreadable manifest maps to the empty shape so consumers
     (launcher reconciliation, /api/maintenance GET) never crash on a file a
@@ -81,7 +103,9 @@ def read_maintenance_manifest(runs_root: str | Path) -> dict[str, Any]:
     """
 
     try:
-        data = json.loads(maintenance_manifest_path(runs_root).read_text(encoding="utf-8"))
+        data = json.loads(
+            maintenance_manifest_path(runs_root, suspend_id).read_text(encoding="utf-8")
+        )
     except (OSError, ValueError):
         return {"runs": []}
     if not isinstance(data, dict) or not isinstance(data.get("runs"), list):
@@ -90,13 +114,120 @@ def read_maintenance_manifest(runs_root: str | Path) -> dict[str, Any]:
 
 
 def maintenance_manifest_run_ids(runs_root: str | Path) -> set[str]:
-    """Run ids currently parked by a maintenance suspend."""
+    """Run ids currently parked by any maintenance suspend for this root.
 
+    Reconciliation protection deliberately ignores suspend-id provenance: a
+    parked run must not be reconciled to failed no matter which suspend parked
+    it.  (Revival, by contrast, is id-keyed in ``/api/maintenance/resume``.)
+    """
+
+    paths = [maintenance_manifest_path(runs_root)]
+    try:
+        paths.extend(sorted((Path(runs_root) / "queue").glob("maintenance_manifest_*.json")))
+    except OSError:
+        pass
+    run_ids: set[str] = set()
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("runs"), list):
+            continue
+        run_ids.update(
+            str(item["run_id"])
+            for item in data["runs"]
+            if isinstance(item, dict) and item.get("run_id")
+        )
+    return run_ids
+
+
+# Maintenance launch pause (LHH-SUSPEND-TIMEOUT): a flag distinct from the
+# operator drain (task 242), set synchronously by POST
+# /api/maintenance/suspend BEFORE any run is paused so nothing new can launch
+# inside the suspend window even for an instant.  It is deliberately NOT the
+# drain flag: the drain is operator-owned state with its own reason and is
+# cleared by deploy steps independently of the suspend outcome (the 2026-10-08
+# incident had the drain cleared while the timed-out suspend window was still
+# unresolved, letting the launcher start POOL-256K in the gap).  Owning a
+# separate flag lets the suspend/resume paths set and clear it idempotently
+# without ever mutating the operator's drain state.
+MAINTENANCE_LAUNCH_PAUSE_NAME = "maintenance_launch_pause.json"
+
+
+def maintenance_launch_pause_path(runs_root: str | Path) -> Path:
+    """Path of the maintenance launch-pause flag inside the queue directory."""
+
+    return Path(runs_root) / "queue" / MAINTENANCE_LAUNCH_PAUSE_NAME
+
+
+def read_maintenance_launch_pause(runs_root: str | Path) -> dict[str, Any]:
+    """Read the launch-pause flag; absence or corruption reads as not paused.
+
+    The launch gate must fail open here: an unreadable flag file must not
+    freeze every launch forever.  ``set_maintenance_launch_pause`` rewrites
+    the file wholesale, so a torn or corrupt flag is repaired by the next
+    suspend.
+    """
+
+    try:
+        data = json.loads(
+            maintenance_launch_pause_path(runs_root).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return {"enabled": False}
+    if not isinstance(data, dict):
+        return {"enabled": False}
     return {
-        str(item["run_id"])
-        for item in read_maintenance_manifest(runs_root)["runs"]
-        if isinstance(item, dict) and item.get("run_id")
+        "enabled": bool(data.get("enabled")),
+        "reason": data.get("reason"),
+        "suspend_id": data.get("suspend_id"),
+        "set_at": data.get("set_at"),
     }
+
+
+def set_maintenance_launch_pause(
+    runs_root: str | Path, *, reason: str | None, suspend_id: str
+) -> dict[str, Any]:
+    """Enable the maintenance launch pause (idempotent rewrite).
+
+    Raises OSError on persist failure: the suspend handler fails closed rather
+    than pausing runs with the launch gate open.
+    """
+
+    state = {
+        "enabled": True,
+        "reason": reason,
+        "suspend_id": suspend_id,
+        "set_at": time.time(),
+    }
+    path = maintenance_launch_pause_path(runs_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(state, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(payload)
+    os.replace(tmp, path)
+    return state
+
+
+def clear_maintenance_launch_pause(
+    runs_root: str | Path, *, if_suspend_id: str | None = None
+) -> None:
+    """Clear the maintenance launch pause; safe to call when already clear.
+
+    With ``if_suspend_id`` the flag is removed only while it still names that
+    suspend: once a failed suspend's window closes, a NEWER suspend stamps the
+    flag with its own id, and the older window's late cleanup (or an operator
+    retry resume of its leftover manifest) must never tear the newer flag
+    down mid-window.  Callers that need the check-and-unlink to be race-free
+    against POST /api/maintenance/suspend (which stamps the flag under the
+    server's suspend lock) hold that same lock around this call.
+    """
+
+    if if_suspend_id is not None:
+        if read_maintenance_launch_pause(runs_root).get("suspend_id") != if_suspend_id:
+            return
+    maintenance_launch_pause_path(runs_root).unlink(missing_ok=True)
 
 
 # Stall detector (task 230): when eligible queue entries exist but no launch
@@ -984,6 +1115,29 @@ class Launcher:
             return f"queue drained: {str(reason)[:200]}"
         return "queue drained"
 
+    def _maintenance_pause_skip_reason(self) -> str | None:
+        """Maintenance launch-pause skip reason while the flag is set, else None.
+
+        LHH-SUSPEND-TIMEOUT: POST /api/maintenance/suspend sets this flag
+        synchronously BEFORE pausing any run, so no new launch can start
+        inside the suspend window.  It is a distinct flag from the operator
+        drain (``_drain_skip_reason``) because deploy steps clear the drain on
+        their own schedule regardless of the suspend outcome; overloading the
+        drain would let that clear reopen launches mid-window.  Like the
+        drain, an unreadable flag fails open rather than freezing launches.
+        """
+
+        runs_root = getattr(self.supervisor, "runs_root", None)
+        if runs_root is None:
+            return None
+        state = read_maintenance_launch_pause(runs_root)
+        if not state.get("enabled"):
+            return None
+        suspend_id = state.get("suspend_id")
+        if suspend_id:
+            return f"maintenance launch pause: suspend {suspend_id}"
+        return "maintenance launch pause"
+
     def _check_eligibility(
         self,
         entry: QueueEntry,
@@ -993,6 +1147,9 @@ class Launcher:
         drain_reason = self._drain_skip_reason()
         if drain_reason is not None:
             return drain_reason
+        pause_reason = self._maintenance_pause_skip_reason()
+        if pause_reason is not None:
+            return pause_reason
         waiting_reason = self._waiting_skip_reason(entry)
         if waiting_reason is not None:
             return waiting_reason

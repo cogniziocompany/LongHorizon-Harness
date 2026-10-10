@@ -297,9 +297,13 @@ jobs:
         id: suspend_runs
         if: ${{ !inputs.dry_run && inputs.active_runs == 'suspend' }}
         run: |
-          # With the drain set (no new launches), stop every ACTIVE run
-          # through the maintenance API; the service parks them in a
-          # manifest so the resume step below puts them back after verify.
+          # Async flow (LHH-SUSPEND-TIMEOUT): with the drain set and the
+          # launch pause raised by the API (no new launches from this
+          # instant), POST /api/maintenance/suspend returns 202 at once
+          # with a suspend id; the script polls GET .../suspend/{id} on a
+          # bounded budget until every active run is parked in a manifest
+          # keyed to that id, and exports the id ($GITHUB_OUTPUT) so the
+          # resume step below targets exactly THIS suspend's manifest.
           python3 scripts/deploy/ct110/suspend_runs.py \
             --url "$CT110_WEB_URL" \
             --reason "deploy $EXPECTED_VERSION (${{ needs.preflight.outputs.sha }}) maintenance window"
@@ -471,19 +475,31 @@ jobs:
           echo "status=$status" >> "$GITHUB_OUTPUT"
           echo "rollback: $status"
 
-      # fc-H4b: parked runs come back BEFORE the drain clears, on every path
-      # that suspended them — the success path resumes them after verify,
-      # and a failed deploy resumes them here AFTER the automatic rollback
-      # above (whose restart would otherwise kill them again), so a suspend
-      # can never strand a run in the manifest.
+      # fc-H4b (LHH-SUSPEND-TIMEOUT): parked runs come back BEFORE the
+      # drain clears, on every path that suspended them — the success path
+      # resumes them after verify, and a failed deploy resumes them here
+      # AFTER the automatic rollback above (whose restart would otherwise
+      # kill them again), so a suspend can never strand a run in a manifest.
       # Gate on "the suspend step ran" (outcome != 'skipped'), not on its
-      # success: a suspend that stopped some runs and then failed must still
-      # put them back. resume_runs.py exits 0 on an empty manifest.
+      # success: a suspend that paused some runs and then failed must still
+      # put them back (the server's own bounded cleanup already does — this
+      # step is the second fence and is idempotent).
+      # The resume is keyed to THIS suspend's id, exported by the suspend
+      # step; a stale manifest from an older suspend can never be revived.
+      # If the suspend step failed before producing an id, nothing this
+      # deploy paused is outstanding — notice and succeed rather than
+      # resolving to whatever manifest happens to exist.
       - name: Resume suspended runs (fc-H4b)
         if: ${{ !inputs.dry_run && always() && inputs.active_runs == 'suspend' && steps.suspend_runs.outcome != 'skipped' }}
         run: |
+          suspend_id="${{ steps.suspend_runs.outputs.suspend_id }}"
+          if [ -z "$suspend_id" ]; then
+            echo "::notice::suspend step produced no suspend id (its POST failed); nothing to resume — skipping"
+            exit 0
+          fi
           python3 scripts/deploy/ct110/resume_runs.py \
-            --url "$CT110_WEB_URL"
+            --url "$CT110_WEB_URL" \
+            --suspend-id "$suspend_id"
 
       - name: Clear drain (resume queue launches, task 242)
         if: ${{ !inputs.dry_run && always() && steps.set_drain.outcome == 'success' }}
