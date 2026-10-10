@@ -521,6 +521,30 @@ def test_suspend_mode_order_and_resume_guard() -> None:
     assert "steps.deploy.outcome" in rollback["if"]
 
 
+def test_resume_passes_this_suspends_id_and_survives_an_empty_one() -> None:
+    """LHH-SUSPEND-TIMEOUT: the async suspend step exports the suspend id
+    (suspend_runs.py writes ``suspend_id=...`` to $GITHUB_OUTPUT) and the
+    always() resume cleanup passes it to resume_runs.py --suspend-id, so the
+    resume consumes only this suspend's manifest and a stale manifest from
+    an older suspend can never revive runs (run 37737427710, 2026-10-08)."""
+    steps = _deploy_steps(_workflow_doc())
+    suspend = next(step for step in steps if "suspend_runs.py" in step.get("run", ""))
+    # The step id exposes the script's GITHUB_OUTPUT key as
+    # steps.suspend_runs.outputs.suspend_id.
+    assert suspend.get("id") == "suspend_runs"
+    resume = next(step for step in steps if "resume_runs.py" in step.get("run", ""))
+    assert "always()" in resume["if"]
+    assert "--suspend-id" in resume["run"]
+    assert "steps.suspend_runs.outputs.suspend_id" in resume["run"]
+    # Empty id (the suspend POST itself failed before returning one) must
+    # skip cleanly with a notice — never resolve to whatever stale manifest
+    # an older suspend left behind.
+    body = resume["run"]
+    empty_guard = body.index("[ -z ")
+    assert "exit 0" in body[empty_guard:]
+    assert body.index("--suspend-id") > empty_guard
+
+
 def test_verify_steps_wait_and_check_the_commit_not_the_version() -> None:
     """Run 37162090599 (b6f51f9): one-shot /api/meta + version-keyed rollback."""
     doc = _workflow_doc()
