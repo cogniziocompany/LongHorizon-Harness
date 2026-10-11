@@ -2468,6 +2468,12 @@ def create_app(
                 break
             time.sleep(0.2)
 
+        payload = {
+            "suspend_id": suspend_id,
+            "reason": record["reason"],
+            "created_at": record["created_at"],
+            "runs": paused,
+        }
         try:
             persist(paused)
         except OSError as exc:
