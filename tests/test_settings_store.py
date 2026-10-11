@@ -182,3 +182,164 @@ def test_import_env_file_reports_names_only(tmp_path: Path, capsys) -> None:
     assert values["LH_HARNESS_WEB_TOKEN"] == web and values["LH_HARNESS_FLEET_URL"] == "https://fleet.example"
     audit = SettingsStore(db_path, KEY).audit()
     assert all(e["actor"] == "operator" and e["detail"]["source"] == "import" for e in audit)
+
+
+# ------------------------------------------- queue trios + capacity (v2) --
+QUEUE_CONFIG_TOML = """\
+[queue]
+observe = false
+
+[queue.trios.kimi]
+agent = "claude_code"
+model = "glm-5.2:synthetic-anthropic"
+mcp_profile = "default"
+
+[queue.trios.qwen]
+agent = "claude_code"
+model = "qwen3.8"
+mcp_profile = "default"
+
+[queue.trios.glm]
+agent = "claude_code"
+model = "glm-5.3:zai"
+mcp_profile = "default"
+
+[queue.capacity]
+glm_max = 2
+kimi_max = 1
+qwen_max = 2
+"""
+
+
+def _config_file(tmp_path: Path, text: str = QUEUE_CONFIG_TOML) -> Path:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(text, encoding="utf-8")
+    return cfg
+
+
+def test_schema_v2_fresh_db_has_empty_queue_tables(tmp_path: Path) -> None:
+    path = tmp_path / "db" / "settings.db"
+    store = SettingsStore(path, KEY)
+    raw = sqlite3.connect(path)
+    try:
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
+        tables = {r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        raw.close()
+    assert {"meta", "settings", "audit", "queue_trio", "queue_capacity"} <= tables
+    assert store.queue_trios() == [] and store.queue_capacity() == {}
+
+
+def test_seed_from_config_toml_populates_trios_and_capacity(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    cfg = _config_file(tmp_path)
+    report = store.seed_queue_from_config(cfg)
+    assert report == {"trios": ["kimi", "qwen", "glm"], "capacity": ["glm", "kimi", "qwen"]}
+    trios = {t["name"]: t for t in store.queue_trios()}
+    assert set(trios) == {"kimi", "qwen", "glm"}
+    assert trios["glm"] == {
+        "name": "glm", "agent": "claude_code", "model": "glm-5.3:zai",
+        "mcp_profile": "default", "enabled": True,
+        "updated_by": ss.SEED_ACTOR, "updated_at": trios["glm"]["updated_at"],
+    }
+    assert trios["kimi"]["model"] == "glm-5.2:synthetic-anthropic" and trios["qwen"]["model"] == "qwen3.8"
+    assert all(t["updated_at"] for t in trios.values())
+    assert store.queue_capacity() == {"glm": 2, "kimi": 1, "qwen": 2}
+    seeds = [e for e in store.audit() if e["action"] == "seed"]
+    assert {e["name"] for e in seeds} == {
+        "queue_trio:kimi", "queue_trio:qwen", "queue_trio:glm",
+        "queue_capacity:glm", "queue_capacity:kimi", "queue_capacity:qwen",
+    }
+    assert all(e["actor"] == ss.SEED_ACTOR and e["detail"]["source"] == str(cfg) for e in seeds)
+    glm_seed = next(e for e in seeds if e["name"] == "queue_trio:glm")
+    assert glm_seed["detail"]["model"] == "glm-5.3:zai" and glm_seed["detail"]["mcp_profile"] == "default"
+    cap_seed = next(e for e in seeds if e["name"] == "queue_capacity:glm")
+    assert cap_seed["detail"]["max_concurrent"] == 2
+    # the bootstrap file is read-only for the seed: no writes to config.toml
+    assert cfg.read_text(encoding="utf-8") == QUEUE_CONFIG_TOML
+
+
+def test_reseed_leaves_existing_rows_untouched(tmp_path: Path) -> None:
+    path = tmp_path / "db" / "settings.db"
+    store = SettingsStore(path, KEY)
+    store.seed_queue_from_config(_config_file(tmp_path))
+    raw = sqlite3.connect(path)
+    raw.execute("UPDATE queue_trio SET model='glm-5.2:synthetic-anthropic', updated_by='admin:op' WHERE name='glm'")
+    raw.execute("UPDATE queue_capacity SET max_concurrent=9 WHERE trio='glm'")
+    raw.commit()
+    raw.close()
+    # config.toml changed afterwards (the whole point of hot reload: the DB wins)
+    cfg = _config_file(tmp_path, QUEUE_CONFIG_TOML.replace("glm_max = 2", "glm_max = 3"))
+    before = len(store.audit())
+    report = SettingsStore(path, KEY).seed_queue_from_config(cfg)
+    assert report == {"trios": None, "capacity": None}
+    kept = {t["name"]: t for t in store.queue_trios()}
+    assert kept["glm"]["model"] == "glm-5.2:synthetic-anthropic" and kept["glm"]["updated_by"] == "admin:op"
+    assert store.queue_capacity()["glm"] == 9
+    assert len(store.audit()) == before  # a skip seeds and audits nothing
+
+
+def test_queue_tables_seed_independently(tmp_path: Path) -> None:
+    path = tmp_path / "db" / "settings.db"
+    store = SettingsStore(path, KEY)
+    cfg = _config_file(tmp_path)
+    store.seed_queue_from_config(cfg)
+    raw = sqlite3.connect(path)
+    raw.execute("DELETE FROM queue_capacity")
+    raw.execute("UPDATE queue_trio SET model='hand-edited' WHERE name='glm'")
+    raw.commit()
+    raw.close()
+    report = SettingsStore(path, KEY).seed_queue_from_config(cfg)
+    assert report == {"trios": None, "capacity": ["glm", "kimi", "qwen"]}
+    assert store.queue_capacity() == {"glm": 2, "kimi": 1, "qwen": 2}
+    assert {t["name"]: t["model"] for t in store.queue_trios()}["glm"] == "hand-edited"
+
+
+def test_seed_without_config_or_with_empty_queue_section_is_noop(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    assert store.seed_queue_from_config(tmp_path / "missing.toml") is None
+    cfg = _config_file(tmp_path, "[run]\nmodel = 'x'\n")
+    assert store.seed_queue_from_config(cfg) == {"trios": [], "capacity": []}
+    assert store.queue_trios() == [] and store.queue_capacity() == {}
+    assert [e for e in store.audit() if e["action"] == "seed"] == []
+
+
+def test_trio_rows_needing_an_agent_and_caps_needing_an_int_are_skipped(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    cfg = _config_file(
+        tmp_path,
+        "[queue.trios.broken]\nmodel='no-agent'\n"
+        "[queue.trios.ok]\nagent='codex'\n"
+        "[queue.capacity]\nok_max = 4\nweird_max = 'not-an-int'\naverage = 9\n",
+    )
+    assert store.seed_queue_from_config(cfg) == {"trios": ["ok"], "capacity": ["ok"]}
+    assert [t["name"] for t in store.queue_trios()] == ["ok"]
+    assert store.queue_capacity() == {"ok": 4}
+
+
+def test_migration_from_v1_preserves_settings_meta_and_audit(tmp_path: Path) -> None:
+    path = tmp_path / "db" / "settings.db"
+    store = SettingsStore(path, KEY)
+    token = _token()
+    store.set("LH_HARNESS_WEB_TOKEN", token, "<EMAIL_ADDRESS>")
+    store.set("LH_HARNESS_FLEET_URL", "https://fleet.example", "<EMAIL_ADDRESS>")
+    # Downgrade to exactly what a v1 build left behind: no queue tables, version 1.
+    raw = sqlite3.connect(path)
+    raw.execute("DROP TABLE queue_trio")
+    raw.execute("DROP TABLE queue_capacity")
+    raw.execute("PRAGMA user_version = 1")
+    raw.commit()
+    raw.close()
+    migrated = SettingsStore(path, KEY)  # raises if the key check (meta) broke
+    raw = sqlite3.connect(path)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert raw.execute("SELECT COUNT(*) FROM queue_trio").fetchone()[0] == 0
+    raw.close()
+    assert migrated.values()["LH_HARNESS_WEB_TOKEN"] == token
+    assert migrated.values()["LH_HARNESS_FLEET_URL"] == "https://fleet.example"
+    assert [(e["action"], e["name"]) for e in migrated.audit()] == [
+        ("set", "LH_HARNESS_FLEET_URL"), ("set", "LH_HARNESS_WEB_TOKEN"),
+    ]
+    # a migrated v1 database still seeds like a fresh one
+    assert migrated.seed_queue_from_config(_config_file(tmp_path))["trios"] == ["kimi", "qwen", "glm"]
+    assert migrated.queue_capacity()["glm"] == 2

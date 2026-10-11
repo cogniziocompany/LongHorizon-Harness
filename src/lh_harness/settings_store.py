@@ -14,6 +14,11 @@ values from the web UI (``/admin``); the service reads them at start.
   database is (``LH_HARNESS_SETTINGS_DB``) and its key
   (``LH_HARNESS_SETTINGS_KEY``), plus the admin bootstrap
   (``LH_HARNESS_SETTINGS_ADMINS``, ``LH_HARNESS_SETTINGS_PROXY_AUTH``).
+- Queue trios and capacity live in the store too (schema v2, tables
+  ``queue_trio`` and ``queue_capacity``) so they can change at runtime
+  without a restart. They are seeded once from the project config.toml
+  (``[queue.trios.*]`` / ``[queue.capacity]``); the file stays as the
+  bootstrap and fallback only, and seeding never overwrites rows.
 
 See docs/settings-store.md.
 """
@@ -21,6 +26,7 @@ See docs/settings-store.md.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import json
 import logging
 import os
@@ -29,7 +35,12 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, MutableMapping
+from typing import Any, Iterator, Mapping, MutableMapping
+
+try:
+    tomllib = importlib.import_module("tomllib")
+except ModuleNotFoundError:  # Python < 3.11
+    tomllib = importlib.import_module("tomli")
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +56,9 @@ _SECRET_NAME_RE = re.compile(r"(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL)")
 MAX_VALUE_CHARS = 8192
 MAX_NOTE_CHARS = 500
 MIN_KEY_CHARS = 32
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _KEY_CHECK_PLAINTEXT = b"lh-harness settings key check v1"
+SEED_ACTOR = "seed-queue"
 
 
 class SettingsError(ValueError):
@@ -215,6 +227,28 @@ class SettingsStore:
                     );
                     """
                 )
+            if version < 2:
+                # Queue hot-reload (LHH-QUEUE-HOTRELOAD): trios and capacity
+                # move out of config.toml-at-startup so they can change at
+                # runtime. Idempotent: CREATE IF NOT EXISTS, never drops data.
+                db.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS queue_trio (
+                        name TEXT PRIMARY KEY,
+                        agent TEXT NOT NULL,
+                        model TEXT,
+                        mcp_profile TEXT,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        updated_by TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS queue_capacity (
+                        trio TEXT PRIMARY KEY,
+                        max_concurrent INTEGER NOT NULL
+                    );
+                    """
+                )
+            if version < SCHEMA_VERSION:
                 db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             row = db.execute("SELECT value FROM meta WHERE name = 'key_check'").fetchone()
             if row is None:
@@ -361,6 +395,121 @@ class SettingsStore:
              "detail": json.loads(r["detail"] or "{}")}
             for r in rows
         ]
+
+    # ------------------------------------------------- queue trios + capacity --
+    def queue_trios(self) -> list[dict[str, Any]]:
+        """Every queue trio row, ordered by name."""
+        with self._db() as db:
+            rows = db.execute("SELECT * FROM queue_trio ORDER BY name").fetchall()
+        return [
+            {
+                "name": r["name"],
+                "agent": r["agent"],
+                "model": r["model"],
+                "mcp_profile": r["mcp_profile"],
+                "enabled": bool(r["enabled"]),
+                "updated_by": r["updated_by"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    def queue_capacity(self) -> dict[str, int]:
+        """Per-trio concurrency caps (trio name -> max_concurrent)."""
+        with self._db() as db:
+            rows = db.execute("SELECT trio, max_concurrent FROM queue_capacity ORDER BY trio").fetchall()
+        return {row["trio"]: int(row["max_concurrent"]) for row in rows}
+
+    def seed_queue_defaults(
+        self,
+        trios: Mapping[str, Any] | None = None,
+        capacity: Mapping[str, Any] | None = None,
+        *,
+        actor: str = SEED_ACTOR,
+        source: str = "config.toml",
+    ) -> dict[str, Any]:
+        """Populate the queue tables from config values, once only.
+
+        Each table is seeded only while it is empty: a restart after an admin
+        edited rows (or a config.toml change afterwards) leaves the live rows
+        untouched, so the database is authoritative from the first seed on.
+        ``capacity`` keys are the config-style ``<trio>_max`` integers; other
+        capacity keys (poll_seconds, max_retries, ...) are not per-trio
+        concurrency caps and stay out of the store. Every seeded row is
+        recorded in the audit log; a skip seeds and audits nothing.
+
+        Returns a report: per table, the seeded names, or ``None`` when the
+        table already held rows and was left as is.
+        """
+        report: dict[str, Any] = {"trios": None, "capacity": None}
+        with self._db() as db:
+            if db.execute("SELECT 1 FROM queue_trio LIMIT 1").fetchone() is None:
+                seeded: list[str] = []
+                for name, spec in (trios or {}).items():
+                    if not isinstance(spec, dict) or not isinstance(name, str) or not name.strip():
+                        continue
+                    agent = str(spec.get("agent") or "").strip()
+                    if not agent:
+                        continue
+                    model = str(spec.get("model") or "").strip() or None
+                    profile = str(spec.get("mcp_profile") or "").strip() or None
+                    db.execute(
+                        """INSERT INTO queue_trio(name, agent, model, mcp_profile, enabled, updated_by, updated_at)
+                           VALUES (?, ?, ?, ?, 1, ?, ?)""",
+                        (name.strip(), agent, model, profile, actor, now_iso()),
+                    )
+                    self._audit(
+                        db, actor, "seed", f"queue_trio:{name.strip()}",
+                        agent=agent, model=model, mcp_profile=profile, source=source,
+                    )
+                    seeded.append(name.strip())
+                report["trios"] = seeded
+            if db.execute("SELECT 1 FROM queue_capacity LIMIT 1").fetchone() is None:
+                seeded = []
+                for key, raw in (capacity or {}).items():
+                    if not isinstance(key, str) or not key.endswith("_max"):
+                        continue
+                    trio = key[: -len("_max")].strip()
+                    if not trio or isinstance(raw, bool) or not isinstance(raw, int):
+                        continue
+                    db.execute(
+                        "INSERT INTO queue_capacity(trio, max_concurrent) VALUES (?, ?)",
+                        (trio, max(0, raw)),
+                    )
+                    self._audit(db, actor, "seed", f"queue_capacity:{trio}", max_concurrent=max(0, raw), source=source)
+                    seeded.append(trio)
+                report["capacity"] = seeded
+        return report
+
+    def seed_queue_from_config(self, path: str | Path, *, actor: str = SEED_ACTOR) -> dict[str, Any] | None:
+        """Seed the queue tables from a project config.toml, once only.
+
+        Reads ``[queue.trios.*]`` and ``[queue.capacity]`` exactly as the
+        launcher reads them at start; the file is the bootstrap and stays
+        untouched (read-only). A missing or unreadable file seeds nothing and
+        returns ``None`` (the launcher then falls back to the file as before);
+        it never takes the service down.
+        """
+        source = Path(path)
+        try:
+            with source.open("rb") as fh:
+                payload = tomllib.load(fh)
+        except Exception:  # noqa: BLE001 - a missing/broken bootstrap file must be a no-op
+            logger.info("queue seed skipped: cannot read %s", source)
+            return None
+        if not isinstance(payload, dict):
+            logger.info("queue seed skipped: %s has no TOML table", source)
+            return None
+        queue = payload.get("queue")
+        queue = queue if isinstance(queue, dict) else {}
+        trios = queue.get("trios")
+        capacity = queue.get("capacity")
+        return self.seed_queue_defaults(
+            trios if isinstance(trios, dict) else {},
+            capacity if isinstance(capacity, dict) else {},
+            actor=actor,
+            source=str(source),
+        )
 
     # ------------------------------------------------------------------ import --
     def import_env_file(self, path: str | Path, actor: str) -> list[dict[str, str]]:
