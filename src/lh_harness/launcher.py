@@ -35,6 +35,7 @@ from .queue import (
     queue_config_from_config,
     read_lease,
 )
+from .settings_store import SettingsStore, open_from_environment
 from .supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
 from .supervisor.service import auditor_read_only_violation
 from .workspace_guard import (
@@ -568,6 +569,21 @@ def _unpushed_branch_occupied(workspace: str) -> bool:
     return bool(count and count != "0")
 
 
+def _open_settings_store() -> SettingsStore | None:
+    """Open the embedded settings store from its bootstrap environment.
+
+    ``None`` when the store is not configured (no ``LH_HARNESS_SETTINGS_KEY``)
+    or cannot be opened: a deployment without the settings DB keeps the pure
+    config.toml behaviour, and the launcher must never fail on the store.
+    """
+
+    try:
+        return open_from_environment()
+    except Exception as exc:  # noqa: BLE001 - a broken store must not stop the launcher
+        logger.warning("settings store unavailable (%s); queue config stays file-only", exc)
+        return None
+
+
 class Launcher:
     """Poll the queue and launch eligible entries through the supervisor."""
 
@@ -584,6 +600,21 @@ class Launcher:
         self.supervisor = supervisor
         self.queue_store = queue_store
         self._config = queue_config or self._load_project_queue_config()
+        # Pristine bootstrap config (queue_config argument or config.toml).
+        # ``_refresh_queue_config`` rebuilds ``self._config`` from THIS at the
+        # start of every pass, so a settings-DB row that is later deleted falls
+        # back to the file value rather than a stale per-pass snapshot.
+        self._base_config = self._config
+        self._settings_store = _open_settings_store()
+        if self._settings_store is not None:
+            # One-time seed (LHH-QUEUE-HOTRELOAD): empty queue_trio /
+            # queue_capacity tables are populated from config.toml once; the
+            # file is read-only bootstrap here and operator-edited rows are
+            # never overwritten by a later start.
+            try:
+                self._settings_store.seed_queue_from_config(PROJECT_CONFIG_PATH)
+            except Exception as exc:  # noqa: BLE001 - a seed failure must never stop the launcher
+                logger.warning("queue seeding failed; continuing with bootstrap config: %s", exc)
         # Observe (shadow) mode — task 173 / migration §5 Step 2: when true the
         # launcher computes the full launch decision but starts NOTHING; it
         # appends one shadow record per decision to
@@ -632,6 +663,69 @@ class Launcher:
         except Exception:
             pass
         return default_queue_config()
+
+    def _refresh_queue_config(self) -> None:
+        """Overlay settings-DB queue trios/capacity onto the bootstrap config.
+
+        Runs at the START of every scheduling pass (LHH-QUEUE-HOTRELOAD) so a
+        trio or capacity change an admin writes to the settings DB takes effect
+        on the very next pass — no caching, no TTL, no restart. The merge
+        always starts from the pristine ``self._base_config``; a DB row that is
+        later deleted therefore falls back to the config.toml-derived value
+        instead of a stale per-pass snapshot (bootstrap/fallback semantics).
+        A row with ``enabled = false`` REMOVES that trio from scheduling: once
+        the database holds a row for a name it is authoritative. Only trios and
+        per-trio ``<name>_max`` capacity keys are overlaid; everything else
+        (observe, poll_seconds, key-health, occupancy flags, time limits)
+        stays config-file-owned. A run keeps the trio resolved at its launch;
+        this merge never reaches into a running run. A store read failure is
+        logged and the pass keeps the bootstrap config.
+        """
+
+        if self._settings_store is None:
+            return
+        try:
+            trio_rows = self._settings_store.queue_trios()
+            capacity_rows = self._settings_store.queue_capacity()
+        except Exception as exc:  # noqa: BLE001 - a broken store must not stop the launcher
+            logger.warning("settings queue read failed; keeping bootstrap config: %s", exc)
+            return
+        merged = dict(self._base_config)
+        trios = {
+            name: dict(spec)
+            for name, spec in (merged.get("trios") or {}).items()
+            if isinstance(spec, dict)
+        }
+        for row in trio_rows:
+            name = row.get("name") if isinstance(row, dict) else None
+            if not isinstance(name, str) or not name.strip():
+                continue
+            name = name.strip()
+            if not row.get("enabled", True):
+                trios.pop(name, None)
+                continue
+            agent = str(row.get("agent") or "").strip()
+            if not agent:
+                continue
+            base_spec = trios.get(name) or {}
+            trios[name] = {
+                "agent": agent,
+                "model": str(row.get("model") or "").strip() or None,
+                "mcp_profile": str(row.get("mcp_profile") or "").strip() or None,
+                # queue_trio has no auditor column; keep the file binding.
+                "auditor_mcp_profile": base_spec.get("auditor_mcp_profile"),
+            }
+        merged["trios"] = trios
+        capacity = dict(merged.get("capacity") or {})
+        for trio_name, max_concurrent in capacity_rows.items():
+            if not isinstance(trio_name, str) or not trio_name.strip():
+                continue
+            try:
+                capacity[f"{trio_name.strip()}_max"] = max(0, int(max_concurrent))
+            except (TypeError, ValueError):
+                continue
+        merged["capacity"] = capacity
+        self._config = merged
 
     @staticmethod
     def _project_role_mcp_profile(role: str) -> str | None:
@@ -757,6 +851,9 @@ class Launcher:
         return True
 
     def _run_pass(self) -> None:
+        # Hot-reload (LHH-QUEUE-HOTRELOAD): re-resolve trios/capacity from the
+        # settings DB for THIS pass so admin changes apply with no restart.
+        self._refresh_queue_config()
         entries = self.queue_store.list()
         active = self._active_runs()
         self._update_launched_entries(active)
