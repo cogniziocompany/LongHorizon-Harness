@@ -491,8 +491,10 @@ def create_project_config(
     return target
 
 
-def load_run_defaults(path: str | Path = PROJECT_CONFIG_PATH) -> dict[str, Any]:
-    source = Path(path)
+def load_run_defaults(path: str | Path | None = None) -> dict[str, Any]:
+    # No explicit path: resolve the workspace file, else the node-level one
+    # (see resolve_run_config_path). Callers that pass a path keep it as is.
+    source = Path(path) if path is not None else resolve_run_config_path()
     if not source.is_file():
         return {}
     try:

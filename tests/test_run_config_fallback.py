@@ -51,6 +51,22 @@ def test_explicit_env_path_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert resolve_run_config_path(["run"]) == explicit
 
 
+def test_load_run_defaults_without_a_path_uses_the_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The run command calls load_run_defaults() with no arguments; the child's
+    # own argv carries --runs-root, which is where the node-level file lives.
+    _write(tmp_path / "work" / ".lh-harness" / "config.toml", manager=600)
+    workspace = tmp_path / "work" / "q2-repo"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.delenv(config_mod.ENV_PROJECT_CONFIG, raising=False)
+    monkeypatch.setattr(
+        config_mod.sys, "argv", ["lh-harness", "run", f"--runs-root={tmp_path / 'work' / '.lh-harness' / 'runs'}"]
+    )
+    assert load_run_defaults()["manager_timeout"] == 600
+
+
 def test_nothing_found_keeps_relative_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv(config_mod.ENV_PROJECT_CONFIG, raising=False)
