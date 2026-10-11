@@ -186,6 +186,7 @@ async def _run_impl(
     auditor_format_repair_agent: AgentAdapter | None = None,
     final_response_agent: AgentAdapter | None = None,
     human_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+    parent_debrief_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     pending_instructions: Callable[[], list[str]] | None = None,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
     resume: bool = False,
@@ -215,6 +216,14 @@ async def _run_impl(
 
     ``progress`` is an optional synchronous ``(event, payload)`` sink for
     operator-facing status lines (the CLI prints them to the console).
+
+    ``parent_debrief_hook`` is an optional trusted runtime adapter called at the
+    round boundary before the human gate. It owns Manager reflection and the
+    authenticated full parent packet; it returns a matching checkpoint, durable
+    ``receipt_ref``, explicit ``reply_required`` and continue/wait/stop disposition.
+    Required replies additionally need an adapter-validated ``parent_reply_ref``.
+    Missing evidence or adapter failure holds the run without extending its budget.
+    This callback is not exposed to model tool arguments or the web intake API.
     """
 
     def emit(event: str, **payload: Any) -> None:
@@ -338,6 +347,7 @@ async def _run_impl(
     # directly and reads the results straight back from `gate`.
     gate = _GateContext(
         human_hook=human_hook,
+        parent_debrief_hook=parent_debrief_hook,
         task=task,
         rounds=rounds,
         log_dir=log_dir,
@@ -1121,6 +1131,7 @@ class _GateContext:
     config: HarnessConfig
     events_path: Path
     round_budget: int
+    parent_debrief_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     # The gate writes the user-facing reply before asking the operator to decide,
     # so it needs the pieces an episode requires.
     env: Environment | None = None
@@ -1144,6 +1155,67 @@ class _GateContext:
     failure_reason: str = ""
 
 
+async def _parent_debrief(ctx: _GateContext, outcome: str, round_index: int, task_state: str, question: str) -> bool:
+    """Invoke an admitted runtime adapter before the next round can be launched.
+
+    The trusted adapter owns Manager reflection, the full authorized packet,
+    durable outbox and authenticated reply validation. This compact projection is
+    not itself a delegation packet or a source of identity/permissions. Neither
+    transport ACK nor parent context can extend the admitted round budget.
+    """
+    if ctx.parent_debrief_hook is None:
+        return False
+    record = next((item for item in reversed(ctx.rounds) if item.round_index == round_index), None)
+    checkpoint = hashlib.sha256(json.dumps({
+        "round": asdict(record) if record else None, "round_index": round_index,
+        "outcome": outcome, "task_state": task_state, "question": question,
+        "round_budget": ctx.round_budget,
+    }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    projection = {
+        "phase": "manager_parent_debrief", "checkpoint": checkpoint,
+        "round_index": round_index, "outcome": outcome,
+        "remaining_rounds": max(0, ctx.round_budget-round_index),
+        "task_state": task_state[:8000], "question": question[:8000],
+        "auditor_report": record.auditor_report[:8000] if record else "",
+        "harness_feedback": record.harness_feedback[:8000] if record else "",
+        "evidence_refs": list(record.related_report_refs[:100]) if record else [],
+    }
+    _append_event(ctx.events_path, "parent_debrief_pending", {
+        "round": round_index, "checkpoint": checkpoint,
+    })
+    try:
+        decision = await ctx.parent_debrief_hook(projection)
+    except Exception:
+        decision = {}
+    qualified = (
+        isinstance(decision, dict)
+        and decision.get("checkpoint") == checkpoint
+        and isinstance(decision.get("receipt_ref"), str)
+        and 0 < len(decision["receipt_ref"]) <= 500
+        and type(decision.get("reply_required")) is bool
+        and decision.get("action") in ("continue", "wait", "stop")
+    )
+    answered = qualified and isinstance(decision.get("parent_reply_ref"), str) and 0 < len(decision["parent_reply_ref"]) <= 500
+    action = decision["action"] if qualified else "wait"
+    if qualified and decision["reply_required"] and not answered:
+        action = "wait"
+    _append_event(ctx.events_path, "parent_debrief_disposition", {
+        "round": round_index, "checkpoint": checkpoint, "action": action,
+        "receipt_ref": decision["receipt_ref"] if qualified else None,
+        "parent_reply_ref": decision["parent_reply_ref"] if answered else None,
+    })
+    if action != "continue":
+        ctx.completion_satisfied = False
+        ctx.abort_reason = "needs_parent_input" if action == "wait" else "parent_debrief_stopped"
+        return True
+    if answered:
+        instructions = decision.get("instructions", "")
+        if isinstance(instructions, str) and instructions.strip():
+            ctx.carryover_instructions = "\n".join(filter(None, [ctx.carryover_instructions, instructions[:8000].strip()]))
+            ctx.operator_instructions.append(instructions[:8000].strip())
+    return False
+
+
 async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_state: str, question: str = "", answers: list[str] | None = None) -> bool:
     """End-of-round human-in-the-loop gate; mutates ``ctx``, returns True to stop.
 
@@ -1155,6 +1227,8 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
     reopens / extends the budget and stores any injected instructions (including
     the human's answer to an ``ask``) on ``ctx``.
     """
+    if await _parent_debrief(ctx, outcome, round_index, task_state, question):
+        return True
     reached_max = (not ctx.completion_satisfied) and round_index >= ctx.round_budget
     # `ctx.abort_reason` is only assigned below, so the reason is derived here to
     # keep "ran out of rounds" distinguishable from "blocked" in the reply. `ask`
