@@ -185,7 +185,6 @@ Capacity is configured under `[queue.capacity]`:
 |---|---|---|
 | `kimi_max` | 3 | Concurrent kimi runs allowed |
 | `qwen_max` | 1 | Concurrent qwen runs allowed (QA only, one at a time) |
-| `orfree_max` | 2 | Concurrent orfree runs allowed. Only used when `[queue.trios.orfree]` is defined (see below) |
 | `glm_max` | 1 | Concurrent glm runs allowed. Only used when `[queue.trios.glm]` is defined (see below) |
 | `zai_max` | 5 | Concurrent zai runs allowed. Only used when `[queue.trios.zai]` is defined (see below) |
 | `zaiq_max` | 1 | Concurrent zaiq (mixed) runs. Only used when `[queue.trios.zaiq]` is defined; shares the local qwen lanes with `qwen_max` |
@@ -271,50 +270,6 @@ The Postgres backend stores the field in the `time_limit_minutes` column
 added by `006_harness_queue_time_limit.sql` (idempotent `ADD COLUMN IF NOT
 EXISTS`; existing rows read back as no limit).
 
-## The optional `orfree` trio (OpenRouter free models)
-
-`kimi` and `qwen` always exist. `orfree` exists only on a node whose `config.toml` defines it; an
-`orfree` entry on any other node stays pending with the skip reason `orfree at capacity`.
-
-```toml
-[queue.trios.orfree]
-agent = "claude_code"                     # same backend as the kimi dev trio
-model = "qwen3.8-27b:openrouter-free"     # gateway alias, served by two OpenRouter keys
-mcp_profile = "ops"                       # same profile as the node's kimi trio
-
-[queue.capacity]
-orfree_max = 2
-```
-
-All three roles (manager, executor, auditor) run on that one model. The alias is registered on
-the LiteLLM gateway as two deployments, one per OpenRouter key, each capped at 20 requests per
-minute (see cognizioware-mcp-tools `docs/openrouter-free-models.md`).
-
-**What it is for.** Development work that does not fit the local 9B lane and should not wait for
-kimi quota. A 27B model with a 262,144-token window; whether it holds the harness control-header
-format on multi-file tasks is not proven yet: try it on small tasks first.
-
-**What must never go there.** Free endpoints can log prompts and use them for training. No
-customer data, no secrets, no private repositories whose content must stay private.
-
-**Why `orfree_max = 2`.**
-
-- Per minute: 2 keys x 20 requests = 40 requests per minute. A run has one role working at a
-  time, and an agent sends its next request only after the previous answer and its tool calls
-  finish, so one run is one request stream. Two runs are two streams and share the two keys;
-  even at one request every 3 seconds per run that is 40 per minute, the limit.
-- Per day: 2 keys x 1,000 requests = 2,000 requests per UTC day, shared by every caller of the
-  free models, not only the harness. Assuming about 40 requests per round (manager 5,
-  executor 25, auditor 10; an estimate, not measured) and 4 rounds per run, a run costs about
-  160 requests, so the day's budget is roughly 12 runs. Two concurrent runs of 30 to 60 minutes
-  each already reach that budget in a working day; a third slot would only move the wall earlier.
-- When a key's daily limit is gone its deployment answers 429 and the gateway moves traffic to
-  the other key; when both are gone the run fails with a rate-limit error. Do not requeue into
-  it before 00:00 UTC.
-
-Measure the real requests per run on the first few runs (gateway spend logs, filtered by the
-alias) and adjust `orfree_max` from that. A capacity change needs an lh-harness restart, and a
-restart kills every live run, so do it when no run is active.
 
 ## Example `config.toml` block
 
@@ -592,7 +547,7 @@ last-tick half is deferred to the migration plan §4 as new work.)
 
 ## The optional `glm` trio (Ollama Cloud glm-5.3)
 
-Like `orfree`, `glm` exists only on a node whose `config.toml` defines it; elsewhere a `glm`
+`glm` exists only on a node whose `config.toml` defines it; elsewhere a `glm`
 entry stays pending with `glm at capacity`. It is the dev trio on the keyed Ollama Cloud
 `glm-5.3:cloud` model, separate from the `kimi` trio (which on CT110 runs the synthetic
 provider and must not be changed).
@@ -610,7 +565,7 @@ glm_max = 1
 ## The optional `zai` trio (direct z.ai coding plan)
 
 `zai` is an additional trio. It never replaces `kimi`, `qwen` or `glm`: those keep their models,
-and a task opts in to z.ai by asking for trio `zai`. Like `orfree` and `glm` it exists only on a
+and a task opts in to z.ai by asking for trio `zai`. Like `glm` it exists only on a
 node whose `config.toml` defines it; elsewhere a `zai` entry stays pending with `zai at capacity`.
 
 ```toml

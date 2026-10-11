@@ -1,6 +1,6 @@
 """The optional ``zai`` trio: dev work on the direct z.ai coding plan.
 
-An additional trio, defined per node like ``orfree`` and ``glm``. It never replaces
+An additional trio, defined per node like ``glm``. It never replaces
 another trio: ``kimi``, ``qwen`` and ``glm`` keep their own models.
 """
 

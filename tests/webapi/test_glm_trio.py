@@ -1,6 +1,6 @@
 """The optional ``glm`` trio: dev work on Ollama Cloud glm-5.3.
 
-Like ``orfree`` it exists only when a node's config defines ``[queue.trios.glm]``;
+It exists only when a node's config defines ``[queue.trios.glm]``;
 it keeps glm-5.3 work off the ``kimi`` trio, which on CT110 is the synthetic provider.
 """
 
