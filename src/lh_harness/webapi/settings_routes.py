@@ -1,4 +1,6 @@
-"""Admin settings screen and key restriction view (``/api/admin/*``).
+"""Admin settings screen and key restriction view (``/api/admin/*``), plus the
+queue trio/capacity admin API (``/api/queue/trios``, ``/api/queue/capacity``)
+so queue defaults change at runtime from the same settings store.
 
 Who is an admin (all must hold, otherwise the request is refused):
 
@@ -31,6 +33,7 @@ from ..settings_store import (
     SettingsRuntime,
     active_runtime,
     is_secret_name,
+    now_iso,
     spec_for,
 )
 
@@ -57,6 +60,7 @@ def register_settings_routes(
     caller_specs: dict[str, dict[str, Any]] | None = None,
     ask_runtime: Any = None,
     project_config_path: Any = None,
+    model_fetch: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     def runtime() -> SettingsRuntime:
         return settings_runtime if settings_runtime is not None else active_runtime()
@@ -188,6 +192,240 @@ def register_settings_routes(
         rt = runtime()
         assert rt.store is not None
         return {"node": _node_name(), "keys": key_restrictions(rt, caller_specs, ask_runtime, project_config_path)}
+
+    # ------------------------------------------- queue trios + capacity (R4) --
+    # LHH-QUEUE-HOTRELOAD: trio defaults and per-trio capacity live in the
+    # settings DB (queue_trio/queue_capacity) and the launcher re-reads them on
+    # every scheduling pass, so a PUT below takes effect on the next launch
+    # with no restart and no redeploy.  The store remains the sole accessor --
+    # the writes below go through its ``_db``/``_audit`` machinery, never a
+    # second connection or parallel store.
+    def live_models() -> dict[str, Any] | None:
+        """The backend's live model list per agent, or ``None`` when unknown.
+
+        ``model_fetch`` is injectable so tests never touch the network; the
+        default re-reads model discovery (briefly cached; POST
+        /api/models/refresh forces a re-fetch) on every validation.
+        """
+
+        fetch = model_fetch
+        if fetch is None:
+            from ..model_catalog import discover_model_catalog
+            fetch = discover_model_catalog
+        try:
+            catalogue = fetch()
+        except Exception:  # noqa: BLE001 - a broken provider must refuse writes, not 500
+            return None
+        if not isinstance(catalogue, dict):
+            return None
+        models = catalogue.get("models")
+        return models if isinstance(models, dict) else None
+
+    @app.get("/api/queue/trios")
+    def get_queue_trios(request: Request) -> dict[str, Any]:
+        require_admin(request)
+        rt = runtime()
+        assert rt.store is not None
+        return {"trios": rt.store.queue_trios()}
+
+    @app.put("/api/queue/trios")
+    def put_queue_trios(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        actor = require_admin(request, write=True)
+        rt = runtime()
+        assert rt.store is not None
+        store = rt.store
+        unknown = set(body) - {"trios"}
+        if unknown:
+            raise HTTPException(status_code=400, detail="unknown field(s): " + ", ".join(sorted(unknown)))
+        rows = body.get("trios")
+        if not isinstance(rows, list):
+            raise HTTPException(status_code=422, detail="trios must be a list of trio objects")
+        models = live_models()
+        if models is None:
+            raise HTTPException(status_code=503, detail="the live model list is unavailable; refusing to write unvalidated trios")
+        # Every row is validated against the live list BEFORE any write: a
+        # rejected request leaves the DB and the audit log untouched.
+        cleaned: list[dict[str, Any]] = []
+        errors: list[str] = []
+        seen: set[str] = set()
+        for raw in rows:
+            row, error = _clean_trio_row(raw, models)
+            if error is not None:
+                errors.append(error)
+                continue
+            assert row is not None
+            if row["name"] in seen:
+                errors.append(f"duplicate trio name {row['name']!r}")
+                continue
+            seen.add(row["name"])
+            cleaned.append(row)
+        if errors:
+            raise HTTPException(status_code=422, detail="; ".join(errors))
+        with store._db() as db:
+            for row in cleaned:
+                old = db.execute("SELECT * FROM queue_trio WHERE name = ?", (row["name"],)).fetchone()
+                db.execute(
+                    """INSERT OR REPLACE INTO queue_trio(name, agent, model, mcp_profile, enabled, updated_by, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (row["name"], row["agent"], row["model"], row["mcp_profile"], row["enabled"], actor, now_iso()),
+                )
+                before = (
+                    None
+                    if old is None
+                    else {
+                        "agent": old["agent"],
+                        "model": old["model"],
+                        "mcp_profile": old["mcp_profile"],
+                        "enabled": bool(old["enabled"]),
+                    }
+                )
+                after = {
+                    "agent": row["agent"],
+                    "model": row["model"],
+                    "mcp_profile": row["mcp_profile"],
+                    "enabled": bool(row["enabled"]),
+                }
+                if before != after:
+                    store._audit(db, actor, "set", f"queue_trio:{row['name']}", before=before, after=after)
+        return {"ok": True, "trios": store.queue_trios()}
+
+    @app.get("/api/queue/capacity")
+    def get_queue_capacity(request: Request) -> dict[str, Any]:
+        require_admin(request)
+        rt = runtime()
+        assert rt.store is not None
+        return {"capacity": rt.store.queue_capacity()}
+
+    @app.put("/api/queue/capacity")
+    def put_queue_capacity(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        actor = require_admin(request, write=True)
+        rt = runtime()
+        assert rt.store is not None
+        store = rt.store
+        unknown = set(body) - {"capacity"}
+        if unknown:
+            raise HTTPException(status_code=400, detail="unknown field(s): " + ", ".join(sorted(unknown)))
+        caps = body.get("capacity")
+        if not isinstance(caps, dict):
+            raise HTTPException(status_code=422, detail="capacity must be an object of trio name -> max_concurrent")
+        known_trios = {row["name"] for row in store.queue_trios()}
+        updates: dict[str, int] = {}
+        errors = []
+        for key, raw in caps.items():
+            trio = key.strip() if isinstance(key, str) else ""
+            if not trio:
+                errors.append("capacity keys must be trio names (non-empty strings)")
+                continue
+            if trio not in known_trios:
+                errors.append(f"capacity for unknown trio {trio!r}")
+                continue
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+                errors.append(f"capacity for {trio!r} must be a non-negative integer")
+                continue
+            updates[trio] = raw
+        if errors:
+            raise HTTPException(status_code=422, detail="; ".join(errors))
+        with store._db() as db:
+            for trio, value in updates.items():
+                old = db.execute("SELECT max_concurrent FROM queue_capacity WHERE trio = ?", (trio,)).fetchone()
+                db.execute("INSERT OR REPLACE INTO queue_capacity(trio, max_concurrent) VALUES (?, ?)", (trio, value))
+                before = None if old is None else int(old["max_concurrent"])
+                if before != value:
+                    store._audit(db, actor, "set", f"queue_capacity:{trio}", before=before, after=value)
+        return {"ok": True, "capacity": store.queue_capacity()}
+
+    # The server registers its ``/api/queue/{queue_id}`` capture before this
+    # function runs, and Starlette resolves routes in registration order (the
+    # reason server.py places ``/api/queue/config`` before that capture).
+    # Registering here only appends, so the exact /api/queue/trios and
+    # /api/queue/capacity paths would be shadowed by the parameter route;
+    # move them ahead of the first capture of that shape so they are
+    # reachable.  Server.py itself stays untouched.
+    _rise_exact_queue_routes(app)
+
+
+_TRIO_ROW_FIELDS = {"name", "agent", "model", "mcp_profile", "enabled"}
+_NAME_LIMIT = 64
+
+
+def _clean_trio_row(raw: Any, models_by_agent: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate one queue-trio row; ``(row, None)`` when clean, else ``(None, error)``.
+
+    A trio's model must be on the LIVE model list of its agent -- the source
+    of truth the workbench dropdowns are drawn from -- so an admin cannot
+    schedule work on a model the backend cannot actually route to.  ``model``
+    and ``mcp_profile`` may be null (the launcher then falls back per key to
+    config.toml), matching what the one-time seed writes.
+    """
+
+    if not isinstance(raw, dict):
+        return None, "each trio row must be an object"
+    unknown = set(raw) - _TRIO_ROW_FIELDS
+    if unknown:
+        return None, "unknown field(s): " + ", ".join(sorted(unknown))
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > _NAME_LIMIT:
+        return None, f"trio name must be a non-empty string of at most {_NAME_LIMIT} characters"
+    trio = name.strip()
+    agent = raw.get("agent")
+    if not isinstance(agent, str) or not agent.strip():
+        return None, f"trio {trio!r}: agent must be a non-empty string"
+    agent = agent.strip()
+    if agent not in models_by_agent:
+        return None, f"trio {trio!r}: unknown agent {agent!r}"
+    model = raw.get("model")
+    if model is not None:
+        if not isinstance(model, str):
+            return None, f"trio {trio!r}: model must be a string or null"
+        model = model.strip() or None
+    if model is not None:
+        entries = models_by_agent.get(agent) or []
+        known = {str(entry.get("id")) for entry in entries if isinstance(entry, dict)}
+        if model not in known:
+            return None, f"trio {trio!r}: unknown model {model!r} for agent {agent!r} in the live model list"
+    profile = raw.get("mcp_profile")
+    if profile is not None:
+        if not isinstance(profile, str):
+            return None, f"trio {trio!r}: mcp_profile must be a string or null"
+        profile = profile.strip() or None
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        return None, f"trio {trio!r}: enabled must be true or false"
+    row = {
+        "name": trio,
+        "agent": agent,
+        "model": model,
+        "mcp_profile": profile,
+        "enabled": 1 if enabled else 0,
+    }
+    return row, None
+
+
+_QUEUE_EXACT_PATHS = {"/api/queue/trios", "/api/queue/capacity"}
+
+
+def _rise_exact_queue_routes(app: FastAPI) -> None:
+    """Reposition the exact /api/queue/trios and /api/queue/capacity routes.
+
+    Server.py registers ``/api/queue/{queue_id}`` before register_settings_routes
+    runs, and Starlette scans routes in registration order, so an exact path
+    appended here would never be reached (the parameter route would answer
+    ``queue_id="trios"`` with a 404).  Move only these routes ahead of the
+    first parameter capture of that shape; every other route keeps its order.
+    """
+
+    routes = app.router.routes
+    moved = [route for route in routes if getattr(route, "path", None) in _QUEUE_EXACT_PATHS]
+    if not moved:
+        return
+    for route in moved:
+        routes.remove(route)
+    anchor = next(
+        (i for i, route in enumerate(routes) if getattr(route, "path", None) == "/api/queue/{queue_id}"),
+        len(routes),
+    )
+    for offset, route in enumerate(moved):
+        routes.insert(anchor + offset, route)
 
 
 def _node_name() -> str:
