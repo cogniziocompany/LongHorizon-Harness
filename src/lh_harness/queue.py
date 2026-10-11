@@ -768,6 +768,14 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
             "mcp_profile": mcp_profile,
             "auditor_mcp_profile": str(spec.get("auditor_mcp_profile", "")).strip() or None,
         }
+        # Per-role overrides (<role>_agent / <role>_model) ride along so the
+        # launcher can build a mixed trio such as zaiq (z.ai manager and
+        # auditor, local qwen executor). Blank values are dropped.
+        for role in ("manager", "executor", "auditor"):
+            for key in ("agent", "model"):
+                role_value = str(spec.get(f"{role}_{key}", "")).strip()
+                if role_value:
+                    normalized_trios[name][f"{role}_{key}"] = role_value
     for required in _REQUIRED_TRIOS:
         if required not in normalized_trios:
             # Keep a safe fallback so the API can still report config shape.
