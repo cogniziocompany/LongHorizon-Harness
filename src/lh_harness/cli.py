@@ -23,6 +23,7 @@ from .config import (
     ProjectConfigError,
     create_project_config,
     load_run_defaults,
+    resolve_run_config_path,
 )
 from .types import (
     DEFAULT_CLAUDE_MODEL,
@@ -542,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
     config_error: ProjectConfigError | None = None
     if raw_argv[:1] == ["run"]:
         try:
-            run_defaults = load_run_defaults()
+            run_defaults = load_run_defaults(resolve_run_config_path(raw_argv))
         except ProjectConfigError as exc:
             config_error = exc
 
@@ -1897,7 +1898,7 @@ def _run_command(args: argparse.Namespace) -> int:
     # so the defaults are re-read; a broken project config is not fatal to a
     # run that never asked for these caps.
     try:
-        cap_run_defaults = load_run_defaults()
+        cap_run_defaults = load_run_defaults(resolve_run_config_path())
     except ProjectConfigError:
         cap_run_defaults = {}
     context_cap_defaults: dict[str, int] = {}

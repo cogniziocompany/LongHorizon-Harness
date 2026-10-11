@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,51 @@ except ModuleNotFoundError:
     tomllib = importlib.import_module("tomli")
 
 PROJECT_CONFIG_PATH = Path(".lh-harness/config.toml")
+# Explicit override for the run config file; wins over both lookups below.
+ENV_PROJECT_CONFIG = "LH_HARNESS_PROJECT_CONFIG"
+
+
+def resolve_run_config_path(argv: list[str] | None = None) -> Path:
+    """Pick the config.toml a ``run`` reads its defaults from.
+
+    Queue-launched runs start with cwd = the task workspace, so the relative
+    ``PROJECT_CONFIG_PATH`` only finds a file when that workspace carries its
+    own ``.lh-harness/config.toml``.  On CT110 (2026-10-11) every q2-*/q3-*
+    clone lacked one, and those runs silently fell back to the dataclass
+    budgets (manager/auditor 300 s) while the node-level
+    ``/home/harness/work/.lh-harness/config.toml`` said 600/900.  Order:
+
+    1. ``LH_HARNESS_PROJECT_CONFIG`` (explicit path);
+    2. ``./.lh-harness/config.toml`` (the workspace's own file);
+    3. ``<runs-root>/../config.toml``, the node-level file next to the runs
+       directory the launcher already passes as ``--runs-root``.
+
+    Returns ``PROJECT_CONFIG_PATH`` when none exists, so callers keep their
+    "missing file means no defaults" behaviour.
+    """
+
+    explicit = os.environ.get(ENV_PROJECT_CONFIG, "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    if PROJECT_CONFIG_PATH.is_file():
+        return PROJECT_CONFIG_PATH
+    runs_root = _argv_option(argv if argv is not None else sys.argv[1:], "--runs-root")
+    if not runs_root:
+        runs_root = os.environ.get("LH_HARNESS_RUNS_ROOT", "").strip()
+    if runs_root:
+        candidate = Path(runs_root).expanduser().resolve().parent / "config.toml"
+        if candidate.is_file():
+            return candidate
+    return PROJECT_CONFIG_PATH
+
+
+def _argv_option(argv: list[str], flag: str) -> str:
+    for index, token in enumerate(argv):
+        if token == flag and index + 1 < len(argv):
+            return argv[index + 1]
+        if token.startswith(flag + "="):
+            return token.split("=", 1)[1]
+    return ""
 
 _AGENT_CHOICES = {"claude_code", "codex", "deepseek_harness", "opencode"}
 _ROLE_NAMES = {
