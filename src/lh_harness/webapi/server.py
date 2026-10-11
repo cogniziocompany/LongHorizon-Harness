@@ -2106,15 +2106,48 @@ def create_app(
                 remaining.append(record)
                 continue
             if lifecycle in ACTIVE_STATUSES:
+                _restore_launched_entry(record, run_id)
                 results.append({"run_id": run_id, "ok": True, "error": None})
                 continue
             try:
                 supervisor.resume(run_id, mode="continue")
+                _restore_launched_entry(record, run_id)
                 results.append({"run_id": run_id, "ok": True, "error": None})
             except (TypeError, ValueError, OSError, RevisionConflict, IdempotencyConflict) as exc:
                 results.append({"run_id": run_id, "ok": False, "error": str(exc)})
                 remaining.append(record)
         return results, remaining
+
+    def _restore_launched_entry(record: dict[str, Any], run_id: str) -> None:
+        """Put a revived run's queue entry back to ``launched``.
+
+        If the launcher reconciled the entry to failed/done while the run was
+        parked (the 2026-10-11 defect: live runs invisible to the trio cap and
+        shown as failed), the resume is the moment to undo that.  Entries
+        still launched, or without a queue id, are left alone.
+        """
+
+        if queue_store is None or not isinstance(record, dict):
+            return
+        queue_id = record.get("queue_id")
+        if not queue_id:
+            return
+        try:
+            entry = queue_store.get(str(queue_id))
+        except Exception:
+            return
+        if entry is None or entry.status == "launched":
+            return
+        # mark_launched() only accepts pending entries; a reconciled entry is
+        # failed/done, so set the fields directly and persist through update().
+        entry.status = "launched"
+        entry.run_id = run_id
+        if getattr(entry, "launched_at", None) is None:
+            entry.launched_at = time.time()
+        try:
+            queue_store.update(entry)
+        except Exception:  # pragma: no cover - best effort bookkeeping
+            return
 
     @app.get("/api/maintenance")
     def get_maintenance() -> dict[str, Any]:
@@ -2300,6 +2333,29 @@ def create_app(
 
         paused: list[dict[str, Any]] = []
         paused_ids: set[str] = set()
+
+        def persist(runs_list: list[dict[str, Any]]) -> None:
+            """Write the per-suspend manifest with ``runs_list`` as its runs.
+
+            Called the moment a run is asked to stop, not only at the end: the
+            launcher's reconciliation guard (``maintenance_manifest_run_ids``)
+            reads this file, and on 2026-10-11 (sus-20261011T200603Z-7777c916)
+            six launched queue entries were marked failed "run cancelled"
+            during the grace window because the manifest only appeared after
+            every run had paused.  A run listed here while still "stopping"
+            is protected from reconciliation until it is resumed.
+            """
+
+            payload = {
+                "suspend_id": suspend_id,
+                "reason": record["reason"],
+                "created_at": record["created_at"],
+                "runs": runs_list,
+            }
+            _atomic_bytes_write(
+                maintenance_manifest_path(root, suspend_id),
+                json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+            )
         pending: dict[str, dict[str, Any]] = {}
         stop_requested_at: dict[str, float] = {}
         failed_run_ids: set[str] = set()
@@ -2380,6 +2436,10 @@ def create_app(
                 pending[run_id] = manifest_record
                 stop_requested_at[run_id] = time.monotonic()
                 mark_run(manifest_record, "stopping", None)
+                try:
+                    persist(paused + list(pending.values()))
+                except OSError as exc:
+                    note_error(run_id, f"could not persist maintenance manifest early: {exc}")
             for run_id in list(pending):
                 try:
                     status = supervisor.status(run_id)
@@ -2415,10 +2475,7 @@ def create_app(
             "runs": paused,
         }
         try:
-            _atomic_bytes_write(
-                maintenance_manifest_path(root, suspend_id),
-                json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"),
-            )
+            persist(paused)
         except OSError as exc:
             note_error(None, f"could not persist maintenance manifest: {exc}")
             failed = True
