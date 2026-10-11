@@ -26,6 +26,7 @@ from .environment.base import Environment
 from .environment.remote_files import ensure_remote_dir, write_remote_text
 from .runtime_signals import hard_signal_labels
 from .provider_errors import classify_agent_runtime_failure
+from .manager_reflection import parse_reflection, reflection_prompt
 from .trajectory_artifacts import persist_trajectory_artifacts
 from .role_prompts import (
     MANAGER_NEXT_BLOCKED,
@@ -359,6 +360,7 @@ async def _run_impl(
         env=env,
         role_dir=role_dir,
         response_agent=final_response_agent or manager_agent,
+        reflection_agent=manager_agent if parent_debrief_hook is not None else None,
         emit=emit,
     )
     if _run_progress is not None:
@@ -1140,6 +1142,7 @@ class _GateContext:
     env: Environment | None = None
     role_dir: Path | None = None
     response_agent: AgentAdapter | None = None
+    reflection_agent: AgentAdapter | None = None
     emit: Callable[..., None] = field(default=_discard_progress)
     completion_satisfied: bool = False
     abort_reason: str = ""
@@ -1177,7 +1180,43 @@ async def _parent_debrief(ctx: _GateContext, outcome: str, round_index: int, tas
         "auditor_report": record.auditor_report[:8000] if record else "",
         "harness_feedback": record.harness_feedback[:8000] if record else "",
         "evidence_refs": list(record.related_report_refs[:100]) if record else [],
+        "completion_satisfied": ctx.completion_satisfied,
     }
+    if ctx.reflection_agent is not None:
+        projection["executor_summary"] = record.executor_output[:4000] if record else ""
+        projection["summary_truncated"] = bool(record and (
+            len(record.executor_output)>4000 or len(record.auditor_report)>8000
+            or len(record.harness_feedback)>8000 or len(task_state)>8000
+        ))
+        reflection = None
+        try:
+            prompt = reflection_prompt(ctx.task, projection)
+            if len(prompt) > ctx.config.role_verified_context_chars:
+                raise ValueError("mandatory reflection context exceeds configured budget")
+            round_dir = ctx.log_dir / "role_orchestration" / "rounds" / f"round_{round_index:03d}"
+            _ensure_dir_nofollow(round_dir)
+            _write_local(round_dir / "manager_reflection_input.txt", prompt)
+            ctx.emit("role_start", round=round_index, role="manager_reflection")
+            result = await _run_role_episode(ctx.reflection_agent, prompt, ctx.env,
+                ctx.config.manager_budget, live_trajectory_path=str(round_dir / "manager_reflection_raw_trajectory.jsonl"))
+            _save_role_result(round_dir, "manager_reflection", result,
+                episode_root=ctx.log_dir / "manager_reflection_episodes")
+            if result.status == "done":
+                reflection = parse_reflection(_visible_output(result),
+                    evidence_refs=projection["evidence_refs"], remaining_rounds=projection["remaining_rounds"],
+                    completion_satisfied=ctx.completion_satisfied)
+        except Exception:
+            # Keep provider/tool diagnostics in their owned artifacts, never in
+            # a parent packet or as an inferred approval to continue.
+            reflection = None
+        projection["reflection"] = ({"status": "qualified", **reflection} if reflection is not None
+                                    else {"status": "unavailable", "reason": "reflection_unqualified"})
+        _append_event(ctx.events_path, "manager_reflection_done", {
+            "round": round_index, "status": projection["reflection"]["status"],
+            "disposition": reflection["disposition"] if reflection is not None else None,
+        })
+        ctx.emit("role_done", round=round_index, role="manager_reflection",
+                 status="done" if reflection is not None else "error")
     snapshot = {
         "version": 1, "round_digest": _debrief_digest(asdict(record) if record else None),
         "task_digest": _debrief_digest(ctx.task), "round_budget": ctx.round_budget,
@@ -1263,6 +1302,13 @@ async def _deliver_parent_debrief(ctx: _GateContext, projection: dict[str, Any])
     answered = qualified and isinstance(decision.get("parent_reply_ref"), str) and 0 < len(decision["parent_reply_ref"]) <= 500
     action = decision["action"] if qualified else "wait"
     if qualified and decision["reply_required"] and not answered:
+        action = "wait"
+    reflection = projection.get("reflection", {})
+    if reflection.get("status") == "unavailable":
+        action = "wait"
+    elif reflection.get("disposition") == "stop":
+        action = "stop"
+    elif (reflection.get("disposition") == "wait" or reflection.get("question")) and not answered:
         action = "wait"
     _append_event(ctx.events_path, "parent_debrief_disposition", {
         "round": round_index, "checkpoint": checkpoint, "action": action,

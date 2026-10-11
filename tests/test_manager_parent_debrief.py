@@ -132,20 +132,42 @@ async def test_missing_checkpoint_with_enabled_boundary_holds(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reflection_text", ["unstructured completion", "private provider failure"])
+async def test_receipt_cannot_override_unqualified_manager_reflection(tmp_path: Path, reflection_text):
+    class Agent:
+        async def run_episode(self, prompt, env, budget, live_trajectory_path=None):
+            return EpisodeResult(status="done", actions_log=reflection_text)
+    async def hook(projection):
+        assert projection["reflection"] == {"status": "unavailable", "reason": "reflection_unqualified"}
+        assert reflection_text not in str(projection)
+        return {"action": "continue", "checkpoint": projection["checkpoint"],
+                "receipt_ref": "outbox:1", "reply_required": False}
+    ctx = context(tmp_path, hook)
+    ctx.reflection_agent = Agent()
+    ctx.env = LocalEnvironment(str(tmp_path / "env"))
+    assert await _human_gate(ctx, "progress", 1, "partial")
+    assert ctx.abort_reason == "needs_parent_input"
+    assert ctx.round_budget == 2
+
+
+@pytest.mark.asyncio
 async def test_round_wait_occurs_after_executor_and_auditor(tmp_path: Path):
     calls = []
     replies = iter([
         "Next: cli\n\nCurrent Task State:\npartial\n\nPlan:\nmake one change",
         "executor returned partial work",
         "Status: incomplete\nIntegrity: clean\nContract audit: aligned\n\nSummary:\nneeds more work",
+        json.dumps({"summary": "Auditor reports incomplete work", "disposition": "wait",
+                    "next_slice": "", "question": "Which remaining gap should be addressed?", "evidence_refs": []}),
     ])
     class Agent:
         async def run_episode(self, prompt, env, budget, live_trajectory_path=None):
             calls.append("role")
             return EpisodeResult(status="done", actions_log=next(replies))
     async def hook(projection):
-        assert calls == ["role", "role", "role"]
+        assert calls == ["role", "role", "role", "role"]
         assert "needs more work" in projection["auditor_report"]
+        assert projection["reflection"]["status"] == "qualified"
         calls.append("debrief")
         return {"action": "wait", "receipt_ref": "outbox:1",
                 "checkpoint": projection["checkpoint"], "reply_required": True}
@@ -154,7 +176,7 @@ async def test_round_wait_occurs_after_executor_and_auditor(tmp_path: Path):
         config=HarnessConfig(max_total_episodes=3, prompt_language="en",
             workspace_path=str(tmp_path / "workspace"), harness_dir=str(tmp_path / "harness"),
             log_dir=str(tmp_path / "logs")), parent_debrief_hook=hook)
-    assert calls == ["role", "role", "role", "debrief"]
+    assert calls == ["role", "role", "role", "role", "debrief"]
     assert report["rounds_run"] == 1
     assert report["abort_reason"] == "needs_parent_input"
     assert not report["completion_satisfied"]
@@ -171,7 +193,7 @@ async def test_round_wait_occurs_after_executor_and_auditor(tmp_path: Path):
         config=HarnessConfig(max_total_episodes=3, prompt_language="en",
             workspace_path=str(tmp_path / "workspace"), harness_dir=str(tmp_path / "harness"),
             log_dir=str(tmp_path / "logs")), parent_debrief_hook=still_waiting, resume=True)
-    assert calls == ["role", "role", "role", "debrief"]
+    assert calls == ["role", "role", "role", "role", "debrief"]
     assert observed[0]["round_index"] == 1
     assert resumed["rounds_run"] == 1
     assert resumed["abort_reason"] == "needs_parent_input"
@@ -182,4 +204,4 @@ async def test_round_wait_occurs_after_executor_and_auditor(tmp_path: Path):
             workspace_path=str(tmp_path / "workspace"), harness_dir=str(tmp_path / "harness"),
             log_dir=str(tmp_path / "logs")), resume=True)
     assert missing_adapter["abort_reason"] == "needs_parent_input"
-    assert calls == ["role", "role", "role", "debrief"]
+    assert calls == ["role", "role", "role", "role", "debrief"]

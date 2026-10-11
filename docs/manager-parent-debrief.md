@@ -10,7 +10,18 @@ original round record, outcome, task state, question and current budget. Raw
 Executor trajectories are not copied into this projection. It provides bounded
 Auditor/feedback summaries, evidence references and remaining round count.
 
-The admitted runtime adapter must perform Manager reflection, construct the full
+The Manager now performs a separate bounded reflection episode using its existing
+role adapter and configured Manager episode budget before constructing the debrief
+checkpoint. It sees the original task, bounded role-result summaries and explicit
+truncation state. Mandatory context that exceeds the configured verified-context
+limit is refused, not silently shortened. Its strict JSON assessment names a summary,
+continue/complete/wait/stop disposition, next slice, parent question and supplied
+evidence references. It cannot invent evidence, expand budget, or claim completion
+without the existing completion authority. Raw reflection output stays in owned
+episode artifacts. An unqualified assessment holds even if transport supplies a
+receipt. Resume reuses the saved assessment rather than repeating the model call.
+
+The admitted runtime adapter must construct the full
 existing packet using authenticated tenant/project/task/run/span/parent identity,
 approved scope, pinned policy/revision and checkpoint, and durably enqueue it with
 an idempotency key. This projection does not supply those identities or grant
@@ -35,7 +46,7 @@ a crash between recording that round and dispatching its debrief cannot skip the
 boundary. Legacy runs without the marker keep their existing resume behavior.
 
 Remaining required implementation before enabling this on delegated production
-runs: concrete Manager reflection adapter; full packet and outbox transport;
+runs: full packet and outbox transport;
 runtime identity/policy checks; authenticated reply consumption; idempotent round
 admission across crashes; Supervisor
 and task-detail waiting state projection. The optional hook must stay disabled in
@@ -77,3 +88,5 @@ remain incomplete.
 PostgreSQL serialization also preserves needs_parent_input without a timed backoff deadline. Its regression failed before the fix. The expanded declared-dependency Linux suite passed 112 tests; three scratch-database tests skipped because no scratch database was configured. Actual live PostgreSQL round-trip is not yet qualified.
 
 Scratch PostgreSQL 16 verification now passed all 17 retry/queue-column tests with no skips, including the new parent-wait write, fresh-connection read, dedup reuse and wait clearing. The scratch schema harness was provisioned explicitly because existing migrations assume it exists; the first attempt skipped four tests on that missing prerequisite and was not accepted as evidence. The owned disposable database/container and network were removed afterwards. This verifies scratch storage, not production database migration or runtime activation.
+
+Manager reflection validation: parser tests failed before the module existed; the final expanded 110-test Linux suite passed. The full management-loop test uses scripted AgentAdapter results and proves Executor/Auditor finish, Manager reflection qualifies, debrief follows, and resume does not repeat the assessment. Two explicit failure tests prove a transport receipt cannot override unstructured/unqualified assessment or leak raw provider response into its parent projection. This is local kernel/adapter qualification, not a production model or authenticated transport test.
