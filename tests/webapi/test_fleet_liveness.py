@@ -81,9 +81,13 @@ def _runs_root(tmp_path: Path) -> Path:
     return root
 
 
+_NAME_SEQ = {"n": 0}
+
+
 def _payload(**overrides: Any) -> dict[str, Any]:
+    _NAME_SEQ["n"] += 1
     body: dict[str, Any] = {
-        "name": "liveness",
+        "name": f"liveness {_NAME_SEQ['n']}",
         "task": "do the thing",
         "workspace": "./workspace",
         "trio": "kimi",

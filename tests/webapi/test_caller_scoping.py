@@ -84,6 +84,17 @@ def _app(
     return TestClient(app)
 
 
+_ENQUEUE_SEQ = {"n": 0}
+
+
+def _unique_enqueue_payload(**overrides: Any) -> dict[str, Any]:
+    """_enqueue_payload with a unique name: the 2026-10-11 form-like intake
+    refuses non-terminal same-name duplicates, so rate-ceiling tests vary the
+    name per call while testing the same per-caller semantics."""
+    _ENQUEUE_SEQ["n"] += 1
+    return _enqueue_payload(name=f"scoped task {_ENQUEUE_SEQ['n']}", **overrides)
+
+
 def _enqueue_payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "name": "scoped task",
@@ -443,10 +454,10 @@ class TestEnqueueRateCeiling:
         headers = cu.caller_headers("chat-agent")
         for _ in range(10):
             assert (
-                client.post("/api/queue", json=_enqueue_payload(), headers=headers).status_code
+                client.post("/api/queue", json=_unique_enqueue_payload(), headers=headers).status_code
                 == 200
             )
-        response = client.post("/api/queue", json=_enqueue_payload(), headers=headers)
+        response = client.post("/api/queue", json=_unique_enqueue_payload(), headers=headers)
         assert response.status_code == 429
         assert "max_entries_per_hour" in response.json()["detail"]
         retry_after = response.headers["Retry-After"]
@@ -457,7 +468,7 @@ class TestEnqueueRateCeiling:
         headers = cu.caller_headers("operator")
         for _ in range(12):
             assert (
-                client.post("/api/queue", json=_enqueue_payload(), headers=headers).status_code
+                client.post("/api/queue", json=_unique_enqueue_payload(), headers=headers).status_code
                 == 200
             )
 
@@ -467,14 +478,14 @@ class TestEnqueueRateCeiling:
         for _ in range(10):
             assert (
                 client.post(
-                    "/api/queue", json=_enqueue_payload(), headers=cu.caller_headers("chat-agent")
+                    "/api/queue", json=_unique_enqueue_payload(), headers=cu.caller_headers("chat-agent")
                 ).status_code
                 == 200
             )
         # operator still fine
         assert (
             client.post(
-                "/api/queue", json=_enqueue_payload(), headers=cu.caller_headers("operator")
+                "/api/queue", json=_unique_enqueue_payload(), headers=cu.caller_headers("operator")
             ).status_code
             == 200
         )
@@ -484,11 +495,11 @@ class TestEnqueueRateCeiling:
         for _ in range(10):
             client.post(
                 "/api/mcp/fleet/harness_enqueue_task",
-                json={"arguments": cu.caller_args(_enqueue_payload(), "chat-agent")},
+                json={"arguments": cu.caller_args(_unique_enqueue_payload(), "chat-agent")},
             )
         response = client.post(
             "/api/mcp/fleet/harness_enqueue_task",
-            json={"arguments": cu.caller_args(_enqueue_payload(), "chat-agent")},
+            json={"arguments": cu.caller_args(_unique_enqueue_payload(), "chat-agent")},
         )
         assert response.status_code == 429
         assert response.json()["code"] == 429
@@ -502,9 +513,9 @@ class TestEnqueueRateCeiling:
             },
         )
         headers = cu.caller_headers("chat-agent")
-        assert client.post("/api/queue", json=_enqueue_payload(), headers=headers).status_code == 200
-        assert client.post("/api/queue", json=_enqueue_payload(), headers=headers).status_code == 200
-        assert client.post("/api/queue", json=_enqueue_payload(), headers=headers).status_code == 429
+        assert client.post("/api/queue", json=_unique_enqueue_payload(), headers=headers).status_code == 200
+        assert client.post("/api/queue", json=_unique_enqueue_payload(), headers=headers).status_code == 200
+        assert client.post("/api/queue", json=_unique_enqueue_payload(), headers=headers).status_code == 429
 
     def test_zero_ceiling_blocks_every_enqueue(self, tmp_path: Path) -> None:
         # 0 is a legal configured ceiling: zero entries per hour.
@@ -513,7 +524,7 @@ class TestEnqueueRateCeiling:
             caller_configs={"chat-agent": {"max_entries_per_hour": 0}},
         )
         headers = cu.caller_headers("chat-agent")
-        assert client.post("/api/queue", json=_enqueue_payload(), headers=headers).status_code == 429
+        assert client.post("/api/queue", json=_unique_enqueue_payload(), headers=headers).status_code == 429
 
 
 class TestRoundsClamp:
@@ -536,7 +547,7 @@ class TestRoundsClamp:
         # must refuse too -- the clamp cannot be bypassed by omission.
         client = _app(tmp_path, caller_configs={"chat-agent": {"max_rounds_clamp": 20}})
         response = client.post(
-            "/api/queue", json=_enqueue_payload(), headers=cu.caller_headers("chat-agent")
+            "/api/queue", json=_unique_enqueue_payload(), headers=cu.caller_headers("chat-agent")
         )
         assert response.status_code == 422
 
@@ -650,14 +661,14 @@ class TestDeleteOwnership:
     def test_chat_agent_deletes_own_entry(self, tmp_path: Path) -> None:
         client = _app(tmp_path)
         headers = cu.caller_headers("chat-agent")
-        created = client.post("/api/queue", json=_enqueue_payload(), headers=headers).json()
+        created = client.post("/api/queue", json=_unique_enqueue_payload(), headers=headers).json()
         response = client.delete(f"/api/queue/{created['queue_id']}", headers=headers)
         assert response.status_code == 200
 
     def test_chat_agent_cannot_delete_foreign_entry(self, tmp_path: Path) -> None:
         client = _app(tmp_path)
         created = client.post(
-            "/api/queue", json=_enqueue_payload(), headers=cu.caller_headers("operator")
+            "/api/queue", json=_unique_enqueue_payload(), headers=cu.caller_headers("operator")
         ).json()
         response = client.delete(
             f"/api/queue/{created['queue_id']}", headers=cu.caller_headers("chat-agent")
@@ -669,7 +680,7 @@ class TestDeleteOwnership:
     def test_operator_deletes_any_entry(self, tmp_path: Path) -> None:
         client = _app(tmp_path)
         chat = cu.caller_headers("chat-agent")
-        created = client.post("/api/queue", json=_enqueue_payload(), headers=chat).json()
+        created = client.post("/api/queue", json=_unique_enqueue_payload(), headers=chat).json()
         response = client.delete(
             f"/api/queue/{created['queue_id']}", headers=cu.caller_headers("operator")
         )
@@ -678,7 +689,7 @@ class TestDeleteOwnership:
     def test_anon_delete_401(self, tmp_path: Path) -> None:
         client = _app(tmp_path)
         created = client.post(
-            "/api/queue", json=_enqueue_payload(), headers=cu.caller_headers("operator")
+            "/api/queue", json=_unique_enqueue_payload(), headers=cu.caller_headers("operator")
         ).json()
         assert client.delete(f"/api/queue/{created['queue_id']}").status_code == 401
 
@@ -744,8 +755,8 @@ class TestCallerConfigFromFile:
         try:
             client = _app(tmp_path, caller_configs={"operator": {"max_entries_per_hour": 1}})
             headers = cu.caller_headers("operator")
-            assert client.post("/api/queue", json=_enqueue_payload(), headers=headers).status_code == 200
-            assert client.post("/api/queue", json=_enqueue_payload(), headers=headers).status_code == 429
+            assert client.post("/api/queue", json=_unique_enqueue_payload(), headers=headers).status_code == 200
+            assert client.post("/api/queue", json=_unique_enqueue_payload(), headers=headers).status_code == 429
         finally:
             os.chdir(cwd)
 

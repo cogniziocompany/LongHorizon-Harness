@@ -89,9 +89,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, QueueStore, FakeSupervisor]:
     return root, store, supervisor
 
 
+_NAME_SEQ = {"n": 0}
+
+
 def _base_entry(trio: str = "kimi", priority: int = 0, workspace: str = "./workspace") -> dict[str, Any]:
+    _NAME_SEQ["n"] += 1
     return {
-        "name": "task",
+        "name": f"task {_NAME_SEQ['n']}",
         "task": "do something",
         "workspace": workspace,
         "trio": trio,

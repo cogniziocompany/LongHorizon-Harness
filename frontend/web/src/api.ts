@@ -262,11 +262,12 @@ export async function fetchImageSource(source: string): Promise<string> {
   return URL.createObjectURL(await response.blob());
 }
 
-export async function postInstruction(runId: string, instructions: string, requestKey = idempotencyKey('instruction')): Promise<void> {
+export async function postInstruction(runId: string, instructions: string, requestKey = idempotencyKey('instruction')): Promise<{ delivery?: { consumed_at?: string; active_role?: string | null; note?: string } }> {
   const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/instructions`, {
     method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(), 'Idempotency-Key': requestKey }, body: JSON.stringify({ instructions }),
   });
   if (!response.ok) throw await responseError(response);
+  try { return await response.json(); } catch { return {}; }
 }
 
 export async function resolveApproval(

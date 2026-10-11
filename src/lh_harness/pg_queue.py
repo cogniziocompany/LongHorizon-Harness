@@ -361,6 +361,28 @@ class PgQueueStore:
             existing = self._find_non_terminal_by_dedup(dedup_key)
             if existing is not None:
                 return existing
+        # Form-like intake (2026-10-11): refuse a second non-terminal entry
+        # with the same normalized task name (see the file store's note).
+        from .queue import DuplicateQueueEntryError, normalize_task_name  # lazy: TYPE_CHECKING note
+
+        if entry.name and not dedup_key:
+            wanted = normalize_task_name(entry.name)
+            if wanted:
+                with self._txn() as txn:
+                    txn.execute(
+                        "SELECT queue_id, name, status FROM harness.queue "
+                        "WHERE status IN ('pending', 'launched', 'blocked') "
+                        "ORDER BY created_at ASC"
+                    )
+                    rows = txn.fetchall()
+                for row in rows:
+                    if normalize_task_name(row[1]) == wanted:
+                        from .queue import QueueEntry  # lazy: TYPE_CHECKING note
+
+                        dup = QueueEntry.from_dict(
+                            {"queue_id": row[0], "name": row[1], "status": row[2]}
+                        )
+                        raise DuplicateQueueEntryError(dup)
         try:
             with self._txn() as txn:
                 txn.execute(

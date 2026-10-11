@@ -135,7 +135,7 @@ def classify_agent_runtime_failure(result: EpisodeResult) -> AgentRuntimeFailure
             user_message=f"{label}：{_clean(message, 1200)}",
         )
     kind = "timeout" if result.status == "timeout" else "provider_error"
-    label = "Agent 执行超时" if kind == "timeout" else "Agent provider 启动或运行失败"
+    label = "Agent timeout" if kind == "timeout" else "Agent provider start/run failure"
     # A command episode that reaches its harness budget is a local timeout, not
     # evidence that the provider connection failed. In particular, the
     # adapter's own "Episode timed out after ..." message matches the generic

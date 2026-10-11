@@ -120,10 +120,14 @@ def _launcher(
     return launcher, store, supervisor
 
 
+_NAME_SEQ = {"n": 0}
+
+
 def _entry(store: QueueStore, workspace: Path) -> Any:
+    _NAME_SEQ["n"] += 1
     return store.create(
         {
-            "name": "task",
+            "name": f"task {_NAME_SEQ['n']}",
             "task": "do something",
             "workspace": str(workspace),
             "trio": "kimi",
@@ -368,6 +372,9 @@ def test_launcher_defaults_probe_to_real_gh_probe() -> None:
 # ---------------------------------------------------------------------------
 # Task 201: continuation opt-in (`branch` / `continue_branch`)
 # ---------------------------------------------------------------------------
+
+
+_NAME_SEQ_OPT = {"n": 0}
 
 
 def _entry_with_opt_in(store: QueueStore, workspace: Path, **opt_in: Any) -> Any:

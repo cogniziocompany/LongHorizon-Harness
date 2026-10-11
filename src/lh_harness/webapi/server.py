@@ -72,6 +72,7 @@ from ..fleet.channel import get_channel, loopback_api_base, start_channel, stop_
 from ..queue import (
     PgQueueStore,
     QueueStore,
+    DuplicateQueueEntryError,
     UnknownQueueFieldError,
     default_queue_config,
     queue_config_from_config,
@@ -1967,6 +1968,31 @@ def create_app(
                     observed_addr=observed,
                     verified_caller=caller,
                 )
+            except DuplicateQueueEntryError as exc:
+                # Form-like intake (2026-10-11): a live entry with the same
+                # normalized task name already exists. 409 with the structured
+                # "form" body so an agent caller can act without guessing.
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "duplicate_queue_entry",
+                        "existing_queue_id": exc.existing.queue_id,
+                        "existing_status": exc.existing.status,
+                        "existing_name": exc.existing.name,
+                        "form": [
+                            {
+                                "field": "name",
+                                "message": (
+                                    "a non-terminal queue entry with this task name already "
+                                    "exists; cancel it (DELETE /api/queue/{id}) or wait for it "
+                                    "to finish, or enqueue a re-slice under a new name "
+                                    "(<task>-a, <task>-b) or with a dedup_key to adopt the "
+                                    "existing entry"
+                                ),
+                            }
+                        ],
+                    },
+                ) from exc
             except UnknownQueueFieldError as exc:
                 # Task 233: a body with keys outside the accepted set is a client
                 # error (400) that names every offending field -- never a silent
@@ -1983,6 +2009,22 @@ def create_app(
         observed = request.client.host if request.client is not None else None
         try:
             entry = queue_store.create(body, observed_addr=observed)
+        except DuplicateQueueEntryError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "duplicate_queue_entry",
+                    "existing_queue_id": exc.existing.queue_id,
+                    "existing_status": exc.existing.status,
+                    "existing_name": exc.existing.name,
+                    "form": [
+                        {
+                            "field": "name",
+                            "message": "a non-terminal queue entry with this task name already exists",
+                        }
+                    ],
+                },
+            ) from exc
         except UnknownQueueFieldError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:
@@ -2708,6 +2750,65 @@ def create_app(
                 id_groups[item.status].append(item.queue_id)
             result["groups"] = id_groups
         return result
+
+    @app.get("/api/queue/stats")
+    def queue_stats() -> dict[str, Any]:
+        """Deterministic fleet-window numbers, computed at the source (2026-10-11).
+
+        One small payload the fleet window can stamp verbatim instead of
+        re-deriving counts from independently-synced mirror tables:
+          * ``counts``     — queue entries per status (the same ``counts()`` the
+                              list route reports, read in the same request)
+          * ``by_trio``    — non-terminal entries per trio, so the UI chips and
+                              the enqueue-time feedback share one source
+          * ``runs``       — live run counts (``running`` / ``waiting_approval`` /
+                              ``starting``) from the cheap registry scan
+          * ``reconciliation`` — ``queue_launched - runs_running``: the drift the
+                              window used to hide behind two different counters.
+                              Zero is healthy; non-zero names real drift (a run
+                              created outside the queue, or a mirror lag).
+          * ``computed_at`` — epoch seconds at the source; consumers show
+                              freshness from this stamp, never from their own
+                              poll time.
+        """
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        entries = queue_store.list()
+        counts: dict[str, int] = {s: 0 for s in ("pending", "launched", "done", "failed", "blocked")}
+        by_trio: dict[str, dict[str, int]] = {}
+        for entry in entries:
+            counts[entry.status] = counts.get(entry.status, 0) + 1
+            if entry.status in ("pending", "launched"):
+                trio = entry.trio or "unassigned"
+                bucket = by_trio.setdefault(trio, {"pending": 0, "launched": 0})
+                bucket[entry.status] += 1
+        runs_running = 0
+        runs_waiting = 0
+        runs_starting = 0
+        try:
+            for item in registry.run_items_cheap():
+                status = str(item.get("status") or "")
+                if status == "running" or status == "in_progress":
+                    runs_running += 1
+                elif status == "waiting_approval":
+                    runs_waiting += 1
+                elif status in ("starting", "queued", "launching"):
+                    runs_starting += 1
+        except Exception:
+            pass  # a registry hiccup must not take the queue numbers down
+        return {
+            "counts": counts,
+            "by_trio": by_trio,
+            "runs": {
+                "running": runs_running,
+                "waiting_approval": runs_waiting,
+                "starting": runs_starting,
+            },
+            "reconciliation": {
+                "queue_launched_minus_runs_running": counts.get("launched", 0) - runs_running,
+            },
+            "computed_at": time.time(),
+        }
 
     @app.delete("/api/queue/{queue_id}")
     def delete_queue_entry(queue_id: str, request: Request) -> dict[str, Any]:
@@ -3478,11 +3579,31 @@ def create_app(
         # Operator interactions change operator_messages and possibly approvals,
         # so the next REST/WS snapshot must not reuse a stale cache.
         snapshot_cache.invalidate(run_id)
+        # Form-like feedback (2026-10-11): tell the client WHEN the message will
+        # be consumed. Injections ride the control bus and are read by the
+        # worker at the next role/round boundary — the active role never pauses
+        # mid-episode (the fleet window used to clear the composer with zero
+        # feedback, so operators sent the same message repeatedly).
+        try:
+            snap = _snapshot_for(registry, state_for_run, run_id)
+        except Exception:
+            snap = {}
+        active_role = None
+        if isinstance(snap, dict):
+            active_role = snap.get("active_role")
         return {
             "ok": True,
             "status": "accepted",
             "idempotency_key": _bounded_command_id(request.headers.get("Idempotency-Key")),
             "revision": state_for_run.control_bus.revision(),
+            "delivery": {
+                "consumed_at": "next_stage_boundary",
+                "active_role": active_role,
+                "note": (
+                    "operator messages are read by the worker at the next role/round "
+                    "boundary; the active role does not pause mid-episode"
+                ),
+            },
         }
 
     @app.post("/api/runs/{run_id}/approvals/{approval_id}/resolve")
