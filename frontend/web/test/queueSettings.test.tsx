@@ -277,7 +277,7 @@ test('capacity save PUTs parsed integers and shows success', async () => {
   const { api, rec } = stubApi();
   const state = await loadedState(api);
   const { actions, dispatch } = recorder();
-  await saveQueueCapacity(api, { glm: '3' }, dispatch);
+  await saveQueueCapacity(api, { glm: '3' }, {}, dispatch);
   assert.deepEqual(rec.capacityPayloads, [{ glm: 3 }]);
   const next = run(state, actions);
   assert.equal(next.capacitySaved, 'Saved.');
@@ -287,7 +287,7 @@ test('capacity save PUTs parsed integers and shows success', async () => {
 test('invalid capacity input is refused client-side without calling the API', async () => {
   const { api, rec } = stubApi();
   const { actions, dispatch } = recorder();
-  await saveQueueCapacity(api, { glm: '-1' }, dispatch);
+  await saveQueueCapacity(api, { glm: '-1' }, {}, dispatch);
   assert.equal(rec.capacityPayloads.length, 0);
   const next = run(readyState(), actions);
   assert.match(next.capacityError || '', /non-negative integer/);
@@ -297,7 +297,7 @@ test('invalid capacity input is refused client-side without calling the API', as
 test('capacity save surfaces the endpoint 422 detail', async () => {
   const api = stubApi({ saveCapacityError: new ApiError(422, "capacity for unknown trio 'zzz'") }).api;
   const { actions, dispatch } = recorder();
-  await saveQueueCapacity(api, { zzz: '1' }, dispatch);
+  await saveQueueCapacity(api, { zzz: '1' }, {}, dispatch);
   const next = run(readyState(), actions);
   assert.equal(next.capacityError, "capacity for unknown trio 'zzz'");
   assert.ok(render(next).includes('unknown trio'));
@@ -421,3 +421,17 @@ function fakeJsonResponse(status: number, body: unknown, statusText = ''): Respo
   base.clone = () => make() as unknown as Response;
   return base as unknown as Response;
 }
+
+test('capacity payload carries the peak companion and validates it client-side', async () => {
+  const rich = capacityPayloadFromEdits({ zai: '20' }, { zai: '4' });
+  assert.deepEqual(rich, { capacity: { zai: { max: 20, max_peak: 4 } } });
+
+  const legacy = capacityPayloadFromEdits({ zai: '20' }, {});
+  assert.deepEqual(legacy, { capacity: { zai: 20 } });
+
+  const tooHigh = capacityPayloadFromEdits({ zai: '3' }, { zai: '9' });
+  assert.ok('error' in tooHigh && /cannot exceed/.test(tooHigh.error));
+
+  const notNumber = capacityPayloadFromEdits({ zai: '3' }, { zai: 'x' });
+  assert.ok('error' in notNumber);
+});

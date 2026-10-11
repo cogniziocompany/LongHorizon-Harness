@@ -313,6 +313,7 @@ export interface QueueSettingsState {
   trios: QueueTrio[];
   edits: QueueTrioEdit[];
   capacityEdits: Record<string, string>;
+  capacityPeakEdits: Record<string, string>;
   audit: AdminAuditEntry[];
   refreshing: boolean;
   refreshError: string | null;
@@ -325,10 +326,11 @@ export interface QueueSettingsState {
 }
 
 export type QueueAction =
-  | { type: 'loaded'; trios: QueueTrio[]; capacity: Record<string, number>; meta: WebMeta; audit: AdminAuditEntry[] }
+  | { type: 'loaded'; trios: QueueTrio[]; capacity: Record<string, number>; maxPeak?: Record<string, number | null>; meta: WebMeta; audit: AdminAuditEntry[] }
   | { type: 'load-failed'; error: string; refused: boolean }
   | { type: 'edit-trio'; index: number; patch: Partial<QueueTrioEdit> }
   | { type: 'edit-capacity'; name: string; value: string }
+  | { type: 'edit-capacity-peak'; name: string; value: string }
   | { type: 'refresh-started' }
   | { type: 'refreshed'; meta: WebMeta }
   | { type: 'refresh-failed'; error: string }
@@ -347,8 +349,8 @@ export interface QueueApi {
   refreshModels: () => Promise<WebMeta>;
   fetchQueueTrios: () => Promise<{ trios: QueueTrio[] }>;
   saveQueueTrios: (trios: unknown[]) => Promise<{ trios: QueueTrio[] }>;
-  fetchQueueCapacity: () => Promise<{ capacity: Record<string, number> }>;
-  saveQueueCapacity: (capacity: Record<string, number>) => Promise<{ capacity: Record<string, number> }>;
+  fetchQueueCapacity: () => Promise<{ capacity: Record<string, number>; max_peak?: Record<string, number | null> }>;
+  saveQueueCapacity: (capacity: Record<string, number | { max: number; max_peak: number | null }>) => Promise<{ capacity: Record<string, number>; max_peak?: Record<string, number | null> }>;
   /** The existing settings-audit endpoint (queue rows live in the same store). */
   fetchQueueAudit: (limit?: number) => Promise<{ entries: AdminAuditEntry[] }>;
 }
@@ -384,7 +386,7 @@ export const browserQueueApi: QueueApi = {
   fetchQueueTrios: () => getJson<{ trios: QueueTrio[] }>('/api/queue/trios'),
   saveQueueTrios: (trios) => queueWrite<{ trios: QueueTrio[] }>('/api/queue/trios', { trios }),
   fetchQueueCapacity: () => getJson<{ capacity: Record<string, number> }>('/api/queue/capacity'),
-  saveQueueCapacity: (capacity) => queueWrite<{ capacity: Record<string, number> }>('/api/queue/capacity', { capacity }),
+  saveQueueCapacity: (capacity) => queueWrite<{ capacity: Record<string, number>; max_peak?: Record<string, number | null> }>('/api/queue/capacity', { capacity }),
   fetchQueueAudit: (limit = 50) => fetchAudit(limit),
 };
 
@@ -406,6 +408,7 @@ export function initialQueueSettingsState(): QueueSettingsState {
     savingCapacity: false,
     capacityError: null,
     capacitySaved: null,
+    capacityPeakEdits: {},
   };
 }
 
@@ -445,13 +448,33 @@ export function triosPayloadFromEdits(edits: QueueTrioEdit[]): QueueTrio[] {
   }));
 }
 
-/** Client-side guard mirroring the endpoint's 422; the API is never called on failure. */
-export function capacityPayloadFromEdits(edits: Record<string, string>): { capacity: Record<string, number> } | { error: string } {
-  const capacity: Record<string, number> = {};
+/** Client-side guard mirroring the endpoint's 422; the API is never called on failure.
+ *
+ * ``peaks`` is optional: a blank/absent entry sends the rich form with
+ * ``max_peak: null`` (clears any stored peak override ONLY when a peak input
+ * exists for that trio); a numeric entry sends the lower peak cap applied
+ * Mon-Fri 06:00-10:00 UTC.
+ */
+export function capacityPayloadFromEdits(
+  edits: Record<string, string>,
+  peaks?: Record<string, string>,
+): { capacity: Record<string, number | { max: number; max_peak: number | null }> } | { error: string } {
+  const capacity: Record<string, number | { max: number; max_peak: number | null }> = {};
   for (const [name, raw] of Object.entries(edits)) {
     const value = raw.trim();
     if (!/^\d+$/.test(value)) return { error: `capacity for '${name}' must be a non-negative integer` };
-    capacity[name] = Number.parseInt(value, 10);
+    const base = Number.parseInt(value, 10);
+    const peakRaw = (peaks?.[name] ?? '').trim();
+    if (peakRaw === '') {
+      // No peak input on the row: legacy bare-int form — the stored peak
+      // override (if any) is preserved server-side.
+      capacity[name] = base;
+      continue;
+    }
+    if (!/^\d+$/.test(peakRaw)) return { error: `peak capacity for '${name}' must be blank or a non-negative integer` };
+    const peak = Number.parseInt(peakRaw, 10);
+    if (peak > base) return { error: `peak capacity for '${name}' cannot exceed the all-day max (${base})` };
+    capacity[name] = { max: base, max_peak: peak };
   }
   return { capacity };
 }
@@ -473,6 +496,9 @@ export function queueSettingsReducer(state: QueueSettingsState, action: QueueAct
         trios: action.trios,
         edits: trioEditsFromRows(action.trios),
         capacityEdits: Object.fromEntries(Object.entries(action.capacity).map(([name, value]) => [name, String(value)])),
+        capacityPeakEdits: Object.fromEntries(
+          Object.entries(action.capacity).map(([name]) => [name, action.maxPeak && action.maxPeak[name] != null ? String(action.maxPeak[name]) : '']),
+        ),
         audit: action.audit,
       };
     case 'load-failed':
@@ -488,6 +514,8 @@ export function queueSettingsReducer(state: QueueSettingsState, action: QueueAct
       edits[action.index] = next;
       return { ...state, edits };
     }
+    case 'edit-capacity-peak':
+      return { ...state, capacityPeakEdits: { ...state.capacityPeakEdits, [action.name]: action.value } };
     case 'edit-capacity':
       return { ...state, capacityEdits: { ...state.capacityEdits, [action.name]: action.value } };
     case 'refresh-started':
@@ -522,11 +550,11 @@ export async function loadQueueSettings(api: QueueApi, dispatch: Dispatch<QueueA
   try {
     const [triosRes, capacityRes, meta, auditRes] = await Promise.all([
       api.fetchQueueTrios(),
-      api.fetchQueueCapacity(),
+      api.fetchQueueCapacity(), // shape: {capacity, max_peak}
       api.queueMeta(),
       api.fetchQueueAudit(50),
     ]);
-    dispatch({ type: 'loaded', trios: triosRes.trios, capacity: capacityRes.capacity, meta, audit: auditRes.entries });
+    dispatch({ type: 'loaded', trios: triosRes.trios, capacity: capacityRes.capacity, maxPeak: capacityRes.max_peak, meta, audit: auditRes.entries });
   } catch (reason) {
     dispatch({ type: 'load-failed', error: message(reason), refused: reason instanceof ApiError && reason.status === 403 });
   }
@@ -555,8 +583,8 @@ export async function saveQueueTrios(api: QueueApi, edits: QueueTrioEdit[], disp
   }
 }
 
-export async function saveQueueCapacity(api: QueueApi, edits: Record<string, string>, dispatch: Dispatch<QueueAction>): Promise<void> {
-  const parsed = capacityPayloadFromEdits(edits);
+export async function saveQueueCapacity(api: QueueApi, edits: Record<string, string>, peaks: Record<string, string>, dispatch: Dispatch<QueueAction>): Promise<void> {
+  const parsed = capacityPayloadFromEdits(edits, peaks);
   if ('error' in parsed) {
     dispatch({ type: 'capacity-save-failed', error: parsed.error });
     return;
@@ -570,12 +598,13 @@ export async function saveQueueCapacity(api: QueueApi, edits: Record<string, str
   }
 }
 
-export function QueueSettingsView({ state, onShowAudit, onRefreshModels, onEditTrio, onEditCapacity, onSaveTrios, onSaveCapacity }: {
+export function QueueSettingsView({ state, onShowAudit, onRefreshModels, onEditTrio, onEditCapacity, onEditCapacityPeak, onSaveTrios, onSaveCapacity }: {
   state: QueueSettingsState;
   onShowAudit: () => void;
   onRefreshModels: () => void;
   onEditTrio: (index: number, patch: Partial<QueueTrioEdit>) => void;
   onEditCapacity: (name: string, value: string) => void;
+  onEditCapacityPeak: (name: string, value: string) => void;
   onSaveTrios: () => void;
   onSaveCapacity: () => void;
 }) {
@@ -666,9 +695,12 @@ export function QueueSettingsView({ state, onShowAudit, onRefreshModels, onEditT
               <td>
                 <input aria-label={`${name} max concurrent`} type="number" min={0} step={1} value={state.capacityEdits[name]} onChange={(event) => onEditCapacity(name, event.target.value)} />
               </td>
+              <td>
+                <input aria-label={`${name} peak max (Mon-Fri 06:00-10:00 UTC, blank = no override)`} type="number" min={0} step={1} value={state.capacityPeakEdits[name] ?? ''} onChange={(event) => onEditCapacityPeak(name, event.target.value)} placeholder="—" />
+              </td>
             </tr>
           ))}
-          {!Object.keys(state.capacityEdits).length && <tr><td colSpan={2} className="admin-muted">No capacity caps recorded in the settings store yet.</td></tr>}
+          {!Object.keys(state.capacityEdits).length && <tr><td colSpan={3} className="admin-muted">No capacity caps recorded in the settings store yet.</td></tr>}
         </tbody>
       </table>
       <div className="admin-actions">
@@ -707,8 +739,9 @@ export function QueuePanel({ api, onShowAudit }: { api?: QueueApi; onShowAudit: 
       onRefreshModels={() => void refreshQueueModels(boundApi, dispatch)}
       onEditTrio={(index, patch) => dispatch({ type: 'edit-trio', index, patch })}
       onEditCapacity={(name, value) => dispatch({ type: 'edit-capacity', name, value })}
+      onEditCapacityPeak={(name, value) => dispatch({ type: 'edit-capacity-peak', name, value })}
       onSaveTrios={() => void saveQueueTrios(boundApi, state.edits, dispatch)}
-      onSaveCapacity={() => void saveQueueCapacity(boundApi, state.capacityEdits, dispatch)}
+      onSaveCapacity={() => void saveQueueCapacity(boundApi, state.capacityEdits, state.capacityPeakEdits, dispatch)}
     />
   );
 }

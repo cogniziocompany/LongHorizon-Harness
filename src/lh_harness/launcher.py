@@ -762,6 +762,27 @@ class Launcher:
             pass
         return default_queue_config()
 
+    @staticmethod
+    def _in_capacity_peak_window(now: float | None = None) -> bool:
+        """Mon-Fri 06:00-10:00 UTC — z.ai peak billing hours (2026-10-11).
+
+        Peak is when credit multipliers are full AND the provider's dynamic
+        concurrency is tightest, so lanes carry an optional lower ``*_max_peak``
+        cap alongside the all-day ``*_max``.
+        """
+        import datetime as _dt
+
+        moment = _dt.datetime.fromtimestamp(now if now is not None else time.time(), _dt.timezone.utc)
+        if moment.weekday() >= 5:  # Sat/Sun are fully off-peak
+            return False
+        return 6 <= moment.hour < 10
+
+    @classmethod
+    def _effective_cap(cls, base: int, peak: int | None, now: float | None = None) -> int:
+        if peak is None:
+            return base
+        return max(0, min(base, peak)) if cls._in_capacity_peak_window(now) else base
+
     def _refresh_queue_config(self) -> None:
         """Overlay settings-DB queue trios/capacity onto the bootstrap config.
 
@@ -784,7 +805,7 @@ class Launcher:
             return
         try:
             trio_rows = self._settings_store.queue_trios()
-            capacity_rows = self._settings_store.queue_capacity()
+            capacity_rows = self._settings_store.queue_capacity_rows()
         except Exception as exc:  # noqa: BLE001 - a broken store must not stop the launcher
             logger.warning("settings queue read failed; keeping bootstrap config: %s", exc)
             return
@@ -815,13 +836,16 @@ class Launcher:
             }
         merged["trios"] = trios
         capacity = dict(merged.get("capacity") or {})
-        for trio_name, max_concurrent in capacity_rows.items():
-            if not isinstance(trio_name, str) or not trio_name.strip():
+        for trio_name, row in capacity_rows.items():
+            if not isinstance(trio_name, str) or not trio_name.strip() or not isinstance(row, dict):
                 continue
             try:
-                capacity[f"{trio_name.strip()}_max"] = max(0, int(max_concurrent))
+                base = max(0, int(row.get("max", 0)))
+                raw_peak = row.get("max_peak")
+                peak = None if raw_peak is None else max(0, int(raw_peak))
             except (TypeError, ValueError):
                 continue
+            capacity[f"{trio_name.strip()}_max"] = self._effective_cap(base, peak)
         merged["capacity"] = capacity
         self._config = merged
 

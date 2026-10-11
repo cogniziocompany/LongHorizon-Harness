@@ -40,6 +40,7 @@ from ..settings_store import (
 )
 
 ADMIN_PROXY_HEADER = "x-lh-proxy-auth"
+_KEEP_PEAK = object()  # PUT capacity: preserve the stored max_peak (legacy bare-int form)
 IDENTITY_HEADER = "x-auth-request-email"
 
 
@@ -296,7 +297,12 @@ def register_settings_routes(
         require_admin(request)
         rt = runtime()
         assert rt.store is not None
-        return {"capacity": rt.store.queue_capacity()}
+        rows = rt.store.queue_capacity_rows()
+        return {
+            "capacity": {name: row["max"] for name, row in rows.items()},
+            "max_peak": {name: row["max_peak"] for name, row in rows.items()},
+            "peak_window": "Mon-Fri 06:00-10:00 UTC",
+        }
 
     @app.put("/api/queue/capacity")
     def put_queue_capacity(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
@@ -309,9 +315,10 @@ def register_settings_routes(
             raise HTTPException(status_code=400, detail="unknown field(s): " + ", ".join(sorted(unknown)))
         caps = body.get("capacity")
         if not isinstance(caps, dict):
-            raise HTTPException(status_code=422, detail="capacity must be an object of trio name -> max_concurrent")
+            raise HTTPException(status_code=422, detail="capacity must be an object of trio name -> max_concurrent or {max, max_peak}")
         known_trios = {row["name"] for row in store.queue_trios()}
-        updates: dict[str, int] = {}
+        keep = _KEEP_PEAK  # sentinel: preserve the stored max_peak
+        updates: dict[str, dict[str, int | None]] = {}
         errors = []
         for key, raw in caps.items():
             trio = key.strip() if isinstance(key, str) else ""
@@ -321,20 +328,58 @@ def register_settings_routes(
             if trio not in known_trios:
                 errors.append(f"capacity for unknown trio {trio!r}")
                 continue
-            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
-                errors.append(f"capacity for {trio!r} must be a non-negative integer")
+            # Legacy form: a bare int = the all-day max, peak untouched.
+            # Rich form: {"max": int, "max_peak": int|null} (null clears the
+            # peak override). The schedule layer resolves which applies when.
+            if isinstance(raw, bool) or isinstance(raw, int):
+                if isinstance(raw, bool) or raw < 0:
+                    errors.append(f"capacity for {trio!r} must be a non-negative integer")
+                    continue
+                # Legacy bare int: the all-day max only; an existing peak
+                # override is PRESERVED (cleared only via the rich form's
+                # explicit max_peak: null).
+                parsed = {"max": raw, "max_peak": _KEEP_PEAK}
+            elif isinstance(raw, dict) and set(raw) <= {"max", "max_peak"}:
+                base_val = raw.get("max")
+                peak_val = raw.get("max_peak")
+                if isinstance(base_val, bool) or not isinstance(base_val, int) or base_val < 0:
+                    errors.append(f"capacity.max for {trio!r} must be a non-negative integer")
+                    continue
+                if peak_val is not None and (isinstance(peak_val, bool) or not isinstance(peak_val, int) or peak_val < 0):
+                    errors.append(f"capacity.max_peak for {trio!r} must be a non-negative integer or null")
+                    continue
+                parsed = {"max": base_val, "max_peak": peak_val}
+            else:
+                errors.append(f"capacity for {trio!r} must be a non-negative integer or {{max, max_peak}}")
                 continue
-            updates[trio] = raw
+            updates[trio] = parsed
         if errors:
             raise HTTPException(status_code=422, detail="; ".join(errors))
         with store._db() as db:
             for trio, value in updates.items():
-                old = db.execute("SELECT max_concurrent FROM queue_capacity WHERE trio = ?", (trio,)).fetchone()
-                db.execute("INSERT OR REPLACE INTO queue_capacity(trio, max_concurrent) VALUES (?, ?)", (trio, value))
-                before = None if old is None else int(old["max_concurrent"])
-                if before != value:
-                    store._audit(db, actor, "set", f"queue_capacity:{trio}", before=before, after=value)
-        return {"ok": True, "capacity": store.queue_capacity()}
+                old = db.execute(
+                    "SELECT max_concurrent, max_peak FROM queue_capacity WHERE trio = ?", (trio,)
+                ).fetchone()
+                new_peak = value["max_peak"]
+                if new_peak is keep:
+                    new_peak = None if old is None else old["max_peak"]
+                db.execute(
+                    "INSERT INTO queue_capacity(trio, max_concurrent, max_peak) VALUES (?, ?, ?) "
+                    "ON CONFLICT(trio) DO UPDATE SET max_concurrent=excluded.max_concurrent, max_peak=excluded.max_peak",
+                    (trio, value["max"], new_peak),
+                )
+                before = None
+                if old is not None:
+                    before = {"max": int(old["max_concurrent"]), "max_peak": None if old["max_peak"] is None else int(old["max_peak"])}
+                after = {"max": value["max"], "max_peak": new_peak}
+                if before != after:
+                    store._audit(db, actor, "set", f"queue_capacity:{trio}", before=before, after=after)
+        rows = store.queue_capacity_rows()
+        return {
+            "ok": True,
+            "capacity": {name: row["max"] for name, row in rows.items()},
+            "max_peak": {name: row["max_peak"] for name, row in rows.items()},
+        }
 
     # ----------------------------- pending-task model/roles edit (R7) --
     # LHH-QUEUE-HOTRELOAD (Paxton 2026-10-11): a queued task's model (and its

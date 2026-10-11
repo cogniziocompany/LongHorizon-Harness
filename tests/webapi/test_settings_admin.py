@@ -319,7 +319,7 @@ def test_put_capacity_updates_and_audits(tmp_path: Path) -> None:
     assert r.json()["capacity"] == {"glm": 5} and rt.store.queue_capacity() == {"glm": 5}
     top = rt.store.audit()[0]
     assert top["action"] == "set" and top["name"] == "queue_capacity:glm" and top["actor"] == ADMIN
-    assert top["detail"] == {"after": 5, "before": 2}
+    assert top["detail"] == {"after": {"max": 5, "max_peak": None}, "before": {"max": 2, "max_peak": None}}
 
 
 @pytest.mark.parametrize("payload", [{"zzz": 1}, {"glm": -1}, {"glm": 3.5}, {"glm": True}])

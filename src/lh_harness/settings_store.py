@@ -244,10 +244,16 @@ class SettingsStore:
                     );
                     CREATE TABLE IF NOT EXISTS queue_capacity (
                         trio TEXT PRIMARY KEY,
-                        max_concurrent INTEGER NOT NULL
+                        max_concurrent INTEGER NOT NULL,
+                        max_peak INTEGER
                     );
                     """
                 )
+                # Schedule-aware capacity (2026-10-11): existing stores get the
+                # max_peak companion column in place; fresh ones create it above.
+                cols = {row[1] for row in db.execute("PRAGMA table_info(queue_capacity)").fetchall()}
+                if "max_peak" not in cols:
+                    db.execute("ALTER TABLE queue_capacity ADD COLUMN max_peak INTEGER")
             if version < SCHEMA_VERSION:
                 db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             row = db.execute("SELECT value FROM meta WHERE name = 'key_check'").fetchone()
@@ -419,6 +425,28 @@ class SettingsStore:
         with self._db() as db:
             rows = db.execute("SELECT trio, max_concurrent FROM queue_capacity ORDER BY trio").fetchall()
         return {row["trio"]: int(row["max_concurrent"]) for row in rows}
+
+    def queue_capacity_rows(self) -> dict[str, dict[str, Any]]:
+        """Per-trio caps with the optional schedule-aware peak companion.
+
+        ``max`` is the off-peak/all-day cap; ``max_peak`` (nullable) is the
+        LOWER cap applied while the peak window is active (Mon-Fri
+        06:00-10:00 UTC — z.ai peak billing hours, when dynamic concurrency
+        is also tightest). None/absent = no peak override, ``max`` applies
+        around the clock.
+        """
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT trio, max_concurrent, max_peak FROM queue_capacity ORDER BY trio"
+            ).fetchall()
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            peak = row["max_peak"]
+            out[row["trio"]] = {
+                "max": int(row["max_concurrent"]),
+                "max_peak": int(peak) if peak is not None else None,
+            }
+        return out
 
     def seed_queue_defaults(
         self,
