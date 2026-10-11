@@ -73,3 +73,5 @@ failure; the unchanged launcher reproduced that failure because its optional
 HTTP client rejects the test's local file URL. No unrelated HTTP behavior was
 changed. Dedicated parent-wait UI controls and full delegated runtime wiring
 remain incomplete.
+
+PostgreSQL serialization also preserves needs_parent_input without a timed backoff deadline. Its regression failed before the fix. The expanded declared-dependency Linux suite passed 112 tests; three scratch-database tests skipped because no scratch database was configured. Actual live PostgreSQL round-trip is not yet qualified.

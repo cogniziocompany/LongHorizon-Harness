@@ -87,6 +87,17 @@ def test_row_values_normalise_like_the_file_store() -> None:
     assert values["wait_reason"] == "x" * 64
 
 
+def test_parent_wait_persists_without_a_backoff_deadline() -> None:
+    entry = QueueEntry(
+        queue_id="q-parent", name="n", task="t", workspace="w", max_rounds=3,
+        trio="kimi", priority=1, requested_by="ci", status="launched",
+        run_id="run-parent", wait_reason="needs_parent_input",
+    )
+    values = dict(zip(pg_queue._QUEUE_COLUMNS, pg_queue._entry_values(entry)))
+    assert values["not_before"] is None
+    assert values["wait_reason"] == "needs_parent_input"
+
+
 # --- hermetic: a recording fake connection ----------------------------------
 
 

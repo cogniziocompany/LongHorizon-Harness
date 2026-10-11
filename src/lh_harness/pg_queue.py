@@ -101,7 +101,7 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
     if isinstance(not_before, bool) or not isinstance(not_before, (int, float)):
         not_before = None
     wait_reason = entry.wait_reason
-    if not_before is None or not wait_reason:
+    if not wait_reason or (not_before is None and wait_reason != "needs_parent_input"):
         wait_reason = None
     else:
         wait_reason = str(wait_reason)[:_MAX_WAIT_REASON_CHARS]
