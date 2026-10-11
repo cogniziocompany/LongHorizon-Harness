@@ -62,7 +62,7 @@ _QUEUE_TRIOS = {"kimi", "qwen"}
 # Trios a config MAY define but that are never filled in by default. ``orfree``
 # runs every role on an OpenRouter free model through the gateway (two keys,
 # 20 requests/minute and 1,000 requests/day each): see docs/queue.md.
-_OPTIONAL_QUEUE_TRIOS = {"orfree", "glm"}
+_OPTIONAL_QUEUE_TRIOS = {"orfree", "glm", "zai"}
 # Per-caller tool scoping and budget ceilings (task 174). The complete set of
 # tool names the MCP dispatch exposes; a caller's ``tools`` allowlist is
 # validated against it. Granting a tool here is what also unlocks its REST
@@ -174,6 +174,7 @@ _QUEUE_CAPACITY_KEYS = {
     "qwen_max",
     "orfree_max",
     "glm_max",
+    "zai_max",
     "min_healthy_keys",
     "key_health_url",
     "poll_seconds",
@@ -317,6 +318,13 @@ auditor = 300
 # model = "qwen3.8-27b:openrouter-free"
 # mcp_profile = "ops"
 
+# Optional: dev work on the direct z.ai coding plan. An ADDITIONAL trio; it never
+# replaces kimi, qwen or glm.
+# [queue.trios.zai]
+# agent = "claude_code"
+# model = "glm-5.3:zai"
+# mcp_profile = "ops"
+
 # Optional: dev work on Ollama Cloud glm-5.3 (keyed, not the synthetic provider).
 # [queue.trios.glm]
 # agent = "claude_code"
@@ -328,6 +336,7 @@ auditor = 300
 # qwen_max = 1          # concurrent qwen runs allowed (QA only, one at a time)
 # orfree_max = 2        # concurrent orfree runs (only used when the trio is defined)
 # glm_max = 1           # concurrent glm runs (only used when the trio is defined)
+# zai_max = 1           # concurrent zai runs (only used when the trio is defined)
 # min_healthy_keys = 2  # healthy Ollama Cloud keys required before kimi launches
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
@@ -716,6 +725,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "qwen_max": 1,
         "orfree_max": 2,
         "glm_max": 1,
+        "zai_max": 1,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
@@ -730,6 +740,8 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["orfree_max"] = max(0, capacity["orfree_max"])
     if isinstance(capacity.get("glm_max"), int):
         normalized_capacity["glm_max"] = max(0, capacity["glm_max"])
+    if isinstance(capacity.get("zai_max"), int):
+        normalized_capacity["zai_max"] = max(0, capacity["zai_max"])
     if isinstance(capacity.get("min_healthy_keys"), int):
         normalized_capacity["min_healthy_keys"] = max(0, capacity["min_healthy_keys"])
     if isinstance(capacity.get("key_health_url"), str):
