@@ -75,3 +75,5 @@ changed. Dedicated parent-wait UI controls and full delegated runtime wiring
 remain incomplete.
 
 PostgreSQL serialization also preserves needs_parent_input without a timed backoff deadline. Its regression failed before the fix. The expanded declared-dependency Linux suite passed 112 tests; three scratch-database tests skipped because no scratch database was configured. Actual live PostgreSQL round-trip is not yet qualified.
+
+Scratch PostgreSQL 16 verification now passed all 17 retry/queue-column tests with no skips, including the new parent-wait write, fresh-connection read, dedup reuse and wait clearing. The scratch schema harness was provisioned explicitly because existing migrations assume it exists; the first attempt skipped four tests on that missing prerequisite and was not accepted as evidence. The owned disposable database/container and network were removed afterwards. This verifies scratch storage, not production database migration or runtime activation.
