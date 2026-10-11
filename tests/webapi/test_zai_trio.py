@@ -58,8 +58,7 @@ def test_project_config_accepts_zai_trio(tmp_path: Path) -> None:
 def test_zai_sits_beside_glm_without_replacing_it(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text(
-        "
-".join([
+        "\n".join([
             "[queue.trios.glm]",
             'agent = "claude_code"',
             'model = "glm-5.3:cloud"',
