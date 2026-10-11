@@ -187,6 +187,8 @@ Capacity is configured under `[queue.capacity]`:
 | `qwen_max` | 1 | Concurrent qwen runs allowed (QA only, one at a time) |
 | `orfree_max` | 2 | Concurrent orfree runs allowed. Only used when `[queue.trios.orfree]` is defined (see below) |
 | `glm_max` | 1 | Concurrent glm runs allowed. Only used when `[queue.trios.glm]` is defined (see below) |
+| `zai_max` | 5 | Concurrent zai runs allowed. Only used when `[queue.trios.zai]` is defined (see below) |
+| `zaiq_max` | 1 | Concurrent zaiq (mixed) runs. Only used when `[queue.trios.zaiq]` is defined; shares the local qwen lanes with `qwen_max` |
 | `min_healthy_keys` | 2 | Healthy Ollama Cloud keys required before kimi launches |
 | `key_health_url` | `""` | URL that returns `{ "healthy_keys": [{"healthy": true}, ...] }` |
 | `poll_seconds` | 15 | Launcher poll interval |
@@ -604,3 +606,45 @@ mcp_profile = "ops"
 [queue.capacity]
 glm_max = 1
 ```
+
+## The optional `zai` trio (direct z.ai coding plan)
+
+`zai` is an additional trio. It never replaces `kimi`, `qwen` or `glm`: those keep their models,
+and a task opts in to z.ai by asking for trio `zai`. Like `orfree` and `glm` it exists only on a
+node whose `config.toml` defines it; elsewhere a `zai` entry stays pending with `zai at capacity`.
+
+```toml
+[queue.trios.zai]
+agent = "claude_code"
+model = "glm-5.3:zai"
+mcp_profile = "ops"
+
+[queue.capacity]
+zai_max = 5
+```
+
+Before defining it on a node, check that the node's gateway key is allowed `glm-5.3:zai`. On
+2026-10-11 the CT110 key was not, and every launch failed in seconds with a 403 "key not allowed
+to access model".
+
+## The optional `zaiq` trio (mixed: z.ai manager and auditor, local qwen executor)
+
+Any trio may now carry per-role overrides, `<role>_agent` and `<role>_model` for `manager`,
+`executor` and `auditor`. A role without an override uses the trio-wide `agent` / `model`.
+`zaiq` is the mixed lane Paxton asked for on 2026-10-11: planning and auditing on the z.ai
+coding plan, execution on the local qwen lane.
+
+```toml
+[queue.trios.zaiq]
+agent = "claude_code"
+model = "glm-5.3:zai"          # manager and auditor
+executor_model = "qwen3.8"     # executor on the local 3090 lanes
+mcp_profile = "ops"
+
+[queue.capacity]
+zaiq_max = 1
+```
+
+Capacity is per trio, so a `zaiq` run's executor occupies a local qwen lane that `qwen_max` does
+not know about. On a node with two local lanes keep `qwen_max + zaiq_max <= 2`, or accept that a
+third stream queues at the router.

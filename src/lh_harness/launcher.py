@@ -441,11 +441,32 @@ def _format_utc(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _trio_role_overrides(trio: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """``<role>_agent`` / ``<role>_model`` keys of a trio, grouped per role.
+
+    A mixed trio (``zaiq``: manager and auditor on z.ai, executor on the local
+    qwen lane) sets ``executor_model = "qwen3.8"`` next to the trio-wide
+    ``model``; roles without an override keep the trio-wide values.
+    """
+
+    overrides: dict[str, dict[str, str]] = {}
+    for role in ("manager", "executor", "auditor"):
+        spec: dict[str, str] = {}
+        for key in ("agent", "model"):
+            value = trio.get(f"{role}_{key}")
+            if value and str(value).strip():
+                spec[key] = str(value).strip()
+        if spec:
+            overrides[role] = spec
+    return overrides
+
+
 def _role_configs(
     agent: str,
     model: str | None,
     mcp_profile: str | None = None,
     auditor_mcp_profile: str | None = None,
+    role_overrides: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, dict[str, str]]:
     """Role specs for a queue launch: agent, plus model only when set.
 
@@ -460,11 +481,14 @@ def _role_configs(
     and ignored until the worker round-trips them.
     """
     del mcp_profile, auditor_mcp_profile
+    overrides = role_overrides or {}
     configs: dict[str, dict[str, str]] = {}
     for role in ("manager", "executor", "auditor"):
-        spec: dict[str, str] = {"agent": agent}
-        if model:
-            spec["model"] = model
+        role_override = overrides.get(role, {})
+        spec: dict[str, str] = {"agent": role_override.get("agent") or agent}
+        role_model = role_override.get("model") or model
+        if role_model:
+            spec["model"] = role_model
         configs[role] = spec
     return configs
 
@@ -490,6 +514,7 @@ def _launch_role_configs(
     model: str | None,
     mcp_profile: str | None,
     auditor_mcp_profile: str | None = None,
+    role_overrides: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, dict[str, str]]:
     """Role specs for THIS launch, resolving a dict-form ``entry.roles`` pin set.
 
@@ -516,7 +541,7 @@ def _launch_role_configs(
     default profiles exactly like the legacy trio path.
     """
 
-    configs = _role_configs(agent, model, mcp_profile, auditor_mcp_profile)
+    configs = _role_configs(agent, model, mcp_profile, auditor_mcp_profile, role_overrides=role_overrides)
     pins = getattr(entry, "roles", None)
     if not isinstance(pins, dict) or not pins:
         return configs
@@ -532,7 +557,13 @@ def _launch_role_configs(
             if isinstance(item, str) and item.strip():
                 spec[key] = item.strip()
         if spec:
-            configs[role] = spec
+            # Pins OVERLAY the resolved spec (trio-wide + per-role trio
+            # overrides) instead of replacing it: a model-only pin must keep
+            # the trio's per-role agent (zaiq mixed trios), and an explicit
+            # pin still wins key-by-key.
+            merged = dict(configs[role])
+            merged.update(spec)
+            configs[role] = merged
     return configs
 
 
@@ -1556,7 +1587,8 @@ class Launcher:
         model = _entry_model_override(entry) or trio.get("model")
         mcp_profile = trio.get("mcp_profile")
         role_configs = _launch_role_configs(
-            entry, agent, model, mcp_profile, trio.get("auditor_mcp_profile")
+            entry, agent, model, mcp_profile, trio.get("auditor_mcp_profile"),
+            role_overrides=_trio_role_overrides(trio),
         )
         run_id: str | None = None
         # Eligibility guard, pre-burn (task 234): a role/profile combination
@@ -1779,8 +1811,13 @@ class Launcher:
         # would lock in.
         model = _entry_model_override(entry) or trio.get("model")
         mcp_profile = trio.get("mcp_profile")
+        overrides = _trio_role_overrides(trio)
         roles = {
-            role: {"agent": agent, "model": model, "mcp_profile": mcp_profile}
+            role: {
+                "agent": overrides.get(role, {}).get("agent") or agent,
+                "model": overrides.get(role, {}).get("model") or model,
+                "mcp_profile": mcp_profile,
+            }
             for role in ("manager", "executor", "auditor")
         }
         self._shadow_record(

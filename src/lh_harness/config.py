@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,51 @@ except ModuleNotFoundError:
     tomllib = importlib.import_module("tomli")
 
 PROJECT_CONFIG_PATH = Path(".lh-harness/config.toml")
+# Explicit override for the run config file; wins over both lookups below.
+ENV_PROJECT_CONFIG = "LH_HARNESS_PROJECT_CONFIG"
+
+
+def resolve_run_config_path(argv: list[str] | None = None) -> Path:
+    """Pick the config.toml a ``run`` reads its defaults from.
+
+    Queue-launched runs start with cwd = the task workspace, so the relative
+    ``PROJECT_CONFIG_PATH`` only finds a file when that workspace carries its
+    own ``.lh-harness/config.toml``.  On CT110 (2026-10-11) every q2-*/q3-*
+    clone lacked one, and those runs silently fell back to the dataclass
+    budgets (manager/auditor 300 s) while the node-level
+    ``/home/harness/work/.lh-harness/config.toml`` said 600/900.  Order:
+
+    1. ``LH_HARNESS_PROJECT_CONFIG`` (explicit path);
+    2. ``./.lh-harness/config.toml`` (the workspace's own file);
+    3. ``<runs-root>/../config.toml``, the node-level file next to the runs
+       directory the launcher already passes as ``--runs-root``.
+
+    Returns ``PROJECT_CONFIG_PATH`` when none exists, so callers keep their
+    "missing file means no defaults" behaviour.
+    """
+
+    explicit = os.environ.get(ENV_PROJECT_CONFIG, "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    if PROJECT_CONFIG_PATH.is_file():
+        return PROJECT_CONFIG_PATH
+    runs_root = _argv_option(argv if argv is not None else sys.argv[1:], "--runs-root")
+    if not runs_root:
+        runs_root = os.environ.get("LH_HARNESS_RUNS_ROOT", "").strip()
+    if runs_root:
+        candidate = Path(runs_root).expanduser().resolve().parent / "config.toml"
+        if candidate.is_file():
+            return candidate
+    return PROJECT_CONFIG_PATH
+
+
+def _argv_option(argv: list[str], flag: str) -> str:
+    for index, token in enumerate(argv):
+        if token == flag and index + 1 < len(argv):
+            return argv[index + 1]
+        if token.startswith(flag + "="):
+            return token.split("=", 1)[1]
+    return ""
 
 _AGENT_CHOICES = {"claude_code", "codex", "deepseek_harness", "opencode"}
 _ROLE_NAMES = {
@@ -62,7 +109,13 @@ _QUEUE_TRIOS = {"kimi", "qwen"}
 # Trios a config MAY define but that are never filled in by default. ``orfree``
 # runs every role on an OpenRouter free model through the gateway (two keys,
 # 20 requests/minute and 1,000 requests/day each): see docs/queue.md.
-_OPTIONAL_QUEUE_TRIOS = {"orfree", "glm"}
+_OPTIONAL_QUEUE_TRIOS = {"orfree", "glm", "zai", "zaiq"}
+# Per-role overrides a trio may carry: <role>_agent / <role>_model for the
+# three queue roles. A mixed trio (zaiq: manager+auditor on z.ai, executor
+# on the local qwen lane) is expressed with these; unset roles use the
+# trio-wide agent/model.
+_TRIO_ROLES = ("manager", "executor", "auditor")
+_TRIO_ROLE_KEYS = {f"{role}_{key}" for role in _TRIO_ROLES for key in ("agent", "model")}
 # Per-caller tool scoping and budget ceilings (task 174). The complete set of
 # tool names the MCP dispatch exposes; a caller's ``tools`` allowlist is
 # validated against it. Granting a tool here is what also unlocks its REST
@@ -174,6 +227,8 @@ _QUEUE_CAPACITY_KEYS = {
     "qwen_max",
     "orfree_max",
     "glm_max",
+    "zai_max",
+    "zaiq_max",
     "min_healthy_keys",
     "key_health_url",
     "poll_seconds",
@@ -317,6 +372,23 @@ auditor = 300
 # model = "qwen3.8-27b:openrouter-free"
 # mcp_profile = "ops"
 
+# Optional: dev work on the direct z.ai coding plan. An ADDITIONAL trio; it never
+# replaces kimi, qwen or glm.
+# [queue.trios.zai]
+# agent = "claude_code"
+# model = "glm-5.3:zai"
+# mcp_profile = "ops"
+
+# Optional: MIXED trio. Manager and auditor on the direct z.ai coding plan,
+# executor on the local qwen lane. Per-role keys override the trio-wide
+# agent/model for that role only. Count zaiq_max against the local qwen lanes
+# together with qwen_max (CT110: two lanes).
+# [queue.trios.zaiq]
+# agent = "claude_code"
+# model = "glm-5.3:zai"
+# executor_model = "qwen3.8"
+# mcp_profile = "ops"
+
 # Optional: dev work on Ollama Cloud glm-5.3 (keyed, not the synthetic provider).
 # [queue.trios.glm]
 # agent = "claude_code"
@@ -328,6 +400,8 @@ auditor = 300
 # qwen_max = 1          # concurrent qwen runs allowed (QA only, one at a time)
 # orfree_max = 2        # concurrent orfree runs (only used when the trio is defined)
 # glm_max = 1           # concurrent glm runs (only used when the trio is defined)
+# zai_max = 5           # concurrent zai runs (only used when the trio is defined)
+# zaiq_max = 1          # concurrent zaiq runs; shares the local qwen lanes with qwen_max
 # min_healthy_keys = 2  # healthy Ollama Cloud keys required before kimi launches
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
@@ -435,8 +509,10 @@ def create_project_config(
     return target
 
 
-def load_run_defaults(path: str | Path = PROJECT_CONFIG_PATH) -> dict[str, Any]:
-    source = Path(path)
+def load_run_defaults(path: str | Path | None = None) -> dict[str, Any]:
+    # No explicit path: resolve the workspace file, else the node-level one
+    # (see resolve_run_config_path). Callers that pass a path keep it as is.
+    source = Path(path) if path is not None else resolve_run_config_path()
     if not source.is_file():
         return {}
     try:
@@ -682,7 +758,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     for name, spec in trios.items():
         if not isinstance(spec, dict):
             raise ProjectConfigError(f"[queue.trios.{name}] must be a TOML table")
-        unknown_trio_keys = set(spec) - {"agent", "model", "mcp_profile"}
+        unknown_trio_keys = set(spec) - {"agent", "model", "mcp_profile"} - _TRIO_ROLE_KEYS
         if unknown_trio_keys:
             raise ProjectConfigError(
                 f"unknown [queue.trios.{name}] key(s): {_names(unknown_trio_keys)}"
@@ -695,6 +771,10 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
             "model": str(spec.get("model", "")).strip() or None,
             "mcp_profile": str(spec.get("mcp_profile", "")).strip() or None,
         }
+        for role_key in sorted(_TRIO_ROLE_KEYS & set(spec)):
+            role_value = str(spec.get(role_key, "")).strip()
+            if role_value:
+                normalized_trios[name][role_key] = role_value
     for required in _QUEUE_TRIOS:
         if required not in normalized_trios:
             normalized_trios[required] = {
@@ -716,6 +796,8 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "qwen_max": 1,
         "orfree_max": 2,
         "glm_max": 1,
+        "zai_max": 5,
+        "zaiq_max": 1,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
@@ -730,6 +812,10 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["orfree_max"] = max(0, capacity["orfree_max"])
     if isinstance(capacity.get("glm_max"), int):
         normalized_capacity["glm_max"] = max(0, capacity["glm_max"])
+    if isinstance(capacity.get("zai_max"), int):
+        normalized_capacity["zai_max"] = max(0, capacity["zai_max"])
+    if isinstance(capacity.get("zaiq_max"), int):
+        normalized_capacity["zaiq_max"] = max(0, capacity["zaiq_max"])
     if isinstance(capacity.get("min_healthy_keys"), int):
         normalized_capacity["min_healthy_keys"] = max(0, capacity["min_healthy_keys"])
     if isinstance(capacity.get("key_health_url"), str):

@@ -96,7 +96,7 @@ Accepted fields (all persisted on the queue entry):
   an ' at capacity' skip for the entry (launcher.py _check_eligibility)
   and it stays pending, unlaunched, consuming no capacity; _launch and
   _shadow_launch_decision guard the same condition with an 'unknown trio'
-  skip. Supply 'kimi', 'qwen', 'orfree' or 'glm' whenever the task should actually
+  skip. Supply 'kimi', 'qwen', 'orfree', 'glm', 'zai' or 'zaiq' whenever the task should actually
   launch.
 - max_rounds (integer, optional): maximum harness rounds (default 25).
 - priority (integer, optional): higher number = earlier launch within the
@@ -149,6 +149,13 @@ Rules:
   requests/day per key, and the upstream provider may log prompts. Never send
   customer data or secret-bearing work to it. It launches only on a node whose
   config defines [queue.trios.orfree]; elsewhere the entry stays pending.
+- trio "zaiq" is the MIXED lane: manager and auditor on z.ai, executor on the
+  local qwen lane (zaiq_max, default 1; shares the local lanes with qwen).
+  Launches only on a node whose config defines [queue.trios.zaiq].
+- trio "zai" runs dev work on the direct z.ai coding plan (zai_max, default 5).
+  It is an additional option and never replaces another trio. It launches only
+  on a node whose config defines [queue.trios.zai]; elsewhere the entry stays
+  pending.
 - trio "glm" runs dev work on Ollama Cloud glm-5.3 (glm_max, default 1). It
   launches only on a node whose config defines [queue.trios.glm]; elsewhere
   the entry stays pending.
@@ -520,7 +527,7 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
             {
                 "status": _string_param("Filter by status (comma list): pending, launched, done, failed, blocked.", required=False),
                 "name": _string_param("Only entries whose name contains this text (case-insensitive).", required=False),
-                "trio": _string_param("Only entries for this trio (e.g. qwen, kimi, glm).", required=False),
+                "trio": _string_param("Only entries for this trio (e.g. qwen, kimi, glm, zai, zaiq).", required=False),
                 "limit": _string_param("Page size, 1-500 (default 50).", required=False),
                 "after": _string_param("Cursor from the previous page's next_cursor.", required=False),
                 "queue_id": _string_param("Return this one entry in full (task text included).", required=False),
