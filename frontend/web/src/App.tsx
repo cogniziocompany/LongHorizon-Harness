@@ -45,6 +45,8 @@ import { MAX_ROUNDS, type ArtifactList, type EventEnvelope, type RunSummary, typ
 import { availableCommands, isTrajectoryNoise, managerPlanSummary, managerPlanText, normaliseMaxRounds, projectArtifactView, projectStatus, dedupeEvents, parseCommand, parseNewRunArgs, phaseLabel, projectTrajectoryView, reducePanelState, sortTranscript, DEFAULT_PANEL_STATE, type ArtifactProjection, type FileChangeItem, type PanelName, type StatusView, type TrajectoryItem, type ValidationResultSummary } from '../../core/src';
 import {
   abortRun,
+  ApiError,
+  authHeaders,
   createRun,
   fetchArtifact,
   fetchArtifacts,
@@ -52,6 +54,7 @@ import {
   refreshModels,
   fetchRuns,
   fetchTrajectory,
+  getJson,
   postInstruction,
   resolveApproval,
   resumeRun,
@@ -292,8 +295,8 @@ const MODEL_PRESETS: Record<string, { id: string; label: string }[]> = {
   opencode: [{ id: 'opencode/deepseek-v4-flash-free', label: 'DeepSeek V4 Flash Free · default' }],
 };
 
-type PublicRole = 'manager' | 'executor' | 'auditor';
-type RoleSelection = RoleRuntimeConfig & { custom: boolean; effortCustom?: boolean };
+export type PublicRole = 'manager' | 'executor' | 'auditor';
+export type RoleSelection = RoleRuntimeConfig & { custom: boolean; effortCustom?: boolean };
 const PUBLIC_ROLES: Array<{ id: PublicRole; label: string; description: string }> = [
   { id: 'manager', label: 'Manager', description: '规划、路由与完成判定' },
   { id: 'executor', label: 'Executor', description: '执行 GUI / CLI 子任务' },
@@ -831,6 +834,8 @@ export default function App() {
   const [search, setSearch] = useState('');
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [creatingNew, setCreatingNew] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [queueTasks, dispatchQueueTasks] = useReducer(queueTasksReducer, undefined, initialQueueTasksState);
   const [detailsTab, setDetailsTab] = useState<DetailsTab>('artifacts');
   const [selectedRound, setSelectedRound] = useState<number | null>(null);
   const [artifactList, setArtifactList] = useState<ArtifactList | null>(null);
@@ -1042,6 +1047,12 @@ export default function App() {
       runListGeneration.current += 1;
     };
   }, [runId, authRevision, text]);
+
+  // The queue drawer re-reads on every open, so an entry edited elsewhere
+  // (MCP tool, admin page) is never edited off a stale snapshot.
+  useEffect(() => {
+    if (queueOpen) void loadQueueTasks(browserQueueTasksApi, dispatchQueueTasks);
+  }, [queueOpen]);
 
   useEffect(() => {
     rememberRunId(runId);
@@ -1454,7 +1465,7 @@ export default function App() {
       </aside>
 
       <main className="codex-main">
-        <header className="codex-header"><div className="header-context"><span className="header-folder"><PanelTop size={16} /></span><strong className="header-title">{currentRun?.task || runId || text('新会话', 'New task')}</strong><span className="header-more"><Ellipsis size={16} /></span></div><div className="header-actions"><span className={statusClass(snapshot.run.status)} /><span className="header-status">{statusLabel(snapshot.run.status, Boolean(statusView.finalResponse), language)}</span><button className="mobile-status-button" onClick={() => setMobileStatusOpen((open) => !open)} aria-label={text('打开任务状态', 'Open task status')} title={text('任务状态', 'Task status')}><PanelRight size={14} /><span>{text('状态', 'Status')}</span></button>{canStopRun && <button onClick={() => void lifecycle('stop')} disabled={controlBusy} title={text('让 worker 收尾并写出报告', 'Let the worker finish up and write its report')}>{text('停止', 'Stop')}</button>}{canAbortRun && <button className="danger-text" onClick={() => void lifecycle('abort')} disabled={controlBusy} title={text('停止未生效，强制结束进程；本次运行不会写出报告', 'The stop did not take effect. Force-kill the process; this run will not write a report')}>{text('强制中止', 'Force stop')}</button>}{canResumeRun && <button onClick={() => void lifecycle('resume')} disabled={controlBusy} title={text('沿用已完成的轮次继续跑，不会重头开始', 'Continue from the rounds already finished instead of starting over')}>{text('继续运行', 'Continue')}</button>}{canResumeRun && <button onClick={() => void lifecycle('restart')} disabled={controlBusy} title={text('用同样的任务和配置，从第 1 轮重新开始一个新任务', 'Start a new task from round 1 with the same task and configuration')}>{text('重新开始', 'Restart')}</button>}<button className="details-button" disabled={!runId} onClick={() => { if (!runId) return; setCreatingNew(false); setSelectedRound(activeRound); dispatchPanel({ type: 'open', panel: 'details' }); setDetailsOpen(true); }} aria-label={text('查看详情', 'View details')} title={runId ? text('详情', 'Details') : text('选择任务后查看详情', 'Select a task to view details')}><FolderOpen size={14} /><span>{text('详情', 'Details')}</span></button></div></header>
+        <header className="codex-header"><div className="header-context"><span className="header-folder"><PanelTop size={16} /></span><strong className="header-title">{currentRun?.task || runId || text('新会话', 'New task')}</strong><span className="header-more"><Ellipsis size={16} /></span></div><div className="header-actions"><span className={statusClass(snapshot.run.status)} /><span className="header-status">{statusLabel(snapshot.run.status, Boolean(statusView.finalResponse), language)}</span><button className="mobile-status-button" onClick={() => setMobileStatusOpen((open) => !open)} aria-label={text('打开任务状态', 'Open task status')} title={text('任务状态', 'Task status')}><PanelRight size={14} /><span>{text('状态', 'Status')}</span></button>{canStopRun && <button onClick={() => void lifecycle('stop')} disabled={controlBusy} title={text('让 worker 收尾并写出报告', 'Let the worker finish up and write its report')}>{text('停止', 'Stop')}</button>}{canAbortRun && <button className="danger-text" onClick={() => void lifecycle('abort')} disabled={controlBusy} title={text('停止未生效，强制结束进程；本次运行不会写出报告', 'The stop did not take effect. Force-kill the process; this run will not write a report')}>{text('强制中止', 'Force stop')}</button>}{canResumeRun && <button onClick={() => void lifecycle('resume')} disabled={controlBusy} title={text('沿用已完成的轮次继续跑，不会重头开始', 'Continue from the rounds already finished instead of starting over')}>{text('继续运行', 'Continue')}</button>}{canResumeRun && <button onClick={() => void lifecycle('restart')} disabled={controlBusy} title={text('用同样的任务和配置，从第 1 轮重新开始一个新任务', 'Start a new task from round 1 with the same task and configuration')}>{text('重新开始', 'Restart')}</button>}<button className="details-button queue-open-button" onClick={() => setQueueOpen(true)} aria-label={text('队列任务', 'Queued tasks')} title={text('查看并编辑待启动的队列任务', 'View and edit pending queue tasks')}><ListChecks size={14} /><span>{text('队列', 'Queue')}</span></button><button className="details-button" disabled={!runId} onClick={() => { if (!runId) return; setCreatingNew(false); setSelectedRound(activeRound); dispatchPanel({ type: 'open', panel: 'details' }); setDetailsOpen(true); }} aria-label={text('查看详情', 'View details')} title={runId ? text('详情', 'Details') : text('选择任务后查看详情', 'Select a task to view details')}><FolderOpen size={14} /><span>{text('详情', 'Details')}</span></button></div></header>
 
         <section className="conversation" aria-label="LongHorizon conversation" ref={conversationRef} onScroll={(event) => { const node = event.currentTarget; setFollowLatest(node.scrollHeight - node.scrollTop - node.clientHeight < 48); }}>
           {!runId && <div className="welcome"><div className="welcome-mark"><Sparkles size={20} /></div><h1>{text('你想完成什么？', 'What do you want to accomplish?')}</h1><p>{text('开始一个真实的 LongHorizon 任务。计划、中间过程、验证和最终回答会像 Codex 一样显示在这里。', 'Start a real LongHorizon task. Plans, intermediate work, verification, and the final answer will appear here as they happen.')}</p>{meta && !canCreateRun && <p className="welcome-note">{text('当前连接为只读模式；启动 ', 'This connection is read-only. Start ')}<code>lh-harness web</code>{text(' 后即可创建任务。', ' to create tasks.')}</p>}{!meta && <p className="welcome-note">{text('正在连接 Web 服务…', 'Connecting to the Web service…')}</p>}<button className="welcome-button" disabled={!canCreateRun} onClick={() => { setCreatingNew(true); setDetailsOpen(true); }}><Plus size={15} />{text('开始任务', 'Start task')}</button></div>}
@@ -1486,6 +1497,19 @@ export default function App() {
       />
 
       {detailsOpen && <DetailsDrawer creating={creatingNew} runId={runId} snapshot={snapshot} meta={meta} selectedRound={selectedRound} setSelectedRound={setSelectedRound} tab={panelState.panel === 'details' ? detailsTab : panelState.panel} setTab={(tab) => { setDetailsTab(tab); dispatchPanel({ type: 'open', panel: tab === 'artifacts' && panelState.panel === 'details' ? 'details' : tab }); }} artifactList={artifactList} artifactError={artifactError} artifactName={artifactName} artifactText={artifactText} openArtifact={openArtifact} retryArtifacts={() => setArtifactReload((value) => value + 1)} trajectoryRole={trajectoryRole} setTrajectoryRole={setTrajectoryRole} trajectoryData={trajectoryData} trajectoryError={trajectoryError} retryTrajectory={() => setTrajectoryReload((value) => value + 1)} onClose={() => { dispatchPanel({ type: 'close' }); setDetailsOpen(false); setCreatingNew(false); }} onCreate={submitNewRun} onRefreshModels={refreshModelCatalogue} controlBusy={controlBusy} />}
+      {queueOpen && <QueueTasksDrawer
+        state={queueTasks}
+        meta={meta}
+        onClose={() => setQueueOpen(false)}
+        onReload={() => void loadQueueTasks(browserQueueTasksApi, dispatchQueueTasks)}
+        onEdit={(entry) => dispatchQueueTasks({ type: 'edit', entry, meta })}
+        onCancel={() => dispatchQueueTasks({ type: 'cancel' })}
+        onChangeModel={(model) => dispatchQueueTasks({ type: 'model', model })}
+        onChangeRole={(role, value) => dispatchQueueTasks({ type: 'role', role, value })}
+        onSave={() => void saveQueueTaskDraft(browserQueueTasksApi, queueTasks, dispatchQueueTasks)}
+        onClearRoles={() => void clearQueueTaskRoles(browserQueueTasksApi, queueTasks, dispatchQueueTasks)}
+        onRefreshModels={refreshModelCatalogue}
+      />}
       {authOpen && <AuthDialog onClose={() => setAuthOpen(false)} onSaved={() => { setAuthOpen(false); setAuthRevision((value) => value + 1); setError(''); setDismissedFeedError(''); }} />}
     </div>
   );
@@ -2009,6 +2033,362 @@ function ApprovalCard({ approval, busy, userInput, onUserInput, extraRounds, onE
   const roundsInvalid = roundsValue !== '' && !(/^\d+$/.test(roundsValue) && Number(roundsValue) >= 1 && Number(roundsValue) <= MAX_ROUNDS);
   const roundsPayload = () => (roundsValue === '' || roundsInvalid ? undefined : Number(roundsValue));
   return <article className="approval-card" id={approvalElementId(approval.approval_id)}><div className="message-avatar approval-avatar"><AlertTriangle size={12} /></div><div className="message-body"><div className="message-meta"><strong>{title}</strong><span className="approval-label">{text('需要你的输入', 'Input required')}</span></div><MessageText text={message} />{approval.allow_input && <textarea className="approval-input" value={userInput} onChange={(event) => onUserInput(event.target.value)} placeholder={inputPlaceholder} disabled={busy} />}{allowRounds && <label className="approval-rounds">{text('继续时追加轮数', 'Extra rounds when continuing')}<input type="number" min={1} max={MAX_ROUNDS} step={1} value={extraRounds} disabled={busy} placeholder={text('留空＝沿用原本的轮数上限', 'Blank = keep the configured round budget')} onChange={(event) => onExtraRounds(event.target.value)} /><span className={roundsInvalid ? 'approval-rounds-error' : 'approval-rounds-note'}>{roundsInvalid ? text(`请输入 1 到 ${MAX_ROUNDS} 之间的整数`, `Enter a whole number from 1 to ${MAX_ROUNDS}`) : text('只影响“继续运行”', 'Only affects “Continue run”')}</span></label>} {approval.answers.length > 0 && <div className="approval-answers" aria-label={text('快速回答', 'Quick answers')}>{approval.answers.map((answer) => <button type="button" key={answer} disabled={busy || roundsInvalid} onClick={() => onApprove(approval.approval_id, 'continue', answer, roundsPayload())}>{answer}</button>)}</div>}<div className="approval-actions">{options.map((option) => <button key={option.value} disabled={busy || (roundsInvalid && option.value !== 'stop')} className={option.style === 'danger' ? 'danger-text' : ''} onClick={() => onApprove(approval.approval_id, option.value, undefined, option.value === 'stop' ? undefined : roundsPayload())}>{optionLabel(option.label)}</button>)}</div></div></article>;
+}
+
+// ---------------------------------------------------------------- Queue --
+// LHH-QUEUE-HOTRELOAD R11 (Paxton 2026-10-11): pending-task edit view.  A
+// queued task's model and per-role configuration stay EDITABLE while the
+// entry is pending and lock at launch (R8 writes the resolved values onto
+// the run; a running run is never altered by a later trio-default change).
+// Saving goes through the R7 endpoint PUT /api/queue/{queue_id}/model — one
+// endpoint carries ``model`` and/or ``roles``; there is no separate /roles
+// route.  The server validates ``model`` against the live model list
+// (unknown → 422, provider down → 503, both rendered verbatim here) and
+// refuses a non-pending entry with 409: that flip renders the row locked,
+// exactly the state the launcher already enforces.  The model dropdown is
+// fed ONLY by the same live list the New-task form uses (GET /api/meta with
+// POST /api/models/refresh), grouped by the provider buckets the meta
+// response supplies, and the per-role editor IS the New-task form's
+// RoleRuntimePicker — no second picker, no hardcoded model list.
+
+export type QueueRolePins = Partial<RoleRuntimeConfig> & { mcp_profile?: string };
+
+export interface QueueTaskEntry {
+  queue_id: string;
+  name?: string;
+  task?: string;
+  status: string;
+  trio?: string;
+  model: string | null;
+  roles: Record<string, QueueRolePins> | null;
+  run_id?: string | null;
+}
+
+export interface QueueTaskEditResult {
+  ok: boolean;
+  queue_id: string;
+  status: string;
+  changed: boolean;
+  model: string | null;
+  roles: Record<string, QueueRolePins> | null;
+  trio: string;
+}
+
+/** Injectable seam (same pattern as AdminApp's QueueApi): tests never fetch. */
+export interface QueueTasksApi {
+  fetchQueueTasks: () => Promise<{ entries: QueueTaskEntry[] }>;
+  saveQueueTask: (queueId: string, patch: { model?: string | null; roles?: Record<string, QueueRolePins> | null }) => Promise<QueueTaskEditResult>;
+}
+
+// The R7 write needs the same X-Requested-With guard the R4 admin mutations
+// require.  api.ts's detail-extraction is module-private, so the few lines
+// repeat here (the AdminApp queueWrite already does the same — one shared
+// helper is a follow-up, tracked as the round_011 duplication disclosure).
+async function queueTaskWrite<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'lh-harness', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`.trim();
+    try {
+      const payload = await response.clone().json() as { detail?: unknown };
+      if (payload && typeof payload.detail === 'string' && payload.detail.trim()) message = payload.detail.trim();
+    } catch {
+      try {
+        const text = (await response.clone().text()).trim();
+        if (text) message = text.slice(0, 500);
+      } catch {
+        // Keep the status-only fallback.
+      }
+    }
+    throw new ApiError(response.status, message);
+  }
+  return response.json() as Promise<T>;
+}
+
+export const browserQueueTasksApi: QueueTasksApi = {
+  fetchQueueTasks: async () => {
+    // status= alone keeps the legacy full-entry shape (the summary trimming of
+    // the CT110 leak fix only engages when view/limit/… are also given) and
+    // filters BEFORE serialising.  Full task text is needed for the row labels.
+    const data = await getJson<{ entries?: QueueTaskEntry[] }>('/api/queue?status=pending,launched');
+    return { entries: Array.isArray(data.entries) ? data.entries : [] };
+  },
+  saveQueueTask: (queueId, patch) => queueTaskWrite<QueueTaskEditResult>(`/api/queue/${encodeURIComponent(queueId)}/model`, patch),
+};
+
+export type QueueRoleDrafts = Record<PublicRole, RoleSelection>;
+
+export interface QueueTasksState {
+  phase: 'loading' | 'ready' | 'refused';
+  entries: QueueTaskEntry[];
+  /** Load failure that is not an admin refusal (phase stays 'ready'). */
+  error: string | null;
+  /** queue_id whose editor is open; null when the list is in read mode. */
+  editing: string | null;
+  /** '' means "no override — the trio's model resolves at launch". */
+  draftModel: string;
+  draftRoles: QueueRoleDrafts;
+  /** What the editor was seeded with; a role is PUT only when it moved. */
+  roleSeeds: QueueRoleDrafts;
+  /** mcp_profile pins have no editor here (trio-level mcp lives on the admin
+   * Queue page); they ride along unchanged when a role's pins are saved. */
+  roleMcp: Record<PublicRole, string>;
+  saving: boolean;
+  /** Verbatim server detail (422 validation, 503 live-list refusal, 409). */
+  saveError: string | null;
+  savedFor: string | null;
+}
+
+export type QueueTasksAction =
+  | { type: 'load-start' }
+  | { type: 'loaded'; entries: QueueTaskEntry[] }
+  | { type: 'load-failed'; error: string }
+  | { type: 'refused'; error: string }
+  | { type: 'edit'; entry: QueueTaskEntry; meta: WebMeta | null }
+  | { type: 'cancel' }
+  | { type: 'model'; model: string }
+  | { type: 'role'; role: PublicRole; value: RoleSelection }
+  | { type: 'save-start' }
+  | { type: 'save-ok'; result: QueueTaskEditResult }
+  | { type: 'save-error'; error: string }
+  | { type: 'conflict'; queueId: string; error: string };
+
+function emptyRoleDrafts(): QueueRoleDrafts {
+  return {
+    manager: { agent: 'codex', model: '', custom: false, reasoning_effort: '', effortCustom: false },
+    executor: { agent: 'codex', model: '', custom: false, reasoning_effort: '', effortCustom: false },
+    auditor: { agent: 'codex', model: '', custom: false, reasoning_effort: '', effortCustom: false },
+  };
+}
+
+export function initialQueueTasksState(): QueueTasksState {
+  return {
+    phase: 'loading',
+    entries: [],
+    error: null,
+    editing: null,
+    draftModel: '',
+    draftRoles: emptyRoleDrafts(),
+    roleSeeds: emptyRoleDrafts(),
+    roleMcp: { manager: '', executor: '', auditor: '' },
+    saving: false,
+    saveError: null,
+    savedFor: null,
+  };
+}
+
+/** Seed the editor from the entry's own pins; unpinned fields display the
+ * launch-time default (exactly what they resolve to if left untouched). */
+function roleDraftsFromEntry(entry: QueueTaskEntry, meta: WebMeta | null): { drafts: QueueRoleDrafts; mcp: Record<PublicRole, string> } {
+  const fallback = defaultAgent(meta);
+  const pins = entry.roles || {};
+  const drafts = Object.fromEntries(PUBLIC_ROLES.map(({ id }) => {
+    const pin = pins[id] || {};
+    const configured = meta?.defaults?.roles?.[id];
+    return [id, {
+      agent: pin.agent || configured?.agent || fallback,
+      model: pin.model || '',
+      custom: false,
+      reasoning_effort: pin.reasoning_effort || '',
+      effortCustom: false,
+    }];
+  })) as QueueRoleDrafts;
+  const mcp = Object.fromEntries(PUBLIC_ROLES.map(({ id }) => [id, pins[id]?.mcp_profile || ''])) as Record<PublicRole, string>;
+  return { drafts, mcp };
+}
+
+export function queueTasksReducer(state: QueueTasksState, action: QueueTasksAction): QueueTasksState {
+  switch (action.type) {
+    case 'load-start':
+      return { ...state, phase: 'loading', error: null, saveError: null, savedFor: null, editing: null };
+    case 'loaded':
+      return { ...state, phase: 'ready', entries: action.entries, error: null };
+    case 'load-failed':
+      return { ...state, phase: 'ready', error: action.error };
+    case 'refused':
+      return { ...state, phase: 'refused', error: action.error };
+    case 'edit': {
+      const { drafts, mcp } = roleDraftsFromEntry(action.entry, action.meta);
+      return { ...state, editing: action.entry.queue_id, draftModel: action.entry.model || '', draftRoles: drafts, roleSeeds: drafts, roleMcp: mcp, saving: false, saveError: null, savedFor: null };
+    }
+    case 'cancel':
+      return { ...state, editing: null, saving: false, saveError: null };
+    case 'model':
+      return { ...state, draftModel: action.model, saveError: null };
+    case 'role':
+      return { ...state, draftRoles: { ...state.draftRoles, [action.role]: action.value }, saveError: null };
+    case 'save-start':
+      return { ...state, saving: true, saveError: null, savedFor: null };
+    case 'save-ok':
+      return { ...state, saving: false, editing: null, savedFor: action.result.queue_id, entries: state.entries.map((item) => item.queue_id === action.result.queue_id ? { ...item, status: action.result.status, trio: action.result.trio, model: action.result.model, roles: action.result.roles } : item) };
+    case 'save-error':
+      return { ...state, saving: false, saveError: action.error };
+    case 'conflict':
+      // The entry launched underneath the open editor (R8 lock).  Nothing was
+      // written; the row flips to its read-only locked form with the refusal.
+      return { ...state, saving: false, saveError: action.error, entries: state.entries.map((item) => item.queue_id === action.queueId ? { ...item, status: 'launched' } : item) };
+    default:
+      return state;
+  }
+}
+
+/** The visible pins of one role; agent is always part of a pinned role (the
+ * picker always has a harness selected), model/effort/mcp ride along only
+ * when set, so untouched fields still resolve at launch. */
+export function rolePinsFromSelection(value: RoleSelection, mcpProfile = ''): QueueRolePins {
+  const pins: QueueRolePins = { agent: value.agent };
+  const model = value.model?.trim();
+  if (model) pins.model = model;
+  const effort = value.reasoning_effort?.trim();
+  if (effort) pins.reasoning_effort = effort;
+  const mcp = mcpProfile.trim();
+  if (mcp) pins.mcp_profile = mcp;
+  return pins;
+}
+
+function pinsKey(pins: QueueRolePins): string {
+  return JSON.stringify([pins.agent || '', pins.model || '', pins.reasoning_effort || '', pins.mcp_profile || '']);
+}
+
+/** Roles pins to PUT, or null when no role moved away from its seed — a
+ * model-only edit must not freeze role defaults onto the entry. */
+export function buildQueueRolesPayload(drafts: QueueRoleDrafts, seeds: QueueRoleDrafts, mcp: Record<PublicRole, string>): Record<string, QueueRolePins> | null {
+  const payload: Record<string, QueueRolePins> = {};
+  for (const { id } of PUBLIC_ROLES) {
+    const pins = rolePinsFromSelection(drafts[id], mcp[id]);
+    if (pinsKey(pins) !== pinsKey(rolePinsFromSelection(seeds[id], mcp[id]))) payload[id] = pins;
+  }
+  return Object.keys(payload).length ? payload : null;
+}
+
+/** Live-list model options per provider bucket; empty meta → no options. */
+export function modelOptionsFromMeta(meta: WebMeta | null): Array<{ provider: string; options: { id: string; label: string }[] }> {
+  return Object.keys(meta?.models || {})
+    .map((provider) => ({ provider, options: normalizedModelChoices(meta?.models?.[provider]) }))
+    .filter((group) => group.options.length > 0);
+}
+
+export async function loadQueueTasks(api: QueueTasksApi, dispatch: (action: QueueTasksAction) => void): Promise<void> {
+  dispatch({ type: 'load-start' });
+  try {
+    const { entries } = await api.fetchQueueTasks();
+    dispatch({ type: 'loaded', entries });
+  } catch (reason) {
+    if (reason instanceof ApiError && reason.status === 403) dispatch({ type: 'refused', error: reason.message });
+    else dispatch({ type: 'load-failed', error: reason instanceof Error ? reason.message : String(reason) });
+  }
+}
+
+async function runQueueSave(api: QueueTasksApi, queueId: string, patch: { model?: string | null; roles?: Record<string, QueueRolePins> | null }, dispatch: (action: QueueTasksAction) => void): Promise<void> {
+  dispatch({ type: 'save-start' });
+  try {
+    const result = await api.saveQueueTask(queueId, patch);
+    dispatch({ type: 'save-ok', result });
+  } catch (reason) {
+    // ApiError.message IS the server's detail string — render it verbatim.
+    const detail = reason instanceof Error ? reason.message : String(reason);
+    if (isConflict(reason)) dispatch({ type: 'conflict', queueId, error: detail });
+    else dispatch({ type: 'save-error', error: detail });
+  }
+}
+
+export async function saveQueueTaskDraft(api: QueueTasksApi, state: QueueTasksState, dispatch: (action: QueueTasksAction) => void): Promise<void> {
+  if (!state.editing || state.saving) return;
+  const patch: { model?: string | null; roles?: Record<string, QueueRolePins> | null } = { model: state.draftModel.trim() || null };
+  const roles = buildQueueRolesPayload(state.draftRoles, state.roleSeeds, state.roleMcp);
+  if (roles) patch.roles = roles;
+  await runQueueSave(api, state.editing, patch, dispatch);
+}
+
+/** Drop every per-role pin in one write; trio/launch defaults apply in full. */
+export async function clearQueueTaskRoles(api: QueueTasksApi, state: QueueTasksState, dispatch: (action: QueueTasksAction) => void): Promise<void> {
+  if (!state.editing || state.saving) return;
+  await runQueueSave(api, state.editing, { roles: null }, dispatch);
+}
+
+export function QueueTasksDrawer({ state, meta, onClose, onReload, onEdit, onCancel, onChangeModel, onChangeRole, onSave, onClearRoles, onRefreshModels }: {
+  state: QueueTasksState;
+  meta: WebMeta | null;
+  onClose: () => void;
+  onReload: () => void;
+  onEdit: (entry: QueueTaskEntry) => void;
+  onCancel: () => void;
+  onChangeModel: (model: string) => void;
+  onChangeRole: (role: PublicRole, value: RoleSelection) => void;
+  onSave: () => void;
+  onClearRoles: () => void;
+  onRefreshModels: () => Promise<void>;
+}) {
+  const { text } = useUiLanguage();
+  const backdrop = useBackdropDismiss(onClose);
+  const [modelRefreshBusy, setModelRefreshBusy] = useState(false);
+  const [modelRefreshError, setModelRefreshError] = useState('');
+  const pending = state.entries.filter((item) => item.status === 'pending');
+  const rest = state.entries.filter((item) => item.status !== 'pending');
+  const modelGroups = modelOptionsFromMeta(meta);
+  const liveModelIds = new Set(modelGroups.flatMap((group) => group.options.map((option) => option.id)));
+  const refreshModels = () => {
+    setModelRefreshBusy(true);
+    setModelRefreshError('');
+    void onRefreshModels()
+      .catch((reason) => setModelRefreshError(reason instanceof Error ? reason.message : String(reason)))
+      .finally(() => setModelRefreshBusy(false));
+  };
+  const entryTitle = (entry: QueueTaskEntry) => entry.name || (entry.task || '').split('\n')[0].trim() || entry.queue_id;
+  const editorFor = (entry: QueueTaskEntry) => {
+    const unlisted = state.draftModel && !liveModelIds.has(state.draftModel) ? state.draftModel : '';
+    return <>
+      <label className="drawer-field"><span>{text('任务模型覆盖', 'Task model override')}</span>
+        <select aria-label={`${entry.queue_id} model`} value={state.draftModel} disabled={state.saving} onChange={(event) => onChangeModel(event.target.value)}>
+          <option value="">{text('无覆盖（启动时按 trio 解析）', 'No override (resolved from the trio at launch)')}</option>
+          {modelGroups.map((group) => <optgroup key={group.provider} label={group.provider}>{group.options.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</optgroup>)}
+          {unlisted && <option value={unlisted}>{unlisted} (not in the live list)</option>}
+        </select>
+      </label>
+      <div className="role-runtime-head"><div><strong>{text('角色运行配置', 'Role runtime configuration')}</strong><small>{text('只固定改动过的角色；未改动的角色仍按 trio 默认值在启动时解析', 'Only roles you change are pinned; the rest still resolve from the trio defaults at launch')}</small></div>
+        <button type="button" data-testid="queue-refresh-models" disabled={modelRefreshBusy} onClick={refreshModels}>{modelRefreshBusy ? text('检测中…', 'Detecting…') : text('重新检测模型', 'Refresh models')}</button></div>
+      {modelRefreshError && <div className="drawer-error-state"><span className="drawer-error">{text('模型检测失败：', 'Model detection failed: ')}{compactText(modelRefreshError, 240)}</span></div>}
+      <div className="role-runtime-list">{PUBLIC_ROLES.map((role) => <RoleRuntimePicker key={role.id} role={role} selection={state.draftRoles[role.id]} meta={meta} onChange={(value) => onChangeRole(role.id, value)} />)}</div>
+      {entry.roles && <button type="button" data-testid="queue-clear-roles" disabled={state.saving} onClick={onClearRoles}>{text('清除全部角色覆盖', 'Clear all role overrides')}</button>}
+      {state.saveError && <div className="drawer-error-state"><span className="drawer-error" data-testid="queue-edit-error">{state.saveError}</span></div>}
+      <div className="drawer-actions"><button type="button" onClick={onCancel} disabled={state.saving}>{text('取消', 'Cancel')}</button><button type="button" className="primary-action" data-testid="queue-edit-save" disabled={state.saving} onClick={onSave}>{state.saving ? text('保存中…', 'Saving…') : text('保存', 'Save')}</button></div>
+    </>;
+  };
+  const renderEntry = (entry: QueueTaskEntry) => {
+    const editingThis = state.editing === entry.queue_id;
+    const locked = entry.status !== 'pending';
+    return <article className={`queue-entry ${locked ? 'queue-entry-locked' : ''}`} key={entry.queue_id}>
+      <div className="queue-entry-head">
+        <code>{entry.queue_id}</code>
+        <strong>{entryTitle(entry)}</strong>
+        <small>trio {entry.trio || '—'}{entry.model ? ` · ${entry.model}` : ''}</small>
+        {!locked && !editingThis && <button type="button" onClick={() => onEdit(entry)}>{text('编辑模型/角色', 'Edit model/roles')}</button>}
+        {locked && <small className="queue-locked" data-testid={`queue-locked-${entry.queue_id}`}>{text('已启动，模型与角色已锁定', 'Launched — model and roles are locked')} ({entry.status}){entry.run_id ? ` · run ${entry.run_id}` : ''}</small>}
+        {state.savedFor === entry.queue_id && <small data-testid="queue-edit-saved">{text('已保存。', 'Saved.')}</small>}
+      </div>
+      {editingThis && !locked && editorFor(entry)}
+      {editingThis && locked && <>
+        {state.saveError && <div className="drawer-error-state"><span className="drawer-error" data-testid="queue-edit-error">{state.saveError}</span></div>}
+        <div className="drawer-actions"><button type="button" onClick={onCancel}>{text('关闭', 'Close')}</button></div>
+      </>}
+    </article>;
+  };
+  return <div className="drawer-backdrop" {...backdrop}><aside className="details-drawer queue-drawer" role="dialog" aria-modal="true" aria-label={text('队列任务', 'Queued tasks')}>
+    <div className="drawer-header"><div><div className="drawer-eyebrow">{text('队列', 'QUEUE')}</div><h2>{text('待启动任务', 'Pending queue tasks')}</h2></div>
+      <button type="button" data-testid="queue-reload" onClick={onReload}>{text('刷新', 'Reload')}</button>
+      <button type="button" className="drawer-close" onClick={onClose} aria-label={text('关闭', 'Close')}><X size={18} /></button></div>
+    {state.phase === 'loading' && <p className="drawer-copy">{text('正在读取队列…', 'Loading the queue…')}</p>}
+    {state.phase === 'refused' && <div className="drawer-error-state"><span className="drawer-error" data-testid="queue-refused">{state.error || ''}</span></div>}
+    {state.phase === 'ready' && <>
+      {state.error && <div className="drawer-error-state"><span className="drawer-error" data-testid="queue-load-error">{state.error}</span></div>}
+      {!state.error && <p className="drawer-copy">{text('待启动任务的模型与角色配置可以编辑；任务一启动，就会锁定为启动时解析的值，之后 trio 默认值的变化不会影响它。', 'A pending task’s model and role configuration can be edited; once launched, the values resolved at launch are locked and later trio-default changes cannot alter it.')}</p>}
+      {!state.error && !pending.length && !rest.length && <p className="drawer-copy">{text('当前队列中没有待启动或已启动的任务。', 'No pending or launched queue tasks right now.')}</p>}
+      <div className="queue-entry-list">{pending.map(renderEntry)}{rest.map(renderEntry)}</div>
+    </>}
+  </aside></div>;
 }
 
 function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof PUBLIC_ROLES[number]; selection: RoleSelection; meta: WebMeta | null; onChange: (value: RoleSelection) => void }) {
