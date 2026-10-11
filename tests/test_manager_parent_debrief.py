@@ -110,6 +110,28 @@ async def test_resume_reuses_original_checkpoint_and_budget(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_crash_before_new_debrief_does_not_skip_boundary(tmp_path: Path):
+    async def hook(projection):
+        return {"action": "continue", "checkpoint": projection["checkpoint"],
+                "receipt_ref": "outbox:1", "reply_required": False}
+    ctx = context(tmp_path, hook)
+    assert not await _human_gate(ctx, "progress", 1, "partial")
+    ctx.rounds.append(ManagedRound(round_index=2, next_step="cli", plan_text="next plan"))
+    assert await _resume_parent_debrief(ctx)
+    assert ctx.abort_reason == "needs_parent_input"
+
+
+@pytest.mark.asyncio
+async def test_missing_checkpoint_with_enabled_boundary_holds(tmp_path: Path):
+    ctx = context(tmp_path, None)
+    role = tmp_path / "role_orchestration"
+    role.mkdir()
+    (role / "parent_debrief_enabled.json").write_text('{"version":1}')
+    assert await _resume_parent_debrief(ctx)
+    assert ctx.abort_reason == "needs_parent_input"
+
+
+@pytest.mark.asyncio
 async def test_round_wait_occurs_after_executor_and_auditor(tmp_path: Path):
     calls = []
     replies = iter([

@@ -29,7 +29,10 @@ source-round digests and original budget. Resume revalidates it and reconciles t
 same checkpoint before any role episode starts. Missing adapters, changed tasks,
 altered source evidence, invalid snapshots and unanswered dependencies hold the
 worker. Resume does not implicitly grant extra rounds for that pending boundary.
-A later durable round makes the older debrief snapshot historical.
+The run persists an enabled-boundary marker before its first role episode. Missing
+snapshots and a newer round without its own debrief snapshot hold for reconciliation;
+a crash between recording that round and dispatching its debrief cannot skip the
+boundary. Legacy runs without the marker keep their existing resume behavior.
 
 Remaining required implementation before enabling this on delegated production
 runs: concrete Manager reflection adapter; full packet and outbox transport;
@@ -49,3 +52,5 @@ The subsequent resume regression failed before its fix. The expanded 32-test Lin
 suite verifies no role starts while a restored debrief waits, missing-adapter hold,
 changed snapshot/round/task refusal, exact checkpoint reuse and original-budget
 preservation after a qualified answer.
+Two additional crash-window regressions failed before the enabled-boundary marker
+and latest-snapshot checks were added; the expanded 34-test Linux suite passes.

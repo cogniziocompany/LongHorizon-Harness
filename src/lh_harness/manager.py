@@ -276,6 +276,8 @@ async def _run_impl(
     rounds_dir = role_dir / "rounds"
     _ensure_dir_nofollow(rounds_dir)
     events_path = role_dir / "events.jsonl"
+    if parent_debrief_hook is not None:
+        _write_local(role_dir / "parent_debrief_enabled.json", json.dumps({"version": 1}))
     started = time.monotonic()
 
     await _ensure_remote_layout(env, config)
@@ -1196,6 +1198,11 @@ def _debrief_digest(value: Any) -> str:
 async def _resume_parent_debrief(ctx: _GateContext) -> bool:
     path = ctx.log_dir / "role_orchestration" / "parent_debrief.json"
     if not os.path.lexists(path):
+        if ctx.rounds and os.path.lexists(path.with_name("parent_debrief_enabled.json")):
+            ctx.abort_reason = "needs_parent_input"
+            ctx.completion_satisfied = False
+            _append_event(ctx.events_path, "parent_debrief_resume_held", {"reason": "missing_checkpoint"})
+            return True
         return False
     raw = _read_local_bytes(path, 256 * 1024)
     try:
@@ -1211,7 +1218,9 @@ async def _resume_parent_debrief(ctx: _GateContext) -> bool:
         if type(index) is not int or not ctx.rounds:
             raise ValueError("missing source round")
         if index < ctx.rounds[-1].round_index:
-            return False  # A later durable round proves this boundary advanced.
+            # A new round record without its own debrief snapshot is a crash
+            # window, not proof the parent dependency has been fulfilled.
+            raise ValueError("missing latest-round debrief")
         if index != ctx.rounds[-1].round_index or snapshot["round_digest"] != _debrief_digest(asdict(ctx.rounds[-1])):
             raise ValueError("changed source round")
         if snapshot["task_digest"] != _debrief_digest(ctx.task):
