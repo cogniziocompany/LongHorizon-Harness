@@ -9,6 +9,7 @@ same code path as ``POST /api/runs``.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -89,7 +90,9 @@ def _looks_like_hex(value: str) -> bool:
 # Body keys accepted by _normalize_request (task 233).  Anything else is
 # rejected with the offending key names in the message instead of being
 # dropped silently.  ``task_file`` and ``roles`` are alternative input keys
-# for ``task`` and ``trio`` respectively.
+# for ``task`` and ``trio`` respectively -- the ``roles`` alias applies to
+# the STRING form only; an object form carries per-role configuration
+# (LHH-QUEUE-HOTRELOAD R6), and ``model`` is a per-task model override.
 KNOWN_REQUEST_KEYS = frozenset(
     {
         "name",
@@ -99,6 +102,7 @@ KNOWN_REQUEST_KEYS = frozenset(
         "max_rounds",
         "trio",
         "roles",
+        "model",
         "priority",
         "branch",
         "continue_branch",
@@ -267,6 +271,20 @@ class QueueEntry:
     # ``None`` = no per-entry limit ([queue] default_time_limit_minutes may
     # still apply in the launcher).
     time_limit_minutes: int | None = None
+    # Per-task launch overrides (LHH-QUEUE-HOTRELOAD R6).  ``model`` is one
+    # model id, validated against the backend's live model list at enqueue;
+    # ``roles`` is a create_fleet_run-shaped per-role configuration dict
+    # (only the pins the caller supplied -- the trio's agent and defaults
+    # still flow at launch into every field the dict did not pin).  Both are
+    # None on legacy entries (old JSON loads them as the default) and both
+    # stay editable while the entry is pending; at launch the resolved model
+    # is written onto the run and locked -- a running run keeps the model it
+    # started with even if the trio default changes later (R7 wires the edit
+    # surface and the launch lock).  PgQueueStore has no columns for them
+    # yet (same in-memory-only gap as ``requester``; the file store, CT110's
+    # backend, persists them fully).
+    model: str | None = None
+    roles: dict[str, dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -306,6 +324,8 @@ class QueueEntry:
             "not_before",
             "wait_reason",
             "time_limit_minutes",
+            "model",
+            "roles",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -379,6 +399,185 @@ def _validate_trio(value: Any) -> str:
     if text not in _VALID_TRIOS:
         raise ValueError(f"trio must be one of: {', '.join(sorted(_VALID_TRIOS))}")
     return text
+
+
+# ---------------------------------------------------------------- R6 fields --
+# LHH-QUEUE-HOTRELOAD: per-task ``model`` override and per-role ``roles``
+# configuration on enqueue (persisted on the entry, editable while pending,
+# resolved and locked onto the run at launch).
+
+_MAX_MODEL_CHARS = 256
+
+# Refusal wording mirrors the R4 routes / R5 tools ("... refusing to write
+# unvalidated trios") so every enqueue surface reads the same.
+_LIVE_LIST_UNAVAILABLE = (
+    "the live model list is unavailable; refusing to enqueue an unvalidated model override"
+)
+
+
+def _validate_model_override(value: Any) -> str | None:
+    """The per-task ``model`` override: a bounded non-empty model id, or None.
+
+    Absent (``None`` or blank) carries no override -- the trio's model/launch
+    defaults apply exactly as before.  Live-list membership is checked
+    separately (``_validate_model_live``) so this shape check matches
+    ``POST /api/runs``' ``model`` bounds offline.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError("model must be a string")
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > _MAX_MODEL_CHARS:
+        raise ValueError("model is too long")
+    if "\x00" in text:
+        raise ValueError("model contains a NUL byte")
+    return text
+
+
+def _validate_roles_config(value: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
+    """Validate a dict-form ``roles`` against create_fleet_run's roles semantics.
+
+    Genuine reuse: the supervisor's ``_normalise_role_configs`` performs the
+    full validation the create-run API applies (object shape, role-key
+    allowlist, per-role field allowlist, agent choices, model/effort/profile
+    shapes, and the auditor read-only MCP rule), so a malformed dict is
+    refused at enqueue with the exact ``ValueError`` wording a direct
+    ``POST /api/runs`` would raise (422 on every enqueue surface).  A
+    placeholder global agent -- create_run's own documented default,
+    ``codex`` -- stands in for the trio's agent, which is only resolved at
+    launch: roles that omit ``agent`` inherit the launch-time agent exactly
+    like /api/runs roles inherit the request agent, and anything genuinely
+    agent-dependent is re-checked at launch through the same function.
+
+    Returns the caller's pins, cleaned (trimmed strings, empty entries
+    dropped), NOT the resolved output: storing resolved defaults here would
+    freeze today's trio/default values onto the entry and defeat the
+    hot-reload this work adds.  An empty dict (or one whose entries all
+    resolve to no pins) normalizes to None.
+    """
+
+    from .supervisor.service import _normalise_role_configs  # lazy: supervisor stack
+
+    _normalise_role_configs(value, agent="codex", model=None)
+    cleaned: dict[str, dict[str, Any]] = {}
+    for role, raw in value.items():
+        if not isinstance(raw, dict):
+            continue  # unreachable: _normalise_role_configs rejects non-objects
+        keep: dict[str, Any] = {}
+        for key in ("agent", "model", "reasoning_effort", "mcp_profile"):
+            item = raw.get(key)
+            if isinstance(item, str) and item.strip():
+                keep[key] = item.strip()
+        if keep:
+            cleaned[role] = keep
+    return cleaned or None
+
+
+def _live_models(model_fetch: Any) -> dict[str, Any] | None:
+    """The backend's live model list per agent, or ``None`` when unknown.
+
+    Same injectable seam as the R4 routes' ``live_models()`` and the R5
+    tools' ``_queue_admin_live_models``: ``model_fetch`` when given, else the
+    real catalog discovery.  The lazy import re-reads the module attribute
+    at call time, so tests patch ``model_catalog.discover_model_catalog``
+    (or pass a fake) and never touch the network; a broken provider yields
+    ``None`` (503 below), never an exception.
+    """
+
+    fetch = model_fetch
+    if fetch is None:
+        from .model_catalog import discover_model_catalog
+
+        fetch = discover_model_catalog
+    try:
+        catalogue = fetch()
+    except Exception:  # noqa: BLE001 - a broken provider must refuse writes, not crash
+        return None
+    if not isinstance(catalogue, dict):
+        return None
+    models = catalogue.get("models")
+    return models if isinstance(models, dict) else None
+
+
+def _service_unavailable(detail: str) -> Any:
+    """Carry the R4/R5 provider-down 503 through the existing enqueue surfaces.
+
+    The REST enqueue route maps ``ValueError`` to 422 and propagates
+    exceptions it does not know; an ``HTTPException`` here therefore answers
+    503 with no server.py change, and the MCP dispatcher maps the same
+    exception to an identical code-503 result.
+    """
+
+    from fastapi import HTTPException  # lazy: keeps the core module web-free at import
+
+    return HTTPException(status_code=503, detail=detail)
+
+
+def _validate_model_live(model: str, model_fetch: Any) -> None:
+    """Refuse a per-task ``model`` the backend's live model list does not know.
+
+    Membership is taken across every agent bucket: which agent will own the
+    model is decided at launch (the trio's agent), so enqueue can only ask
+    "is this id on the live list at all".
+    """
+
+    models = _live_models(model_fetch)
+    if models is None:
+        raise _service_unavailable(_LIVE_LIST_UNAVAILABLE)
+    known: set[str] = set()
+    for entries in models.values():
+        if isinstance(entries, list):
+            known.update(
+                str(entry.get("id")) for entry in entries if isinstance(entry, dict)
+            )
+    if model not in known:
+        raise ValueError(f"unknown model {model!r} in the live model list")
+
+
+def _enqueue_audit_store(settings_runtime: Any) -> tuple[Any, Any]:
+    """(settings store, error) for the enqueue-override audit row.
+
+    Defaults to the process-wide settings runtime exactly like the R4 admin
+    routes; an explicit ``settings_runtime`` (the MCP dispatcher's injectable
+    seam) wins.  A ``(None, error)`` result refuses the write (all-or-nothing
+    -- an override the audit log cannot record is never persisted).
+    """
+
+    if settings_runtime is not None:
+        return getattr(settings_runtime, "store", None), getattr(settings_runtime, "error", None)
+    from .settings_store import active_runtime  # lazy: the web process wires this at boot
+
+    runtime = active_runtime()
+    return getattr(runtime, "store", None), getattr(runtime, "error", None)
+
+
+_AUDIT_STORE_UNAVAILABLE = (
+    "the settings store is not configured; refusing to enqueue unaudited model/roles overrides"
+)
+
+
+def _audit_enqueue_overrides(
+    store: Any, *, actor: str, queue_id: str, model: Any, roles: Any
+) -> None:
+    """One settings-audit row per override-carrying enqueue.
+
+    Follows the R4/R5 convention: a single ``_audit`` write inside the
+    store's own ``_db`` transaction, keyed to the actor (the verified caller
+    stamp when one exists, else the entry's ``requested_by``), with the
+    before/after shape in the detail payload.
+    """
+
+    after = {
+        key: value
+        for key, value in {"model": model, "roles": roles}.items()
+        if value is not None
+    }
+    with store._db() as db:
+        store._audit(db, actor, "enqueue", f"queue_entry:{queue_id}", before=None, after=after)
 
 
 def _validate_max_rounds(value: Any) -> int:
@@ -654,6 +853,12 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
 
     ``requested_by`` stays required and its caller stamp wins over the block --
     the two are independent proofs.
+
+    LHH-QUEUE-HOTRELOAD (R6): ``roles`` as a string keeps its exact legacy
+    trio-alias behaviour; a dict form is a per-role configuration validated
+    with the create-run API's own normalizer.  ``model`` (shape-checked here)
+    and a roles dict persist on the entry; live-list membership for ``model``
+    and the settings-audit write happen in the store's ``create``.
     """
     # Rollout mode is read from the environment at call time (task 300).
     legacy = _queue_requester_mode() == "legacy"
@@ -675,7 +880,18 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         task = path.read_text(encoding="utf-8")
     task_text = _validate_task(task)
 
-    trio = body.get("roles") if "roles" in body else body.get("trio")
+    # ``roles``: a STRING is the legacy trio alias (the branch below is
+    # byte-identical to the pre-R6 behaviour, including the null shadowing
+    # of ``trio``); a DICT is a per-role configuration validated against
+    # create_fleet_run's roles semantics (LHH-QUEUE-HOTRELOAD R6) and does
+    # not alias the trio.
+    roles_raw = body.get("roles")
+    if isinstance(roles_raw, dict):
+        roles_config = _validate_roles_config(roles_raw)
+        trio = body.get("trio")
+    else:
+        roles_config = None
+        trio = body.get("roles") if "roles" in body else body.get("trio")
     branch = _validate_branch(body.get("branch"))
     continue_branch = _validate_continue_branch(body.get("continue_branch"))
     if branch and continue_branch:
@@ -724,6 +940,8 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "workspace": _validate_workspace(body.get("workspace")),
         "max_rounds": _validate_max_rounds(body.get("max_rounds")),
         "trio": _validate_trio(trio),
+        "model": _validate_model_override(body.get("model")),
+        "roles": roles_config,
         "priority": _validate_priority(body.get("priority")),
         "branch": branch,
         "continue_branch": continue_branch,
@@ -1037,8 +1255,29 @@ class QueueStore:
         payload = json.dumps(entry.to_dict(), ensure_ascii=False, sort_keys=True, indent=2)
         _atomic_bytes_write(self._path(entry.queue_id), payload.encode("utf-8"))
 
-    def create(self, body: dict[str, Any], *, observed_addr: str | None = None, verified_caller: str | None = None) -> QueueEntry:
+    def create(
+        self,
+        body: dict[str, Any],
+        *,
+        observed_addr: str | None = None,
+        verified_caller: str | None = None,
+        model_fetch: Any = None,
+        settings_runtime: Any = None,
+    ) -> QueueEntry:
         """Create a queue entry, de-duplicating by ``dedup_key`` when supplied.
+
+        LHH-QUEUE-HOTRELOAD (R6): a body carrying a ``model`` override is
+        validated against the backend's live model list through the
+        injectable ``model_fetch`` seam (defaulting to the real catalog,
+        exactly like the R4 admin routes; a provider that is down refuses
+        with a 503-shaped ``HTTPException``, an unknown id with
+        ``ValueError`` -> 422).  An override-carrying enqueue (``model``
+        and/or a ``roles`` dict) additionally writes one settings-audit row
+        after a successful write, and is refused up front when no settings
+        store can record it (all-or-nothing -- the audit row is part of the
+        change).  Enqueues without either override take none of these paths
+        and behave exactly as before: no fetch, no settings-store read, no
+        audit row.
 
         Idempotent-enqueue semantics: when ``dedup_key`` is a non-empty string
         and a non-terminal entry (``pending`` or ``launched``) with the same key
@@ -1074,6 +1313,19 @@ class QueueStore:
         requester = params.get("requester")
         if requester is not None:
             requester = _stamp_requester(requester, observed_addr=observed_addr, verified_caller=verified_caller)
+        # R6 preflight, before anything exists: live-list membership for the
+        # model override, and a settings store able to record the audit row.
+        # Both refusals happen before the dedup lookup too, so an override a
+        # caller could never use never resolves to an existing entry.
+        model = params.get("model")
+        roles = params.get("roles")
+        if model is not None:
+            _validate_model_live(model, model_fetch)
+        audit_store = None
+        if model is not None or roles is not None:
+            audit_store, store_error = _enqueue_audit_store(settings_runtime)
+            if audit_store is None:
+                raise _service_unavailable(store_error or _AUDIT_STORE_UNAVAILABLE)
         dedup_key = params.get("dedup_key")
         if dedup_key:
             existing = self._find_non_terminal_by_dedup(dedup_key)
@@ -1089,6 +1341,14 @@ class QueueStore:
             **{key: value for key, value in params.items() if key != "requester"},
         )
         self._write(entry)
+        if audit_store is not None:
+            _audit_enqueue_overrides(
+                audit_store,
+                actor=verified_caller or entry.requested_by or "enqueue",
+                queue_id=queue_id,
+                model=model,
+                roles=roles,
+            )
         return entry
 
     def _find_non_terminal_by_dedup(self, dedup_key: str) -> QueueEntry | None:
@@ -1297,7 +1557,9 @@ class QueueStore:
 
         # Create successor entry. The continuation opt-ins (branch /
         # continue_branch) carry over (task 233): a retried continuation
-        # task stays a continuation task, not a fresh one.
+        # task stays a continuation task, not a fresh one.  The R6 per-task
+        # overrides carry over too -- a retry of a task enqueued with a
+        # specific model/roles must not silently fall back to trio defaults.
         successor = QueueEntry(
             queue_id=f"q-{uuid.uuid4().hex[:16]}",
             name=entry.name,
@@ -1319,6 +1581,8 @@ class QueueStore:
             dedup_key=None,  # retries must not collide with original dedup_key
             requester=entry.requester,  # the retry carries the same requester identity
             time_limit_minutes=entry.time_limit_minutes,
+            model=entry.model,
+            roles=copy.deepcopy(entry.roles),
             not_before=float(not_before) if not_before is not None else None,
             wait_reason=str(wait_reason)[:64] if (not_before is not None and wait_reason) else None,
         )

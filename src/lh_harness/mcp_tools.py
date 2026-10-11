@@ -115,6 +115,17 @@ Accepted fields (all persisted on the queue entry):
   or 'hydra'. With per-caller scoping (task 174) the server stamps it from
   the verified caller identity; a client-supplied value is overridden.
 - base_check (string, optional): base commit/branch check guard.
+- model (string, optional): per-task model override. Must be on the
+  backend's live model list (the list list_trios/refresh_models show);
+  unknown models are refused and nothing is enqueued, and an unreachable
+  provider refuses the enqueue rather than writing it unvalidated. Editable
+  while the entry is pending; resolved and locked onto the run at launch.
+- roles (string or object, optional): a STRING is the legacy trio alias
+  (identical to trio). An OBJECT carries per-role configuration with the
+  create-run API's semantics: {"manager"|"executor"|"auditor": {agent?,
+  model?, reasoning_effort?, mcp_profile?}} -- only the fields you pin
+  override the trio defaults; unknown roles, fields, agents, or malformed
+  values are refused at enqueue. Editable while pending, locked at launch.
 
 - requester (object, required): structured identity block (task 300). Send
   kind, name, and host at minimum. When kind is 'ai' you must also send agent
@@ -467,6 +478,25 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                 "dedup_key": _string_param(
                     "Idempotent-enqueue key: same non-terminal key resolves to one queue entry, launched at most once.",
                 ),
+                # LHH-QUEUE-HOTRELOAD (R6): per-task launch overrides.  Both
+                # are forwarded only when actually supplied (an explicit null
+                # stays unforwarded, matching the pre-R6 body); both are
+                # validated by the store like every other field.
+                "model": _string_param(
+                    "Per-task model override: one model id from the backend's live model list "
+                    "(unknown ids and an unreachable provider are both refused). Editable while "
+                    "pending, locked onto the run at launch.",
+                    required=False,
+                ),
+                "roles": {
+                    "description": (
+                        "A STRING is the legacy trio alias (same as trio). An OBJECT carries per-role "
+                        "configuration (create-run API semantics): {'manager'|'executor'|'auditor': "
+                        "{'agent'?, 'model'?, 'reasoning_effort'?, 'mcp_profile'?}}; only pinned fields "
+                        "override the trio defaults. Editable while pending, locked at launch."
+                    ),
+                    "anyOf": [{"type": "string"}, {"type": "object"}],
+                },
                 "base_check": _string_param("Optional base commit/branch check guard.", required=False),
                 "time_limit_minutes": _optional_integer_param(
                     "Optional wall-clock limit in minutes (1-1440) from launch; the launcher stops the run "
@@ -727,11 +757,14 @@ def dispatch(
     overseer-state tools share the deployment's archive path.
 
     ``settings_runtime``/``model_fetch`` (LHH-QUEUE-HOTRELOAD R5) are the
-    injectable seams of the queue admin tools.  The WebAPI passes neither:
-    the tools then default to ``settings_store.active_runtime()`` (the same
-    store the R4 admin routes default to) and
-    ``model_catalog.discover_model_catalog`` (the same live-list fetch the R4
-    routes validate against), so tests can run fully offline.
+    injectable seams of the queue admin tools; R6 reuses the same pair for
+    ``harness_enqueue_task`` (live-list validation of a per-task ``model``
+    override and the settings-audit row behind override-carrying enqueues).
+    The WebAPI passes neither: the tools and the enqueue path then default to
+    ``settings_store.active_runtime()`` (the same store the R4 admin routes
+    default to) and ``model_catalog.discover_model_catalog`` (the same
+    live-list fetch the R4 routes validate against), so tests can run fully
+    offline.
     """
     # Auth parity with the REST boundary.
     if auth_token is not None and auth_token != (request_token or ""):
@@ -815,7 +848,13 @@ def dispatch(
     # REST routes' injected-table semantics.
     if caller_configs is None:
         if tool_name == "harness_enqueue_task":
-            return _enqueue(arguments, queue_store=queue_store, caller=None)
+            return _enqueue(
+                arguments,
+                queue_store=queue_store,
+                caller=None,
+                model_fetch=model_fetch,
+                settings_runtime=settings_runtime,
+            )
         if tool_name == "harness_list_queue":
             return _list_queue(arguments, queue_store=queue_store)
         if tool_name == "harness_run_status":
@@ -854,6 +893,8 @@ def dispatch(
             queue_store=queue_store,
             caller=caller,
             spec=specs.get(caller) if caller is not None else None,
+            model_fetch=model_fetch,
+            settings_runtime=settings_runtime,
         )
     if tool_name == "harness_list_queue":
         return _list_queue(arguments, queue_store=queue_store)
@@ -1145,6 +1186,8 @@ def _enqueue(
     queue_store: Any,
     caller: str | None = None,
     spec: dict[str, Any] | None = None,
+    model_fetch: Any = None,
+    settings_runtime: Any = None,
 ) -> dict[str, Any]:
     if queue_store is None:
         return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
@@ -1208,6 +1251,22 @@ def _enqueue(
         # fc-H2: validated by the store (int 1..1440 or omitted).
         "time_limit_minutes": arguments.get("time_limit_minutes"),
     }
+    # LHH-QUEUE-HOTRELOAD (R6): model/roles are forwarded ONLY when actually
+    # supplied.  An explicit null stays unforwarded (matching the pre-R6
+    # body), so the legacy "roles" string keeps its exact alias semantics in
+    # the store and calls without either override produce a byte-identical
+    # body.  A string roles is bounded like ``trio``; a dict passes through
+    # to the store's create-run-shaped validation.
+    raw_roles = arguments.get("roles")
+    if raw_roles is not None:
+        body["roles"] = (
+            _bounded(raw_roles, field="roles", max_chars=64)
+            if isinstance(raw_roles, str)
+            else raw_roles
+        )
+    raw_model = arguments.get("model")
+    if raw_model is not None:
+        body["model"] = _bounded(raw_model, field="model", max_chars=256)
     # Task 300: the requester block is passed through verbatim (validated by the
     # store) and stamped with the verified caller.  ``arguments["requester"]``
     # is the dict the client supplied; ``caller`` (the verified identity) is the
@@ -1216,11 +1275,19 @@ def _enqueue(
     # succeed.  AdditionalProperties=false in the schema keeps a non-dict
     # requester from reaching here unguarded.
     body["requester"] = arguments.get("requester")
+    from fastapi import HTTPException  # lazy: R6 503 carrier from the store
     try:
         entry = queue_store.create(
             body,
             verified_caller=caller,
+            model_fetch=model_fetch,
+            settings_runtime=settings_runtime,
         )
+    except HTTPException as exc:
+        # R6: provider-down / settings-store-down refusals carry the R4/R5
+        # 503 taxonomy through unchanged; the web route gets the same 503 by
+        # letting the exception propagate to FastAPI's own handler.
+        return {"ok": False, "error": exc.detail, "code": exc.status_code}
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "code": 422}
     result: dict[str, Any] = {"ok": True, "queue_id": entry.queue_id, "status": entry.status}
