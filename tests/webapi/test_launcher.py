@@ -100,6 +100,37 @@ def _base_entry(trio: str = "kimi", priority: int = 0, workspace: str = "./works
     }
 
 
+@pytest.mark.parametrize("lifecycle", ["incomplete", "failed", "cancelled"])
+def test_parent_wait_retains_same_queue_entry_only_for_clean_hold(tmp_path: Path, lifecycle: str):
+    root, store, supervisor = _fixture(tmp_path)
+    entry = store.create({**_base_entry(), "dedup_key": "parent-task"})
+    store.mark_launched(entry.queue_id, "run-parent")
+    supervisor.add_run("run-parent", entry.workspace, status=lifecycle)
+    report_dir = root / "run-parent" / "lh_harness"
+    report_dir.mkdir(parents=True)
+    (report_dir / "report.json").write_text(json.dumps({
+        "status": "incomplete", "completion_satisfied": False,
+        "abort_reason": "needs_parent_input",
+    }))
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config())
+    launcher._update_launched_entries({})
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.run_id == "run-parent"
+    assert updated.status == ("launched" if lifecycle == "incomplete" else "failed")
+    assert updated.wait_reason == ("needs_parent_input" if lifecycle == "incomplete" else None)
+    launcher._update_launched_entries({})
+    assert len(store.list()) == 1
+    assert supervisor.created == []
+    if lifecycle == "incomplete":
+        events = (report_dir / "role_orchestration" / "events.jsonl").read_text()
+        assert events.count('"queue.parent_wait"') == 1
+        assert store.create({**_base_entry(), "dedup_key": "parent-task"}).queue_id == entry.queue_id
+        supervisor._statuses["run-parent"]["status"] = "running"
+        launcher._update_launched_entries({"run-parent": {"status": "running"}})
+        assert store.get(entry.queue_id).wait_reason is None
+
+
 def test_launcher_launches_highest_priority_kimi(tmp_path: Path) -> None:
     root, store, supervisor = _fixture(tmp_path)
     config = default_queue_config()

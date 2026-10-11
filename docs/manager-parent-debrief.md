@@ -54,3 +54,22 @@ changed snapshot/round/task refusal, exact checkpoint reuse and original-budget
 preservation after a qualified answer.
 Two additional crash-window regressions failed before the enabled-boundary marker
 and latest-snapshot checks were added; the expanded 34-test Linux suite passes.
+
+## Queue lifecycle while waiting
+
+A clean `incomplete` worker report with `needs_parent_input` retains the existing
+launched queue item and run ID, with `wait_reason=needs_parent_input`. Its dedup key
+remains occupied. Launcher polls create no retry/replacement run and publish a
+waiting event when entering the state. Re-entry into an active worker clears the
+waiting projection; completion/failure then follows normal reconciliation. Failed,
+cancelled and time-limited workers are not converted into parent waits by a stale
+report. This does not authorize resume or supply an authenticated parent answer.
+
+The new queue regression failed before this change. All 99 selected Manager,
+resume, launcher, quota-backoff and occupancy tests passed in a fresh Linux
+environment installed from Harness's declared test dependencies. A shared
+Omnigent environment first yielded 98 passes and one existing key-health test
+failure; the unchanged launcher reproduced that failure because its optional
+HTTP client rejects the test's local file URL. No unrelated HTTP behavior was
+changed. Dedicated parent-wait UI controls and full delegated runtime wiring
+remain incomplete.
