@@ -1,6 +1,8 @@
 """Admin settings screen and key restriction view (``/api/admin/*``), plus the
 queue trio/capacity admin API (``/api/queue/trios``, ``/api/queue/capacity``)
-so queue defaults change at runtime from the same settings store.
+so queue defaults change at runtime from the same settings store, and the
+pending-task override edit (``PUT /api/queue/{queue_id}/model``) so one queued
+task's model/roles/trio can change while it waits.
 
 Who is an admin (all must hold, otherwise the request is refused):
 
@@ -333,6 +335,106 @@ def register_settings_routes(
                 if before != value:
                     store._audit(db, actor, "set", f"queue_capacity:{trio}", before=before, after=value)
         return {"ok": True, "capacity": store.queue_capacity()}
+
+    # ----------------------------- pending-task model/roles edit (R7) --
+    # LHH-QUEUE-HOTRELOAD (Paxton 2026-10-11): a queued task's model (and its
+    # trio/roles) stays EDITABLE while the entry is pending.  The edit below
+    # accepts the R6 per-task overrides with the exact semantics enqueue
+    # applies -- ``model`` is one id validated against the backend's LIVE
+    # model list (unknown -> 422, provider down -> 503, nothing written), and
+    # ``roles`` is a STRING trio alias (same validation as the legacy enqueue
+    # alias, so the trio is editable too) or an OBJECT of per-role
+    # configuration validated with create_fleet_run's own normalizer.
+    # ``null`` clears: ``model`` null/blank drops the override; ``roles``
+    # null drops the per-role configuration (the trio is only ever touched
+    # through the explicit string form).  The persisted entry is what the R3
+    # launcher re-reads on every scheduling pass, so the edit applies to the
+    # next launch with no restart.  Once the entry is no longer pending the
+    # resolved model belongs to the run and is LOCKED: the edit is refused
+    # with 409 (a state refusal, not a validation error) and a trio-default
+    # change can never alter a running run.  Every accepted change writes one
+    # settings-audit row (R4/R5 convention: ``_db`` + ``_audit``, before/
+    # after keyed to the verified admin identity).  The PgQueueStore
+    # override-persistence gap tracked for the gate applies here exactly as
+    # it does to R6 enqueue; the file store (CT110's backend) persists fully.
+    @app.put("/api/queue/{queue_id}/model")
+    def put_queue_entry_model(
+        queue_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        actor = require_admin(request, write=True)
+        rt = runtime()
+        assert rt.store is not None
+        queue_store = getattr(request.app.state, "queue_store", None)
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        unknown = set(body) - {"model", "roles"}
+        if unknown:
+            raise HTTPException(status_code=400, detail="unknown field(s): " + ", ".join(sorted(unknown)))
+        if "model" not in body and "roles" not in body:
+            raise HTTPException(status_code=422, detail="provide model and/or roles to edit")
+        try:
+            entry = queue_store.get(queue_id)
+        except ValueError:  # malformed queue id: the store refuses the path
+            entry = None
+        if entry is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        if entry.status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"cannot edit model/roles for status {entry.status}",
+            )
+        from .. import queue as _q  # lazy: the R6 override validators live with the entry semantics
+
+        # Every supplied value is validated BEFORE the entry is mutated, so a
+        # refused request leaves the entry and the audit log untouched.  The
+        # R6 helpers raise ValueError (422 here) and the 503 ``HTTPException``
+        # for a provider that is down, which FastAPI answers directly -- the
+        # R4/R5/R6 taxonomy, unchanged.
+        before: dict[str, Any] = {}
+        after: dict[str, Any] = {}
+        try:
+            if "model" in body:
+                cleaned_model = _q._validate_model_override(body.get("model"))
+                if cleaned_model is not None:
+                    _q._validate_model_live(cleaned_model, model_fetch)
+                before["model"] = entry.model
+                after["model"] = cleaned_model
+            if "roles" in body:
+                raw_roles = body.get("roles")
+                if raw_roles is None:
+                    before["roles"] = entry.roles
+                    after["roles"] = None
+                elif isinstance(raw_roles, str):
+                    before["trio"] = entry.trio
+                    after["trio"] = _q._validate_trio(raw_roles)
+                elif isinstance(raw_roles, dict):
+                    before["roles"] = entry.roles
+                    after["roles"] = _q._validate_roles_config(raw_roles)
+                else:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="roles must be a string trio alias or an object of per-role configuration",
+                    )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        changed = before != after
+        if changed:
+            for key, value in after.items():
+                setattr(entry, key, value)
+            queue_store.update(entry)
+            with rt.store._db() as db:
+                rt.store._audit(db, actor, "edit", f"queue_entry:{queue_id}", before=before, after=after)
+        return {
+            "ok": True,
+            "queue_id": queue_id,
+            "status": entry.status,
+            "changed": changed,
+            "model": entry.model,
+            "roles": entry.roles,
+            "trio": entry.trio,
+        }
 
     # The server registers its ``/api/queue/{queue_id}`` capture before this
     # function runs, and Starlette resolves routes in registration order (the
