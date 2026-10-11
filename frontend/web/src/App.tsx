@@ -818,6 +818,11 @@ export default function App() {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [runId, setRunId] = useState(readRunId);
   const [error, setError] = useState('');
+  // Form-like delivery feedback (2026-10-11): injections are accepted onto the
+  // control bus immediately but only CONSUMED at the next role/round boundary.
+  // The notice says so explicitly and clears at the boundary (active_role
+  // change), so operators stop re-sending messages that were already queued.
+  const [composerNotice, setComposerNotice] = useState('');
   const [dismissedFeedError, setDismissedFeedError] = useState('');
   const [instruction, setInstruction] = useState('');
   const [busy, setBusy] = useState(false);
@@ -860,6 +865,8 @@ export default function App() {
   const trajectoryRequest = useRef(0);
 
   const feed = useRunFeed(runId, authRevision);
+  const composerNoticeRole = feed.snapshot.active_role;
+  useEffect(() => { setComposerNotice(''); }, [composerNoticeRole]);
   const snapshot = feed.snapshot;
   const connection = feed.connection;
 
@@ -911,6 +918,11 @@ export default function App() {
   const composerCanSend = composerInteractive && Boolean(instruction.trim()) && Boolean(
     typedCommand ? commandOptions.some((item) => item.name === typedCommandName) : true,
   );
+  // How many operator messages are queued but not yet consumed by a role —
+  // the count the delivery notice surfaces so repeated sends are visible.
+  const queuedInstructionCount = (feed.snapshot.operator_messages ?? []).filter(
+    (message) => message.status === 'queued',
+  ).length;
   // Sending from a resumable run goes through the lifecycle call, which tracks
   // `controlBusy`; without it the send button stays live and fires twice.
   const composerBusy = busy || (composerResumes && controlBusy);
@@ -1227,7 +1239,18 @@ export default function App() {
     setInstruction('');
     feed.appendOperatorMessage({ id: requestKey, text: messageText, created_at: createdAt, status: 'queued' });
     try {
-      await postInstruction(runId, messageText, requestKey);
+      const resp = await postInstruction(runId, messageText, requestKey);
+      // Form-like feedback (2026-10-11): the injection is ACCEPTED onto the
+      // control bus but is only CONSUMED at the next role/round boundary —
+      // the active role never pauses mid-episode. Say so explicitly, with the
+      // queue depth, instead of silently clearing the composer (operators
+      // re-sent the same message because nothing acknowledged delivery).
+      const role = resp?.delivery?.active_role || snapshot?.active_role || null;
+      const depth = (feed.snapshot.operator_messages ?? []).filter((message) => message.status === 'queued').length;
+      setComposerNotice(text(
+        `已排队：${role ? `${role} 阶段` : '工作进程'}不会暂停，操作消息在下个阶段边界读取${depth > 1 ? `（当前待读取 ${depth} 条）` : ''}`,
+        `Queued — the ${role ? `${role} stage` : 'worker'} does not pause mid-episode; operator messages are read at the next stage boundary${depth > 1 ? ` (${depth} queued)` : ''}`,
+      ));
     } catch (reason) {
       feed.appendOperatorMessage({ id: requestKey, text: messageText, created_at: createdAt, status: 'failed' });
       setError(String(reason));
@@ -1467,7 +1490,7 @@ export default function App() {
 
         {signInRequired && <div className="error-line" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{text('登录会话已过期，请重新登录。', 'Your sign-in session has expired. Sign in again to continue.')}<button onClick={() => window.location.reload()}>{text('重新登录', 'Sign in')}</button></div>}
         {!signInRequired && visibleError && <div className="error-line" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{visibleError}<button onClick={() => { setError(''); setDismissedFeedError(feed.error); }}>{text('关闭', 'Dismiss')}</button></div>}
-        <div className={`composer-wrap ${composerInteractive ? '' : 'composer-disabled'}`}><textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void sendInstruction(); } }} placeholder={composerPlaceholder} disabled={composerBusy || !composerInteractive} /><div className="composer-footer"><span>{composerFooter}{composerInteractive && <> · <kbd>⌘</kbd><kbd>↵</kbd> {text('发送', 'Send')}</>}</span><button onClick={() => void sendInstruction()} disabled={composerBusy || !composerCanSend}>{text('发送', 'Send')}</button></div></div>
+        <div className={`composer-wrap ${composerInteractive ? '' : 'composer-disabled'}`}><textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void sendInstruction(); } }} placeholder={composerPlaceholder} disabled={composerBusy || !composerInteractive} />{composerNotice && <div className="composer-notice" role="status">{composerNotice}</div>}<div className="composer-footer"><span>{composerFooter}{composerInteractive && <> · <kbd>⌘</kbd><kbd>↵</kbd> {text('发送', 'Send')}</>}</span><button onClick={() => void sendInstruction()} disabled={composerBusy || !composerCanSend}>{text('发送', 'Send')}</button></div></div>
       </main>
 
       {mobileStatusOpen && <button type="button" className="status-mobile-backdrop" onClick={() => setMobileStatusOpen(false)} aria-label={text('关闭任务状态', 'Close task status')} />}

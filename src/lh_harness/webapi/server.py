@@ -3522,11 +3522,31 @@ def create_app(
         # Operator interactions change operator_messages and possibly approvals,
         # so the next REST/WS snapshot must not reuse a stale cache.
         snapshot_cache.invalidate(run_id)
+        # Form-like feedback (2026-10-11): tell the client WHEN the message will
+        # be consumed. Injections ride the control bus and are read by the
+        # worker at the next role/round boundary — the active role never pauses
+        # mid-episode (the fleet window used to clear the composer with zero
+        # feedback, so operators sent the same message repeatedly).
+        try:
+            snap = _snapshot_for(registry, state_for_run, run_id)
+        except Exception:
+            snap = {}
+        active_role = None
+        if isinstance(snap, dict):
+            active_role = snap.get("active_role")
         return {
             "ok": True,
             "status": "accepted",
             "idempotency_key": _bounded_command_id(request.headers.get("Idempotency-Key")),
             "revision": state_for_run.control_bus.revision(),
+            "delivery": {
+                "consumed_at": "next_stage_boundary",
+                "active_role": active_role,
+                "note": (
+                    "operator messages are read by the worker at the next role/round "
+                    "boundary; the active role does not pause mid-episode"
+                ),
+            },
         }
 
     @app.post("/api/runs/{run_id}/approvals/{approval_id}/resolve")
