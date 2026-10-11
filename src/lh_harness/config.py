@@ -336,7 +336,7 @@ auditor = 300
 # qwen_max = 1          # concurrent qwen runs allowed (QA only, one at a time)
 # orfree_max = 2        # concurrent orfree runs (only used when the trio is defined)
 # glm_max = 1           # concurrent glm runs (only used when the trio is defined)
-# zai_max = 1           # concurrent zai runs (only used when the trio is defined)
+# zai_max = 5           # concurrent zai runs (only used when the trio is defined)
 # min_healthy_keys = 2  # healthy Ollama Cloud keys required before kimi launches
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
@@ -725,7 +725,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "qwen_max": 1,
         "orfree_max": 2,
         "glm_max": 1,
-        "zai_max": 1,
+        "zai_max": 5,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,

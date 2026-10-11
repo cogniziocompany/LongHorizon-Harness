@@ -187,7 +187,7 @@ Capacity is configured under `[queue.capacity]`:
 | `qwen_max` | 1 | Concurrent qwen runs allowed (QA only, one at a time) |
 | `orfree_max` | 2 | Concurrent orfree runs allowed. Only used when `[queue.trios.orfree]` is defined (see below) |
 | `glm_max` | 1 | Concurrent glm runs allowed. Only used when `[queue.trios.glm]` is defined (see below) |
-| `zai_max` | 1 | Concurrent zai runs allowed. Only used when `[queue.trios.zai]` is defined (see below) |
+| `zai_max` | 5 | Concurrent zai runs allowed. Only used when `[queue.trios.zai]` is defined (see below) |
 | `min_healthy_keys` | 2 | Healthy Ollama Cloud keys required before kimi launches |
 | `key_health_url` | `""` | URL that returns `{ "healthy_keys": [{"healthy": true}, ...] }` |
 | `poll_seconds` | 15 | Launcher poll interval |
@@ -619,7 +619,7 @@ model = "glm-5.3:zai"
 mcp_profile = "ops"
 
 [queue.capacity]
-zai_max = 1
+zai_max = 5
 ```
 
 Before defining it on a node, check that the node's gateway key is allowed `glm-5.3:zai`. On

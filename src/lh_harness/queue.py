@@ -785,7 +785,7 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         # Only consulted when [queue.trios.glm] is defined (Ollama Cloud glm-5.3).
         "glm_max": 1,
         # Only consulted when [queue.trios.zai] is defined (direct z.ai coding plan).
-        "zai_max": 1,
+        "zai_max": 5,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,

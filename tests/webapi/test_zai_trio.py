@@ -17,7 +17,7 @@ ZAI_TRIO = {"agent": "claude_code", "model": "glm-5.3:zai", "mcp_profile": "ops"
 def test_zai_is_not_a_default_trio_but_has_a_default_cap() -> None:
     config = default_queue_config()
     assert "zai" not in config["trios"]
-    assert config["capacity"]["zai_max"] == 1
+    assert config["capacity"]["zai_max"] == 5
 
 
 def test_enqueue_accepts_zai() -> None:

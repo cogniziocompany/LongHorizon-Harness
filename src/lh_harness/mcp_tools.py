@@ -108,7 +108,7 @@ Rules:
   requests/day per key, and the upstream provider may log prompts. Never send
   customer data or secret-bearing work to it. It launches only on a node whose
   config defines [queue.trios.orfree]; elsewhere the entry stays pending.
-- trio "zai" runs dev work on the direct z.ai coding plan (zai_max, default 1).
+- trio "zai" runs dev work on the direct z.ai coding plan (zai_max, default 5).
   It is an additional option and never replaces another trio. It launches only
   on a node whose config defines [queue.trios.zai]; elsewhere the entry stays
   pending.
