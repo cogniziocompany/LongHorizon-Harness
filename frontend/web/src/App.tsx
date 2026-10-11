@@ -1602,6 +1602,69 @@ function localizedContention(contention: { severity: string; peers: Array<{ run_
   return { title, body };
 }
 
+/**
+ * LHH-QUEUE-HOTRELOAD (R12): the launch-locked model/roles on the run page.
+ *
+ * The snapshot's ``run.model`` / ``run.role_configs`` are projected from the
+ * supervisor's owner record — exactly the state the launch resolved and
+ * locked (R8).  This section reads ONLY that record: it never consults the
+ * live meta model list or the current trio defaults, so a later queue
+ * settings change cannot alter what a launched run displays, and nothing
+ * here is editable.  ``model: null`` is itself recorded state ("the run
+ * followed the agent/provider default"); a genuinely absent field (older
+ * run records) renders nothing rather than implying a model the owner
+ * record does not carry — in particular it never falls back to the current
+ * trio default, which would falsely suggest the running run follows trio
+ * edits.
+ */
+const LOCKED_ROLE_ORDER = ['manager', 'executor', 'auditor'] as const;
+type LockedRoleKey = (typeof LOCKED_ROLE_ORDER)[number];
+
+function lockedRoleConfig(value: unknown): { agent: string; model: string } | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const agent = typeof record.agent === 'string' ? record.agent.trim() : '';
+  const model = typeof record.model === 'string' ? record.model.trim() : '';
+  if (!agent && !model) return null;
+  return { agent, model };
+}
+
+export function LockedLaunchModelSection({ run }: { run: Snapshot['run'] }) {
+  const { text } = useUiLanguage();
+  // ``undefined`` = nothing recorded; ``null`` = recorded "provider default";
+  // a non-empty string = the model the launch resolved and locked.
+  const launchModel: string | null | undefined =
+    typeof run.model === 'string' && run.model.trim() ? run.model.trim() : run.model === null ? null : undefined;
+  const recordedRoles = LOCKED_ROLE_ORDER
+    .map((role) => ({ role, config: lockedRoleConfig(run.role_configs?.[role]) }))
+    .filter((item): item is { role: LockedRoleKey; config: { agent: string; model: string } } => item.config !== null);
+  if (launchModel === undefined && recordedRoles.length === 0) return null;
+  const modelLabel = launchModel === null ? text('跟随 agent/provider 默认（未选择模型）', 'Agent/provider default (no model selected)') : launchModel;
+  return (
+    <section className="status-section" data-testid="locked-launch-model">
+      <div className="status-section-title"><span>{text('模型（启动时锁定）', 'Model (locked at launch)')}</span><small>{text('只读', 'Read-only')}</small></div>
+      <div className="status-role-list">
+        {modelLabel && (
+          <div className="status-role-row" data-testid="locked-launch-model-value">
+            <div className="status-role-copy">
+              <div><strong>{modelLabel}</strong><span className="role-status-text phase-done">{text('已锁定', 'Locked')}</span></div>
+              <small>{text('启动时解析并锁定；之后修改队列默认值不影响本次运行。', 'Resolved and locked at launch; later trio default changes do not affect this run.')}</small>
+            </div>
+          </div>
+        )}
+        {recordedRoles.map(({ role, config }) => (
+          <div className="status-role-row" key={role} data-testid={`locked-launch-role-${role}`}>
+            <div className="status-role-copy">
+              <div><strong>{roleTitle(role)}</strong><span className="role-status-text phase-done">{text('已锁定', 'Locked')}</span></div>
+              <small>{[config.agent, config.model].filter(Boolean).join(' · ')}</small>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function StatusPanel({ view, snapshot, connection, mobileOpen, onMobileClose, onDetails }: { view: StatusView; snapshot: Snapshot; connection: string; mobileOpen: boolean; onMobileClose: () => void; onDetails: () => void }) {
   const { language, text } = useUiLanguage();
   const hasRun = Boolean(view.runId && view.task.trim());
@@ -1646,6 +1709,7 @@ function StatusPanel({ view, snapshot, connection, mobileOpen, onMobileClose, on
   return <aside className={`status-panel ${mobileOpen ? 'mobile-open' : ''}`} aria-label={text('任务状态面板', 'Task status panel')} aria-live="polite">
     <div className="status-panel-head"><div><span className="status-eyebrow">RUN STATUS</span><h2>{text('任务状态', 'Task status')}</h2></div><div className="status-panel-head-actions"><span className={`status-panel-dot phase-${view.status} connection-${hasRun ? connection : 'idle'}`} title={`${localized} · ${connectionLabel}`} /><button className="status-mobile-close" onClick={onMobileClose} aria-label={text('关闭任务状态', 'Close task status')}><X size={16} /></button></div></div>
     <div className="status-overview"><div className="status-overview-line"><strong>{localized}</strong><span>{connectionLabel}</span></div><p>{view.taskSummary || text('尚未选择任务', 'No task selected')}</p><div className={`status-progress status-progress-${view.status}`}><i style={{ width: `${percent}%` }} /></div><div className="status-progress-meta"><span>{executionStages.length ? text(`${percent}% 全局 · ${resultLabel}${totalCount ? ` · 本轮 ${doneCount}/${totalCount}` : ''}`, `${percent}% overall · ${resultLabel}${totalCount ? ` · This round ${doneCount}/${totalCount}` : ''}`) : hasRun ? text('等待第一轮', 'Waiting for the first round') : text('尚未开始', 'Not started')}</span><span>{roundLabel}</span></div></div>
+    {hasRun && <LockedLaunchModelSection run={snapshot.run} />}
     <section className="status-section"><div className="status-section-title"><span>{text('本轮执行链', 'Execution chain')}</span><small>{totalCount ? `${doneCount}/${totalCount}` : '—'}</small></div>{stages.length ? <ol className="status-stage-list">{stages.filter((stage) => stage.key !== 'record').map((stage) => <li className={`status-stage stage-${stage.status}`} key={stage.id}><span className="stage-marker">{stage.status === 'done' ? <Check size={10} /> : stage.status === 'failed' ? <X size={10} /> : stage.status === 'active' || stage.status === 'stopping' ? <LoaderCircle className="trajectory-spinner" size={10} /> : stage.status === 'waiting' ? <CircleDotDashed size={10} /> : stage.status === 'blocked' ? <AlertTriangle size={10} /> : <Circle size={8} />}</span><div><strong>{stage.label}</strong><small>{localizedStageStatus(stage.status, language)}</small></div></li>)}</ol> : <p className="status-empty-copy">{text('暂无轮次结果；任务开始后会在这里显示每个阶段。', 'No round results yet. Each stage will appear here after the task starts.')}</p>}</section>
     <section className="status-section"><div className="status-section-title"><span>{text('下一步', 'Next step')}</span><small>{round ? (view.activeRound !== null ? `R${round.round}` : text(`最近 R${round.round}`, `Latest R${round.round}`)) : '—'}</small></div><div className="status-next-step"><span className="status-next-icon"><ArrowRight size={13} /></span><div><strong>{nextStep}</strong><p>{nextDetail}</p></div></div></section>
     {hasRun && <section className="status-section"><div className="status-section-title"><span>{text('角色输出', 'Role output')}</span><small>{roleItems.length}</small></div><div className="status-role-list">{roleItems.map((role) => <div className="status-role-row" key={role.key}><span className={`role-marker phase-${role.status}`}>{role.key === 'manager' ? 'M' : role.key === 'executor' ? 'E' : 'A'}</span><div className="status-role-copy"><div><strong>{role.label}</strong><span className={`role-status-text phase-${role.status}`}>{roleState(role.status)}</span></div><small><ExpandableText text={localizedRoleSummary(role, language)} lines={2} /></small></div></div>)}</div></section>}
