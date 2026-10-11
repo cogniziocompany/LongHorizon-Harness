@@ -52,12 +52,51 @@ def test_same_dedup_key_yields_one_entry(tmp_path: Path) -> None:
 def test_no_dedup_key_mints_unique_ids(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     store = QueueStore(root)
-    a = store.create(_payload())
-    b = store.create(_payload())
+    a = store.create(_payload(name="dedup-one"))
+    b = store.create(_payload(name="dedup-two"))
     assert a.queue_id != b.queue_id
     assert a.dedup_key is None
     assert b.dedup_key is None
     assert len(store.list()) == 2
+
+
+def test_same_name_without_dedup_key_is_refused(tmp_path: Path) -> None:
+    """Form-like intake (2026-10-11): one live copy per task name.
+
+    The fleet window showed the same task parked twice on different trios
+    because nothing enforced this; a non-terminal duplicate is now a refusal
+    that names the existing entry, not a silent second entry.
+    """
+    from lh_harness.queue import DuplicateQueueEntryError
+
+    root = _fixture(tmp_path)
+    store = QueueStore(root)
+    first = store.create(_payload(name="E2E-QUAR-EXPIRY-1013"))
+    with pytest.raises(DuplicateQueueEntryError) as excinfo:
+        store.create(_payload(name="  e2e-quar-expiry-1013  "))
+    assert excinfo.value.existing.queue_id == first.queue_id
+    assert len(store.list()) == 1
+
+
+def test_terminal_entry_frees_the_name(tmp_path: Path) -> None:
+    """A failed/done entry does not block a same-name re-enqueue (retry path)."""
+    root = _fixture(tmp_path)
+    store = QueueStore(root)
+    first = store.create(_payload(name="retry-me"))
+    store.mark_failed(first.queue_id, reason="provider_5xx")
+    second = store.create(_payload(name="retry-me"))
+    assert second.queue_id != first.queue_id
+    assert len(store.list()) == 2
+
+
+def test_reslice_names_never_collide(tmp_path: Path) -> None:
+    """The re-slice convention (<task>-a/-b) stays distinct under normalization."""
+    root = _fixture(tmp_path)
+    store = QueueStore(root)
+    store.create(_payload(name="OVERSEER-LEDGER-1"))
+    store.create(_payload(name="OVERSEER-LEDGER-1a"))
+    store.create(_payload(name="OVERSEER-LEDGER-1b"))
+    assert len(store.list()) == 3
 
 
 def test_distinct_dedup_keys_create_distinct_entries(tmp_path: Path) -> None:
@@ -118,13 +157,30 @@ def test_dedup_survives_restart_read(tmp_path: Path) -> None:
 
 
 def test_empty_dedup_key_behaves_as_no_key(tmp_path: Path) -> None:
+    """Empty/whitespace dedup_key behaves as keyless: unique ids, key None.
+
+    Since the 2026-10-11 form-like intake, keyless same-name enqueues are
+    REFUSED (one live copy per task name), so this test uses distinct names to
+    exercise the no-key path.
+    """
     root = _fixture(tmp_path)
     store = QueueStore(root)
-    a = store.create(_payload(dedup_key="   "))
-    b = store.create(_payload(dedup_key=""))
+    a = store.create(_payload(name="empty-key-a", dedup_key="   "))
+    b = store.create(_payload(name="empty-key-b", dedup_key=""))
     assert a.queue_id != b.queue_id
     assert a.dedup_key is None
     assert b.dedup_key is None
+    assert len(store.list()) == 2
+
+
+def test_distinct_dedup_keys_allow_same_name(tmp_path: Path) -> None:
+    """Explicit distinct dedup_keys are deliberate parallel work (task 233):
+    the name-duplicate refusal applies only to keyless enqueues."""
+    root = _fixture(tmp_path)
+    store = QueueStore(root)
+    a = store.create(_payload(dedup_key="key-a"))
+    b = store.create(_payload(name="  DEDUP  ", dedup_key="key-b"))
+    assert a.queue_id != b.queue_id
     assert len(store.list()) == 2
 
 

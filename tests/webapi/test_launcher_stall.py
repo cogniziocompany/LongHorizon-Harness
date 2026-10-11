@@ -63,10 +63,14 @@ def _service_types(root: Path) -> list[str]:
     return [ev.get("type") for ev in _service_events(root)]
 
 
+_NAME_SEQ = {"n": 0}
+
+
 def _entry(store: QueueStore, workspace: Path) -> Any:
+    _NAME_SEQ["n"] += 1
     return store.create(
         {
-            "name": "task",
+            "name": f"task {_NAME_SEQ['n']}",
             "task": "do something",
             "workspace": str(workspace),
             "trio": "kimi",

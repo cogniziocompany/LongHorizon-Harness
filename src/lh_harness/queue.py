@@ -147,6 +147,36 @@ class UnknownQueueFieldError(ValueError):
     the key names in the message.
     """
 
+
+class DuplicateQueueEntryError(ValueError):
+    """A non-terminal entry with the same normalized task name already exists.
+
+    Raised by ``create`` when the request carries no ``dedup_key`` (or the key
+    did not collide) but a ``pending``/``launched``/``blocked`` entry with the
+    same normalized name is already parked in the queue. The enqueue is refused
+    — NOT silently deduplicated — so the caller learns the work is already
+    queued and can decide: cancel the old entry, wait for it to finish, or
+    enqueue under a new name (the re-slice convention: ``<task>-a``, ``-b`` …).
+    Carries the existing entry as ``existing`` for the API's 409 body.
+    """
+
+    def __init__(self, existing: "QueueEntry"):
+        super().__init__(
+            f"non-terminal entry {existing.queue_id} already exists with name {existing.name!r}"
+        )
+        self.existing = existing
+
+
+def normalize_task_name(name: Any) -> str:
+    """Canonical form of a task name for duplicate detection.
+
+    Whitespace collapsed, case-folded, capped at 120 chars — so
+    ``# E2E-QUAR-EXPIRY-1013`` and ``e2e-quar-expiry-1013`` collide but
+    ``TASK-a`` / ``TASK-b`` re-slices never do.
+    """
+    return " ".join(str(name or "").split()).strip().lower()[:120]
+
+
 # Allowed queue-entry state transitions. Keyed by (from, to); the value is the
 # operation that performs the move. Read-only edges ("update (record_...)") are
 # not a first-class QueueStore method: they are applied by the launcher by
@@ -1083,6 +1113,20 @@ class QueueStore:
             existing = self._find_non_terminal_by_dedup(dedup_key)
             if existing is not None:
                 return existing
+        # Form-like intake (2026-10-11): with no dedup_key collision, a
+        # non-terminal entry with the SAME normalized task name is a refused
+        # duplicate — the fleet window showed the same task parked twice on
+        # different trios because nothing enforced one-live-copy-per-name.
+        # Terminal entries never collide (retries/re-slices re-enqueue freely);
+        # distinct names never collide even when they share a prefix.
+        # An EXPLICIT (non-empty) dedup_key marks deliberate orchestrator work
+        # (task 233): after the key check above passes, the name check is
+        # skipped — distinct keys on one name are intentional parallel work.
+        name = params.get("name")
+        if name and not dedup_key:
+            dup = self._find_non_terminal_by_name(name)
+            if dup is not None:
+                raise DuplicateQueueEntryError(dup)
         queue_id = f"q-{uuid.uuid4().hex[:16]}"
         now = _now()
         entry = QueueEntry(
@@ -1099,6 +1143,16 @@ class QueueStore:
         """Return the non-terminal entry currently holding ``dedup_key``, if any."""
         for entry in self.list():
             if entry.dedup_key == dedup_key and entry.status in _NON_TERMINAL_STATUS:
+                return entry
+        return None
+
+    def _find_non_terminal_by_name(self, name: str) -> QueueEntry | None:
+        """Return the non-terminal entry whose normalized name matches, if any."""
+        wanted = normalize_task_name(name)
+        if not wanted:
+            return None
+        for entry in self.list():
+            if entry.status in _NON_TERMINAL_STATUS and normalize_task_name(entry.name) == wanted:
                 return entry
         return None
 

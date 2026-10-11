@@ -26,15 +26,20 @@ from lh_harness.config import ProjectConfigError, _flatten_queue_table
 from lh_harness.launcher import Launcher
 from lh_harness.queue import QueueStore, queue_config_from_config
 
-_BODY = {
-    "name": "limited task",
-    "task": "do the thing",
-    "workspace": "./workspace",
-    "max_rounds": 5,
-    "trio": "kimi",
-    "priority": 0,
-    "requested_by": "ci",
-}
+_NAME_SEQ = {"n": 0}
+
+
+def _body() -> dict:
+    _NAME_SEQ["n"] += 1
+    return {
+        "name": f"limited task {_NAME_SEQ['n']}",
+        "task": "do the thing",
+        "workspace": "./workspace",
+        "max_rounds": 5,
+        "trio": "kimi",
+        "priority": 0,
+        "requested_by": "ci",
+    }
 
 _CONFIG = {
     "trios": {"kimi": {"agent": "codex", "model": None, "mcp_profile": None}},
@@ -55,26 +60,26 @@ def _store(tmp_path: Path) -> tuple[QueueStore, Path]:
 def test_enqueue_rejects_bad_time_limit(tmp_path: Path, bad: Any) -> None:
     store, _ = _store(tmp_path)
     with pytest.raises(ValueError, match="time_limit_minutes"):
-        store.create({**_BODY, "time_limit_minutes": bad})
+        store.create({**_body(), "time_limit_minutes": bad})
 
 
 @pytest.mark.parametrize("good", [1, 60, 1440])
 def test_enqueue_accepts_and_persists_time_limit(tmp_path: Path, good: int) -> None:
     store, root = _store(tmp_path)
-    entry = store.create({**_BODY, "time_limit_minutes": good})
+    entry = store.create({**_body(), "time_limit_minutes": good})
     assert entry.time_limit_minutes == good
     assert QueueStore(root).get(entry.queue_id).time_limit_minutes == good
 
 
 def test_enqueue_without_time_limit_is_unlimited(tmp_path: Path) -> None:
     store, _ = _store(tmp_path)
-    entry = store.create(dict(_BODY))
+    entry = store.create(dict(_body()))
     assert entry.time_limit_minutes is None
 
 
 def test_requeue_carries_the_limit(tmp_path: Path) -> None:
     store, _ = _store(tmp_path)
-    entry = store.create({**_BODY, "time_limit_minutes": 45})
+    entry = store.create({**_body(), "time_limit_minutes": 45})
     store.mark_failed(entry.queue_id, "provider_rate_limit")
     successor = store.requeue(entry.queue_id, "provider_rate_limit")
     assert successor is not None and successor.time_limit_minutes == 45
@@ -120,7 +125,7 @@ class _Supervisor:
 
 
 def _launched(store: QueueStore, sup: _Supervisor, run_id: str, *, minutes_ago: float, limit: int | None) -> str:
-    body = dict(_BODY)
+    body = dict(_body())
     if limit is not None:
         body["time_limit_minutes"] = limit
     entry = store.create(body)
@@ -232,7 +237,7 @@ def _app(tmp_path: Path):
     dashboard = DashboardState(root / "run-a" / "lh_harness", runs_root=root, control_enabled=False)
     app = create_app(state=dashboard, runs_root=root, run_id="run-a", supervisor=supervisor)
     store = QueueStore(root, {})
-    entry = store.create({**_BODY, "time_limit_minutes": 30})
+    entry = store.create({**_body(), "time_limit_minutes": 30})
     store.mark_launched(entry.queue_id, "run-a")
     return TestClient(app), store, entry.queue_id, root
 
