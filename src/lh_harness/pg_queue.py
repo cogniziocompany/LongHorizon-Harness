@@ -59,6 +59,12 @@ _COLUMN_NOT_BEFORE = "not_before"
 _COLUMN_WAIT_REASON = "wait_reason"
 # Per-task wall-clock limit (task fc-H2, migration 006).
 _COLUMN_TIME_LIMIT_MINUTES = "time_limit_minutes"
+# Per-task launch overrides (LHH-QUEUE-HOTRELOAD R6, persisted in R9): ``model``
+# is one validated model id; ``roles`` is the create_fleet_run-shaped per-role
+# pin set (a dict; the legacy string form of ``roles`` is the trio alias and
+# lands in the ``trio`` column instead).  See _MIGRATION_TASK_OVERRIDES_SQL.
+_COLUMN_MODEL = "model"
+_COLUMN_ROLES = "roles"
 # ``requester`` (task 300) still has no column; see ``create``.
 _QUEUE_COLUMNS = (
     _COLUMN_QUEUE_ID,
@@ -87,7 +93,24 @@ _QUEUE_COLUMNS = (
     _COLUMN_NOT_BEFORE,
     _COLUMN_WAIT_REASON,
     _COLUMN_TIME_LIMIT_MINUTES,
+    _COLUMN_MODEL,
+    _COLUMN_ROLES,
 )
+
+# LHH-QUEUE-HOTRELOAD R9: the two per-task override columns, applied in-code
+# (the round's one-source-file budget keeps the statements next to the column
+# list rather than in a migrations/*.sql file).  Same ADD COLUMN IF NOT EXISTS
+# pattern as migrations 005/006: a no-op once the columns exist, existing rows
+# read back NULL, exactly how the file store loads an entry written before the
+# fields existed (both are ``None`` on legacy entries).
+_MIGRATION_TASK_OVERRIDES_SQL = """\
+-- LHH-QUEUE-HOTRELOAD R9: per-task launch overrides (model/roles) on the
+-- Postgres queue backend, mirroring the file store's persistence of
+-- QueueEntry.model / QueueEntry.roles (queue.py R6).
+ALTER TABLE harness.queue
+    ADD COLUMN IF NOT EXISTS model VARCHAR(256),
+    ADD COLUMN IF NOT EXISTS roles JSONB;
+"""
 
 # Same bound the file store applies in ``QueueStore.requeue``.
 _MAX_WAIT_REASON_CHARS = 64
@@ -111,6 +134,20 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
     time_limit = getattr(entry, "time_limit_minutes", None)
     if isinstance(time_limit, bool) or not isinstance(time_limit, int) or time_limit < 1:
         time_limit = None
+    # R9 per-task launch overrides.  ``model`` is stored as-validated at
+    # enqueue/edit (persistence never re-validates against the live list, so
+    # a queued task survives a changing gateway list); the shape guard only
+    # keeps a hand-built entry from writing a non-string.  ``roles`` is the
+    # dict pin set serialised like ``skip_reasons`` (``json.dumps`` into the
+    # JSONB column), ``None`` when the entry carries no pins -- an empty dict
+    # is kept verbatim so the file store's on-disk shape round-trips 1:1.
+    model = getattr(entry, "model", None)
+    if not isinstance(model, str) or not model.strip():
+        model = None
+    else:
+        model = model.strip()
+    roles = getattr(entry, "roles", None)
+    roles_json = json.dumps(roles) if isinstance(roles, dict) else None
     return [
         entry.queue_id,
         entry.name,
@@ -138,6 +175,8 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         float(not_before) if not_before is not None else None,
         wait_reason,
         time_limit,
+        model,
+        roles_json,
     ]
 
 
@@ -260,6 +299,12 @@ class PgQueueStore:
             with self._txn() as txn:
                 for sql in self._read_migrations():
                     txn.execute(sql)
+                # LHH-QUEUE-HOTRELOAD R9: the per-task override columns are
+                # applied in-code (see _MIGRATION_TASK_OVERRIDES_SQL) inside
+                # the same single committed unit as the file migrations, so a
+                # store connect can never leave a schema that accepts the old
+                # columns but not the new ones.
+                txn.execute(_MIGRATION_TASK_OVERRIDES_SQL)
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"migration failed: {exc}") from exc
@@ -323,6 +368,8 @@ class PgQueueStore:
         *,
         observed_addr: str | None = None,
         verified_caller: str | None = None,
+        model_fetch: Any = None,
+        settings_runtime: Any = None,
     ) -> QueueEntry:
         """Create a queue entry, de-duplicating by ``dedup_key`` when supplied.
 
@@ -333,14 +380,46 @@ class PgQueueStore:
         persisted: ``harness.queue`` has no requester column, so a re-read loads
         ``requester=None``.  Adding the column is a schema migration tracked as
         follow-up work; the file store (CT110's backend) persists it fully.
+
+        LHH-QUEUE-HOTRELOAD (R6 enqueues, R9 persistence): the per-task
+        ``model``/``roles`` overrides go through the exact file-store
+        preflight -- live-list validation for ``model`` and the
+        all-or-nothing settings-audit requirement, both BEFORE the dedup
+        lookup and the insert, so an unvalidated or unaudited override never
+        persists and never resolves to an existing entry -- and one settings
+        audit row lands after the insert.  ``model_fetch``/``settings_runtime``
+        are the file-store create's own injectable seams (the MCP dispatcher
+        passes both), so the two stores now take identical create calls; the
+        override columns themselves (see _MIGRATION_TASK_OVERRIDES_SQL) make
+        the overrides survive a re-read exactly as the file store's JSON does.
         """
-        from .queue import _normalize_request, _stamp_requester  # lazy: see TYPE_CHECKING note
+        from .queue import (  # lazy: see TYPE_CHECKING note
+            _AUDIT_STORE_UNAVAILABLE,
+            _audit_enqueue_overrides,
+            _enqueue_audit_store,
+            _normalize_request,
+            _service_unavailable,
+            _stamp_requester,
+            _validate_model_live,
+        )
 
         params = _normalize_request(body)
         if params.get("requester") is not None:
             params["requester"] = _stamp_requester(
                 params["requester"], observed_addr=observed_addr, verified_caller=verified_caller
             )
+        # R6 preflight, copied 1:1 from the file store's create: live-list
+        # membership for the model override, and a settings store able to
+        # record the audit row -- both before the dedup lookup.
+        model = params.get("model")
+        roles = params.get("roles")
+        if model is not None:
+            _validate_model_live(model, model_fetch)
+        audit_store = None
+        if model is not None or roles is not None:
+            audit_store, store_error = _enqueue_audit_store(settings_runtime)
+            if audit_store is None:
+                raise _service_unavailable(store_error or _AUDIT_STORE_UNAVAILABLE)
         dedup_key = params.get("dedup_key")
         now = time.time()
         queue_id = f"q-{uuid.uuid4().hex[:16]}"
@@ -370,6 +449,14 @@ class PgQueueStore:
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"could not create queue entry: {exc}") from exc
+        if audit_store is not None:
+            _audit_enqueue_overrides(
+                audit_store,
+                actor=verified_caller or entry.requested_by or "enqueue",
+                queue_id=queue_id,
+                model=model,
+                roles=roles,
+            )
         return entry
 
     def _find_non_terminal_by_dedup(self, dedup_key: str) -> QueueEntry | None:
@@ -438,6 +525,22 @@ class PgQueueStore:
         the optional string/list columns, and ``0.0`` for the timestamp columns
         so arithmetic never sees a NULL.
         """
+        if column == "roles":
+            # R9: the JSONB pin set -- psycopg decodes it to a dict itself;
+            # a raw string is decoded explicitly.  Anything that is not a
+            # dict round-trips to None, the same "entry carries no pins"
+            # state NULL models.
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+            return None
         if column == "skip_reasons":
             if value is None:
                 return []
