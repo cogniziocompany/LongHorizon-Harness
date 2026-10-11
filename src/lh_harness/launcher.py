@@ -469,6 +469,73 @@ def _role_configs(
     return configs
 
 
+def _entry_model_override(entry: QueueEntry) -> str | None:
+    """The entry's per-task model override, or None when it carries none.
+
+    LHH-QUEUE-HOTRELOAD (R6/R8): the enqueue and pending-edit surfaces
+    persist a validated, trimmed model id on the entry; legacy/old entries
+    load ``model`` as None.  The only caller-side work here is the defensive
+    shape+blank guard a hand-written or older store file could still carry.
+    """
+
+    value = getattr(entry, "model", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _launch_role_configs(
+    entry: QueueEntry,
+    agent: str,
+    model: str | None,
+    mcp_profile: str | None,
+    auditor_mcp_profile: str | None = None,
+) -> dict[str, dict[str, str]]:
+    """Role specs for THIS launch, resolving a dict-form ``entry.roles`` pin set.
+
+    LHH-QUEUE-HOTRELOAD R8: a dict-form ``roles`` on the entry (stored by the
+    R6 enqueue / R7 pending-edit surfaces as the caller's pins, deliberately
+    UNRESOLVED so trio/default edits keep flowing into every unpinned field
+    until launch) is applied on top of the legacy trio specs HERE, at launch:
+    the base specs come from this pass's hot-reloaded trio exactly as before,
+    and each pinned role then carries just its pins so inheritance still
+    resolves inside ``create_run``'s existing ``_normalise_role_configs``
+    call (unpinned agent/model fall to this launch's agent/model and the
+    per-agent defaults, exactly like ``POST /api/runs`` pins inherit the
+    request's agent/model).  The fully resolved per-role configs are what
+    ``create_run`` writes into the reservation ``control/owner.json`` -- the
+    run record -- which nothing rewrites after launch, so the launch is also
+    the lock: a running run keeps exactly the model/roles it started with.
+    ``mcp_profile`` pins are dropped for the same reason ``_role_configs``
+    never emits the trio's profile: the worker rebuilds its roles from
+    agent/model/reasoning_effort only
+    (``cli._public_role_configs_from_args``), so a spec carrying mcp_profile
+    can never equal its reservation and the run would die at start.  The
+    auditor read-only rule on the pins was already enforced at enqueue/edit
+    through the same normalizer, and queue runs take the service's per-role
+    default profiles exactly like the legacy trio path.
+    """
+
+    configs = _role_configs(agent, model, mcp_profile, auditor_mcp_profile)
+    pins = getattr(entry, "roles", None)
+    if not isinstance(pins, dict) or not pins:
+        return configs
+    for role, raw in pins.items():
+        # ``configs`` keys are exactly the three role keys; anything else
+        # (rejected at enqueue/edit, but a hand-written store file could
+        # still carry it) is ignored rather than crashing the pass.
+        if role not in configs or not isinstance(raw, dict):
+            continue
+        spec: dict[str, str] = {}
+        for key in ("agent", "model", "reasoning_effort"):
+            item = raw.get(key)
+            if isinstance(item, str) and item.strip():
+                spec[key] = item.strip()
+        if spec:
+            configs[role] = spec
+    return configs
+
+
 def _now() -> float:
     return time.time()
 
@@ -1475,9 +1542,22 @@ class Launcher:
             self._skip(entry, f"unknown trio {entry.trio}")
             return False
         agent = trio.get("agent", "codex")
-        model = trio.get("model")
+        # LHH-QUEUE-HOTRELOAD (R8): the launch-time resolution and lock.
+        # ``model`` resolves HERE -- the entry's per-task override (editable
+        # only while pending, validated at enqueue/edit against the live
+        # model list) wins over THIS pass's hot-reloaded trio default -- and
+        # together with the entry's pin set it flows straight into
+        # ``create_run`` below, whose reservation record persists the model
+        # and the fully resolved role configs verbatim.  Nothing rewrites
+        # that record after launch: a later trio default change lands only
+        # on the next launch's resolution, and a later edit of this entry is
+        # already refused (409) once it has launched -- so the run keeps
+        # exactly the model/roles it started with.
+        model = _entry_model_override(entry) or trio.get("model")
         mcp_profile = trio.get("mcp_profile")
-        role_configs = _role_configs(agent, model, mcp_profile, trio.get("auditor_mcp_profile"))
+        role_configs = _launch_role_configs(
+            entry, agent, model, mcp_profile, trio.get("auditor_mcp_profile")
+        )
         run_id: str | None = None
         # Eligibility guard, pre-burn (task 234): a role/profile combination
         # the supervisor would reject (auditor with a non-read-only MCP
@@ -1693,7 +1773,11 @@ class Launcher:
             self._shadow_skip(entry, f"unknown trio {entry.trio}")
             return
         agent = trio.get("agent", "codex")
-        model = trio.get("model")
+        # Same launch-time resolution as ``_launch`` (LHH-QUEUE-HOTRELOAD
+        # R8): the entry's per-task model override wins over the trio
+        # default, so a would-launch record names the model the real launch
+        # would lock in.
+        model = _entry_model_override(entry) or trio.get("model")
         mcp_profile = trio.get("mcp_profile")
         roles = {
             role: {"agent": agent, "model": model, "mcp_profile": mcp_profile}
