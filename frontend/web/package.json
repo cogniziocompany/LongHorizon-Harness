@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "test": "npm --prefix ../core test",
+    "test": "node scripts/test.mjs && npm --prefix ../core test",
     "preview": "vite preview"
   },
   "dependencies": {

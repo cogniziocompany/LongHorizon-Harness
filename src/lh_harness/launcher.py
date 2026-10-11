@@ -35,6 +35,7 @@ from .queue import (
     queue_config_from_config,
     read_lease,
 )
+from .settings_store import SettingsStore, open_from_environment
 from .supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
 from .supervisor.service import auditor_read_only_violation
 from .workspace_guard import (
@@ -492,6 +493,80 @@ def _role_configs(
     return configs
 
 
+def _entry_model_override(entry: QueueEntry) -> str | None:
+    """The entry's per-task model override, or None when it carries none.
+
+    LHH-QUEUE-HOTRELOAD (R6/R8): the enqueue and pending-edit surfaces
+    persist a validated, trimmed model id on the entry; legacy/old entries
+    load ``model`` as None.  The only caller-side work here is the defensive
+    shape+blank guard a hand-written or older store file could still carry.
+    """
+
+    value = getattr(entry, "model", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _launch_role_configs(
+    entry: QueueEntry,
+    agent: str,
+    model: str | None,
+    mcp_profile: str | None,
+    auditor_mcp_profile: str | None = None,
+    role_overrides: dict[str, dict[str, str]] | None = None,
+) -> dict[str, dict[str, str]]:
+    """Role specs for THIS launch, resolving a dict-form ``entry.roles`` pin set.
+
+    LHH-QUEUE-HOTRELOAD R8: a dict-form ``roles`` on the entry (stored by the
+    R6 enqueue / R7 pending-edit surfaces as the caller's pins, deliberately
+    UNRESOLVED so trio/default edits keep flowing into every unpinned field
+    until launch) is applied on top of the legacy trio specs HERE, at launch:
+    the base specs come from this pass's hot-reloaded trio exactly as before,
+    and each pinned role then carries just its pins so inheritance still
+    resolves inside ``create_run``'s existing ``_normalise_role_configs``
+    call (unpinned agent/model fall to this launch's agent/model and the
+    per-agent defaults, exactly like ``POST /api/runs`` pins inherit the
+    request's agent/model).  The fully resolved per-role configs are what
+    ``create_run`` writes into the reservation ``control/owner.json`` -- the
+    run record -- which nothing rewrites after launch, so the launch is also
+    the lock: a running run keeps exactly the model/roles it started with.
+    ``mcp_profile`` pins are dropped for the same reason ``_role_configs``
+    never emits the trio's profile: the worker rebuilds its roles from
+    agent/model/reasoning_effort only
+    (``cli._public_role_configs_from_args``), so a spec carrying mcp_profile
+    can never equal its reservation and the run would die at start.  The
+    auditor read-only rule on the pins was already enforced at enqueue/edit
+    through the same normalizer, and queue runs take the service's per-role
+    default profiles exactly like the legacy trio path.
+    """
+
+    configs = _role_configs(agent, model, mcp_profile, auditor_mcp_profile, role_overrides=role_overrides)
+    pins = getattr(entry, "roles", None)
+    if not isinstance(pins, dict) or not pins:
+        return configs
+    for role, raw in pins.items():
+        # ``configs`` keys are exactly the three role keys; anything else
+        # (rejected at enqueue/edit, but a hand-written store file could
+        # still carry it) is ignored rather than crashing the pass.
+        if role not in configs or not isinstance(raw, dict):
+            continue
+        spec: dict[str, str] = {}
+        for key in ("agent", "model", "reasoning_effort"):
+            item = raw.get(key)
+            if isinstance(item, str) and item.strip():
+                spec[key] = item.strip()
+        if spec:
+            # Pins OVERLAY the resolved spec (trio-wide + per-role trio
+            # overrides) instead of replacing it: a model-only pin must keep
+            # the trio's per-role agent (zaiq mixed trios), and an explicit
+            # pin still wins key-by-key.
+            merged = dict(configs[role])
+            merged.update(spec)
+            configs[role] = merged
+    return configs
+
+
 def _now() -> float:
     return time.time()
 
@@ -592,6 +667,21 @@ def _unpushed_branch_occupied(workspace: str) -> bool:
     return bool(count and count != "0")
 
 
+def _open_settings_store() -> SettingsStore | None:
+    """Open the embedded settings store from its bootstrap environment.
+
+    ``None`` when the store is not configured (no ``LH_HARNESS_SETTINGS_KEY``)
+    or cannot be opened: a deployment without the settings DB keeps the pure
+    config.toml behaviour, and the launcher must never fail on the store.
+    """
+
+    try:
+        return open_from_environment()
+    except Exception as exc:  # noqa: BLE001 - a broken store must not stop the launcher
+        logger.warning("settings store unavailable (%s); queue config stays file-only", exc)
+        return None
+
+
 class Launcher:
     """Poll the queue and launch eligible entries through the supervisor."""
 
@@ -608,6 +698,21 @@ class Launcher:
         self.supervisor = supervisor
         self.queue_store = queue_store
         self._config = queue_config or self._load_project_queue_config()
+        # Pristine bootstrap config (queue_config argument or config.toml).
+        # ``_refresh_queue_config`` rebuilds ``self._config`` from THIS at the
+        # start of every pass, so a settings-DB row that is later deleted falls
+        # back to the file value rather than a stale per-pass snapshot.
+        self._base_config = self._config
+        self._settings_store = _open_settings_store()
+        if self._settings_store is not None:
+            # One-time seed (LHH-QUEUE-HOTRELOAD): empty queue_trio /
+            # queue_capacity tables are populated from config.toml once; the
+            # file is read-only bootstrap here and operator-edited rows are
+            # never overwritten by a later start.
+            try:
+                self._settings_store.seed_queue_from_config(PROJECT_CONFIG_PATH)
+            except Exception as exc:  # noqa: BLE001 - a seed failure must never stop the launcher
+                logger.warning("queue seeding failed; continuing with bootstrap config: %s", exc)
         # Observe (shadow) mode — task 173 / migration §5 Step 2: when true the
         # launcher computes the full launch decision but starts NOTHING; it
         # appends one shadow record per decision to
@@ -656,6 +761,93 @@ class Launcher:
         except Exception:
             pass
         return default_queue_config()
+
+    @staticmethod
+    def _in_capacity_peak_window(now: float | None = None) -> bool:
+        """Mon-Fri 06:00-10:00 UTC — z.ai peak billing hours (2026-10-11).
+
+        Peak is when credit multipliers are full AND the provider's dynamic
+        concurrency is tightest, so lanes carry an optional lower ``*_max_peak``
+        cap alongside the all-day ``*_max``.
+        """
+        import datetime as _dt
+
+        moment = _dt.datetime.fromtimestamp(now if now is not None else time.time(), _dt.timezone.utc)
+        if moment.weekday() >= 5:  # Sat/Sun are fully off-peak
+            return False
+        return 6 <= moment.hour < 10
+
+    @classmethod
+    def _effective_cap(cls, base: int, peak: int | None, now: float | None = None) -> int:
+        if peak is None:
+            return base
+        return max(0, min(base, peak)) if cls._in_capacity_peak_window(now) else base
+
+    def _refresh_queue_config(self) -> None:
+        """Overlay settings-DB queue trios/capacity onto the bootstrap config.
+
+        Runs at the START of every scheduling pass (LHH-QUEUE-HOTRELOAD) so a
+        trio or capacity change an admin writes to the settings DB takes effect
+        on the very next pass — no caching, no TTL, no restart. The merge
+        always starts from the pristine ``self._base_config``; a DB row that is
+        later deleted therefore falls back to the config.toml-derived value
+        instead of a stale per-pass snapshot (bootstrap/fallback semantics).
+        A row with ``enabled = false`` REMOVES that trio from scheduling: once
+        the database holds a row for a name it is authoritative. Only trios and
+        per-trio ``<name>_max`` capacity keys are overlaid; everything else
+        (observe, poll_seconds, key-health, occupancy flags, time limits)
+        stays config-file-owned. A run keeps the trio resolved at its launch;
+        this merge never reaches into a running run. A store read failure is
+        logged and the pass keeps the bootstrap config.
+        """
+
+        if self._settings_store is None:
+            return
+        try:
+            trio_rows = self._settings_store.queue_trios()
+            capacity_rows = self._settings_store.queue_capacity_rows()
+        except Exception as exc:  # noqa: BLE001 - a broken store must not stop the launcher
+            logger.warning("settings queue read failed; keeping bootstrap config: %s", exc)
+            return
+        merged = dict(self._base_config)
+        trios = {
+            name: dict(spec)
+            for name, spec in (merged.get("trios") or {}).items()
+            if isinstance(spec, dict)
+        }
+        for row in trio_rows:
+            name = row.get("name") if isinstance(row, dict) else None
+            if not isinstance(name, str) or not name.strip():
+                continue
+            name = name.strip()
+            if not row.get("enabled", True):
+                trios.pop(name, None)
+                continue
+            agent = str(row.get("agent") or "").strip()
+            if not agent:
+                continue
+            base_spec = trios.get(name) or {}
+            trios[name] = {
+                "agent": agent,
+                "model": str(row.get("model") or "").strip() or None,
+                "mcp_profile": str(row.get("mcp_profile") or "").strip() or None,
+                # queue_trio has no auditor column; keep the file binding.
+                "auditor_mcp_profile": base_spec.get("auditor_mcp_profile"),
+            }
+        merged["trios"] = trios
+        capacity = dict(merged.get("capacity") or {})
+        for trio_name, row in capacity_rows.items():
+            if not isinstance(trio_name, str) or not trio_name.strip() or not isinstance(row, dict):
+                continue
+            try:
+                base = max(0, int(row.get("max", 0)))
+                raw_peak = row.get("max_peak")
+                peak = None if raw_peak is None else max(0, int(raw_peak))
+            except (TypeError, ValueError):
+                continue
+            capacity[f"{trio_name.strip()}_max"] = self._effective_cap(base, peak)
+        merged["capacity"] = capacity
+        self._config = merged
 
     @staticmethod
     def _project_role_mcp_profile(role: str) -> str | None:
@@ -781,6 +973,9 @@ class Launcher:
         return True
 
     def _run_pass(self) -> None:
+        # Hot-reload (LHH-QUEUE-HOTRELOAD): re-resolve trios/capacity from the
+        # settings DB for THIS pass so admin changes apply with no restart.
+        self._refresh_queue_config()
         entries = self.queue_store.list()
         active = self._active_runs()
         self._update_launched_entries(active)
@@ -1402,13 +1597,21 @@ class Launcher:
             self._skip(entry, f"unknown trio {entry.trio}")
             return False
         agent = trio.get("agent", "codex")
-        model = trio.get("model")
+        # LHH-QUEUE-HOTRELOAD (R8): the launch-time resolution and lock.
+        # ``model`` resolves HERE -- the entry's per-task override (editable
+        # only while pending, validated at enqueue/edit against the live
+        # model list) wins over THIS pass's hot-reloaded trio default -- and
+        # together with the entry's pin set it flows straight into
+        # ``create_run`` below, whose reservation record persists the model
+        # and the fully resolved role configs verbatim.  Nothing rewrites
+        # that record after launch: a later trio default change lands only
+        # on the next launch's resolution, and a later edit of this entry is
+        # already refused (409) once it has launched -- so the run keeps
+        # exactly the model/roles it started with.
+        model = _entry_model_override(entry) or trio.get("model")
         mcp_profile = trio.get("mcp_profile")
-        role_configs = _role_configs(
-            agent,
-            model,
-            mcp_profile,
-            trio.get("auditor_mcp_profile"),
+        role_configs = _launch_role_configs(
+            entry, agent, model, mcp_profile, trio.get("auditor_mcp_profile"),
             role_overrides=_trio_role_overrides(trio),
         )
         run_id: str | None = None
@@ -1626,7 +1829,11 @@ class Launcher:
             self._shadow_skip(entry, f"unknown trio {entry.trio}")
             return
         agent = trio.get("agent", "codex")
-        model = trio.get("model")
+        # Same launch-time resolution as ``_launch`` (LHH-QUEUE-HOTRELOAD
+        # R8): the entry's per-task model override wins over the trio
+        # default, so a would-launch record names the model the real launch
+        # would lock in.
+        model = _entry_model_override(entry) or trio.get("model")
         mcp_profile = trio.get("mcp_profile")
         overrides = _trio_role_overrides(trio)
         roles = {

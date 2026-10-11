@@ -13,6 +13,16 @@ No native MCP server SDK is required.  The tools are advertised in
 server over streamable HTTP at ``POST /mcp`` (``webapi/mcp_jsonrpc.py``), so
 LiteLLM can register the gateway alias ``lhharness`` directly; both transports
 share this module's manifest and dispatcher.
+
+LHH-QUEUE-HOTRELOAD (R5): four queue admin tools -- ``list_trios``,
+``set_trio_model``, ``set_trio_capacity``, ``refresh_models`` -- expose the
+settings-DB queue trios/capacity the launcher re-reads every scheduling pass,
+so Overseer1 can change the trio model or capacity at runtime with no restart
+and no redeploy.  They reuse the R4 admin-route machinery
+(``webapi/settings_routes._clean_trio_row``, the store's ``_db``/``_audit``,
+and the same injectable model-list fetch seam) so validation, error
+semantics, and the per-change before/after audit rows match the REST admin
+API exactly.
 """
 
 from __future__ import annotations
@@ -43,6 +53,26 @@ from .config import ASK_APPLY_TARGETS, ASK_TOOL_SCOPES
 from .config import _MCP_TOOL_NAMES as _SCOPING_ELIGIBLE_TOOLS
 from .contention import detect_contention, groups_to_json
 from .workspace_identity import resolve_many
+
+# LHH-QUEUE-HOTRELOAD R5: the queue admin tools.  They are known to THIS
+# dispatcher but deliberately not part of config.py's static tool sets: those
+# sets also validate the task-174 ``[callers.*.tools]`` allowlists, so a name
+# added there becomes grantable per caller -- a config-surface change this
+# round must not make.  Like the task-A3d ask tools (which live outside
+# ``_MCP_TOOL_NAMES`` for the same reason), the queue admin tools verify the
+# caller identity themselves with the same HMAC machinery before any write,
+# and the verified caller becomes the settings-store audit actor.
+_QUEUE_ADMIN_TOOL_NAMES = frozenset(
+    {
+        "list_trios",
+        "set_trio_model",
+        "set_trio_capacity",
+        "refresh_models",
+    }
+)
+# Local dispatcher view: config's known set plus the tools above.  Only the
+# unknown-tool 404 check below reads this name; config.py stays untouched.
+_KNOWN_TOOLS = _KNOWN_TOOLS | _QUEUE_ADMIN_TOOL_NAMES
 
 # Descriptions exposed to clients and the gateway.  They carry the operating
 # rules: scoped task text, trio usage, and lane policy.
@@ -85,6 +115,17 @@ Accepted fields (all persisted on the queue entry):
   or 'hydra'. With per-caller scoping (task 174) the server stamps it from
   the verified caller identity; a client-supplied value is overridden.
 - base_check (string, optional): base commit/branch check guard.
+- model (string, optional): per-task model override. Must be on the
+  backend's live model list (the list list_trios/refresh_models show);
+  unknown models are refused and nothing is enqueued, and an unreachable
+  provider refuses the enqueue rather than writing it unvalidated. Editable
+  while the entry is pending; resolved and locked onto the run at launch.
+- roles (string or object, optional): a STRING is the legacy trio alias
+  (identical to trio). An OBJECT carries per-role configuration with the
+  create-run API's semantics: {"manager"|"executor"|"auditor": {agent?,
+  model?, reasoning_effort?, mcp_profile?}} -- only the fields you pin
+  override the trio defaults; unknown roles, fields, agents, or malformed
+  values are refused at enqueue. Editable while pending, locked at launch.
 
 - requester (object, required): structured identity block (task 300). Send
   kind, name, and host at minimum. When kind is 'ai' you must also send agent
@@ -241,6 +282,52 @@ substring) to pick one. Each handoff is a point-in-time statement of fact,
 not a live status - newer handoffs supersede older ones on the same topic.
 """
 
+# LHH-QUEUE-HOTRELOAD R5: queue trio/capacity hot-edits over MCP.  These
+# tools read and write the SAME settings-DB tables the R4 admin routes
+# (GET/PUT /api/queue/trios, /api/queue/capacity, POST /api/models/refresh)
+# manage, through the same store and validation helpers, so a change made
+# here is exactly the change the web admin page makes -- the launcher picks
+# it up on its next scheduling pass with no restart, and every change lands
+# in the settings audit log keyed to the verified MCP caller.
+_LIST_TRIOS_DESCRIPTION = """List the queue trios and per-trio capacity from the settings DB.
+
+Returns the same state as GET /api/queue/trios plus GET /api/queue/capacity:
+every trio row (name, agent, model, mcp_profile, enabled, updated_by/at) and
+the per-trio max_concurrent map.  This is the live state the launcher
+re-reads on every scheduling pass, not the config.toml bootstrap.
+"""
+
+_SET_TRIO_MODEL_DESCRIPTION = """Change one queue trio's model, live.
+
+The trio keeps its agent, mcp_profile, and enabled flag; only the model
+changes.  The model must be on the backend's LIVE model list for the trio's
+agent (the same list the workbench dropdowns show): an unknown model is
+refused and nothing changes, and if the live list cannot be fetched the
+write is refused rather than made unvalidated.  Each accepted change writes
+one settings-audit row with the before/after row, keyed to the verified MCP
+caller, identical to PUT /api/queue/trios.  The launcher applies the new
+model to the next launch; running runs keep the model they started with.
+"""
+
+_SET_TRIO_CAPACITY_DESCRIPTION = """Change one trio's max_concurrent, live.
+
+The trio must exist in the settings DB and the value must be a non-negative
+integer (0 pauses new launches for the trio).  Unknown trios and bad values
+are refused and nothing changes; each accepted change writes one
+settings-audit row with the before/after value, keyed to the verified MCP
+caller, identical to PUT /api/queue/capacity.  The launcher's next
+scheduling pass respects the new cap immediately.
+"""
+
+_REFRESH_MODELS_DESCRIPTION = """Re-fetch the live provider model list now.
+
+Forces a fresh model discovery (the same refresh POST /api/models/refresh
+performs for the workbench) instead of the briefly cached list, and returns
+the per-agent model list it sees.  Read-only: nothing in the settings store
+changes, so no audit row is written.  Fails when the provider is
+unreachable.
+"""
+
 
 def _is_ascii_only(value: str) -> bool:
     """Return True if every character in value is ASCII."""
@@ -392,6 +479,25 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                 "dedup_key": _string_param(
                     "Idempotent-enqueue key: same non-terminal key resolves to one queue entry, launched at most once.",
                 ),
+                # LHH-QUEUE-HOTRELOAD (R6): per-task launch overrides.  Both
+                # are forwarded only when actually supplied (an explicit null
+                # stays unforwarded, matching the pre-R6 body); both are
+                # validated by the store like every other field.
+                "model": _string_param(
+                    "Per-task model override: one model id from the backend's live model list "
+                    "(unknown ids and an unreachable provider are both refused). Editable while "
+                    "pending, locked onto the run at launch.",
+                    required=False,
+                ),
+                "roles": {
+                    "description": (
+                        "A STRING is the legacy trio alias (same as trio). An OBJECT carries per-role "
+                        "configuration (create-run API semantics): {'manager'|'executor'|'auditor': "
+                        "{'agent'?, 'model'?, 'reasoning_effort'?, 'mcp_profile'?}}; only pinned fields "
+                        "override the trio defaults. Editable while pending, locked at launch."
+                    ),
+                    "anyOf": [{"type": "string"}, {"type": "object"}],
+                },
                 "base_check": _string_param("Optional base commit/branch check guard.", required=False),
                 "time_limit_minutes": _optional_integer_param(
                     "Optional wall-clock limit in minutes (1-1440) from launch; the launcher stops the run "
@@ -573,6 +679,48 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                 ),
             },
         ),
+        # LHH-QUEUE-HOTRELOAD R5: queue admin tools (settings-DB trios and
+        # capacity; the launcher's per-pass reads make changes live).
+        _tool_spec(
+            "list_trios",
+            _LIST_TRIOS_DESCRIPTION,
+            {},
+        ),
+        _tool_spec(
+            "set_trio_model",
+            _SET_TRIO_MODEL_DESCRIPTION,
+            {
+                "trio": _string_param(
+                    "Queue trio name as listed by list_trios (e.g. 'glm').",
+                    required=True,
+                ),
+                "model": _string_param(
+                    "Model id from the backend's live model list for the trio's agent.",
+                    required=True,
+                ),
+            },
+        ),
+        _tool_spec(
+            "set_trio_capacity",
+            _SET_TRIO_CAPACITY_DESCRIPTION,
+            {
+                "trio": _string_param(
+                    "Queue trio name as listed by list_trios (e.g. 'glm').",
+                    required=True,
+                ),
+                # No default: the value is required; the handler validates
+                # presence and range (non-negative integer).
+                "max_concurrent": {
+                    "type": "integer",
+                    "description": "Required. New max_concurrent for the trio (non-negative integer; 0 pauses new launches).",
+                },
+            },
+        ),
+        _tool_spec(
+            "refresh_models",
+            _REFRESH_MODELS_DESCRIPTION,
+            {},
+        ),
     ]
 
 
@@ -588,6 +736,8 @@ def dispatch(
     caller_configs: dict[str, dict[str, Any]] | None = None,
     overseer_root: str | None = None,
     ask_runtime: Any = None,
+    settings_runtime: Any = None,
+    model_fetch: Any = None,
 ) -> dict[str, Any]:
     """Run one MCP tool call and return a JSON-RPC style result.
 
@@ -606,6 +756,16 @@ def dispatch(
     ``overseer_root`` (task 235) is the resolved apparatus archive root; the
     WebAPI resolves it once at app creation and passes it here so the
     overseer-state tools share the deployment's archive path.
+
+    ``settings_runtime``/``model_fetch`` (LHH-QUEUE-HOTRELOAD R5) are the
+    injectable seams of the queue admin tools; R6 reuses the same pair for
+    ``harness_enqueue_task`` (live-list validation of a per-task ``model``
+    override and the settings-audit row behind override-carrying enqueues).
+    The WebAPI passes neither: the tools and the enqueue path then default to
+    ``settings_store.active_runtime()`` (the same store the R4 admin routes
+    default to) and ``model_catalog.discover_model_catalog`` (the same
+    live-list fetch the R4 routes validate against), so tests can run fully
+    offline.
     """
     # Auth parity with the REST boundary.
     if auth_token is not None and auth_token != (request_token or ""):
@@ -635,6 +795,20 @@ def dispatch(
                 supervisor=supervisor,
                 queue_store=queue_store,
             ),
+        )
+
+    # LHH-QUEUE-HOTRELOAD R5: queue trio/capacity admin tools.  Dispatched
+    # like the ask tools -- before the scoping-eligible/fallback split --
+    # because identity is verified by the tool itself (the config-validated
+    # task-174 allowlists can never name these tools; see the
+    # _QUEUE_ADMIN_TOOL_NAMES note above).
+    if tool_name in _QUEUE_ADMIN_TOOL_NAMES:
+        return _dispatch_queue_admin_tool(
+            tool_name,
+            arguments,
+            caller_configs=caller_configs,
+            settings_runtime=settings_runtime,
+            model_fetch=model_fetch,
         )
 
     # Task 235: the read-only overseer-state tools are called from the
@@ -675,7 +849,13 @@ def dispatch(
     # REST routes' injected-table semantics.
     if caller_configs is None:
         if tool_name == "harness_enqueue_task":
-            return _enqueue(arguments, queue_store=queue_store, caller=None)
+            return _enqueue(
+                arguments,
+                queue_store=queue_store,
+                caller=None,
+                model_fetch=model_fetch,
+                settings_runtime=settings_runtime,
+            )
         if tool_name == "harness_list_queue":
             return _list_queue(arguments, queue_store=queue_store)
         if tool_name == "harness_run_status":
@@ -714,6 +894,8 @@ def dispatch(
             queue_store=queue_store,
             caller=caller,
             spec=specs.get(caller) if caller is not None else None,
+            model_fetch=model_fetch,
+            settings_runtime=settings_runtime,
         )
     if tool_name == "harness_list_queue":
         return _list_queue(arguments, queue_store=queue_store)
@@ -1005,6 +1187,8 @@ def _enqueue(
     queue_store: Any,
     caller: str | None = None,
     spec: dict[str, Any] | None = None,
+    model_fetch: Any = None,
+    settings_runtime: Any = None,
 ) -> dict[str, Any]:
     if queue_store is None:
         return {"ok": False, "error": "queue requires a configured runs root", "code": 501}
@@ -1068,6 +1252,22 @@ def _enqueue(
         # fc-H2: validated by the store (int 1..1440 or omitted).
         "time_limit_minutes": arguments.get("time_limit_minutes"),
     }
+    # LHH-QUEUE-HOTRELOAD (R6): model/roles are forwarded ONLY when actually
+    # supplied.  An explicit null stays unforwarded (matching the pre-R6
+    # body), so the legacy "roles" string keeps its exact alias semantics in
+    # the store and calls without either override produce a byte-identical
+    # body.  A string roles is bounded like ``trio``; a dict passes through
+    # to the store's create-run-shaped validation.
+    raw_roles = arguments.get("roles")
+    if raw_roles is not None:
+        body["roles"] = (
+            _bounded(raw_roles, field="roles", max_chars=64)
+            if isinstance(raw_roles, str)
+            else raw_roles
+        )
+    raw_model = arguments.get("model")
+    if raw_model is not None:
+        body["model"] = _bounded(raw_model, field="model", max_chars=256)
     # Task 300: the requester block is passed through verbatim (validated by the
     # store) and stamped with the verified caller.  ``arguments["requester"]``
     # is the dict the client supplied; ``caller`` (the verified identity) is the
@@ -1076,11 +1276,19 @@ def _enqueue(
     # succeed.  AdditionalProperties=false in the schema keeps a non-dict
     # requester from reaching here unguarded.
     body["requester"] = arguments.get("requester")
+    from fastapi import HTTPException  # lazy: R6 503 carrier from the store
     try:
         entry = queue_store.create(
             body,
             verified_caller=caller,
+            model_fetch=model_fetch,
+            settings_runtime=settings_runtime,
         )
+    except HTTPException as exc:
+        # R6: provider-down / settings-store-down refusals carry the R4/R5
+        # 503 taxonomy through unchanged; the web route gets the same 503 by
+        # letting the exception propagate to FastAPI's own handler.
+        return {"ok": False, "error": exc.detail, "code": exc.status_code}
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "code": 422}
     result: dict[str, Any] = {"ok": True, "queue_id": entry.queue_id, "status": entry.status}
@@ -1342,6 +1550,244 @@ def _resolve_gate(arguments: dict[str, Any], *, registry: Any, supervisor: Any) 
     if not ok:
         return {"ok": False, "error": "approval is missing, resolved, or read-only", "code": 409}
     return {"ok": True, "approval_id": approval_id, "status": "accepted"}
+
+
+# --------------------------------------------------------------------- R5 --
+# LHH-QUEUE-HOTRELOAD: queue trio/capacity admin tools.
+#
+# These handlers are thin wrappers: row validation reuses the R4 admin
+# routes' ``_clean_trio_row`` verbatim (imported lazily -- it lives behind
+# the webapi module that imports fastapi), the reads reuse the store's
+# ``queue_trios()``/``queue_capacity()``, and the writes go through the
+# store's own ``_db`` transaction and ``_audit`` machinery with the R4
+# routes' exact write pattern (INSERT OR REPLACE + before/after audit, only
+# audited when the row actually changed).  The live model list comes through
+# the R4 injectable fetch seam: ``model_fetch`` when given, else
+# ``model_catalog.discover_model_catalog``.
+
+# Error wording shared with the R4 routes so both surfaces refuse the same
+# way (the routes answer 503 with this text when the provider is down).
+_QUEUE_ADMIN_LIST_UNAVAILABLE = "the live model list is unavailable; refusing to write unvalidated trios"
+
+
+def _queue_admin_live_models(model_fetch: Any) -> dict[str, Any] | None:
+    """The backend's live model list per agent, or ``None`` when unknown.
+
+    Same shape as the R4 routes' ``live_models()``: the fetch is injectable
+    so tests never touch the network, and a broken provider yields ``None``
+    (503 below), never an exception.
+    """
+
+    fetch = model_fetch
+    if fetch is None:
+        from .model_catalog import discover_model_catalog
+
+        fetch = discover_model_catalog
+    try:
+        catalogue = fetch()
+    except Exception:  # noqa: BLE001 - a broken provider must refuse writes, not crash
+        return None
+    if not isinstance(catalogue, dict):
+        return None
+    models = catalogue.get("models")
+    return models if isinstance(models, dict) else None
+
+
+def _dispatch_queue_admin_tool(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    caller_configs: dict[str, dict[str, Any]] | None,
+    settings_runtime: Any = None,
+    model_fetch: Any = None,
+) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        return {"ok": False, "error": "arguments must be an object", "code": 400}
+    from .settings_store import active_runtime
+
+    rt = settings_runtime if settings_runtime is not None else active_runtime()
+    store = getattr(rt, "store", None)
+    if store is None:
+        return {
+            "ok": False,
+            "error": getattr(rt, "error", None) or "the settings store is not configured",
+            "code": 503,
+        }
+    # Identity.  There is no per-caller grant surface for these tools (their
+    # names can never enter a task-174 ``tools`` allowlist -- the config
+    # loader validates that list against config.py's static tool set), so
+    # when scoping is ON a verified non-anon caller is required but no
+    # allowlist check applies; when scoping is OFF the bearer-parity check at
+    # the top of ``dispatch`` is the gate, matching the pre-174 contract of
+    # every other fleet tool, and the audit actor marks the channel.
+    if caller_configs is None:
+        caller = None
+    else:
+        caller = resolve_mcp_caller(arguments, caller_configs_or_defaults(caller_configs))
+        if caller == ANON_CALLER:
+            return {"ok": False, "error": "invalid or missing caller identity", "code": 401}
+    arguments = strip_caller_arguments(arguments)
+    actor = caller if caller is not None else "mcp"
+    handlers = {
+        "list_trios": _queue_admin_list_trios,
+        "set_trio_model": _queue_admin_set_trio_model,
+        "set_trio_capacity": _queue_admin_set_trio_capacity,
+        "refresh_models": _queue_admin_refresh_models,
+    }
+    return handlers[tool_name](arguments, store=store, actor=actor, model_fetch=model_fetch)
+
+
+def _queue_admin_unknown_fields(arguments: dict[str, Any], allowed: set[str]) -> dict[str, Any] | None:
+    unknown = sorted(set(arguments) - allowed)
+    if unknown:
+        return {"ok": False, "error": "unknown field(s): " + ", ".join(unknown), "code": 400}
+    return None
+
+
+def _queue_admin_list_trios(
+    arguments: dict[str, Any],
+    *,
+    store: Any,
+    actor: str,
+    model_fetch: Any,
+) -> dict[str, Any]:
+    refusal = _queue_admin_unknown_fields(arguments, set())
+    if refusal is not None:
+        return refusal
+    return {"ok": True, "trios": store.queue_trios(), "capacity": store.queue_capacity()}
+
+
+def _queue_admin_set_trio_model(
+    arguments: dict[str, Any],
+    *,
+    store: Any,
+    actor: str,
+    model_fetch: Any,
+) -> dict[str, Any]:
+    refusal = _queue_admin_unknown_fields(arguments, {"trio", "model"})
+    if refusal is not None:
+        return refusal
+    from .settings_store import now_iso
+    from .webapi.settings_routes import _clean_trio_row
+
+    trio = arguments.get("trio")
+    if not isinstance(trio, str) or not trio.strip():
+        return {"ok": False, "error": "trio must be a non-empty string", "code": 422}
+    name = trio.strip()
+    model = arguments.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return {"ok": False, "error": "model must be a non-empty string model id", "code": 422}
+    existing = next((row for row in store.queue_trios() if row["name"] == name), None)
+    if existing is None:
+        return {"ok": False, "error": f"unknown trio {name!r}", "code": 404}
+    models = _queue_admin_live_models(model_fetch)
+    if models is None:
+        return {"ok": False, "error": _QUEUE_ADMIN_LIST_UNAVAILABLE, "code": 503}
+    # Only the model changes; every other field keeps its stored value.  The
+    # full row goes through the same validator the R4 PUT applies to each
+    # row, so a refusal here carries the identical rule set and wording.
+    row, error = _clean_trio_row(
+        {
+            "name": name,
+            "agent": existing["agent"],
+            "model": model.strip(),
+            "mcp_profile": existing["mcp_profile"],
+            "enabled": existing["enabled"],
+        },
+        models,
+    )
+    if error is not None:
+        return {"ok": False, "error": error, "code": 422}
+    assert row is not None
+    with store._db() as db:  # the R4 PUT body, verbatim, for the single row
+        old = db.execute("SELECT * FROM queue_trio WHERE name = ?", (row["name"],)).fetchone()
+        db.execute(
+            """INSERT OR REPLACE INTO queue_trio(name, agent, model, mcp_profile, enabled, updated_by, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (row["name"], row["agent"], row["model"], row["mcp_profile"], row["enabled"], actor, now_iso()),
+        )
+        before = (
+            None
+            if old is None
+            else {
+                "agent": old["agent"],
+                "model": old["model"],
+                "mcp_profile": old["mcp_profile"],
+                "enabled": bool(old["enabled"]),
+            }
+        )
+        after = {
+            "agent": row["agent"],
+            "model": row["model"],
+            "mcp_profile": row["mcp_profile"],
+            "enabled": bool(row["enabled"]),
+        }
+        if before != after:
+            store._audit(db, actor, "set", f"queue_trio:{row['name']}", before=before, after=after)
+    return {"ok": True, "trios": store.queue_trios()}
+
+
+def _queue_admin_set_trio_capacity(
+    arguments: dict[str, Any],
+    *,
+    store: Any,
+    actor: str,
+    model_fetch: Any,
+) -> dict[str, Any]:
+    refusal = _queue_admin_unknown_fields(arguments, {"trio", "max_concurrent"})
+    if refusal is not None:
+        return refusal
+    trio = arguments.get("trio")
+    if not isinstance(trio, str) or not trio.strip():
+        return {"ok": False, "error": "trio must be a non-empty string", "code": 422}
+    name = trio.strip()
+    known_trios = {row["name"] for row in store.queue_trios()}
+    if name not in known_trios:
+        return {"ok": False, "error": f"capacity for unknown trio {name!r}", "code": 422}
+    raw = arguments.get("max_concurrent")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return {"ok": False, "error": f"capacity for {name!r} must be a non-negative integer", "code": 422}
+    with store._db() as db:  # the R4 PUT body, verbatim, for the single trio
+        old = db.execute("SELECT max_concurrent FROM queue_capacity WHERE trio = ?", (name,)).fetchone()
+        db.execute("INSERT OR REPLACE INTO queue_capacity(trio, max_concurrent) VALUES (?, ?)", (name, raw))
+        before = None if old is None else int(old["max_concurrent"])
+        if before != raw:
+            store._audit(db, actor, "set", f"queue_capacity:{name}", before=before, after=raw)
+    return {"ok": True, "capacity": store.queue_capacity()}
+
+
+def _queue_admin_refresh_models(
+    arguments: dict[str, Any],
+    *,
+    store: Any,
+    actor: str,
+    model_fetch: Any,
+) -> dict[str, Any]:
+    refusal = _queue_admin_unknown_fields(arguments, set())
+    if refusal is not None:
+        return refusal
+    fetch = model_fetch
+    if fetch is None:
+        from .model_catalog import discover_model_catalog
+
+        fetch = discover_model_catalog
+    try:
+        # force=True is the refresh semantic -- the POST /api/models/refresh
+        # route calls the same discovery with the same flag; otherwise the
+        # list is briefly cached.
+        catalogue = fetch(force=True)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": "the live model list is unavailable", "code": 503}
+    if not isinstance(catalogue, dict):
+        return {"ok": False, "error": "the live model list is unavailable", "code": 503}
+    models = catalogue.get("models")
+    models = models if isinstance(models, dict) else {}
+    return {
+        "ok": True,
+        "refreshed": True,
+        "models": models,
+        "counts": {agent: len(entries) for agent, entries in models.items() if isinstance(entries, list)},
+    }
 
 
 def normalize_request_token(authorization: str | None) -> str | None:

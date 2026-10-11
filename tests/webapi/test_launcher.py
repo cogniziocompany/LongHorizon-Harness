@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from lh_harness import settings_store
 from lh_harness.launcher import Launcher, maintenance_manifest_run_ids
 from lh_harness.queue import QueueStore, default_queue_config
+from lh_harness.settings_store import SettingsStore
 
 
 class FakeSupervisor:
@@ -514,3 +517,170 @@ def test_launcher_stale_suspend_manifest_never_revives_runs(tmp_path: Path) -> N
     assert supervisor.created == []
     assert supervisor.status("run-stale")["status"] == "cancelled"
     assert json.loads(stale_path.read_text(encoding="utf-8")) == stale_manifest
+
+
+# ----------------------------------------------------------------------
+# LHH-QUEUE-HOTRELOAD R3: trios/capacity hot-reload from the settings DB.
+#
+# The launcher seeds the embedded settings DB once at construction (empty
+# tables only, from the patched PROJECT_CONFIG_PATH below) and then re-reads
+# queue_trio / queue_capacity at the start of every scheduling pass, so a DB
+# change lands on the next pass with no restart. A launch still freezes the
+# trio the run started with. Tests never touch the real .lh-harness paths:
+# PROJECT_CONFIG_PATH and the settings env are pointed at tmp_path.
+# ----------------------------------------------------------------------
+
+_SETTINGS_KEY = "k" * 40  # >= settings_store.MIN_KEY_CHARS
+
+
+def _settings_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the launcher at a throwaway settings DB; return its path."""
+
+    db_path = tmp_path / "settings.db"
+    monkeypatch.setenv(settings_store.DB_ENV, str(db_path))
+    monkeypatch.setenv(settings_store.KEY_ENV, _SETTINGS_KEY)
+    return db_path
+
+
+def _write_project_config(path: Path, *, model: str | None = None, kimi_max: int = 1) -> None:
+    lines = ["[queue.trios.kimi]", 'agent = "claude_code"']
+    if model is not None:
+        lines.append(f'model = "{model}"')
+    lines += ["", "[queue.capacity]", f"kimi_max = {kimi_max}", ""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _patch_project_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    monkeypatch.setattr("lh_harness.launcher.PROJECT_CONFIG_PATH", path)
+
+
+def _db_update(db_path: Path, sql: str, params: tuple[Any, ...] = ()) -> None:
+    with sqlite3.connect(db_path) as db:
+        db.execute(sql, params)
+
+
+def test_db_trio_change_takes_effect_on_next_pass_without_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, store, supervisor = _fixture(tmp_path)
+    db_path = _settings_env(tmp_path, monkeypatch)
+    config_path = tmp_path / "config.toml"
+    _write_project_config(config_path, model="model-from-file", kimi_max=3)
+    _patch_project_config(tmp_path, monkeypatch, config_path)
+    settings = SettingsStore(db_path, _SETTINGS_KEY)
+    # Operator rows land BEFORE the launcher starts, so its one-time seed
+    # skips these tables entirely.
+    settings.seed_queue_defaults(
+        {"kimi": {"agent": "claude_code", "model": "model-a"}}, {"kimi_max": 3}
+    )
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config())
+
+    first = store.create(_base_entry(trio="kimi", workspace="./w1"))
+    asyncio.run(launcher.tick())
+    assert store.get(first.queue_id).status == "launched"
+    assert supervisor.created[0]["owner"]["role_configs"]["manager"]["model"] == "model-a"
+
+    # Admin edit mid-flight: same process, no restart, no new Launcher.
+    _db_update(db_path, "UPDATE queue_trio SET model = ? WHERE name = 'kimi'", ("model-b",))
+
+    second = store.create(_base_entry(trio="kimi", workspace="./w2"))
+    asyncio.run(launcher.tick())
+    assert store.get(second.queue_id).status == "launched"
+    assert supervisor.created[1]["owner"]["role_configs"]["manager"]["model"] == "model-b"
+    # The run that started under the old trio keeps its resolved model.
+    assert supervisor.created[0]["owner"]["role_configs"]["manager"]["model"] == "model-a"
+
+
+def test_db_capacity_change_takes_effect_on_next_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, store, supervisor = _fixture(tmp_path)
+    db_path = _settings_env(tmp_path, monkeypatch)
+    config_path = tmp_path / "config.toml"
+    _write_project_config(config_path, kimi_max=3)
+    _patch_project_config(tmp_path, monkeypatch, config_path)
+    settings = SettingsStore(db_path, _SETTINGS_KEY)
+    # DB says zero: it must beat the bootstrap config's kimi_max=3.
+    settings.seed_queue_defaults(
+        {"kimi": {"agent": "claude_code"}}, {"kimi_max": 0}
+    )
+    bootstrap = default_queue_config()
+    bootstrap["capacity"]["kimi_max"] = 3
+    launcher = Launcher(supervisor, store, queue_config=bootstrap)
+
+    entry = store.create(_base_entry(trio="kimi", workspace="./w1"))
+    asyncio.run(launcher.tick())
+    refused = store.get(entry.queue_id)
+    assert refused is not None
+    assert refused.status == "pending"
+    assert any("kimi at capacity" in reason for reason in refused.skip_reasons)
+    assert supervisor.created == []
+
+    _db_update(db_path, "UPDATE queue_capacity SET max_concurrent = 2 WHERE trio = 'kimi'")
+    asyncio.run(launcher.tick())
+    assert store.get(entry.queue_id).status == "launched"
+    assert len(supervisor.created) == 1
+
+
+def test_empty_db_falls_back_to_config_toml_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, store, supervisor = _fixture(tmp_path)
+    db_path = _settings_env(tmp_path, monkeypatch)
+    # A missing bootstrap file: the one-time seed is a no-op and the tables
+    # stay empty, so every pass must use the config-derived values.
+    _patch_project_config(tmp_path, monkeypatch, tmp_path / "missing.toml")
+    settings = SettingsStore(db_path, _SETTINGS_KEY)
+    bootstrap = default_queue_config()
+    bootstrap["capacity"]["kimi_max"] = 1
+    launcher = Launcher(supervisor, store, queue_config=bootstrap)
+
+    head = store.create(_base_entry(trio="kimi", workspace="./w1"))
+    tail = store.create(_base_entry(trio="kimi", workspace="./w2"))
+    asyncio.run(launcher.tick())
+
+    assert store.get(head.queue_id).status == "launched"
+    assert "model" not in supervisor.created[0]["owner"]["role_configs"]["manager"]
+    tail_entry = store.get(tail.queue_id)
+    assert tail_entry is not None
+    assert tail_entry.status == "pending"
+    assert any("kimi at capacity" in reason for reason in tail_entry.skip_reasons)
+    # The empty tables were not secretly populated during the pass.
+    assert settings.queue_trios() == []
+    assert settings.queue_capacity() == {}
+
+
+def test_restarting_seed_preserves_operator_edited_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, store, supervisor = _fixture(tmp_path)
+    db_path = _settings_env(tmp_path, monkeypatch)
+    config_path = tmp_path / "config.toml"
+    _write_project_config(config_path, model="model-from-file", kimi_max=1)
+    _patch_project_config(tmp_path, monkeypatch, config_path)
+
+    # First start: empty tables are seeded from config.toml.
+    Launcher(supervisor, store, queue_config=default_queue_config())
+    settings = SettingsStore(db_path, _SETTINGS_KEY)
+    assert [row["model"] for row in settings.queue_trios() if row["name"] == "kimi"] == [
+        "model-from-file"
+    ]
+    assert settings.queue_capacity()["kimi"] == 1
+
+    # Operator edits both tables.
+    _db_update(db_path, "UPDATE queue_trio SET model = ? WHERE name = 'kimi'", ("model-edited",))
+    _db_update(db_path, "UPDATE queue_capacity SET max_concurrent = 5 WHERE trio = 'kimi'")
+
+    # Second start (simulated restart): the seed must leave the rows alone.
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config())
+    assert launcher._settings_store is not None
+    assert [row["model"] for row in settings.queue_trios() if row["name"] == "kimi"] == [
+        "model-edited"
+    ]
+    assert settings.queue_capacity()["kimi"] == 5
+
+    # And the edited model is what the next launch actually resolves.
+    entry = store.create(_base_entry(trio="kimi", workspace="./w1"))
+    asyncio.run(launcher.tick())
+    assert store.get(entry.queue_id).status == "launched"
+    assert supervisor.created[0]["owner"]["role_configs"]["manager"]["model"] == "model-edited"

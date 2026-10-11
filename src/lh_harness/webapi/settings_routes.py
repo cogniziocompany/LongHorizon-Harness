@@ -1,4 +1,8 @@
-"""Admin settings screen and key restriction view (``/api/admin/*``).
+"""Admin settings screen and key restriction view (``/api/admin/*``), plus the
+queue trio/capacity admin API (``/api/queue/trios``, ``/api/queue/capacity``)
+so queue defaults change at runtime from the same settings store, and the
+pending-task override edit (``PUT /api/queue/{queue_id}/model``) so one queued
+task's model/roles/trio can change while it waits.
 
 Who is an admin (all must hold, otherwise the request is refused):
 
@@ -31,10 +35,12 @@ from ..settings_store import (
     SettingsRuntime,
     active_runtime,
     is_secret_name,
+    now_iso,
     spec_for,
 )
 
 ADMIN_PROXY_HEADER = "x-lh-proxy-auth"
+_KEEP_PEAK = object()  # PUT capacity: preserve the stored max_peak (legacy bare-int form)
 IDENTITY_HEADER = "x-auth-request-email"
 
 
@@ -57,6 +63,7 @@ def register_settings_routes(
     caller_specs: dict[str, dict[str, Any]] | None = None,
     ask_runtime: Any = None,
     project_config_path: Any = None,
+    model_fetch: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     def runtime() -> SettingsRuntime:
         return settings_runtime if settings_runtime is not None else active_runtime()
@@ -188,6 +195,384 @@ def register_settings_routes(
         rt = runtime()
         assert rt.store is not None
         return {"node": _node_name(), "keys": key_restrictions(rt, caller_specs, ask_runtime, project_config_path)}
+
+    # ------------------------------------------- queue trios + capacity (R4) --
+    # LHH-QUEUE-HOTRELOAD: trio defaults and per-trio capacity live in the
+    # settings DB (queue_trio/queue_capacity) and the launcher re-reads them on
+    # every scheduling pass, so a PUT below takes effect on the next launch
+    # with no restart and no redeploy.  The store remains the sole accessor --
+    # the writes below go through its ``_db``/``_audit`` machinery, never a
+    # second connection or parallel store.
+    def live_models() -> dict[str, Any] | None:
+        """The backend's live model list per agent, or ``None`` when unknown.
+
+        ``model_fetch`` is injectable so tests never touch the network; the
+        default re-reads model discovery (briefly cached; POST
+        /api/models/refresh forces a re-fetch) on every validation.
+        """
+
+        fetch = model_fetch
+        if fetch is None:
+            from ..model_catalog import discover_model_catalog
+            fetch = discover_model_catalog
+        try:
+            catalogue = fetch()
+        except Exception:  # noqa: BLE001 - a broken provider must refuse writes, not 500
+            return None
+        if not isinstance(catalogue, dict):
+            return None
+        models = catalogue.get("models")
+        return models if isinstance(models, dict) else None
+
+    @app.get("/api/queue/trios")
+    def get_queue_trios(request: Request) -> dict[str, Any]:
+        require_admin(request)
+        rt = runtime()
+        assert rt.store is not None
+        return {"trios": rt.store.queue_trios()}
+
+    @app.put("/api/queue/trios")
+    def put_queue_trios(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        actor = require_admin(request, write=True)
+        rt = runtime()
+        assert rt.store is not None
+        store = rt.store
+        unknown = set(body) - {"trios"}
+        if unknown:
+            raise HTTPException(status_code=400, detail="unknown field(s): " + ", ".join(sorted(unknown)))
+        rows = body.get("trios")
+        if not isinstance(rows, list):
+            raise HTTPException(status_code=422, detail="trios must be a list of trio objects")
+        models = live_models()
+        if models is None:
+            raise HTTPException(status_code=503, detail="the live model list is unavailable; refusing to write unvalidated trios")
+        # Every row is validated against the live list BEFORE any write: a
+        # rejected request leaves the DB and the audit log untouched.
+        cleaned: list[dict[str, Any]] = []
+        errors: list[str] = []
+        seen: set[str] = set()
+        for raw in rows:
+            row, error = _clean_trio_row(raw, models)
+            if error is not None:
+                errors.append(error)
+                continue
+            assert row is not None
+            if row["name"] in seen:
+                errors.append(f"duplicate trio name {row['name']!r}")
+                continue
+            seen.add(row["name"])
+            cleaned.append(row)
+        if errors:
+            raise HTTPException(status_code=422, detail="; ".join(errors))
+        with store._db() as db:
+            for row in cleaned:
+                old = db.execute("SELECT * FROM queue_trio WHERE name = ?", (row["name"],)).fetchone()
+                db.execute(
+                    """INSERT OR REPLACE INTO queue_trio(name, agent, model, mcp_profile, enabled, updated_by, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (row["name"], row["agent"], row["model"], row["mcp_profile"], row["enabled"], actor, now_iso()),
+                )
+                before = (
+                    None
+                    if old is None
+                    else {
+                        "agent": old["agent"],
+                        "model": old["model"],
+                        "mcp_profile": old["mcp_profile"],
+                        "enabled": bool(old["enabled"]),
+                    }
+                )
+                after = {
+                    "agent": row["agent"],
+                    "model": row["model"],
+                    "mcp_profile": row["mcp_profile"],
+                    "enabled": bool(row["enabled"]),
+                }
+                if before != after:
+                    store._audit(db, actor, "set", f"queue_trio:{row['name']}", before=before, after=after)
+        return {"ok": True, "trios": store.queue_trios()}
+
+    @app.get("/api/queue/capacity")
+    def get_queue_capacity(request: Request) -> dict[str, Any]:
+        require_admin(request)
+        rt = runtime()
+        assert rt.store is not None
+        rows = rt.store.queue_capacity_rows()
+        return {
+            "capacity": {name: row["max"] for name, row in rows.items()},
+            "max_peak": {name: row["max_peak"] for name, row in rows.items()},
+            "peak_window": "Mon-Fri 06:00-10:00 UTC",
+        }
+
+    @app.put("/api/queue/capacity")
+    def put_queue_capacity(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        actor = require_admin(request, write=True)
+        rt = runtime()
+        assert rt.store is not None
+        store = rt.store
+        unknown = set(body) - {"capacity"}
+        if unknown:
+            raise HTTPException(status_code=400, detail="unknown field(s): " + ", ".join(sorted(unknown)))
+        caps = body.get("capacity")
+        if not isinstance(caps, dict):
+            raise HTTPException(status_code=422, detail="capacity must be an object of trio name -> max_concurrent or {max, max_peak}")
+        known_trios = {row["name"] for row in store.queue_trios()}
+        keep = _KEEP_PEAK  # sentinel: preserve the stored max_peak
+        updates: dict[str, dict[str, int | None]] = {}
+        errors = []
+        for key, raw in caps.items():
+            trio = key.strip() if isinstance(key, str) else ""
+            if not trio:
+                errors.append("capacity keys must be trio names (non-empty strings)")
+                continue
+            if trio not in known_trios:
+                errors.append(f"capacity for unknown trio {trio!r}")
+                continue
+            # Legacy form: a bare int = the all-day max, peak untouched.
+            # Rich form: {"max": int, "max_peak": int|null} (null clears the
+            # peak override). The schedule layer resolves which applies when.
+            if isinstance(raw, bool) or isinstance(raw, int):
+                if isinstance(raw, bool) or raw < 0:
+                    errors.append(f"capacity for {trio!r} must be a non-negative integer")
+                    continue
+                # Legacy bare int: the all-day max only; an existing peak
+                # override is PRESERVED (cleared only via the rich form's
+                # explicit max_peak: null).
+                parsed = {"max": raw, "max_peak": _KEEP_PEAK}
+            elif isinstance(raw, dict) and set(raw) <= {"max", "max_peak"}:
+                base_val = raw.get("max")
+                peak_val = raw.get("max_peak")
+                if isinstance(base_val, bool) or not isinstance(base_val, int) or base_val < 0:
+                    errors.append(f"capacity.max for {trio!r} must be a non-negative integer")
+                    continue
+                if peak_val is not None and (isinstance(peak_val, bool) or not isinstance(peak_val, int) or peak_val < 0):
+                    errors.append(f"capacity.max_peak for {trio!r} must be a non-negative integer or null")
+                    continue
+                parsed = {"max": base_val, "max_peak": peak_val}
+            else:
+                errors.append(f"capacity for {trio!r} must be a non-negative integer or {{max, max_peak}}")
+                continue
+            updates[trio] = parsed
+        if errors:
+            raise HTTPException(status_code=422, detail="; ".join(errors))
+        with store._db() as db:
+            for trio, value in updates.items():
+                old = db.execute(
+                    "SELECT max_concurrent, max_peak FROM queue_capacity WHERE trio = ?", (trio,)
+                ).fetchone()
+                new_peak = value["max_peak"]
+                if new_peak is keep:
+                    new_peak = None if old is None else old["max_peak"]
+                db.execute(
+                    "INSERT INTO queue_capacity(trio, max_concurrent, max_peak) VALUES (?, ?, ?) "
+                    "ON CONFLICT(trio) DO UPDATE SET max_concurrent=excluded.max_concurrent, max_peak=excluded.max_peak",
+                    (trio, value["max"], new_peak),
+                )
+                before = None
+                if old is not None:
+                    before = {"max": int(old["max_concurrent"]), "max_peak": None if old["max_peak"] is None else int(old["max_peak"])}
+                after = {"max": value["max"], "max_peak": new_peak}
+                if before != after:
+                    store._audit(db, actor, "set", f"queue_capacity:{trio}", before=before, after=after)
+        rows = store.queue_capacity_rows()
+        return {
+            "ok": True,
+            "capacity": {name: row["max"] for name, row in rows.items()},
+            "max_peak": {name: row["max_peak"] for name, row in rows.items()},
+        }
+
+    # ----------------------------- pending-task model/roles edit (R7) --
+    # LHH-QUEUE-HOTRELOAD (Paxton 2026-10-11): a queued task's model (and its
+    # trio/roles) stays EDITABLE while the entry is pending.  The edit below
+    # accepts the R6 per-task overrides with the exact semantics enqueue
+    # applies -- ``model`` is one id validated against the backend's LIVE
+    # model list (unknown -> 422, provider down -> 503, nothing written), and
+    # ``roles`` is a STRING trio alias (same validation as the legacy enqueue
+    # alias, so the trio is editable too) or an OBJECT of per-role
+    # configuration validated with create_fleet_run's own normalizer.
+    # ``null`` clears: ``model`` null/blank drops the override; ``roles``
+    # null drops the per-role configuration (the trio is only ever touched
+    # through the explicit string form).  The persisted entry is what the R3
+    # launcher re-reads on every scheduling pass, so the edit applies to the
+    # next launch with no restart.  Once the entry is no longer pending the
+    # resolved model belongs to the run and is LOCKED: the edit is refused
+    # with 409 (a state refusal, not a validation error) and a trio-default
+    # change can never alter a running run.  Every accepted change writes one
+    # settings-audit row (R4/R5 convention: ``_db`` + ``_audit``, before/
+    # after keyed to the verified admin identity).  The PgQueueStore
+    # override-persistence gap tracked for the gate applies here exactly as
+    # it does to R6 enqueue; the file store (CT110's backend) persists fully.
+    @app.put("/api/queue/{queue_id}/model")
+    def put_queue_entry_model(
+        queue_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        actor = require_admin(request, write=True)
+        rt = runtime()
+        assert rt.store is not None
+        queue_store = getattr(request.app.state, "queue_store", None)
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        unknown = set(body) - {"model", "roles"}
+        if unknown:
+            raise HTTPException(status_code=400, detail="unknown field(s): " + ", ".join(sorted(unknown)))
+        if "model" not in body and "roles" not in body:
+            raise HTTPException(status_code=422, detail="provide model and/or roles to edit")
+        try:
+            entry = queue_store.get(queue_id)
+        except ValueError:  # malformed queue id: the store refuses the path
+            entry = None
+        if entry is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        if entry.status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"cannot edit model/roles for status {entry.status}",
+            )
+        from .. import queue as _q  # lazy: the R6 override validators live with the entry semantics
+
+        # Every supplied value is validated BEFORE the entry is mutated, so a
+        # refused request leaves the entry and the audit log untouched.  The
+        # R6 helpers raise ValueError (422 here) and the 503 ``HTTPException``
+        # for a provider that is down, which FastAPI answers directly -- the
+        # R4/R5/R6 taxonomy, unchanged.
+        before: dict[str, Any] = {}
+        after: dict[str, Any] = {}
+        try:
+            if "model" in body:
+                cleaned_model = _q._validate_model_override(body.get("model"))
+                if cleaned_model is not None:
+                    _q._validate_model_live(cleaned_model, model_fetch)
+                before["model"] = entry.model
+                after["model"] = cleaned_model
+            if "roles" in body:
+                raw_roles = body.get("roles")
+                if raw_roles is None:
+                    before["roles"] = entry.roles
+                    after["roles"] = None
+                elif isinstance(raw_roles, str):
+                    before["trio"] = entry.trio
+                    after["trio"] = _q._validate_trio(raw_roles)
+                elif isinstance(raw_roles, dict):
+                    before["roles"] = entry.roles
+                    after["roles"] = _q._validate_roles_config(raw_roles)
+                else:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="roles must be a string trio alias or an object of per-role configuration",
+                    )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        changed = before != after
+        if changed:
+            for key, value in after.items():
+                setattr(entry, key, value)
+            queue_store.update(entry)
+            with rt.store._db() as db:
+                rt.store._audit(db, actor, "edit", f"queue_entry:{queue_id}", before=before, after=after)
+        return {
+            "ok": True,
+            "queue_id": queue_id,
+            "status": entry.status,
+            "changed": changed,
+            "model": entry.model,
+            "roles": entry.roles,
+            "trio": entry.trio,
+        }
+
+    # The server registers its ``/api/queue/{queue_id}`` capture before this
+    # function runs, and Starlette resolves routes in registration order (the
+    # reason server.py places ``/api/queue/config`` before that capture).
+    # Registering here only appends, so the exact /api/queue/trios and
+    # /api/queue/capacity paths would be shadowed by the parameter route;
+    # move them ahead of the first capture of that shape so they are
+    # reachable.  Server.py itself stays untouched.
+    _rise_exact_queue_routes(app)
+
+
+_TRIO_ROW_FIELDS = {"name", "agent", "model", "mcp_profile", "enabled"}
+_NAME_LIMIT = 64
+
+
+def _clean_trio_row(raw: Any, models_by_agent: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate one queue-trio row; ``(row, None)`` when clean, else ``(None, error)``.
+
+    A trio's model must be on the LIVE model list of its agent -- the source
+    of truth the workbench dropdowns are drawn from -- so an admin cannot
+    schedule work on a model the backend cannot actually route to.  ``model``
+    and ``mcp_profile`` may be null (the launcher then falls back per key to
+    config.toml), matching what the one-time seed writes.
+    """
+
+    if not isinstance(raw, dict):
+        return None, "each trio row must be an object"
+    unknown = set(raw) - _TRIO_ROW_FIELDS
+    if unknown:
+        return None, "unknown field(s): " + ", ".join(sorted(unknown))
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > _NAME_LIMIT:
+        return None, f"trio name must be a non-empty string of at most {_NAME_LIMIT} characters"
+    trio = name.strip()
+    agent = raw.get("agent")
+    if not isinstance(agent, str) or not agent.strip():
+        return None, f"trio {trio!r}: agent must be a non-empty string"
+    agent = agent.strip()
+    if agent not in models_by_agent:
+        return None, f"trio {trio!r}: unknown agent {agent!r}"
+    model = raw.get("model")
+    if model is not None:
+        if not isinstance(model, str):
+            return None, f"trio {trio!r}: model must be a string or null"
+        model = model.strip() or None
+    if model is not None:
+        entries = models_by_agent.get(agent) or []
+        known = {str(entry.get("id")) for entry in entries if isinstance(entry, dict)}
+        if model not in known:
+            return None, f"trio {trio!r}: unknown model {model!r} for agent {agent!r} in the live model list"
+    profile = raw.get("mcp_profile")
+    if profile is not None:
+        if not isinstance(profile, str):
+            return None, f"trio {trio!r}: mcp_profile must be a string or null"
+        profile = profile.strip() or None
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        return None, f"trio {trio!r}: enabled must be true or false"
+    row = {
+        "name": trio,
+        "agent": agent,
+        "model": model,
+        "mcp_profile": profile,
+        "enabled": 1 if enabled else 0,
+    }
+    return row, None
+
+
+_QUEUE_EXACT_PATHS = {"/api/queue/trios", "/api/queue/capacity"}
+
+
+def _rise_exact_queue_routes(app: FastAPI) -> None:
+    """Reposition the exact /api/queue/trios and /api/queue/capacity routes.
+
+    Server.py registers ``/api/queue/{queue_id}`` before register_settings_routes
+    runs, and Starlette scans routes in registration order, so an exact path
+    appended here would never be reached (the parameter route would answer
+    ``queue_id="trios"`` with a 404).  Move only these routes ahead of the
+    first parameter capture of that shape; every other route keeps its order.
+    """
+
+    routes = app.router.routes
+    moved = [route for route in routes if getattr(route, "path", None) in _QUEUE_EXACT_PATHS]
+    if not moved:
+        return
+    for route in moved:
+        routes.remove(route)
+    anchor = next(
+        (i for i, route in enumerate(routes) if getattr(route, "path", None) == "/api/queue/{queue_id}"),
+        len(routes),
+    )
+    for offset, route in enumerate(moved):
+        routes.insert(anchor + offset, route)
 
 
 def _node_name() -> str:
