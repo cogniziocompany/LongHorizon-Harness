@@ -106,10 +106,8 @@ _RUN_KEYS = {
 # per-caller tool scoping and budget ceilings (task 174).
 _TOP_LEVEL_KEYS = {"run", "queue", "experience", "callers", "asks"}
 _QUEUE_TRIOS = {"kimi", "qwen"}
-# Trios a config MAY define but that are never filled in by default. ``orfree``
-# runs every role on an OpenRouter free model through the gateway (two keys,
-# 20 requests/minute and 1,000 requests/day each): see docs/queue.md.
-_OPTIONAL_QUEUE_TRIOS = {"orfree", "glm", "zai", "zaiq"}
+# Trios a config MAY define but that are never filled in by default.
+_OPTIONAL_QUEUE_TRIOS = {"glm", "zai", "zaiq"}
 # Per-role overrides a trio may carry: <role>_agent / <role>_model for the
 # three queue roles. A mixed trio (zaiq: manager+auditor on z.ai, executor
 # on the local qwen lane) is expressed with these; unset roles use the
@@ -225,7 +223,6 @@ def _caller_secret_env(name: str) -> str:
 _QUEUE_CAPACITY_KEYS = {
     "kimi_max",
     "qwen_max",
-    "orfree_max",
     "glm_max",
     "zai_max",
     "zaiq_max",
@@ -364,14 +361,6 @@ auditor = 300
 # model = "qwen3.8"
 # mcp_profile = "audit"
 
-# Optional: every role on an OpenRouter free model (gateway alias). Free tier:
-# 2 keys x 20 requests/minute, 1,000 requests/day each; prompts may be logged
-# by the upstream provider, so no customer or secret-bearing work here.
-# [queue.trios.orfree]
-# agent = "claude_code"
-# model = "qwen3.8-27b:openrouter-free"
-# mcp_profile = "ops"
-
 # Optional: dev work on the direct z.ai coding plan. An ADDITIONAL trio; it never
 # replaces kimi, qwen or glm.
 # [queue.trios.zai]
@@ -398,7 +387,6 @@ auditor = 300
 # [queue.capacity]
 # kimi_max = 3          # concurrent kimi runs allowed
 # qwen_max = 1          # concurrent qwen runs allowed (QA only, one at a time)
-# orfree_max = 2        # concurrent orfree runs (only used when the trio is defined)
 # glm_max = 1           # concurrent glm runs (only used when the trio is defined)
 # zai_max = 5           # concurrent zai runs (only used when the trio is defined)
 # zaiq_max = 1          # concurrent zaiq runs; shares the local qwen lanes with qwen_max
@@ -794,7 +782,6 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     normalized_capacity: dict[str, Any] = {
         "kimi_max": 3,
         "qwen_max": 1,
-        "orfree_max": 2,
         "glm_max": 1,
         "zai_max": 5,
         "zaiq_max": 1,
@@ -808,8 +795,6 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["kimi_max"] = max(0, capacity["kimi_max"])
     if isinstance(capacity.get("qwen_max"), int):
         normalized_capacity["qwen_max"] = max(0, capacity["qwen_max"])
-    if isinstance(capacity.get("orfree_max"), int):
-        normalized_capacity["orfree_max"] = max(0, capacity["orfree_max"])
     if isinstance(capacity.get("glm_max"), int):
         normalized_capacity["glm_max"] = max(0, capacity["glm_max"])
     if isinstance(capacity.get("zai_max"), int):

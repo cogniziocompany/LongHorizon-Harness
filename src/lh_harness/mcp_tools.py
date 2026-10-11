@@ -58,15 +58,15 @@ Accepted fields (all persisted on the queue entry):
   deliverables, and hard rules.
 - workspace (string, required): workspace directory path for the run.
 - trio (string, optional): resource trio, 'kimi' for development work,
-  'qwen' for QA only, 'orfree' (OpenRouter free model) or 'glm' (Ollama
-  Cloud glm-5.3), the last two only on nodes whose config defines them. No default trio is applied at enqueue time. When
+  'qwen' for QA only, or 'glm' / 'zai' / 'zaiq' on nodes whose config
+  defines them. No default trio is applied at enqueue time. When
   omitted, the entry persists with trio unset and never launches until a
   trio is set: remaining capacity is derived only from the configured
   trios (launcher.py _remaining_capacity), so each launcher pass records
   an ' at capacity' skip for the entry (launcher.py _check_eligibility)
   and it stays pending, unlaunched, consuming no capacity; _launch and
   _shadow_launch_decision guard the same condition with an 'unknown trio'
-  skip. Supply 'kimi', 'qwen', 'orfree', 'glm', 'zai' or 'zaiq' whenever the task should actually
+  skip. Supply 'kimi', 'qwen', 'glm', 'zai' or 'zaiq' whenever the task should actually
   launch.
 - max_rounds (integer, optional): maximum harness rounds (default 25).
 - priority (integer, optional): higher number = earlier launch within the
@@ -103,11 +103,6 @@ Rules:
   least min_healthy_keys healthy Ollama Cloud keys and counts against kimi_max.
 - trio "qwen" is for QA only (codex backend) and is limited to one concurrent
   run (qwen_max=1).
-- trio "orfree" runs every role on an OpenRouter free model through the
-  gateway (orfree_max, default 2). Free tier: 20 requests/minute and 1,000
-  requests/day per key, and the upstream provider may log prompts. Never send
-  customer data or secret-bearing work to it. It launches only on a node whose
-  config defines [queue.trios.orfree]; elsewhere the entry stays pending.
 - trio "zaiq" is the MIXED lane: manager and auditor on z.ai, executor on the
   local qwen lane (zaiq_max, default 1; shares the local lanes with qwen).
   Launches only on a node whose config defines [queue.trios.zaiq].
@@ -379,8 +374,7 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                 "task": _string_param("Scoped task text. Provide repo, branch, deliverables, and hard rules.", required=True),
                 "workspace": _string_param("Workspace directory path for the run.", required=True),
                 "trio": _string_param(
-                    "Resource trio: 'kimi' for dev, 'qwen' for QA only, 'orfree' for "
-                    "OpenRouter free-model work (no customer or secret data), 'glm' for "
+                    "Resource trio: 'kimi' for dev, 'qwen' for QA only, 'glm' for "
                     "Ollama Cloud glm-5.3 dev work where the node defines it. "
                     "Optional: omit to store the entry with trio unset; the "
                     "launcher then skips it as 'unknown trio' until a trio "
