@@ -1,8 +1,9 @@
 from pathlib import Path
+import json
 
 import pytest
 
-from lh_harness.manager import _GateContext, _human_gate
+from lh_harness.manager import _GateContext, _human_gate, _resume_parent_debrief
 from lh_harness.types import HarnessConfig, ManagedRound
 from lh_harness.environment.local import LocalEnvironment
 from lh_harness.manager import run
@@ -64,6 +65,51 @@ async def test_unavailable_parent_holds_without_exposing_error(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["snapshot", "round", "task"])
+async def test_resume_refuses_changed_checkpoint_sources(tmp_path: Path, mutation):
+    async def hook(projection):
+        return {"action": "wait", "checkpoint": projection["checkpoint"],
+                "receipt_ref": "outbox:1", "reply_required": True}
+    ctx = context(tmp_path, hook)
+    assert await _human_gate(ctx, "progress", 1, "partial")
+    if mutation == "snapshot":
+        path = tmp_path / "role_orchestration" / "parent_debrief.json"
+        snapshot = json.loads(path.read_text())
+        snapshot["projection"]["outcome"] = "completed"
+        path.write_text(json.dumps(snapshot))
+    elif mutation == "round":
+        ctx.rounds[-1].auditor_report = "changed evidence"
+    else:
+        ctx.task = "expanded scope"
+    async def forbidden(projection):
+        pytest.fail("changed checkpoint must not reach parent transport")
+    ctx.parent_debrief_hook = forbidden
+    assert await _resume_parent_debrief(ctx)
+    assert ctx.abort_reason == "needs_parent_input"
+
+
+@pytest.mark.asyncio
+async def test_resume_reuses_original_checkpoint_and_budget(tmp_path: Path):
+    seen = []
+    async def waiting(projection):
+        seen.append(dict(projection))
+        return {"action": "wait", "checkpoint": projection["checkpoint"],
+                "receipt_ref": "outbox:1", "reply_required": True}
+    ctx = context(tmp_path, waiting)
+    assert await _human_gate(ctx, "progress", 1, "partial")
+    ctx.round_budget = 20
+    async def answered(projection):
+        assert projection == seen[0]
+        return {"action": "continue", "checkpoint": projection["checkpoint"],
+                "receipt_ref": "outbox:1", "reply_required": True,
+                "parent_reply_ref": "reply:1", "instructions": "clarification"}
+    ctx.parent_debrief_hook = answered
+    assert not await _resume_parent_debrief(ctx)
+    assert ctx.round_budget == 2
+    assert ctx.carryover_instructions == "clarification"
+
+
+@pytest.mark.asyncio
 async def test_round_wait_occurs_after_executor_and_auditor(tmp_path: Path):
     calls = []
     replies = iter([
@@ -90,3 +136,28 @@ async def test_round_wait_occurs_after_executor_and_auditor(tmp_path: Path):
     assert report["rounds_run"] == 1
     assert report["abort_reason"] == "needs_parent_input"
     assert not report["completion_satisfied"]
+
+    # Resume must revisit the same debrief, not run Manager/Executor first or
+    # silently turn the configured additional budget into permission to proceed.
+    observed = []
+    async def still_waiting(projection):
+        observed.append(projection)
+        return {"action": "wait", "receipt_ref": "outbox:1",
+                "checkpoint": projection["checkpoint"], "reply_required": True}
+    resumed = await run(task="make and verify one change", agent=Agent(),
+        env=LocalEnvironment(str(tmp_path / "env")),
+        config=HarnessConfig(max_total_episodes=3, prompt_language="en",
+            workspace_path=str(tmp_path / "workspace"), harness_dir=str(tmp_path / "harness"),
+            log_dir=str(tmp_path / "logs")), parent_debrief_hook=still_waiting, resume=True)
+    assert calls == ["role", "role", "role", "debrief"]
+    assert observed[0]["round_index"] == 1
+    assert resumed["rounds_run"] == 1
+    assert resumed["abort_reason"] == "needs_parent_input"
+
+    missing_adapter = await run(task="make and verify one change", agent=Agent(),
+        env=LocalEnvironment(str(tmp_path / "env")),
+        config=HarnessConfig(max_total_episodes=3,
+            workspace_path=str(tmp_path / "workspace"), harness_dir=str(tmp_path / "harness"),
+            log_dir=str(tmp_path / "logs")), resume=True)
+    assert missing_adapter["abort_reason"] == "needs_parent_input"
+    assert calls == ["role", "role", "role", "debrief"]

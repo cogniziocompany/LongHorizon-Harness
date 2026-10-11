@@ -366,7 +366,8 @@ async def _run_impl(
         _run_progress.gate = gate
         _run_progress.started_at = started
 
-    while round_index < gate.round_budget:
+    parent_resume_held = resume and await _resume_parent_debrief(gate)
+    while not parent_resume_held and round_index < gate.round_budget:
         round_index += 1
         round_dir = rounds_dir / f"round_{round_index:03d}"
         _ensure_dir_nofollow(round_dir)
@@ -1166,13 +1167,8 @@ async def _parent_debrief(ctx: _GateContext, outcome: str, round_index: int, tas
     if ctx.parent_debrief_hook is None:
         return False
     record = next((item for item in reversed(ctx.rounds) if item.round_index == round_index), None)
-    checkpoint = hashlib.sha256(json.dumps({
-        "round": asdict(record) if record else None, "round_index": round_index,
-        "outcome": outcome, "task_state": task_state, "question": question,
-        "round_budget": ctx.round_budget,
-    }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     projection = {
-        "phase": "manager_parent_debrief", "checkpoint": checkpoint,
+        "phase": "manager_parent_debrief",
         "round_index": round_index, "outcome": outcome,
         "remaining_rounds": max(0, ctx.round_budget-round_index),
         "task_state": task_state[:8000], "question": question[:8000],
@@ -1180,6 +1176,66 @@ async def _parent_debrief(ctx: _GateContext, outcome: str, round_index: int, tas
         "harness_feedback": record.harness_feedback[:8000] if record else "",
         "evidence_refs": list(record.related_report_refs[:100]) if record else [],
     }
+    snapshot = {
+        "version": 1, "round_digest": _debrief_digest(asdict(record) if record else None),
+        "task_digest": _debrief_digest(ctx.task), "round_budget": ctx.round_budget,
+        "projection": projection,
+    }
+    checkpoint = _debrief_digest(snapshot)
+    projection["checkpoint"] = checkpoint
+    # Persist before calling the adapter: crashes and parent restarts must revisit
+    # this original checkpoint rather than synthesize a new resume budget.
+    _write_local(ctx.log_dir / "role_orchestration" / "parent_debrief.json", json.dumps(snapshot))
+    return await _deliver_parent_debrief(ctx, projection)
+
+
+def _debrief_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+async def _resume_parent_debrief(ctx: _GateContext) -> bool:
+    path = ctx.log_dir / "role_orchestration" / "parent_debrief.json"
+    if not os.path.lexists(path):
+        return False
+    raw = _read_local_bytes(path, 256 * 1024)
+    try:
+        snapshot = json.loads(raw) if raw is not None else None
+        if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+            raise ValueError("invalid debrief snapshot")
+        projection = snapshot["projection"]
+        checkpoint = projection.pop("checkpoint")
+        if checkpoint != _debrief_digest(snapshot):
+            raise ValueError("changed debrief snapshot")
+        projection["checkpoint"] = checkpoint
+        index = projection["round_index"]
+        if type(index) is not int or not ctx.rounds:
+            raise ValueError("missing source round")
+        if index < ctx.rounds[-1].round_index:
+            return False  # A later durable round proves this boundary advanced.
+        if index != ctx.rounds[-1].round_index or snapshot["round_digest"] != _debrief_digest(asdict(ctx.rounds[-1])):
+            raise ValueError("changed source round")
+        if snapshot["task_digest"] != _debrief_digest(ctx.task):
+            raise ValueError("changed task")
+        budget = snapshot["round_budget"]
+        if type(budget) is not int or not index <= budget <= MAX_ROUNDS:
+            raise ValueError("invalid original budget")
+        ctx.round_budget = budget
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        ctx.abort_reason = "needs_parent_input"
+        ctx.completion_satisfied = False
+        _append_event(ctx.events_path, "parent_debrief_resume_held", {"reason": "invalid_checkpoint"})
+        return True
+    if ctx.parent_debrief_hook is None:
+        ctx.abort_reason = "needs_parent_input"
+        ctx.completion_satisfied = False
+        _append_event(ctx.events_path, "parent_debrief_resume_held", {"reason": "adapter_unavailable"})
+        return True
+    return await _deliver_parent_debrief(ctx, projection)
+
+
+async def _deliver_parent_debrief(ctx: _GateContext, projection: dict[str, Any]) -> bool:
+    checkpoint = projection["checkpoint"]
+    round_index = projection["round_index"]
     _append_event(ctx.events_path, "parent_debrief_pending", {
         "round": round_index, "checkpoint": checkpoint,
     })
