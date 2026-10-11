@@ -84,6 +84,12 @@ def test_mcp_fleet_tools_manifest(client_fixture: Any = None) -> None:
             "respond_open_ask",
             "clear_ask_secret",
             "apply_ask_secret",
+            # LHH-QUEUE-HOTRELOAD R5: queue trio/capacity admin tools (settings
+            # DB hot-reload; literal unprefixed contract names).
+            "list_trios",
+            "set_trio_model",
+            "set_trio_capacity",
+            "refresh_models",
         }
         enqueue = next(tool for tool in data["tools"] if tool["name"] == "harness_enqueue_task")
         assert "kimi" in enqueue["description"]
