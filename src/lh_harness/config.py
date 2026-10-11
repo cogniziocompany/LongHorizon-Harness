@@ -109,7 +109,13 @@ _QUEUE_TRIOS = {"kimi", "qwen"}
 # Trios a config MAY define but that are never filled in by default. ``orfree``
 # runs every role on an OpenRouter free model through the gateway (two keys,
 # 20 requests/minute and 1,000 requests/day each): see docs/queue.md.
-_OPTIONAL_QUEUE_TRIOS = {"orfree", "glm", "zai"}
+_OPTIONAL_QUEUE_TRIOS = {"orfree", "glm", "zai", "zaiq"}
+# Per-role overrides a trio may carry: <role>_agent / <role>_model for the
+# three queue roles. A mixed trio (zaiq: manager+auditor on z.ai, executor
+# on the local qwen lane) is expressed with these; unset roles use the
+# trio-wide agent/model.
+_TRIO_ROLES = ("manager", "executor", "auditor")
+_TRIO_ROLE_KEYS = {f"{role}_{key}" for role in _TRIO_ROLES for key in ("agent", "model")}
 # Per-caller tool scoping and budget ceilings (task 174). The complete set of
 # tool names the MCP dispatch exposes; a caller's ``tools`` allowlist is
 # validated against it. Granting a tool here is what also unlocks its REST
@@ -222,6 +228,7 @@ _QUEUE_CAPACITY_KEYS = {
     "orfree_max",
     "glm_max",
     "zai_max",
+    "zaiq_max",
     "min_healthy_keys",
     "key_health_url",
     "poll_seconds",
@@ -372,6 +379,16 @@ auditor = 300
 # model = "glm-5.3:zai"
 # mcp_profile = "ops"
 
+# Optional: MIXED trio. Manager and auditor on the direct z.ai coding plan,
+# executor on the local qwen lane. Per-role keys override the trio-wide
+# agent/model for that role only. Count zaiq_max against the local qwen lanes
+# together with qwen_max (CT110: two lanes).
+# [queue.trios.zaiq]
+# agent = "claude_code"
+# model = "glm-5.3:zai"
+# executor_model = "qwen3.8"
+# mcp_profile = "ops"
+
 # Optional: dev work on Ollama Cloud glm-5.3 (keyed, not the synthetic provider).
 # [queue.trios.glm]
 # agent = "claude_code"
@@ -384,6 +401,7 @@ auditor = 300
 # orfree_max = 2        # concurrent orfree runs (only used when the trio is defined)
 # glm_max = 1           # concurrent glm runs (only used when the trio is defined)
 # zai_max = 5           # concurrent zai runs (only used when the trio is defined)
+# zaiq_max = 1          # concurrent zaiq runs; shares the local qwen lanes with qwen_max
 # min_healthy_keys = 2  # healthy Ollama Cloud keys required before kimi launches
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
@@ -740,7 +758,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
     for name, spec in trios.items():
         if not isinstance(spec, dict):
             raise ProjectConfigError(f"[queue.trios.{name}] must be a TOML table")
-        unknown_trio_keys = set(spec) - {"agent", "model", "mcp_profile"}
+        unknown_trio_keys = set(spec) - {"agent", "model", "mcp_profile"} - _TRIO_ROLE_KEYS
         if unknown_trio_keys:
             raise ProjectConfigError(
                 f"unknown [queue.trios.{name}] key(s): {_names(unknown_trio_keys)}"
@@ -753,6 +771,10 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
             "model": str(spec.get("model", "")).strip() or None,
             "mcp_profile": str(spec.get("mcp_profile", "")).strip() or None,
         }
+        for role_key in sorted(_TRIO_ROLE_KEYS & set(spec)):
+            role_value = str(spec.get(role_key, "")).strip()
+            if role_value:
+                normalized_trios[name][role_key] = role_value
     for required in _QUEUE_TRIOS:
         if required not in normalized_trios:
             normalized_trios[required] = {
@@ -775,6 +797,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "orfree_max": 2,
         "glm_max": 1,
         "zai_max": 5,
+        "zaiq_max": 1,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
@@ -791,6 +814,8 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["glm_max"] = max(0, capacity["glm_max"])
     if isinstance(capacity.get("zai_max"), int):
         normalized_capacity["zai_max"] = max(0, capacity["zai_max"])
+    if isinstance(capacity.get("zaiq_max"), int):
+        normalized_capacity["zaiq_max"] = max(0, capacity["zaiq_max"])
     if isinstance(capacity.get("min_healthy_keys"), int):
         normalized_capacity["min_healthy_keys"] = max(0, capacity["min_healthy_keys"])
     if isinstance(capacity.get("key_health_url"), str):

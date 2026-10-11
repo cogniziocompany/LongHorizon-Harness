@@ -49,7 +49,7 @@ _NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
 # on an OpenRouter free model through the gateway; an entry enqueued for it on
 # a node whose config does not define it stays pending ("orfree at capacity").
 _REQUIRED_TRIOS = frozenset({"kimi", "qwen"})
-_OPTIONAL_TRIOS = frozenset({"orfree", "glm", "zai"})
+_OPTIONAL_TRIOS = frozenset({"orfree", "glm", "zai", "zaiq"})
 _VALID_TRIOS = _REQUIRED_TRIOS | _OPTIONAL_TRIOS
 
 # The requester identity block (task 300).  A JSON object on the entry body
@@ -768,6 +768,14 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
             "mcp_profile": mcp_profile,
             "auditor_mcp_profile": str(spec.get("auditor_mcp_profile", "")).strip() or None,
         }
+        # Per-role overrides (<role>_agent / <role>_model) ride along so the
+        # launcher can build a mixed trio such as zaiq (z.ai manager and
+        # auditor, local qwen executor). Blank values are dropped.
+        for role in ("manager", "executor", "auditor"):
+            for key in ("agent", "model"):
+                role_value = str(spec.get(f"{role}_{key}", "")).strip()
+                if role_value:
+                    normalized_trios[name][f"{role}_{key}"] = role_value
     for required in _REQUIRED_TRIOS:
         if required not in normalized_trios:
             # Keep a safe fallback so the API can still report config shape.
@@ -786,6 +794,8 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "glm_max": 1,
         # Only consulted when [queue.trios.zai] is defined (direct z.ai coding plan).
         "zai_max": 5,
+        # Only consulted when [queue.trios.zaiq] is defined (mixed z.ai + local qwen).
+        "zaiq_max": 1,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
@@ -802,6 +812,8 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["glm_max"] = max(0, capacity["glm_max"])
     if isinstance(capacity.get("zai_max"), int):
         normalized_capacity["zai_max"] = max(0, capacity["zai_max"])
+    if isinstance(capacity.get("zaiq_max"), int):
+        normalized_capacity["zaiq_max"] = max(0, capacity["zaiq_max"])
     if isinstance(capacity.get("min_healthy_keys"), int):
         normalized_capacity["min_healthy_keys"] = max(0, capacity["min_healthy_keys"])
     if isinstance(capacity.get("key_health_url"), str):
