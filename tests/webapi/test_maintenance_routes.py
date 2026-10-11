@@ -597,3 +597,78 @@ def test_launcher_keeps_manifest_listed_entry_launched(tmp_path: Path) -> None:
     assert parked_entry.status == "launched"
     # A terminal run that is NOT in the manifest reconciles exactly as before.
     assert orphan_entry.status == "failed"
+
+
+def test_manifest_lists_a_run_while_it_is_still_stopping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The manifest must exist from the stop REQUEST, not from the final pause.
+
+    2026-10-11 (sus-20261011T200603Z-7777c916): six launched entries were
+    reconciled to failed "run cancelled" during the grace window because the
+    manifest was written only after every run had paused, so the launcher's
+    guard (maintenance_manifest_run_ids) had nothing to protect them with."""
+    from lh_harness.launcher import maintenance_manifest_run_ids
+
+    monkeypatch.setenv("LH_HARNESS_SUSPEND_RUN_GRACE_SECONDS", "5")
+    monkeypatch.setenv("LH_HARNESS_SUSPEND_DEADLINE_SECONDS", "10")
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _CheckpointSupervisor(root, {"run-slow": 1.5})
+    app = create_app(
+        runs_root=root, supervisor=supervisor, auth_token="secret", bind_host="testserver", probe_open_pr=None
+    )
+    client = TestClient(app)
+    supervisor.add_run("run-slow", "./w1", status="running")
+    entry = store.create(_base_entry(trio="kimi", priority=5, workspace="./w1"))
+    store.mark_launched(entry.queue_id, "run-slow")
+    store.set_drain(True, reason="deploy early-manifest")
+
+    response = client.post("/api/maintenance/suspend", json={"reason": "deploy early-manifest"}, headers=_AUTH)
+    assert response.status_code == 202, response.text
+    suspend_id = str(response.json()["suspend_id"])
+
+    # Well inside the 1.5 s checkpoint delay: the job is still running, the
+    # run has not paused, and the manifest ALREADY names it.
+    deadline = time.monotonic() + 1.0
+    seen_early = False
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/maintenance/suspend/{suspend_id}", headers=_AUTH).json()
+        if status["state"] == "running" and "run-slow" in maintenance_manifest_run_ids(root):
+            seen_early = True
+            break
+        time.sleep(0.05)
+    assert seen_early, "manifest must list the run before it finishes stopping"
+    manifest_entry = [item for item in _manifest(root, suspend_id)["runs"] if item["run_id"] == "run-slow"]
+    assert manifest_entry and manifest_entry[0]["queue_id"] == entry.queue_id
+
+    status = _wait_suspend(client, suspend_id)
+    assert status["state"] == "suspended", status
+    assert [item["run_id"] for item in _manifest(root, suspend_id)["runs"]] == ["run-slow"]
+
+
+def test_resume_restores_a_reconciled_queue_entry_to_launched(tmp_path: Path) -> None:
+    """A queue entry the launcher marked failed while its run was parked goes
+    back to launched when the resume revives the run, so the trio cap counts
+    it again and it does not read as failed while running."""
+    client, root, store, supervisor = _client(tmp_path)
+    supervisor.add_run("run-a", "./w1", status="running")
+    entry = store.create(_base_entry(trio="kimi", priority=5, workspace="./w1"))
+    store.mark_launched(entry.queue_id, "run-a")
+    store.set_drain(True, reason="deploy")
+    suspend_id = _post_suspend(client)
+    assert _wait_suspend(client, suspend_id)["state"] == "suspended"
+    # Simulate the 2026-10-11 reconciliation race.
+    assert store.mark_failed(entry.queue_id, "run cancelled") is not None
+    assert store.get(entry.queue_id).status == "failed"
+
+    response = client.post("/api/maintenance/resume", json={"suspend_id": suspend_id}, headers=_AUTH)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["ok"] is True
+    restored = store.get(entry.queue_id)
+    assert restored is not None
+    assert restored.status == "launched"
+    assert restored.run_id == "run-a"
+    assert ("run-a", "continue") in supervisor.resumed
