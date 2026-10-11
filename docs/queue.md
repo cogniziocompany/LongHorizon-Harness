@@ -187,6 +187,7 @@ Capacity is configured under `[queue.capacity]`:
 | `qwen_max` | 1 | Concurrent qwen runs allowed (QA only, one at a time) |
 | `orfree_max` | 2 | Concurrent orfree runs allowed. Only used when `[queue.trios.orfree]` is defined (see below) |
 | `glm_max` | 1 | Concurrent glm runs allowed. Only used when `[queue.trios.glm]` is defined (see below) |
+| `zai_max` | 1 | Concurrent zai runs allowed. Only used when `[queue.trios.zai]` is defined (see below) |
 | `min_healthy_keys` | 2 | Healthy Ollama Cloud keys required before kimi launches |
 | `key_health_url` | `""` | URL that returns `{ "healthy_keys": [{"healthy": true}, ...] }` |
 | `poll_seconds` | 15 | Launcher poll interval |
@@ -604,3 +605,23 @@ mcp_profile = "ops"
 [queue.capacity]
 glm_max = 1
 ```
+
+## The optional `zai` trio (direct z.ai coding plan)
+
+`zai` is an additional trio. It never replaces `kimi`, `qwen` or `glm`: those keep their models,
+and a task opts in to z.ai by asking for trio `zai`. Like `orfree` and `glm` it exists only on a
+node whose `config.toml` defines it; elsewhere a `zai` entry stays pending with `zai at capacity`.
+
+```toml
+[queue.trios.zai]
+agent = "claude_code"
+model = "glm-5.3:zai"
+mcp_profile = "ops"
+
+[queue.capacity]
+zai_max = 1
+```
+
+Before defining it on a node, check that the node's gateway key is allowed `glm-5.3:zai`. On
+2026-10-11 the CT110 key was not, and every launch failed in seconds with a 403 "key not allowed
+to access model".
