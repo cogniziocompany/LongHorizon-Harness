@@ -338,6 +338,166 @@ def test_old_records_without_identity_still_load(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# Persona-channel accept paths: fleet-chat and web-sso REQUIRE a verified
+# identity.  A signed caller (identity_source = "caller-secret") provides it,
+# so resolves succeed; a no-config install keeps identity_source at "none"
+# and is refused -- re-tested here as accept paths to lock the contract.
+# --------------------------------------------------------------------------
+def test_fleet_chat_with_signed_caller_is_accepted(monkeypatch: Any, tmp_path: Path) -> None:
+    _enable_reporter(monkeypatch)
+    configs = {"chat-agent": {"secret_env": "LH_HARNESS_CALLER_CHAT_AGENT_SECRET", "tools": ["harness_resolve_gate"]}}
+    root, state, client = _fixture(tmp_path, caller_configs=configs)
+    from .caller_util import install_caller_secret, clear_caller_secrets
+
+    install_caller_secret("chat-agent")
+    approval = state.create_approval(title="gate", options=[ApprovalOption(value="continue", label="Continue")])
+    r = _mcp(client, caller_args(
+        {"run_id": "run-1", "approval_id": approval.approval_id, "action": "continue",
+         "approved_by": UPN, "channel": "fleet-chat"},
+        "chat-agent",
+    ))
+    assert r.status_code == 200, r.text
+    resolved = state.get_approval(approval.approval_id)
+    assert resolved is not None and resolved.status == "resolved"
+    assert resolved.approved_by == UPN
+    assert resolved.channel == "fleet-chat"
+    assert resolved.unattributed is False
+    events_path = root / "run-1" / "logs" / "role_management" / "events.jsonl"
+    if not events_path.exists():
+        state._apply_pending_resolutions()
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    payload = [e for e in events if e.get("event") == "approval_resolved"][-1]
+    assert payload.get("approved_by") == UPN
+    assert payload.get("channel") == "fleet-chat"
+    assert payload.get("approved_via") == f"approved by {UPN} via fleet-chat"
+    assert payload.get("unattributed") is False
+    clear_caller_secrets()
+
+
+def test_web_sso_with_signed_caller_is_accepted(tmp_path: Path) -> None:
+    configs = {"operator": {"secret_env": "LH_HARNESS_CALLER_OPERATOR_SECRET", "tools": ["harness_resolve_gate"]}}
+    root, state, client = _fixture(tmp_path, caller_configs=configs)
+    from .caller_util import install_caller_secret, clear_caller_secrets
+
+    install_caller_secret("operator")
+    approval = state.create_approval(title="gate", options=[ApprovalOption(value="continue", label="Continue")])
+    r = _post(client, f"{RESOLVE}/{approval.approval_id}/resolve",
+              {"action": "continue", "approved_by": UPN, "channel": "web-sso"},
+              headers=caller_headers("operator"))
+    assert r.status_code == 200, r.text
+    resolved = state.get_approval(approval.approval_id)
+    assert resolved is not None and resolved.status == "resolved"
+    assert resolved.approved_by == UPN and resolved.channel == "web-sso"
+    assert resolved.unattributed is False
+    clear_caller_secrets()
+
+
+def test_terminal_via_mcp_is_accepted(monkeypatch: Any, tmp_path: Path) -> None:
+    """Round-trip identity through MCP: signed caller + terminal channel."""
+    _enable_reporter(monkeypatch)
+    configs = {"operator": {"secret_env": "LH_HARNESS_CALLER_OPERATOR_SECRET", "tools": ["harness_resolve_gate"]}}
+    root, state, client = _fixture(tmp_path, caller_configs=configs)
+    from .caller_util import install_caller_secret, clear_caller_secrets
+
+    install_caller_secret("operator")
+    approval = state.create_approval(title="gate", options=[ApprovalOption(value="continue", label="Continue")])
+    r = _mcp(client, caller_args(
+        {"run_id": "run-1", "approval_id": approval.approval_id, "action": "continue",
+         "approved_by": TERMINAL, "channel": "terminal"},
+        "operator",
+    ))
+    assert r.status_code == 200, r.text
+    resolved = state.get_approval(approval.approval_id)
+    assert resolved is not None and resolved.status == "resolved"
+    assert resolved.approved_by == TERMINAL and resolved.channel == "terminal"
+    events_path = root / "run-1" / "logs" / "role_management" / "events.jsonl"
+    if not events_path.exists():
+        state._apply_pending_resolutions()
+    payload = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()
+               if json.loads(line).get("event") == "approval_resolved"][-1]
+    assert payload.get("approved_via") == f"approved by {TERMINAL} via terminal"
+    clear_caller_secrets()
+
+
+# --------------------------------------------------------------------------
+# Refusals: WARNING must always carry the attempted identity source so a
+# relayed or malformed resolve is auditable downstream.
+# --------------------------------------------------------------------------
+def test_slack_dm_refusal_is_logged_with_attempted_identity_source(caplog: Any, tmp_path: Path) -> None:
+    """Slack-dm is not a persona channel, but a missing caller still goes through
+    the validator with identity_source="none" -- which must NOT be a 403 here
+    (slack-dm does not require identity), so a slack-dm resolve from an unsigned
+    caller must succeed with caller-secret absent (caller=None path).  This
+    test pins the WARNING format on the persona-channel refusal path."""
+    root, state, client = _fixture(tmp_path)
+    approval = state.create_approval(title="gate")
+    with caplog.at_level(logging.WARNING, logger="lh_harness.webapi.server"):
+        r = _post(client, f"{RESOLVE}/{approval.approval_id}/resolve",
+                  {"action": "continue", "approved_by": UPN, "channel": "fleet-chat"})
+    assert r.status_code == 403
+    payload = [rec for rec in caplog.records
+               if "relayed approval refused" in rec.getMessage()][-1]
+    msg = payload.getMessage()
+    assert "identity_source=none" in msg
+    assert "channel=fleet-chat" in msg
+    assert "approved_by=" + UPN in msg
+
+
+def test_service_refusal_is_logged_with_no_signed_caller(caplog: Any, tmp_path: Path) -> None:
+    """A service: payload from a no-caller-config install is refused with the
+    attempted identity_source ("none") carried in the WARNING."""
+    root, state, client = _fixture(tmp_path)
+    approval = state.create_approval(title="gate")
+    with caplog.at_level(logging.WARNING, logger="lh_harness.webapi.server"):
+        r = _post(client, f"{RESOLVE}/{approval.approval_id}/resolve",
+                  {"action": "continue", "approved_by": "service:hydra-mcp", "channel": "service"})
+    assert r.status_code == 403
+    payload = [rec for rec in caplog.records
+               if "relayed approval refused" in rec.getMessage()][-1]
+    assert "identity_source=none" in payload.getMessage()
+    assert "channel=service" in payload.getMessage()
+
+
+# --------------------------------------------------------------------------
+# MCP 422 parity: the REST resolve path is fully pinned for 422.  The MCP
+# resolve route funnels through the same validator, so the same required-field
+# enforcement must fire there too.
+# --------------------------------------------------------------------------
+def test_mcp_resolve_without_channel_is_422(tmp_path: Path) -> None:
+    configs = {"operator": {"secret_env": "LH_HARNESS_CALLER_OPERATOR_SECRET", "tools": ["harness_resolve_gate"]}}
+    root, state, client = _fixture(tmp_path, caller_configs=configs)
+    from .caller_util import install_caller_secret, clear_caller_secrets
+
+    install_caller_secret("operator")
+    approval = state.create_approval(title="gate")
+    r = _mcp(client, caller_args(
+        {"run_id": "run-1", "approval_id": approval.approval_id, "action": "continue",
+         "approved_by": TERMINAL},
+        "operator",
+    ))
+    assert r.status_code == 422
+    assert r.json()["error"] == "approved_by and channel are required"
+    clear_caller_secrets()
+
+
+def test_mcp_resolve_without_approved_by_is_422(tmp_path: Path) -> None:
+    configs = {"operator": {"secret_env": "LH_HARNESS_CALLER_OPERATOR_SECRET", "tools": ["harness_resolve_gate"]}}
+    root, state, client = _fixture(tmp_path, caller_configs=configs)
+    from .caller_util import install_caller_secret, clear_caller_secrets
+
+    install_caller_secret("operator")
+    approval = state.create_approval(title="gate")
+    r = _mcp(client, caller_args(
+        {"run_id": "run-1", "approval_id": approval.approval_id, "action": "continue",
+         "channel": "terminal"},
+        "operator",
+    ))
+    assert r.status_code == 422
+    assert r.json()["error"] == "approved_by and channel are required"
+    clear_caller_secrets()
+
+
+# --------------------------------------------------------------------------
 # /admin identity fallback chain (UPN / preferred_username headers).
 # --------------------------------------------------------------------------
 PROXY = "proxy-" + "p" * 32
