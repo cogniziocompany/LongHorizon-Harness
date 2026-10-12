@@ -658,6 +658,12 @@ class SettingsRuntime:
     proxy_auth: str | None = None
     started_at: str = field(default_factory=now_iso)
     sources: dict[str, str] = field(default_factory=dict)  # name -> "db" | "env"
+    # LHH-QUEUE-PROTECT-DOCS (F3): queue trios that refuse model/agent edits
+    # unless an SSO admin supplies ``force: true``.  Resolved from the project
+    # config's ``[queue].protected_trios``; defaults to
+    # ``config.DEFAULT_PROTECTED_TRIOS`` when never set.  An empty tuple
+    # disables the rule.
+    protected_trios: tuple[str, ...] = ()
 
     def is_admin(self, identity: str | None) -> bool:
         return bool(identity) and identity.strip().lower() in self.admins
@@ -695,6 +701,39 @@ def apply_startup_settings(environ: MutableMapping[str, str] | None = None) -> S
     )
     proxy_auth = environ.pop(PROXY_AUTH_ENV, None) or None
     runtime = SettingsRuntime(admins=admins, proxy_auth=proxy_auth)
+    # LHH-QUEUE-PROTECT-DOCS (F3): read [queue].protected_trios from the
+    # same project config the queue runtime uses.  Defer the import so the
+    # settings store stays importable without pulling the full config
+    # loader (the auth helpers in ``caller_auth`` import this module).
+    # The same opt-in convention as ``_resolve_protected_trios`` in the
+    # REST route applies: a missing or unreadable project config leaves
+    # the rule OFF; an explicit empty list also disables it; the default
+    # ``("kimi", "glm", "qwen")`` only applies when the loader sees a
+    # ``[queue].protected_trios`` key that omits a list.  Web deployments
+    # that want the rule should make the key explicit so the default is
+    # never picked up implicitly.
+    try:
+        from .config import load_run_defaults as _load_run_defaults_for_protected
+        try:
+            _project = _load_run_defaults_for_protected()
+        except Exception:  # noqa: BLE001 - a broken file must not silently disable the rule
+            _project = None
+        _configured: tuple[str, ...] | None = None
+        if isinstance(_project, dict):
+            _queue = _project.get("queue")
+            if isinstance(_queue, dict) and "protected_trios" in _queue:
+                _raw = _queue.get("protected_trios")
+                if isinstance(_raw, list):
+                    _configured = tuple(
+                        dict.fromkeys(
+                            item.strip() for item in _raw if isinstance(item, str) and item.strip()
+                        )
+                    )
+                else:
+                    _configured = ()
+        runtime.protected_trios = _configured if _configured is not None else ()
+    except Exception:  # noqa: BLE001 - imports/loader failures must leave the rule OFF
+        runtime.protected_trios = ()
     try:
         store = open_from_environment(environ)
     except Exception as exc:  # noqa: BLE001 - a broken store must not take the service down

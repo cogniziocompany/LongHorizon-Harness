@@ -36,6 +36,42 @@ def _client(tmp_path: Path, *, admins=(ADMIN,), proxy: str | None = PROXY, store
     return TestClient(app), rt
 
 
+def _client_with_protected(tmp_path: Path, *, protected_trios=(), admins=(ADMIN,), proxy: str | None = PROXY, store: bool = True, token: str | None = TOKEN):
+    """Variant of ``_client`` that writes a project config under ``runs_root``
+    with the requested ``[queue].protected_trios`` set, so the loader sees
+    the rule (or no rule, when the list is empty). Used by the
+    LHH-QUEUE-PROTECT-DOCS F3 tests; the older tests stay on ``_client``
+    because they cover behaviour that should not depend on the protected list
+    (the loader's default config lookup will find no file and return ``()``
+    for the protected set).
+    """
+
+    runs = tmp_path / "runs"
+    runs.mkdir(exist_ok=True)
+    cfg_path = runs / ".lh-harness" / "config.toml"
+    cfg_path.parent.mkdir(exist_ok=True)
+    if protected_trios:
+        cfg_path.write_text(
+            "[queue]\nprotected_trios = ["
+            + ", ".join(f'"{name}"' for name in protected_trios)
+            + "]\n",
+            encoding="utf-8",
+        )
+    else:
+        # Empty list explicitly disables the rule; ``load_run_defaults`` seeds
+        # the default tuple when the key is missing, so to opt out we must
+        # write the key with an empty list.
+        cfg_path.write_text("[queue]\nprotected_trios = []\n", encoding="utf-8")
+    st = SettingsStore(tmp_path / "settings.db", "k" * 40) if store else None
+    rt = SettingsRuntime(store=st, admins=tuple(a.lower() for a in admins), proxy_auth=proxy,
+                         error=None if store else "the settings store is not configured",
+                         protected_trios=tuple(protected_trios))
+    ask = AskRuntime(str(tmp_path / "asks"), grants={"fleet-admin": ["overseer:write"], "overseer": ["overseer", "overseer:apply"]})
+    app = create_app(runs_root=runs, auth_token=token, bind_host="testserver", probe_open_pr=None,
+                     settings_runtime=rt, ask_runtime=ask)
+    return TestClient(app), rt
+
+
 def _h(identity: str | None = ADMIN, proxy: str | None = PROXY, write: bool = False, bearer: str | None = TOKEN) -> dict[str, str]:
     h: dict[str, str] = {}
     if bearer:
@@ -384,3 +420,157 @@ def test_models_refresh_re_fetches_the_live_list_now(tmp_path: Path, monkeypatch
     r = client.post("/api/models/refresh", json={}, headers=_h())
     assert r.status_code == 200, r.text
     assert calls == [True]
+
+
+# ----------------------------------------- LHH-QUEUE-PROTECT-DOCS F3 --
+# Paxton's standing rule: the kimi (synthetic), glm (cloud) and qwen (QA)
+# trios are never modified at runtime.  PUT /api/queue/trios refuses any
+# write to a row whose ``name`` is on the project config's
+# ``[queue].protected_trios`` list with HTTP 409 (and a clear message
+# naming the trio and the rule), unless the request carries
+# ``force: true`` AND the caller is a verified SSO admin (the audit row
+# then carries ``protected_override: true`` and the response names the
+# overridden trios).  Capacity edits on protected trios stay allowed --
+# caps are operational, not modelling choices.  The default list is
+# ``["kimi", "glm", "qwen"]``; an empty list disables the rule.
+
+def _protected_client(tmp_path: Path, *, protected_trios=("kimi", "glm", "qwen")):
+    client, rt = _client_with_protected(tmp_path, protected_trios=protected_trios)
+    seeded = rt.store.seed_queue_defaults(
+        {
+            "glm": {"agent": "claude_code", "model": "opus", "mcp_profile": "default"},
+            "zai": {"agent": "claude_code", "model": "opus", "mcp_profile": "default"},
+            "kimi": {"agent": "claude_code", "model": "opus", "mcp_profile": "default"},
+        },
+        {"glm_max": 2, "zai_max": 1, "kimi_max": 1},
+    )
+    assert seeded == {"trios": ["glm", "zai", "kimi"], "capacity": ["glm", "zai", "kimi"]}
+    return client, rt
+
+
+def test_put_trio_on_protected_kimi_without_force_refuses_409(tmp_path: Path, monkeypatch: Any) -> None:
+    client, rt = _protected_client(tmp_path)
+    monkeypatch.setattr(lh_model_catalog, "discover_model_catalog", _fake_model_catalog)
+    before = rt.store.queue_trios()
+    before_audit = rt.store.audit()
+    r = client.put(
+        "/api/queue/trios",
+        json={"trios": [{"name": "kimi", "agent": "claude_code", "model": "sonnet"}]},
+        headers=_h(write=True),
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "kimi" in detail and "protected" in detail and "Paxton" in detail
+    # All-or-nothing: the row did not change AND no audit row was written.
+    assert rt.store.queue_trios() == before
+    assert rt.store.audit() == before_audit
+
+
+def test_put_trio_on_protected_kimi_with_force_from_admin_succeeds(tmp_path: Path, monkeypatch: Any) -> None:
+    client, rt = _protected_client(tmp_path)
+    monkeypatch.setattr(lh_model_catalog, "discover_model_catalog", _fake_model_catalog)
+    r = client.put(
+        "/api/queue/trios",
+        json={
+            "trios": [{"name": "kimi", "agent": "claude_code", "model": "sonnet"}],
+            "force": True,
+        },
+        headers=_h(write=True),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("protected_override") == ["kimi"]
+    kimi = {t["name"]: t for t in rt.store.queue_trios()}["kimi"]
+    assert kimi["model"] == "sonnet" and kimi["updated_by"] == ADMIN
+    top = rt.store.audit()[0]
+    assert top["action"] == "set" and top["name"] == "queue_trio:kimi" and top["actor"] == ADMIN
+    assert top["detail"].get("protected_override") is True
+
+
+def test_put_trio_on_protected_kimi_with_force_from_non_admin_refuses(tmp_path: Path, monkeypatch: Any) -> None:
+    # A non-admin caller (signed in, but not on the SSO admin list) cannot
+    # bypass the rule even with ``force: true`` -- they hit 403 at the
+    # ``require_admin`` gate before the protected check runs.
+    client, rt = _protected_client(tmp_path)
+    monkeypatch.setattr(lh_model_catalog, "discover_model_catalog", _fake_model_catalog)
+    before = rt.store.queue_trios()
+    r = client.put(
+        "/api/queue/trios",
+        json={
+            "trios": [{"name": "kimi", "agent": "claude_code", "model": "sonnet"}],
+            "force": True,
+        },
+        headers=_h(identity="<EMAIL_ADDRESS_G2LRS_12>", write=True),
+    )
+    assert r.status_code == 403, r.text
+    assert rt.store.queue_trios() == before
+
+
+def test_put_trio_on_zai_not_protected_succeeds(tmp_path: Path, monkeypatch: Any) -> None:
+    client, rt = _protected_client(tmp_path)
+    monkeypatch.setattr(lh_model_catalog, "discover_model_catalog", _fake_model_catalog)
+    r = client.put(
+        "/api/queue/trios",
+        json={"trios": [{"name": "zai", "agent": "claude_code", "model": "sonnet"}]},
+        headers=_h(write=True),
+    )
+    assert r.status_code == 200, r.text
+    # ``zai`` is not on the default protected list, so no override marker
+    # is added and the audit row reflects a normal write.
+    assert "protected_override" not in r.json()
+    zai = {t["name"]: t for t in rt.store.queue_trios()}["zai"]
+    assert zai["model"] == "sonnet"
+    top = rt.store.audit()[0]
+    assert top["name"] == "queue_trio:zai"
+    assert "protected_override" not in top["detail"]
+
+
+def test_put_capacity_on_protected_kimi_stays_allowed(tmp_path: Path) -> None:
+    # Capacity edits bypass the protected rule: caps are operational, so a
+    # pause-on-kimi or a kimi_max lift has to go through.  We confirm the
+    # rule is OFF on /api/queue/capacity by sending a kimi-only capacity
+    # edit and watching it land with an audit row.
+    client, rt = _protected_client(tmp_path)
+    r = client.put(
+        "/api/queue/capacity",
+        json={"capacity": {"kimi": 4}},
+        headers=_h(write=True),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["capacity"]["kimi"] == 4
+    top = rt.store.audit()[0]
+    assert top["action"] == "set" and top["name"] == "queue_capacity:kimi" and top["actor"] == ADMIN
+
+
+def test_put_trio_empty_protected_list_disables_the_rule(tmp_path: Path, monkeypatch: Any) -> None:
+    # An empty ``[queue].protected_trios`` list disables the rule entirely
+    # -- the same way a missing project config does.  This is how a node
+    # opts out without renaming the legacy trios.
+    client, rt = _protected_client(tmp_path, protected_trios=())
+    monkeypatch.setattr(lh_model_catalog, "discover_model_catalog", _fake_model_catalog)
+    r = client.put(
+        "/api/queue/trios",
+        json={"trios": [{"name": "kimi", "agent": "claude_code", "model": "sonnet"}]},
+        headers=_h(write=True),
+    )
+    assert r.status_code == 200, r.text
+    kimi = {t["name"]: t for t in rt.store.queue_trios()}["kimi"]
+    assert kimi["model"] == "sonnet"
+    assert r.json().get("protected_override") is None
+
+
+def test_put_trio_with_force_and_no_protected_rows_returns_no_override_marker(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    client, rt = _protected_client(tmp_path)
+    monkeypatch.setattr(lh_model_catalog, "discover_model_catalog", _fake_model_catalog)
+    r = client.put(
+        "/api/queue/trios",
+        json={
+            "trios": [{"name": "zai", "agent": "claude_code", "model": "sonnet"}],
+            "force": True,
+        },
+        headers=_h(write=True),
+    )
+    assert r.status_code == 200, r.text
+    assert "protected_override" not in r.json()
+

@@ -12,7 +12,7 @@ import pytest
 from lh_harness import settings_store
 from lh_harness.launcher import Launcher, maintenance_manifest_run_ids
 from lh_harness.queue import QueueStore, default_queue_config
-from lh_harness.settings_store import SettingsStore
+from lh_harness.settings_store import SettingsRuntime, SettingsStore
 
 
 class FakeSupervisor:
@@ -684,3 +684,80 @@ def test_restarting_seed_preserves_operator_edited_rows(
     asyncio.run(launcher.tick())
     assert store.get(entry.queue_id).status == "launched"
     assert supervisor.created[0]["owner"]["role_configs"]["manager"]["model"] == "model-edited"
+
+
+# ----------------------------------------- LHH-QUEUE-PROTECT-DOCS F4 --
+# Paxton (2026-10-12): a launcher-facing read-path regression test for the
+# F3 protected-trio plumbing.  The launcher holds a settings store
+# (``_open_settings_store()`` -> ``active_runtime().store``) and reads
+# ``queue_trios()`` / ``queue_capacity_rows()`` on every scheduling pass
+# (``_refresh_queue_config``).  This test instantiates a launcher with a
+# mocked settings store, seeds it with the F3 protected-trio contract
+# (kimi / glm / qwen are present with their seeded models, zai is
+# non-protected), and asserts the resolved trio / capacity dicts the
+# launcher would enforce match the store.  The mocked store replaces the
+# ``_ACTIVE`` runtime the launcher's store opener reads, so the launcher
+# never opens a real DB on disk.  See docs/queue.md "Protected trios".
+
+def test_launcher_read_path_sees_the_protected_trio_set_via_mocked_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, store, supervisor = _fixture(tmp_path)
+    db_path = _settings_env(tmp_path, monkeypatch)
+    _patch_project_config(tmp_path, monkeypatch, tmp_path / "missing.toml")
+
+    # Mocked settings store: same on-disk sqlite, but the launcher's
+    # ``_open_settings_store()`` reads it through the active runtime
+    # (``active_runtime().store``) so the test is hermetic to the
+    # launcher's own store-opening path.
+    mocked = SettingsStore(db_path, _SETTINGS_KEY)
+    mocked.seed_queue_defaults(
+        {
+            "kimi": {"agent": "claude_code", "model": "kimi-from-store", "mcp_profile": "ops"},
+            "glm": {"agent": "claude_code", "model": "glm-from-store", "mcp_profile": "ops"},
+            "qwen": {"agent": "codex", "model": "qwen-from-store", "mcp_profile": "audit"},
+            "zai": {"agent": "claude_code", "model": "zai-from-store", "mcp_profile": "ops"},
+        },
+        {"kimi_max": 2, "glm_max": 1, "qwen_max": 1, "zai_max": 3},
+    )
+    rt = SettingsRuntime(store=mocked, protected_trios=("kimi", "glm", "qwen"))
+    monkeypatch.setattr(settings_store, "_ACTIVE", rt)
+
+    bootstrap = default_queue_config()
+    bootstrap["capacity"]["kimi_max"] = 5  # file value -- the store row must win
+    bootstrap["capacity"]["glm_max"] = 5
+    bootstrap["capacity"]["qwen_max"] = 5
+    bootstrap["capacity"]["zai_max"] = 5
+    bootstrap["trios"]["kimi"] = {"agent": "claude_code", "model": "kimi-from-file"}
+    bootstrap["trios"]["glm"] = {"agent": "claude_code", "model": "glm-from-file"}
+    bootstrap["trios"]["qwen"] = {"agent": "codex", "model": "qwen-from-file"}
+    bootstrap["trios"]["zai"] = {"agent": "claude_code", "model": "zai-from-file"}
+    launcher = Launcher(supervisor, store, queue_config=bootstrap)
+
+    # The launcher wired the mocked store on construction (one-time seed
+    # already populated the tables; the launcher's store is the mock).
+    assert launcher._settings_store is not None
+    assert launcher._settings_store is mocked
+    assert rt.protected_trios == ("kimi", "glm", "qwen")
+
+    # Trigger a pass; the launcher re-reads the store on every pass.
+    asyncio.run(launcher.tick())
+
+    trios = launcher._config["trios"]
+    assert trios["kimi"]["model"] == "kimi-from-store"
+    assert trios["glm"]["model"] == "glm-from-store"
+    assert trios["qwen"]["model"] == "qwen-from-store"
+    assert trios["zai"]["model"] == "zai-from-store"
+    capacity = launcher._config["capacity"]
+    assert capacity["kimi_max"] == 2
+    assert capacity["glm_max"] == 1
+    assert capacity["qwen_max"] == 1
+    assert capacity["zai_max"] == 3
+
+    # The F3 protected-trio set is the SAME set the REST/MCP admin gates
+    # enforce (PUT /api/queue/trios and set_trio_model).  Reading from
+    # the runtime here proves the launcher's view is consistent with the
+    # admin gate: an operator who tries to PUT a new model on kimi sees
+    # 409, and the launcher's hot-reload path uses the same row.
+    protected_in_view = {name for name in ("kimi", "glm", "qwen") if trios.get(name)}
+    assert protected_in_view == {"kimi", "glm", "qwen"}

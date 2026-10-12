@@ -626,3 +626,98 @@ minimax_max = 2
 On a node whose settings store is already seeded, add the trio and its cap through the runtime
 path (store rows), not only the file: the file is read once at the first seed. The node's gateway
 key must be allowed the three aliases, or launches fail with 403 "key not allowed to access model".
+
+## Protected trios (Paxton 2026-10-12, LHH-QUEUE-PROTECT-DOCS)
+
+The legacy `kimi` (synthetic), `glm` (cloud) and `qwen` (QA) trios are never
+modified at runtime. The `PUT /api/queue/trios` route and the MCP
+`set_trio_model` tool refuse any write whose row is on the project config's
+`[queue].protected_trios` list with **HTTP 409 / JSON-RPC 409** (and a clear
+message naming the trio and the rule), unless the request carries
+`force: true` **and** the caller is a verified SSO admin. The audit row then
+carries `protected_override: true` and the response names the overridden
+trios. **Capacity edits on protected trios stay allowed**: caps are
+operational, not modelling choices, so a pause-on-kimi or a `kimi_max` lift
+goes through `PUT /api/queue/capacity` without the override gate.
+
+The list is read live from the project config (the same file
+`_refresh_queue_config` reads for the launcher's per-pass hot-reload), so
+edits take effect on the next request without a service restart:
+
+```toml
+[queue]
+protected_trios = ["kimi", "glm", "qwen"]   # the default; an empty list disables the rule
+```
+
+A missing `protected_trios` key seeds the default. An empty
+`protected_trios = []` explicitly opts the node out. The rule fires only
+on `set_trio_model`; `set_trio_capacity` (MCP) and `PUT /api/queue/capacity`
+bypass it on purpose.
+
+The default `kimi` / `glm` / `qwen` set reflects the standing rule Paxton
+issued on 2026-10-12: those are the legacy trios whose model and agent
+bindings are stable. Adding a new trio (`zai`, `zaiq`, `minimax`, etc.) does
+not require listing it in `protected_trios`; the rule only locks the names
+you explicitly name. Renaming a legacy trio is an explicit operator action
+that requires editing the project config (and thus goes through the same
+release review as the rest of the config).
+
+## Credential and role matrix (Paxton 2026-10-12, LHH-QUEUE-PROTECT-DOCS)
+
+Every queue admin endpoint answers the same way regardless of whether the
+caller is a fleet client, an MCP integration, or a REST tool: a single
+caller identity and a single rule table, no per-tool shortcuts. The
+matrix below is the read-and-write surface for the four queue admin
+endpoints (`GET/PUT /api/queue/trios`, `GET/PUT /api/queue/capacity`,
+`POST /api/models/refresh`) and their MCP mirrors (`list_trios`,
+`set_trio_model`, `set_trio_capacity`, `refresh_models`). The launcher
+read path (`_refresh_queue_config`) is **not** a caller-visible endpoint;
+it is the per-pass hot-reload the launcher's store readers power.
+
+| Caller | Identifies with | Reads | Writes (non-protected trio) | Writes (protected trio) | Override (`force: true`) | Capacity edits on protected trios |
+|---|---|---|---|---|---|---|
+| **Unauthenticated** | no headers | 401 from every `/api/queue/*` and `/mcp` path | refused (401) | refused (401) | refused (401) | refused (401) |
+| **Bearer-only** (any token) | `Authorization: Bearer <LH_HARNESS_WEB_TOKEN>` | 200 — full trios / capacity snapshot | 200 (rule: non-admin sees `actor="bearer"`, audit row stamped `actor=bearer`) | 409 (refused) | 409 (refused — `force` requires an SSO admin identity) | 200 — capacity edits bypass the protected rule |
+| **SSO admin** (on `LH_HARNESS_SETTINGS_ADMINS`) | bearer + `X-LH-Proxy-Auth` (HMAC over `LH_HARNESS_SETTINGS_PROXY_AUTH`) + `X-Auth-Request-Email` (the verified email) + `X-Requested-With: lh-harness` on writes | 200 | 200 (audit row stamped with the verified email) | 409 (refused) | **200** — audit row carries `protected_override: true` and `actor` is the verified admin email; the response names the overridden trios | 200 — same gate as the bearer path |
+| **MCP caller, scoping off** (bearer-only dispatch, no caller table) | bearer only; caller is recorded as `mcp` in the audit | 200 | 200 (`actor=mcp`) | 409 (refused) | 409 (refused) | 200 |
+| **MCP caller, scoping on, not on the protected set** | bearer + HMAC caller signature (`caller`, `caller_ts`, `caller_sig`) where the resolved `caller` is on the table with the right tools | 200 (when the caller has the read tools) | 200 (when the caller has `set_trio_model` / `set_trio_capacity`); audit row stamped with the caller name | 409 (refused) | 409 (refused — `force` requires an SSO admin identity, which the MCP caller path does not establish) | 200 (same caller tools check) |
+| **MCP caller, scoping on, but missing the tool grant** | bearer + valid HMAC signature | 401 (the dispatch path refuses the tool call before any handler runs) | 401 | 401 | 401 | 401 |
+| **Signed-in but not an admin** (SSO succeeds, email not on `LH_HARNESS_SETTINGS_ADMINS`) | bearer + proxy + email | 200 (reads) | 403 (the `require_admin` gate refuses — the protected check never runs) | 403 | 403 | 403 |
+| **No `LH_HARNESS_SETTINGS_PROXY_AUTH` on the node** | — | reads still answer 200 for SSO, but `is_admin` is False | 403 (`admin is off: LH_HARNESS_SETTINGS_PROXY_AUTH is not set`) | 403 | 403 | 403 |
+| **Empty `LH_HARNESS_SETTINGS_ADMINS` list** | — | 200 for reads | 403 (`admin is off: LH_HARNESS_SETTINGS_ADMINS is empty`) | 403 | 403 | 403 |
+| **Launcher (read-only, hot-reload)** | reads `queue_trios()` / `queue_capacity_rows()` from the settings store every pass (`_refresh_queue_config`) | reads the store the admin writes update; never refuses | n/a (the launcher never writes the queue admin tables) | n/a | n/a | n/a |
+
+The matrix above is enforced by:
+
+- `PUT /api/queue/trios` and `PUT /api/queue/capacity` go through
+  `require_admin(request, write=True)` (`settings_routes.py:106-116`). The
+  gate verifies the bearer, the proxy secret, the SSO email and the admin
+  list before any other check. A write from a non-admin caller is **403**
+  (not 409) because the `require_admin` gate refuses the request before
+  the protected check runs.
+- The protected check (`_resolve_protected_trios` + the per-row refusal
+  in `put_queue_trios`) fires **after** `require_admin` and **before**
+  `live_models()`. A refused request never reaches the provider, never
+  writes the audit log, and never mutates a row.
+- The MCP path mirrors the REST gate in `dispatch_queue_admin_tool`
+  (`mcp_tools.py`): the per-row protected check uses
+  `_queue_admin_resolve_protected` and the caller-is-admin check uses
+  `_queue_admin_caller_is_admin`. The same 409 / 403 split applies.
+- The launcher's `_refresh_queue_config` (`launcher.py:804-874`) reads
+  `queue_trios()` and `queue_capacity_rows()` from the active
+  `SettingsRuntime` and overlays them on the bootstrap config. The
+  protected list is **not** enforced on the read path: the launcher only
+  reads the values; writes flow through the admin gate. This is by design
+  (the read path is not a write surface) and the regression test
+  `test_launcher_read_path_sees_the_protected_trio_set_via_mocked_store`
+  (`tests/webapi/test_launcher.py`) pins the consistency: the F3
+  protected-trio set the admin gate enforces is the same set the launcher
+  would never let an operator silently change under a hot reload.
+
+The store's own audit log is the single source of truth for who wrote
+what. Every accepted change writes one row keyed to the verified identity
+(bearer, mcp, or the SSO admin email). The override flag
+(`protected_override: true`) is a structured field on the audit row and on
+the response, so the override path is searchable in
+`GET /api/admin/audit` and in the response body of a successful
+`force: true` write.

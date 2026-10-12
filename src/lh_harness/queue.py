@@ -987,6 +987,21 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
     queue = config.get("queue", {}) if isinstance(config, dict) else {}
     trios = queue.get("trios", {}) if isinstance(queue, dict) else {}
     capacity = queue.get("capacity", {}) if isinstance(queue, dict) else {}
+    # Paxton's standing rule (2026-10-12): the kimi (synthetic) and glm
+    # (cloud) trios and the auditor model are never modified at runtime.
+    # Writes to a protected trio refuse with HTTP 409 unless ``force: true``
+    # arrives from a verified SSO admin. Capacity edits stay allowed. The
+    # default mirrors ``config.DEFAULT_PROTECTED_TRIOS`` so an unset key
+    # still protects the legacy trio set; an empty list disables the rule.
+    from .config import DEFAULT_PROTECTED_TRIOS
+
+    protected_raw = queue.get("protected_trios", list(DEFAULT_PROTECTED_TRIOS))
+    if not isinstance(protected_raw, list) or not all(
+        isinstance(item, str) and item.strip() for item in protected_raw
+    ):
+        protected_trios: tuple[str, ...] = tuple(DEFAULT_PROTECTED_TRIOS)
+    else:
+        protected_trios = tuple(dict.fromkeys(item.strip() for item in protected_raw))
     observe = queue.get("observe", False) if isinstance(queue, dict) else False
     if not isinstance(observe, bool):
         observe = False
@@ -1083,6 +1098,7 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "observe": observe,
         "occupancy_ignore_dirty": occupancy_ignore_dirty,
         "default_time_limit_minutes": default_time_limit,
+        "protected_trios": protected_trios,
     }
 
 
