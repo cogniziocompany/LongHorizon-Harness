@@ -75,6 +75,12 @@ import {
   type TrajectoryView,
 } from './api';
 import { useRunFeed } from './useRunFeed';
+import {
+  clampDrawerWidth,
+  nextToggleDrawerWidth,
+  readDrawerWidth,
+  writeDrawerWidth,
+} from './drawerWidth';
 import { uiText, useUiLanguage, type UiLanguage } from './i18n';
 
 type DetailsTab = 'artifacts' | 'trajectory' | 'events';
@@ -2567,34 +2573,16 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
   const [maxRounds, setMaxRounds] = useState('25');
   const [promptLanguage, setPromptLanguage] = useState<'en' | 'zh'>('en');
   const [roundLimit, setRoundLimit] = useState(MAX_TRAJECTORY_ROUNDS);
-  const clampDrawerWidth = (value: number) => {
-    const min = 410;
-    const max = Math.max(min, Math.floor(0.9 * window.innerWidth));
-    return Math.max(min, Math.min(max, Math.round(value)));
-  };
+  const clampDrawerWidthView = (value: number) => clampDrawerWidth(value, window.innerWidth);
   const [drawerWidth, setDrawerWidth] = useState<number>(() => {
     if (typeof window === 'undefined') return 410;
-    try {
-      const stored = window.localStorage.getItem('lhh.detailsWidth');
-      if (stored !== null) {
-        const parsed = Number.parseInt(stored, 10);
-        if (Number.isFinite(parsed)) return clampDrawerWidth(parsed);
-      }
-    } catch {
-      // Storage may be disabled (private mode, quota); fall through to default.
-    }
-    return clampDrawerWidth(410);
+    return readDrawerWidth(window.localStorage, window.innerWidth);
   });
   const toggleDrawerWidth = () => {
     if (typeof window === 'undefined') return;
-    const max = clampDrawerWidth(Math.floor(0.9 * window.innerWidth));
-    const next = drawerWidth >= max ? 410 : max;
-    setDrawerWidth(clampDrawerWidth(next));
-    try {
-      window.localStorage.setItem('lhh.detailsWidth', String(next));
-    } catch {
-      // Storage may be disabled; the in-memory state still updates.
-    }
+    const next = nextToggleDrawerWidth(drawerWidth, window.innerWidth);
+    setDrawerWidth(clampDrawerWidth(next, window.innerWidth));
+    writeDrawerWidth(window.localStorage, next);
   };
   // Drag handle: update width on every pointermove while dragging, clamped to
   // [410, 90% of viewport]. Below 900 px viewport the old CSS takes over and
@@ -2615,7 +2603,7 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
       const delta = moveEvent.clientX - startX;
       // Drawer is right-aligned (justify-content: flex-end), so dragging the
       // left edge left makes the drawer wider.
-      const nextWidth = clampDrawerWidth(startWidth + delta);
+      const nextWidth = clampDrawerWidthView(startWidth + delta);
       setDrawerWidth(nextWidth);
     };
     const handleUp = (upEvent: PointerEvent) => {
