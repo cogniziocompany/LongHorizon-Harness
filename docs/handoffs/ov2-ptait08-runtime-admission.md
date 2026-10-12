@@ -35,6 +35,19 @@
 >     not imply sharing one credential or giving every role admin access; an existing independent
 >     Claude process is not auto-imported; plus the existing claude-code-teams migration.
 >
+> **Two targeted corrections (2026-10-12, applied on top of the 10-point pass above).**
+> 1. **Migration paragraph (§10, hosted-family migration bullet).** claude-code-teams PR #29
+>    (`77599bf`, verified) is now described as evidence of **parent-channel RECEIPTS only**; any
+>    wording implying the hosted-family migration of the three families / six slots is complete is
+>    removed (it is stated nowhere as complete).
+> 2. **Enrollment principal (§2 step 4 + §5).** Decided as a **dedicated scoped machine identity**
+>    (host-bound, expiring, revocable, no user-token fallback); the `[PAXTON DECISION]` marker is
+>    removed from §2.4; the Paxton-owned CLI host is listed as the **rejected alternative**; and a
+>    reference to cognizioware PR #2's `deployment/omnigent/` enrollment artifact is added.
+>    *Flagged:* the directive's `deployment/omnigent/machine-host-enrollment.md` does not exist in the
+>    cognizioware repo at `df8b0cb`; the reference points at the real `enroll-ptait08-tailscale.sh`
+>    instead.
+>
 > **Kept open for Paxton (not resolved):** every account and grant choice remains a decision — see
 > §5. The approval-by-link (Entra) design is preserved unchanged.
 
@@ -134,16 +147,27 @@ step beneath them until resolved.
    the v2 build report) plus its `config.toml` defining the trios/models this node serves. This is
    an install-time elevated step; after it, the runtime runs unprivileged as the dedicated account
    chosen in step 1. *Owner: infraops1.* (Execute only after steps 1–2; blocked until then.)
-4. **Choose the effective server principal and enrollment mechanism.** Specify owner, scope,
-   lifetime, revocation, and host ID. The supported path is a **user-owned CLI** login (e.g. the
-   patched Omnigent host client), which produces a user-owned host identity. A bare Linux service
-   account does **not** narrow the server token, so it is not accepted as the principal. A general
-   **admin enrollment API for arbitrary existing PVE guests has not been verified** and should not be
-   chosen until verified. **Do not mint any credentials or write tokens into the database** to bridge
-   this gap. This enrollment happens under the **Shared Omnigent umbrella** (`https://agents.easybutt0n.ai`;
+4. **Enrollment principal decided: a dedicated scoped machine identity.** Per Paxton 2026-10-12,
+   the effective server principal is **decided** (not left open): the v2 runtime binds as a
+   **dedicated, scoped machine identity** — **host-bound** (tied to this host's host ID), **expiring**
+   (not a long-lived principal), **revocable** (revoked without a separate user action), and with
+   **no user-token fallback** (a bare user login does not stand in for the scoped identity). The
+   supported path is the **user-owned CLI login** (e.g. the patched Omnigent host client,
+   `enroll-ptait08-tailscale.sh`), which produces exactly that scoped host identity. The **only
+   rejected alternative** is a **Paxton-owned CLI host** (a general, wide-scope CLI identity) — it was
+   considered and **rejected** because it does not narrow the server token to this host and so is not
+   the principal. **Do not mint any credentials or write tokens into the database** to bridge this gap.
+   This enrollment happens under the **Shared Omnigent umbrella** (`https://agents.easybutt0n.ai`;
    see §9): the runtime binds to a stable family workspace and the umbrella is the shared management
-   surface for the three infrastructure-agent families, not a per-role grant. *Owner: Paxton chooses
-   the principal; devspecops1 executes.* **[PAXTON DECISION on the principal before devspecops1 executes — the request text is section 3, sent only after Paxton approves it]**
+   surface for the three infrastructure-agent families, not a per-role grant. *Owner: devspecops1
+   executes (principal already decided above; the request text is section 3, sent only after Paxton
+   approves it).*
+   - **Reference (source of the decided shape):** cognizioware PR #2, `deployment/omnigent/` — the
+     enrollment artifact is `enroll-ptait08-tailscale.sh` (host-bound, authenticated by the owner,
+     verified at head `df8b0cb`). *Discrepancy flagged:* the operator's directive referenced a
+     `deployment/omnigent/machine-host-enrollment.md`; that file **does not exist** in the cognizioware
+     repo at `df8b0cb` (full-tree + PR#2 search returned 0 hits), so the reference points at the real
+     enrollment script instead of a non-existent path.
 5. **Register the gateway route / parent route.** The **Fleet Chat parent channel and verified
    parent/span/tenant binding are mandatory** for every delegated span — the parent route is not
    optional. Register the v2 runtime's route under that parent route so calls from the new key land
@@ -203,9 +227,13 @@ step beneath them until resolved.
       automatically imported or managed just because the management server is running. Preserve its
       production history and writer while verifying its connection/migration independently.
     - **Existing migration (claude-code-teams).** The claude-code-teams PR#29 evidence
-      (`77599bf9817d97bd04e6daf18f89b49901fb33c6`, verified) records the prior hosted-family
-      migration. This proposal does not reopen it; it is carried here only so the reviewer knows the
-      umbrella's acceptance criteria already include that migration lineage.
+      (`77599bf9817d97bd04e6daf18f89b49901fb33c6`, verified) is evidence of the parent-channel
+      **RECEIPTS only** — PR29's file is `agents/orchestrator/plans/fleet-chat-prod-migration.txt`,
+      which lets the Fleet Chat deploy pipeline manage its own live prod pipeline (the parent
+      channel's receipts), not a hosted-family migration of the three families or the six slots.
+      This proposal does not reopen it; it is carried here only so the reviewer knows the umbrella's
+      acceptance criteria already include that parent-channel receipt lineage, and so the hosted-family
+      migration of the three families and the six slots is **not** stated anywhere as complete.
     - **The admitted controller.** Additions to the registry seed are applied through the admitted
       controller — preserving existing session links — once that controller is operational. The
       updater deliberately preserves an existing registry rather than overwriting live bindings.
