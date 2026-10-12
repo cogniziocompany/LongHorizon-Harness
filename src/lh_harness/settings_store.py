@@ -98,10 +98,12 @@ def upsert_queue_trio(db: Any, row: Mapping[str, Any], actor: str, *, roles: Map
         (row["name"], row["agent"], row["model"], row["mcp_profile"], row["enabled"], actor, now_iso()),
     )
     if roles is not None:
-        cleaned = trio_role_overrides(roles)
+        # Always a JSON object, even when empty: "{}" means "this row has no
+        # overrides" (authoritative), while NULL means "written before the
+        # column existed" and makes the launcher keep the file's keys.
         db.execute(
             "UPDATE queue_trio SET role_models = ? WHERE name = ?",
-            (json.dumps(cleaned, sort_keys=True) if cleaned else None, row["name"]),
+            (json.dumps(trio_role_overrides(roles), sort_keys=True), row["name"]),
         )
 
 
