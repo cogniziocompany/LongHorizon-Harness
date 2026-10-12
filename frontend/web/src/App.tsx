@@ -25,6 +25,7 @@ import {
   FlaskConical,
   FolderOpen,
   GitBranch,
+  GripVertical,
   ListChecks,
   LoaderCircle,
   KeyRound,
@@ -74,6 +75,12 @@ import {
   type TrajectoryView,
 } from './api';
 import { useRunFeed } from './useRunFeed';
+import {
+  clampDrawerWidth,
+  nextToggleDrawerWidth,
+  readDrawerWidth,
+  writeDrawerWidth,
+} from './drawerWidth';
 import { uiText, useUiLanguage, type UiLanguage } from './i18n';
 
 type DetailsTab = 'artifacts' | 'trajectory' | 'events';
@@ -2566,6 +2573,53 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
   const [maxRounds, setMaxRounds] = useState('25');
   const [promptLanguage, setPromptLanguage] = useState<'en' | 'zh'>('en');
   const [roundLimit, setRoundLimit] = useState(MAX_TRAJECTORY_ROUNDS);
+  const clampDrawerWidthView = (value: number) => clampDrawerWidth(value, window.innerWidth);
+  const [drawerWidth, setDrawerWidth] = useState<number>(() => {
+    if (typeof window === 'undefined') return 410;
+    return readDrawerWidth(window.localStorage, window.innerWidth);
+  });
+  const toggleDrawerWidth = () => {
+    if (typeof window === 'undefined') return;
+    const next = nextToggleDrawerWidth(drawerWidth, window.innerWidth);
+    setDrawerWidth(clampDrawerWidth(next, window.innerWidth));
+    writeDrawerWidth(window.localStorage, next);
+  };
+  // Drag handle: update width on every pointermove while dragging, clamped to
+  // [410, 90% of viewport]. Below 900 px viewport the old CSS takes over and
+  // the drag handle has nothing to resize, so it is ignored.
+  const beginDrawerDrag = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (typeof window === 'undefined') return;
+    if (window.innerWidth < 900) return;
+    event.preventDefault();
+    const target = event.currentTarget;
+    try {
+      target.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is a nice-to-have; ignore when unavailable.
+    }
+    const startX = event.clientX;
+    const startWidth = drawerWidth;
+    const handleMove = (moveEvent: PointerEvent) => {
+      const delta = moveEvent.clientX - startX;
+      // Drawer is right-aligned (justify-content: flex-end), so dragging the
+      // left edge left makes the drawer wider.
+      const nextWidth = clampDrawerWidthView(startWidth + delta);
+      setDrawerWidth(nextWidth);
+    };
+    const handleUp = (upEvent: PointerEvent) => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+      window.removeEventListener('pointercancel', handleUp);
+      try {
+        target.releasePointerCapture(upEvent.pointerId);
+      } catch {
+        // Pointer may already be released; nothing to do.
+      }
+    };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+    window.addEventListener('pointercancel', handleUp);
+  };
   useEffect(() => {
     if (!meta || rolesInitialised.current) return;
     const fallbackAgent = defaultAgent(meta);
@@ -2598,8 +2652,9 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
       ...(effort ? { reasoning_effort: effort } : {}),
     }];
   })) as Record<PublicRole, RoleRuntimeConfig>;
-  return <div className="drawer-backdrop" {...backdrop}><aside className={`details-drawer ${creating ? 'create-drawer' : ''}`} role="dialog" aria-modal="true" aria-label={creating ? text('创建新任务', 'Create new task') : text('会话详情', 'Task details')}>
-    <div className="drawer-header"><div><div className="drawer-eyebrow">{creating ? text('新任务', 'NEW TASK') : text('会话详情', 'TASK DETAILS')}</div><h2>{creating ? text('创建 LongHorizon 任务', 'Create a LongHorizon task') : text('详情', 'Details')}</h2></div><button className="drawer-close" onClick={onClose} aria-label={text('关闭', 'Close')}><X size={18} /></button></div>
+  return <div className="drawer-backdrop" {...backdrop}><aside className={`details-drawer ${creating ? 'create-drawer' : ''}`} role="dialog" aria-modal="true" aria-label={creating ? text('创建新任务', 'Create new task') : text('会话详情', 'Task details')} style={{ '--drawer-width': `${drawerWidth}px` } as React.CSSProperties}>
+    <button type="button" className="drawer-resize-handle" onPointerDown={beginDrawerDrag} aria-label={text('拖动调整面板宽度', 'Resize panel width')} title={text('拖动调整面板宽度', 'Resize panel width')}><GripVertical size={14} /></button>
+    <div className="drawer-header"><div><div className="drawer-eyebrow">{creating ? text('新任务', 'NEW TASK') : text('会话详情', 'TASK DETAILS')}</div><h2>{creating ? text('创建 LongHorizon 任务', 'Create a LongHorizon task') : text('详情', 'Details')}</h2></div><button type="button" className="drawer-toggle" onClick={toggleDrawerWidth} aria-label={text('切换面板宽度', 'Toggle panel width')} title={text('切换面板宽度', 'Toggle panel width')}><PanelRight size={18} /></button><button className="drawer-close" onClick={onClose} aria-label={text('关闭', 'Close')}><X size={18} /></button></div>
     {creating ? <>
       <p className="drawer-copy">{text('任务会由真实 worker 执行。右侧状态面板会持续显示进度，中间区域只保留可读的步骤结果。', 'A real worker will execute the task. The status panel tracks progress while the conversation shows readable step results.')}</p>
       <label className="drawer-field"><span>{text('任务', 'Task')}</span><textarea autoFocus value={task} onChange={(event) => setTask(event.target.value)} placeholder={text('请描述 LongHorizon 需要完成的任务', 'What should LongHorizon do?')} /></label>
