@@ -127,6 +127,12 @@ class Approval:
     extra_rounds: int = 0  # 0 -> use the manager's configured budget
     created_at: float = field(default_factory=time.time)
     resolved_at: float | None = None
+    # DR-05a: identity of the approver and the channel through which the
+    # approval arrived.  Stored additively so pre-existing records load with
+    # empty defaults and remain unchanged on disk.
+    approved_by: str = ""
+    channel: str = ""
+    unattributed: bool = False
 
     @property
     def round_index(self) -> int:
@@ -151,6 +157,9 @@ class Approval:
             "extra_rounds": self.extra_rounds,
             "created_at": self.created_at,
             "resolved_at": self.resolved_at,
+            "approved_by": self.approved_by,
+            "channel": self.channel,
+            "unattributed": self.unattributed,
         }
 
 
@@ -830,6 +839,9 @@ class DashboardState:
         action: str,
         reason: str = "",
         user_input: str = "",
+        approved_by: str = "",
+        channel: str = "",
+        unattributed: bool = False,
         extra_rounds: int | None = None,
         command_id: str | None = None,
         expected_revision: int | None = None,
@@ -869,6 +881,14 @@ class DashboardState:
             # as the idempotency fingerprint, so an unconditional new key would
             # make a retry of a pre-upgrade command look like a different one.
             payload["extra_rounds"] = normalized_extra
+        # DR-05a: the approver identity and channel ride on the control-bus
+        # command so the worker's resolve can persist them on the record.  Kept
+        # out of the payload when empty so pre-upgrade retries compare equal.
+        if approved_by.strip() or channel.strip():
+            payload["approved_by"] = str(approved_by).strip()
+            payload["channel"] = str(channel).strip()
+            if unattributed:
+                payload["unattributed"] = True
         # The approval id is the durable uniqueness key.  Browser retries may
         # carry different Idempotency-Key values (or none at all), but one
         # checkpoint must never enqueue two decisions.  ControlBus serialises
@@ -984,6 +1004,11 @@ class DashboardState:
             extra_rounds=_normalise_extra_rounds(record.get("extra_rounds")),
             created_at=float(record.get("created_at", time.time())),
             resolved_at=float(record["resolved_at"]) if record.get("resolved_at") else None,
+            # Additive DR-05a fields: old records without them keep loading
+            # unchanged (empty identity, not unattributed).
+            approved_by=str(record.get("approved_by", "") or ""),
+            channel=str(record.get("channel", "") or ""),
+            unattributed=bool(record.get("unattributed", False)),
         )
 
     def _refresh_approval_from_disk(self, approval_id: str) -> None:
@@ -1033,6 +1058,10 @@ class DashboardState:
                 approval.reason = str(payload.get("reason", "")).strip()
                 approval.user_input = user_input
                 approval.extra_rounds = extra_rounds
+                # DR-05a: the identity that travelled on the command payload.
+                approval.approved_by = str(payload.get("approved_by", "") or "").strip()
+                approval.channel = str(payload.get("channel", "") or "").strip()
+                approval.unattributed = bool(payload.get("unattributed", False))
                 approval.status = "resolved"
                 approval.resolved_at = time.time()
                 snapshot = approval.to_dict()
@@ -1040,6 +1069,12 @@ class DashboardState:
             reporter = get_reporter()
             if reporter is not None and reporter.enabled:
                 events_path = self._role_dir / "events.jsonl"
+                # DR-05a: the resolve-time run event names the approver and the
+                # channel so the run report reads
+                # "approved by <approved_by> via <channel>".
+                approved_via = ""
+                if approval.approved_by and approval.channel:
+                    approved_via = f"approved by {approval.approved_by} via {approval.channel}"
                 try:
                     _append_event(
                         events_path,
@@ -1050,6 +1085,10 @@ class DashboardState:
                             "trigger": approval.context.get("trigger", ""),
                             "status": "resolved",
                             "action": action,
+                            "approved_by": approval.approved_by,
+                            "channel": approval.channel,
+                            "unattributed": approval.unattributed,
+                            "approved_via": approved_via,
                         },
                     )
                 except (ImportError, OSError):
@@ -1146,6 +1185,13 @@ class DashboardState:
             resolved["user_input"] = user_input
             resolved["extra_rounds"] = extra_rounds
             resolved["resolved_at"] = float(command.get("created_at") or time.time())
+            # DR-05a additive overlay: only when the payload carried identity.
+            if str(payload.get("approved_by", "") or "").strip():
+                resolved["approved_by"] = str(payload.get("approved_by")).strip()
+            if str(payload.get("channel", "") or "").strip():
+                resolved["channel"] = str(payload.get("channel")).strip()
+            if payload.get("unattributed"):
+                resolved["unattributed"] = True
             merged[approval_id] = resolved
 
     def list_approvals(self) -> list[dict[str, Any]]:

@@ -1369,6 +1369,16 @@ def _resolve_gate(
     channel = arguments.get("channel")
     refusal = validate_resolve_identity(approved_by, channel, identity_source)
     if refusal is not None:
+        # Every refusal is logged at WARNING with the identity source the
+        # transport presented, so a relayed or malformed resolve is auditable.
+        logger.warning(
+            "gate resolve refused (%s): identity_source=%s channel=%s run_id=%s approval_id=%s",
+            refusal,
+            str(identity_source),
+            str(channel),
+            run_id,
+            approval_id,
+        )
         if refusal == "relayed approval refused":
             logger.warning(
                 "relayed approval refused: identity_source=%s channel=%s approved_by=%s run_id=%s approval_id=%s",
