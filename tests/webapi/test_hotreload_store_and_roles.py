@@ -28,29 +28,27 @@ from lh_harness.settings_store import SettingsStore, upsert_queue_trio
 
 from .test_launcher import _SETTINGS_KEY, _base_entry, _fixture, _patch_project_config, _settings_env
 
+# The trio blocks mirror CT110 minus mcp_profile: launcher tests leave the trio
+# profile unset because the auditor guard refuses a non-read-only one.
 CT110_QUEUE_TOML = """
 [queue.trios.kimi]
 agent = "claude_code"
 model = "glm-5.2:synthetic-anthropic"
-mcp_profile = "default"
 
 [queue.trios.qwen]
 agent = "claude_code"
 model = "qwen3.8"
-mcp_profile = "default"
 
 [queue.trios.zai]
 agent = "claude_code"
 model = "glm-5.3:zai"
 manager_model = "glm-5.3-flash:zai"
 auditor_model = "glm-5.3-flash:zai"
-mcp_profile = "default"
 
 [queue.trios.zaiq]
 agent = "claude_code"
 model = "glm-5.3:zai"
 executor_model = "qwen3.8"
-mcp_profile = "default"
 
 [queue.capacity]
 kimi_max = 1
@@ -126,7 +124,7 @@ def test_model_edit_keeps_role_models_and_role_edit_hot_reloads(tmp_path: Path, 
     queue_config = _ct110_config(tmp_path, monkeypatch)
     launcher = Launcher(supervisor, store, queue_config=queue_config)
     settings = SettingsStore(db_path, _SETTINGS_KEY)
-    base = {"name": "zaiq", "agent": "claude_code", "model": "glm-5.3:zai", "mcp_profile": "default", "enabled": 1}
+    base = {"name": "zaiq", "agent": "claude_code", "model": "glm-5.3:zai", "mcp_profile": None, "enabled": 1}
 
     # A trio-wide model edit (set_trio_model / a PUT row without role keys)
     # must not reset the executor override.
