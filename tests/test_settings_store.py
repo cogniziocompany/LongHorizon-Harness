@@ -241,6 +241,7 @@ def test_seed_from_config_toml_populates_trios_and_capacity(tmp_path: Path) -> N
         "name": "glm", "agent": "claude_code", "model": "glm-5.3:zai",
         "mcp_profile": "default", "enabled": True,
         "updated_by": ss.SEED_ACTOR, "updated_at": trios["glm"]["updated_at"],
+        "role_models_set": True,
     }
     assert trios["kimi"]["model"] == "glm-5.2:synthetic-anthropic" and trios["qwen"]["model"] == "qwen3.8"
     assert all(t["updated_at"] for t in trios.values())

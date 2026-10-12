@@ -56,7 +56,62 @@ _SECRET_NAME_RE = re.compile(r"(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL)")
 MAX_VALUE_CHARS = 8192
 MAX_NOTE_CHARS = 500
 MIN_KEY_CHARS = 32
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# Per-role overrides a queue trio may carry (same keys as config.toml's
+# ``[queue.trios.<name>]``): ``<role>_agent`` / ``<role>_model`` for the three
+# queue roles. Stored as one JSON object in ``queue_trio.role_models``.
+TRIO_ROLE_KEYS = tuple(
+    f"{role}_{key}" for role in ("manager", "executor", "auditor") for key in ("agent", "model")
+)
+
+
+def trio_role_overrides(spec: Any) -> dict[str, str]:
+    """The non-blank per-role keys of a trio spec/row, as ``{key: value}``."""
+
+    if not isinstance(spec, Mapping):
+        return {}
+    out: dict[str, str] = {}
+    for key in TRIO_ROLE_KEYS:
+        value = spec.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()
+    return out
+
+
+def upsert_queue_trio(db: Any, row: Mapping[str, Any], actor: str, *, roles: Mapping[str, str] | None = None) -> None:
+    """Write one queue_trio row WITHOUT clobbering its per-role overrides.
+
+    ``roles=None`` keeps whatever ``role_models`` the row already has (the
+    single-field edits: set_trio_model, a PUT row that names no role key).
+    A mapping replaces them; an empty mapping clears them.  The earlier
+    ``INSERT OR REPLACE`` rewrote the whole row, which would have reset a
+    mixed trio (zaiq: z.ai manager/auditor, local qwen executor) to one model.
+    """
+
+    db.execute(
+        """INSERT INTO queue_trio(name, agent, model, mcp_profile, enabled, updated_by, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(name) DO UPDATE SET
+               agent = excluded.agent, model = excluded.model, mcp_profile = excluded.mcp_profile,
+               enabled = excluded.enabled, updated_by = excluded.updated_by, updated_at = excluded.updated_at""",
+        (row["name"], row["agent"], row["model"], row["mcp_profile"], row["enabled"], actor, now_iso()),
+    )
+    if roles is not None:
+        cleaned = trio_role_overrides(roles)
+        db.execute(
+            "UPDATE queue_trio SET role_models = ? WHERE name = ?",
+            (json.dumps(cleaned, sort_keys=True) if cleaned else None, row["name"]),
+        )
+
+
+def _row_role_models(raw: Any) -> dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        return trio_role_overrides(json.loads(raw))
+    except (TypeError, ValueError):
+        return {}
 _KEY_CHECK_PLAINTEXT = b"lh-harness settings key check v1"
 SEED_ACTOR = "seed-queue"
 
@@ -254,6 +309,11 @@ class SettingsStore:
                 cols = {row[1] for row in db.execute("PRAGMA table_info(queue_capacity)").fetchall()}
                 if "max_peak" not in cols:
                     db.execute("ALTER TABLE queue_capacity ADD COLUMN max_peak INTEGER")
+            # v3 (2026-10-12): per-role overrides on trios. Checked by column, not
+            # only by version, so a store created by any earlier build gains it.
+            trio_cols = {row[1] for row in db.execute("PRAGMA table_info(queue_trio)").fetchall()}
+            if trio_cols and "role_models" not in trio_cols:
+                db.execute("ALTER TABLE queue_trio ADD COLUMN role_models TEXT")
             if version < SCHEMA_VERSION:
                 db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             row = db.execute("SELECT value FROM meta WHERE name = 'key_check'").fetchone()
@@ -416,6 +476,11 @@ class SettingsStore:
                 "enabled": bool(r["enabled"]),
                 "updated_by": r["updated_by"],
                 "updated_at": r["updated_at"],
+                # Per-role overrides, flattened next to the trio-wide fields;
+                # ``role_models_set`` tells a reader whether the row carries
+                # its own (possibly empty) set or predates the column.
+                **_row_role_models(r["role_models"]),
+                "role_models_set": r["role_models"] is not None,
             }
             for r in rows
         ]
@@ -481,14 +546,15 @@ class SettingsStore:
                         continue
                     model = str(spec.get("model") or "").strip() or None
                     profile = str(spec.get("mcp_profile") or "").strip() or None
+                    roles = trio_role_overrides(spec)
                     db.execute(
-                        """INSERT INTO queue_trio(name, agent, model, mcp_profile, enabled, updated_by, updated_at)
-                           VALUES (?, ?, ?, ?, 1, ?, ?)""",
-                        (name.strip(), agent, model, profile, actor, now_iso()),
+                        """INSERT INTO queue_trio(name, agent, model, mcp_profile, enabled, updated_by, updated_at, role_models)
+                           VALUES (?, ?, ?, ?, 1, ?, ?, ?)""",
+                        (name.strip(), agent, model, profile, actor, now_iso(), json.dumps(roles, sort_keys=True)),
                     )
                     self._audit(
                         db, actor, "seed", f"queue_trio:{name.strip()}",
-                        agent=agent, model=model, mcp_profile=profile, source=source,
+                        agent=agent, model=model, mcp_profile=profile, source=source, **roles,
                     )
                     seeded.append(name.strip())
                 report["trios"] = seeded
@@ -663,6 +729,9 @@ def apply_startup_settings(environ: MutableMapping[str, str] | None = None) -> S
 
 __all__ = [
     "ADMINS_ENV",
+    "TRIO_ROLE_KEYS",
+    "trio_role_overrides",
+    "upsert_queue_trio",
     "BOOTSTRAP_NAMES",
     "CATALOG",
     "DB_ENV",

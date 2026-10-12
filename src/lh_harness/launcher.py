@@ -35,7 +35,7 @@ from .queue import (
     queue_config_from_config,
     read_lease,
 )
-from .settings_store import SettingsStore, open_from_environment
+from .settings_store import SettingsStore, active_runtime, open_from_environment, trio_role_overrides
 from .supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
 from .supervisor.service import auditor_read_only_violation
 from .workspace_guard import (
@@ -675,6 +675,17 @@ def _open_settings_store() -> SettingsStore | None:
     config.toml behaviour, and the launcher must never fail on the store.
     """
 
+    # ``lh-harness web`` opens the store in apply_startup_settings() and then
+    # REMOVES the key from the environment so no child inherits it.  Reading
+    # the environment here therefore found nothing in the real service and the
+    # launcher silently stayed file-only (CT110, 2026-10-12: queue tables
+    # empty after a restart, hot reload inert).  Use the already-open store.
+    try:
+        active = active_runtime().store
+    except Exception:  # noqa: BLE001
+        active = None
+    if active is not None:
+        return active
     try:
         return open_from_environment()
     except Exception as exc:  # noqa: BLE001 - a broken store must not stop the launcher
@@ -710,9 +721,16 @@ class Launcher:
             # file is read-only bootstrap here and operator-edited rows are
             # never overwritten by a later start.
             try:
-                self._settings_store.seed_queue_from_config(PROJECT_CONFIG_PATH)
+                seed_report = self._settings_store.seed_queue_from_config(PROJECT_CONFIG_PATH)
+                logger.info(
+                    "queue settings store %s: seed report %s (None = table already had rows)",
+                    getattr(self._settings_store, "path", "?"),
+                    seed_report,
+                )
             except Exception as exc:  # noqa: BLE001 - a seed failure must never stop the launcher
                 logger.warning("queue seeding failed; continuing with bootstrap config: %s", exc)
+        else:
+            logger.info("queue settings store not configured; trios and capacity stay config.toml-only")
         # Observe (shadow) mode — task 173 / migration §5 Step 2: when true the
         # launcher computes the full launch decision but starts NOTHING; it
         # appends one shadow record per decision to
@@ -834,6 +852,12 @@ class Launcher:
                 # queue_trio has no auditor column; keep the file binding.
                 "auditor_mcp_profile": base_spec.get("auditor_mcp_profile"),
             }
+            # Per-role overrides (zai: flash manager/auditor; zaiq: local qwen
+            # executor).  A row that carries its own set is authoritative; a
+            # row written before the column existed keeps the file's keys, so
+            # a mixed trio can never silently collapse to one model.
+            role_source = row if row.get("role_models_set") else base_spec
+            trios[name].update(trio_role_overrides(role_source))
         merged["trios"] = trios
         capacity = dict(merged.get("capacity") or {})
         for trio_name, row in capacity_rows.items():
