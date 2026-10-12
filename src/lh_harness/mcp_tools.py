@@ -18,11 +18,20 @@ share this module's manifest and dispatcher.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 from .caller_auth import (
+    APPROVED_BY_MAX_CHARS,
+    APPROVAL_CHANNELS,
+    GATEWAY_KEY_IDENTITY_SOURCE_PREFIX,
+    PERSONA_CHANNELS,
+    SERVICE_APPROVED_BY_PREFIX,
+    validate_resolve_identity,
     ANON_CALLER,
     RESOLVE_TOOL,
     ask_caller_specs,
@@ -140,6 +149,15 @@ Use the run_id returned by harness_enqueue_task / harness_list_queue.
 """
 
 _RESOLVE_GATE_DESCRIPTION = """Resolve an operator gate for a running harness run.
+
+Every resolve records who approved and through which channel: approved_by is
+exactly one of upn:<user@domain>, slack:<Uxxxx>, terminal:<os user>@<host>
+or the unattributed service marker service:<caller alias> (with channel
+"service"), and channel is one of fleet-chat, slack-dm, terminal, web-sso,
+service. Model-supplied text can never produce a service: value -- the
+transport sets it from the verified caller identity. A resolve claiming
+fleet-chat or web-sso without a verified signed-in identity is refused as a
+relayed approval.
 
 user_input must be plain ASCII. Any non-ASCII character is rejected because
 MCP/chat clients cannot safely transmit formatting bytes through the gateway.
@@ -442,6 +460,15 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                 "run_id": _string_param("Run whose gate should be resolved.", required=True),
                 "approval_id": _string_param("Gate/approval identifier from the run snapshot.", required=True),
                 "action": _string_param("Action chosen by the operator (continue/stop/etc).", required=True),
+                "approved_by": _string_param(
+                    "Who approved: upn:<user@domain>, slack:<Uxxxx>, terminal:<os user>@<host> "
+                    "or service:<caller alias> (channel service only). Required; max 254 chars.",
+                    required=True,
+                ),
+                "channel": _string_param(
+                    "How the approval arrived: fleet-chat, slack-dm, terminal, web-sso or service. Required.",
+                    required=True,
+                ),
                 "user_input": _string_param("ASCII-only operator message or instruction. Non-ASCII is rejected.", required=False),
                 "reason": _string_param("Operator reason for the resolution.", required=False),
             },
@@ -687,7 +714,10 @@ def dispatch(
         if tool_name == "harness_run_status":
             return _run_status(arguments, registry=registry, supervisor=supervisor)
         if tool_name == "harness_resolve_gate":
-            return _resolve_gate(arguments, registry=registry, supervisor=supervisor)
+            # DR-05a: scoping-OFF installs have no signed caller, so the
+            # transport's identity source is "none" -- persona channels and
+            # the service channel are refused as relayed.
+            return _resolve_gate(arguments, registry=registry, supervisor=supervisor, identity_source="none")
         if tool_name == "harness_list_contentions":
             return _list_contentions(runs_root=_runs_root(registry, supervisor))
         return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
@@ -726,7 +756,9 @@ def dispatch(
     if tool_name == "harness_run_status":
         return _run_status(arguments, registry=registry, supervisor=supervisor)
     if tool_name == "harness_resolve_gate":
-        return _resolve_gate(arguments, registry=registry, supervisor=supervisor)
+        # DR-05a: the caller reached this branch only after the A3d HMAC
+        # verified, so the transport's identity source is "caller-secret".
+        return _resolve_gate(arguments, registry=registry, supervisor=supervisor, identity_source="caller-secret")
     if tool_name == "harness_list_contentions":
         return _list_contentions(runs_root=_runs_root(registry, supervisor))
     # Unreachable: every scoping-eligible tool is dispatched above (the config
@@ -1315,7 +1347,13 @@ def _warning_payload(severity: str, peer_ids: list[str]) -> dict[str, Any]:
     }
 
 
-def _resolve_gate(arguments: dict[str, Any], *, registry: Any, supervisor: Any) -> dict[str, Any]:
+def _resolve_gate(
+    arguments: dict[str, Any],
+    *,
+    registry: Any,
+    supervisor: Any,
+    identity_source: str = "none",
+) -> dict[str, Any]:
     run_id = _bounded(arguments.get("run_id"), field="run_id", max_chars=128, required=True)
     approval_id = _bounded(arguments.get("approval_id"), field="approval_id", max_chars=128, required=True)
     state = registry.state_for(run_id)
@@ -1323,6 +1361,30 @@ def _resolve_gate(arguments: dict[str, Any], *, registry: Any, supervisor: Any) 
         return {"ok": False, "error": "run not found", "code": 404}
     if supervisor is not None and not supervisor.can_control(run_id):
         return {"ok": False, "error": "run is not accepting approvals", "code": 409}
+
+    # DR-05a: approved_by/channel are required wire-contract inputs.
+    # ``identity_source`` comes from the dispatch layer (verified caller or
+    # explicit "none"), never from the caller payload.
+    approved_by = arguments.get("approved_by")
+    channel = arguments.get("channel")
+    refusal = validate_resolve_identity(approved_by, channel, identity_source)
+    if refusal is not None:
+        if refusal == "relayed approval refused":
+            logger.warning(
+                "relayed approval refused: identity_source=%s channel=%s approved_by=%s run_id=%s approval_id=%s",
+                str(identity_source),
+                str(channel),
+                str(approved_by),
+                run_id,
+                approval_id,
+            )
+        return {
+            "ok": False,
+            "error": refusal,
+            "code": 403 if refusal == "relayed approval refused" else 422,
+        }
+    approved_by_text = str(approved_by).strip()
+    channel_text = str(channel).strip()
 
     action = _bounded(arguments.get("action"), field="action", max_chars=128, required=True)
     reason = _bounded(arguments.get("reason"), field="reason", max_chars=10_000)
@@ -1342,6 +1404,9 @@ def _resolve_gate(arguments: dict[str, Any], *, registry: Any, supervisor: Any) 
             action=action,
             reason=reason,
             user_input=user_input,
+            approved_by=approved_by_text,
+            channel=channel_text,
+            unattributed=(channel_text == "service"),
         )
     except Exception as exc:
         return {"ok": False, "error": str(exc), "code": 409}

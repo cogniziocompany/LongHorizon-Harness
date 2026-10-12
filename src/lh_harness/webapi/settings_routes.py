@@ -36,6 +36,28 @@ from ..settings_store import (
 
 ADMIN_PROXY_HEADER = "x-lh-proxy-auth"
 IDENTITY_HEADER = "x-auth-request-email"
+PREFERRED_USERNAME_HEADER = "x-forwarded-preferred-username"
+USER_HEADER = "x-forwarded-user"
+
+
+_HEADER_CHAIN = (IDENTITY_HEADER, PREFERRED_USERNAME_HEADER, USER_HEADER)
+
+
+def _admin_identity(headers: Any) -> str | None:
+    """Resolve the signed-in identity from the SSO header chain.
+
+    oauth2-proxy sets ``X-Auth-Request-Email``.  Entra does not always
+    publish a ``mail`` attribute for service/ai-dev accounts, so that
+    header can be empty; in that case we fall back to
+    ``X-Forwarded-Preferred-Username`` and then ``X-Forwarded-User``
+    (the UPN / oid).  Comparison against ``LH_HARNESS_SETTINGS_ADMINS``
+    is case-insensitive and happens in ``SettingsRuntime.is_admin``.
+    """
+    for name in _HEADER_CHAIN:
+        value = (headers.get(name) or "").strip()
+        if value:
+            return value
+    return None
 
 
 def _digest(value: str) -> bytes:
@@ -73,7 +95,7 @@ def register_settings_routes(
         supplied = request.headers.get(ADMIN_PROXY_HEADER) or ""
         if not supplied or not hmac.compare_digest(_digest(supplied), _digest(rt.proxy_auth)):
             return None, "not signed in through the SSO edge"
-        identity = (request.headers.get(IDENTITY_HEADER) or "").strip()
+        identity = _admin_identity(request.headers)
         if not identity:
             return None, "no signed-in identity on the request"
         if not rt.admins:
@@ -276,4 +298,4 @@ def key_restrictions(
     return out
 
 
-__all__ = ["register_settings_routes", "key_restrictions"]
+__all__ = ["register_settings_routes", "key_restrictions", "_admin_identity"]
