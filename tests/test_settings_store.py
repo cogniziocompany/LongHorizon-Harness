@@ -222,7 +222,7 @@ def test_schema_v2_fresh_db_has_empty_queue_tables(tmp_path: Path) -> None:
     store = SettingsStore(path, KEY)
     raw = sqlite3.connect(path)
     try:
-        assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == ss.SCHEMA_VERSION
         tables = {r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     finally:
         raw.close()
@@ -241,6 +241,7 @@ def test_seed_from_config_toml_populates_trios_and_capacity(tmp_path: Path) -> N
         "name": "glm", "agent": "claude_code", "model": "glm-5.3:zai",
         "mcp_profile": "default", "enabled": True,
         "updated_by": ss.SEED_ACTOR, "updated_at": trios["glm"]["updated_at"],
+        "role_models_set": True,
     }
     assert trios["kimi"]["model"] == "glm-5.2:synthetic-anthropic" and trios["qwen"]["model"] == "qwen3.8"
     assert all(t["updated_at"] for t in trios.values())
@@ -332,7 +333,7 @@ def test_migration_from_v1_preserves_settings_meta_and_audit(tmp_path: Path) -> 
     raw.close()
     migrated = SettingsStore(path, KEY)  # raises if the key check (meta) broke
     raw = sqlite3.connect(path)
-    assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == ss.SCHEMA_VERSION
     assert raw.execute("SELECT COUNT(*) FROM queue_trio").fetchone()[0] == 0
     raw.close()
     assert migrated.values()["LH_HARNESS_WEB_TOKEN"] == token

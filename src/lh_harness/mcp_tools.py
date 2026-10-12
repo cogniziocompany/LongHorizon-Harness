@@ -1667,7 +1667,7 @@ def _queue_admin_set_trio_model(
     refusal = _queue_admin_unknown_fields(arguments, {"trio", "model"})
     if refusal is not None:
         return refusal
-    from .settings_store import now_iso
+    from .settings_store import upsert_queue_trio
     from .webapi.settings_routes import _clean_trio_row
 
     trio = arguments.get("trio")
@@ -1701,11 +1701,8 @@ def _queue_admin_set_trio_model(
     assert row is not None
     with store._db() as db:  # the R4 PUT body, verbatim, for the single row
         old = db.execute("SELECT * FROM queue_trio WHERE name = ?", (row["name"],)).fetchone()
-        db.execute(
-            """INSERT OR REPLACE INTO queue_trio(name, agent, model, mcp_profile, enabled, updated_by, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (row["name"], row["agent"], row["model"], row["mcp_profile"], row["enabled"], actor, now_iso()),
-        )
+        # Only the trio-wide model changes; per-role overrides are kept.
+        upsert_queue_trio(db, row, actor, roles=None)
         before = (
             None
             if old is None

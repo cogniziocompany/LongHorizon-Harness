@@ -21,6 +21,7 @@ No route ever returns a secret value.
 
 from __future__ import annotations
 
+import json
 import hashlib
 import hmac
 import os
@@ -34,9 +35,12 @@ from ..settings_store import (
     SettingsError,
     SettingsRuntime,
     active_runtime,
+    TRIO_ROLE_KEYS,
     is_secret_name,
     now_iso,
     spec_for,
+    trio_role_overrides,
+    upsert_queue_trio,
 )
 
 ADMIN_PROXY_HEADER = "x-lh-proxy-auth"
@@ -267,11 +271,7 @@ def register_settings_routes(
         with store._db() as db:
             for row in cleaned:
                 old = db.execute("SELECT * FROM queue_trio WHERE name = ?", (row["name"],)).fetchone()
-                db.execute(
-                    """INSERT OR REPLACE INTO queue_trio(name, agent, model, mcp_profile, enabled, updated_by, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (row["name"], row["agent"], row["model"], row["mcp_profile"], row["enabled"], actor, now_iso()),
-                )
+                upsert_queue_trio(db, row, actor, roles=row.get("roles"))
                 before = (
                     None
                     if old is None
@@ -288,6 +288,9 @@ def register_settings_routes(
                     "mcp_profile": row["mcp_profile"],
                     "enabled": bool(row["enabled"]),
                 }
+                if row.get("roles") is not None:
+                    before = None if before is None else {**before, "roles": _old_roles(old)}
+                    after["roles"] = dict(row["roles"])
                 if before != after:
                     store._audit(db, actor, "set", f"queue_trio:{row['name']}", before=before, after=after)
         return {"ok": True, "trios": store.queue_trios()}
@@ -491,8 +494,21 @@ def register_settings_routes(
     _rise_exact_queue_routes(app)
 
 
-_TRIO_ROW_FIELDS = {"name", "agent", "model", "mcp_profile", "enabled"}
+_TRIO_ROW_FIELDS = {"name", "agent", "model", "mcp_profile", "enabled"} | set(TRIO_ROLE_KEYS)
 _NAME_LIMIT = 64
+
+
+def _old_roles(old: Any) -> dict[str, str]:
+    """The stored per-role overrides of a fetched queue_trio row (for audit)."""
+
+    try:
+        raw = old["role_models"]
+    except (IndexError, KeyError, TypeError):
+        return {}
+    try:
+        return trio_role_overrides(json.loads(raw)) if raw else {}
+    except (TypeError, ValueError):
+        return {}
 
 
 def _clean_trio_row(raw: Any, models_by_agent: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -545,6 +561,35 @@ def _clean_trio_row(raw: Any, models_by_agent: dict[str, Any]) -> tuple[dict[str
         "mcp_profile": profile,
         "enabled": 1 if enabled else 0,
     }
+    # Per-role overrides: validated like the trio-wide pair.  ``roles`` is
+    # None when the row names no role key at all (the stored set is kept),
+    # else the full replacement set (null/blank values drop that key).
+    if any(key in raw for key in TRIO_ROLE_KEYS):
+        roles: dict[str, str] = {}
+        for role in ("manager", "executor", "auditor"):
+            role_agent = raw.get(f"{role}_agent")
+            if role_agent is not None and not isinstance(role_agent, str):
+                return None, f"trio {trio!r}: {role}_agent must be a string or null"
+            role_agent = (role_agent or "").strip() or None
+            if role_agent is not None and role_agent not in models_by_agent:
+                return None, f"trio {trio!r}: unknown {role}_agent {role_agent!r}"
+            role_model = raw.get(f"{role}_model")
+            if role_model is not None and not isinstance(role_model, str):
+                return None, f"trio {trio!r}: {role}_model must be a string or null"
+            role_model = (role_model or "").strip() or None
+            if role_model is not None:
+                entries = models_by_agent.get(role_agent or agent) or []
+                known = {str(entry.get("id")) for entry in entries if isinstance(entry, dict)}
+                if role_model not in known:
+                    return None, (
+                        f"trio {trio!r}: unknown {role}_model {role_model!r} for agent "
+                        f"{(role_agent or agent)!r} in the live model list"
+                    )
+            if role_agent:
+                roles[f"{role}_agent"] = role_agent
+            if role_model:
+                roles[f"{role}_model"] = role_model
+        row["roles"] = roles
     return row, None
 
 
