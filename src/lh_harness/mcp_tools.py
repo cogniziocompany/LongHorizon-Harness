@@ -310,6 +310,13 @@ write is refused rather than made unvalidated.  Each accepted change writes
 one settings-audit row with the before/after row, keyed to the verified MCP
 caller, identical to PUT /api/queue/trios.  The launcher applies the new
 model to the next launch; running runs keep the model they started with.
+
+Protected trios (Paxton's standing rule, default ``["kimi", "glm", "qwen"]``):
+a write that targets a protected trio returns ``{ok: false, code: 409,
+error: "trio '<name>' is protected: ..."}`` unless ``force: true`` is
+supplied AND the verified MCP caller is on the SSO admin list.  Force alone
+is not enough; a non-admin caller with force still gets 409/403.  Capacity
+edits on protected trios are NOT refused (use ``set_trio_capacity``).
 """
 
 _SET_TRIO_CAPACITY_DESCRIPTION = """Change one trio's max_concurrent, live.
@@ -700,6 +707,14 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                 "model": _string_param(
                     "Model id from the backend's live model list for the trio's agent.",
                     required=True,
+                ),
+                # LHH-QUEUE-PROTECT-DOCS (F3): the explicit override flag,
+                # honoured only when the verified caller is on the SSO
+                # admin list (force alone is not enough).  Defaults to
+                # false; a stray truthy value still needs an admin caller.
+                "force": _boolean_param(
+                    "Override the protected-trio refusal (SSO admins only).",
+                    default=False,
                 ),
             },
         ),
@@ -1596,6 +1611,49 @@ def _queue_admin_live_models(model_fetch: Any) -> dict[str, Any] | None:
     return models if isinstance(models, dict) else None
 
 
+# LHH-QUEUE-PROTECT-DOCS (F3): the MCP tools mirror the R4 ``set_trio_model``
+# protection.  These two helpers are the rule's runtime seams:
+#
+# - ``_queue_admin_resolve_protected`` returns the project config's
+#   ``[queue].protected_trios`` tuple (``("kimi", "glm", "qwen")`` by default
+#   -- ``config.DEFAULT_PROTECTED_TRIOS``).  An empty tuple disables the
+#   rule entirely (the same way the REST route does).
+# - ``_queue_admin_caller_is_admin`` answers True only when the runtime has
+#   a non-empty admin list AND the caller identity is on it.  ``actor=None``
+#   (bearer-only dispatch, caller_configs is None) always returns False --
+#   force has no meaning without an SSO admin list to guard it.
+def _queue_admin_resolve_protected(settings_runtime: Any) -> tuple[str, ...]:
+    from .settings_store import active_runtime
+
+    rt = settings_runtime if settings_runtime is not None else active_runtime()
+    protected = getattr(rt, "protected_trios", None)
+    if isinstance(protected, tuple):
+        return protected
+    if isinstance(protected, list):
+        return tuple(dict.fromkeys(item.strip() for item in protected if isinstance(item, str) and item.strip()))
+    # No runtime list -> the rule is off (matches the REST route's
+    # ``_resolve_protected_trios``).  The MCP path defaults via the
+    # ``SettingsRuntime`` that ``dispatch`` constructs through
+    # ``active_runtime()``, whose ``protected_trios`` is populated from the
+    # project config when present and stays empty otherwise.
+    return ()
+
+
+def _queue_admin_caller_is_admin(actor: str | None, settings_runtime: Any) -> bool:
+    from .settings_store import active_runtime
+
+    rt = settings_runtime if settings_runtime is not None else active_runtime()
+    if not isinstance(actor, str) or not actor.strip():
+        return False
+    is_admin = getattr(rt, "is_admin", None)
+    if not callable(is_admin):
+        return False
+    try:
+        return bool(is_admin(actor))
+    except Exception:  # noqa: BLE001 - a broken runtime must fail closed
+        return False
+
+
 def _dispatch_queue_admin_tool(
     tool_name: str,
     arguments: dict[str, Any],
@@ -1637,7 +1695,13 @@ def _dispatch_queue_admin_tool(
         "set_trio_capacity": _queue_admin_set_trio_capacity,
         "refresh_models": _queue_admin_refresh_models,
     }
-    return handlers[tool_name](arguments, store=store, actor=actor, model_fetch=model_fetch)
+    return handlers[tool_name](
+        arguments,
+        store=store,
+        actor=actor,
+        model_fetch=model_fetch,
+        settings_runtime=settings_runtime,
+    )
 
 
 def _queue_admin_unknown_fields(arguments: dict[str, Any], allowed: set[str]) -> dict[str, Any] | None:
@@ -1653,6 +1717,7 @@ def _queue_admin_list_trios(
     store: Any,
     actor: str,
     model_fetch: Any,
+    settings_runtime: Any = None,
 ) -> dict[str, Any]:
     refusal = _queue_admin_unknown_fields(arguments, set())
     if refusal is not None:
@@ -1666,8 +1731,9 @@ def _queue_admin_set_trio_model(
     store: Any,
     actor: str,
     model_fetch: Any,
+    settings_runtime: Any = None,
 ) -> dict[str, Any]:
-    refusal = _queue_admin_unknown_fields(arguments, {"trio", "model"})
+    refusal = _queue_admin_unknown_fields(arguments, {"trio", "model", "force"})
     if refusal is not None:
         return refusal
     from .settings_store import upsert_queue_trio
@@ -1680,6 +1746,40 @@ def _queue_admin_set_trio_model(
     model = arguments.get("model")
     if not isinstance(model, str) or not model.strip():
         return {"ok": False, "error": "model must be a non-empty string model id", "code": 422}
+    # LHH-QUEUE-PROTECT-DOCS (F3): honour the explicit override flag ONLY
+    # when the caller is on the SSO admin list (``runtime.is_admin``). A
+    # non-admin caller that supplies ``force: true`` is refused with 409
+    # (the force flag is not a bypass on its own). The check runs BEFORE
+    # the live-list validation so a refused request never reaches the
+    # provider, never writes an audit row, and never mutates the trio.
+    force_raw = arguments.get("force", False)
+    if isinstance(force_raw, bool):
+        force = force_raw
+    elif isinstance(force_raw, int):
+        force = bool(force_raw)
+    else:
+        force = False
+    protected = _queue_admin_resolve_protected(settings_runtime)
+    if name in protected and not force:
+        return {
+            "ok": False,
+            "error": (
+                f"trio {name!r} is protected: Paxton's standing rule "
+                f"prohibits model or agent changes to {name}"
+            ),
+            "code": 409,
+        }
+    if name in protected and force and not _queue_admin_caller_is_admin(actor, settings_runtime):
+        # Force without admin status: refuse with the same 409 the REST
+        # route answers for a non-admin caller asking to bypass the rule.
+        return {
+            "ok": False,
+            "error": (
+                f"force=true on protected trio {name!r} requires the verified "
+                "caller to be on the SSO admin list"
+            ),
+            "code": 409,
+        }
     existing = next((row for row in store.queue_trios() if row["name"] == name), None)
     if existing is None:
         return {"ok": False, "error": f"unknown trio {name!r}", "code": 404}
@@ -1723,8 +1823,18 @@ def _queue_admin_set_trio_model(
             "enabled": bool(row["enabled"]),
         }
         if before != after:
-            store._audit(db, actor, "set", f"queue_trio:{row['name']}", before=before, after=after)
-    return {"ok": True, "trios": store.queue_trios()}
+            audit_detail: dict[str, Any] = {"before": before, "after": after}
+            # LHH-QUEUE-PROTECT-DOCS (F3): mark the audit row when the
+            # protected-trio override was used, so the SSO admin identity
+            # (``actor``) is searchable in ``GET /api/admin/audit`` with
+            # the structured flag.
+            if row["name"] in protected and force:
+                audit_detail["protected_override"] = True
+            store._audit(db, actor, "set", f"queue_trio:{row['name']}", **audit_detail)
+    result = {"ok": True, "trios": store.queue_trios()}
+    if name in protected and force:
+        result["protected_override"] = [name]
+    return result
 
 
 def _queue_admin_set_trio_capacity(
@@ -1733,6 +1843,7 @@ def _queue_admin_set_trio_capacity(
     store: Any,
     actor: str,
     model_fetch: Any,
+    settings_runtime: Any = None,
 ) -> dict[str, Any]:
     refusal = _queue_admin_unknown_fields(arguments, {"trio", "max_concurrent"})
     if refusal is not None:
@@ -1762,6 +1873,7 @@ def _queue_admin_refresh_models(
     store: Any,
     actor: str,
     model_fetch: Any,
+    settings_runtime: Any = None,
 ) -> dict[str, Any]:
     refusal = _queue_admin_unknown_fields(arguments, set())
     if refusal is not None:

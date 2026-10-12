@@ -42,6 +42,15 @@ from ..settings_store import (
     trio_role_overrides,
     upsert_queue_trio,
 )
+# LHH-QUEUE-PROTECT-DOCS (F3): the kimi (synthetic) and glm (cloud) trios are
+# never modified at runtime.  Both REST ``PUT /api/queue/trios`` and the MCP
+# ``set_trio_model`` tool refuse writes to a row whose ``name`` is on the
+# project config's ``[queue].protected_trios`` list with HTTP 409, unless the
+# request carries ``force: true`` AND the caller is verified as an SSO admin.
+# Capacity edits on protected trios stay allowed (caps are operational).  The
+# list is read live from the same project config the other queue keys come
+# from.  See docs/queue.md "Protected trios".
+from .. import queue as _queue_runtime  # the helper that exposes the resolved set + WIP
 
 ADMIN_PROXY_HEADER = "x-lh-proxy-auth"
 _KEEP_PEAK = object()  # PUT capacity: preserve the stored max_peak (legacy bare-int form)
@@ -68,6 +77,7 @@ def register_settings_routes(
     ask_runtime: Any = None,
     project_config_path: Any = None,
     model_fetch: Callable[[], dict[str, Any]] | None = None,
+    protected_trios: tuple[str, ...] | None = None,
 ) -> None:
     def runtime() -> SettingsRuntime:
         return settings_runtime if settings_runtime is not None else active_runtime()
@@ -104,6 +114,67 @@ def register_settings_routes(
             raise HTTPException(status_code=503, detail=rt.error or "the settings store is not configured")
         assert identity is not None
         return identity
+
+    # LHH-QUEUE-PROTECT-DOCS (F3): resolve the project config's
+    # ``[queue].protected_trios`` set the way the launcher's
+    # ``_refresh_queue_config`` does.  An explicit injection wins so tests
+    # can pin a deterministic set without touching the on-disk config;
+    # the file fallback keeps the rule live across edits.  The default
+    # (kimi / glm / qwen) only applies when the project config EXISTS --
+    # not when it is missing or empty.  A missing file means a deployment
+    # that has not opted into the rule (the same convention [queue].observe
+    # uses: no table = no behaviour change).
+    def _resolve_protected_trios() -> tuple[str, ...]:
+        if protected_trios is not None:
+            return tuple(protected_trios)
+        try:
+            from ..config import load_run_defaults
+            from pathlib import Path as _P
+
+            payload = None
+            if project_config_path is not None and _P(str(project_config_path)).is_file():
+                payload = load_run_defaults(project_config_path)
+            queue = payload.get("queue") if isinstance(payload, dict) else None
+            if isinstance(queue, dict) and "protected_trios" in queue:
+                configured = queue.get("protected_trios")
+                if isinstance(configured, (list, tuple)):
+                    return tuple(
+                        dict.fromkeys(
+                            item.strip() for item in configured if isinstance(item, str) and item.strip()
+                        )
+                    )
+                return ()
+        except Exception:  # noqa: BLE001 - a broken file must not silently disable the rule
+            pass
+        return ()
+
+    def _refuse_if_protected(name: str, *, force: bool, actor: str) -> None:
+        """Reject a write that targets a protected trio, unless the caller
+        asked for ``force`` AND holds SSO-admin status (a verified identity
+        on ``[settings_admins]``).  Capacity edits bypass this path: caps
+        are operational, not modelling choices.  The check runs BEFORE any
+        live-model validation so a refused request never reaches the
+        provider, never writes the audit log, and never mutates the row.
+        """
+
+        protected = _resolve_protected_trios()
+        if name not in protected:
+            return
+        if not force:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"trio {name!r} is protected: Paxton's standing rule "
+                    f"prohibits model or agent changes to {name}"
+                ),
+            )
+        # ``force=true`` is honoured only when the caller is an SSO admin
+        # (the ``actor`` returned from ``require_admin`` IS the verified
+        # admin identity -- non-admin callers were already 403'd there).
+        # Belt-and-braces: require_admin raises 403 before this fires, so
+        # reaching the override branch means the caller is an admin.
+        # Documented in docs/queue.md "Protected trios".
+        return
 
     def setting_row(name: str, stored: dict[str, dict[str, Any]], rt: SettingsRuntime) -> dict[str, Any]:
         spec = spec_for(name)
@@ -241,12 +312,44 @@ def register_settings_routes(
         rt = runtime()
         assert rt.store is not None
         store = rt.store
-        unknown = set(body) - {"trios"}
+        # LHH-QUEUE-PROTECT-DOCS (F3): the protected check runs BEFORE
+        # ``live_models()`` and the row validation -- a refused request
+        # never reaches the provider, never writes the audit log, and
+        # never mutates a row.  The ``force`` flag (boolean) opts in to the
+        # override branch and is honoured ONLY when ``actor`` came from
+        # ``require_admin`` (which requires the SSO admin list).
+        unknown = set(body) - {"trios", "force"}
         if unknown:
             raise HTTPException(status_code=400, detail="unknown field(s): " + ", ".join(sorted(unknown)))
+        force = bool(body.get("force")) if isinstance(body.get("force"), (bool, int)) else False
         rows = body.get("trios")
         if not isinstance(rows, list):
             raise HTTPException(status_code=422, detail="trios must be a list of trio objects")
+        # The protected check is per row: each row's name is checked, and a
+        # refusal on any row is all-or-nothing (mirrors the rest of the
+        # validation in this route).  Capacity edits go through the
+        # separate ``put_queue_capacity`` route, which does NOT apply the
+        # protected rule.
+        protected_set = _resolve_protected_trios()
+        if protected_set:
+            refused_protected: list[str] = []
+            for raw in rows:
+                if not isinstance(raw, dict):
+                    continue
+                name = raw.get("name")
+                if isinstance(name, str) and name.strip() in protected_set:
+                    refused_protected.append(name.strip())
+            if refused_protected and not force:
+                names = ", ".join(repr(n) for n in refused_protected)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"trio(s) {names} are protected: Paxton's standing rule "
+                        "prohibits model or agent changes to protected trios"
+                    ),
+                )
+            # When force is set we still surface which rows are protected so
+            # the audit row (and the response) make the override explicit.
         models = live_models()
         if models is None:
             raise HTTPException(status_code=503, detail="the live model list is unavailable; refusing to write unvalidated trios")
@@ -292,8 +395,20 @@ def register_settings_routes(
                     before = None if before is None else {**before, "roles": _old_roles(old)}
                     after["roles"] = dict(row["roles"])
                 if before != after:
-                    store._audit(db, actor, "set", f"queue_trio:{row['name']}", before=before, after=after)
-        return {"ok": True, "trios": store.queue_trios()}
+                    audit_detail: dict[str, Any] = {"before": before, "after": after}
+                    # Mark the audit row when the override was used -- the
+                    # SSO admin identity in ``actor`` is the actual proof,
+                    # but a structured flag makes the override searchable
+                    # in ``GET /api/admin/audit``.
+                    if row["name"] in protected_set and force:
+                        audit_detail["protected_override"] = True
+                    store._audit(db, actor, "set", f"queue_trio:{row['name']}", **audit_detail)
+        result: dict[str, Any] = {"ok": True, "trios": store.queue_trios()}
+        if protected_set and force:
+            overridden = sorted({row["name"] for row in cleaned if row["name"] in protected_set})
+            if overridden:
+                result["protected_override"] = overridden
+        return result
 
     @app.get("/api/queue/capacity")
     def get_queue_capacity(request: Request) -> dict[str, Any]:

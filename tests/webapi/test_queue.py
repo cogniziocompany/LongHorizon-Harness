@@ -265,6 +265,7 @@ def test_default_queue_config_shape() -> None:
         "observe",
         "occupancy_ignore_dirty",
         "default_time_limit_minutes",
+        "protected_trios",
     }
     assert set(config["trios"]) == {"kimi", "qwen"}
     assert config["capacity"]["kimi_max"] == 3
@@ -279,6 +280,9 @@ def test_default_queue_config_shape() -> None:
     assert config["occupancy_ignore_dirty"] is False
     # No per-task wall-clock limit unless configured (task fc-H2).
     assert config["default_time_limit_minutes"] is None
+    # Paxton's standing rule (LHH-QUEUE-PROTECT-DOCS, 2026-10-12): the
+    # kimi/glm/qwen trios are protected from runtime edits by default.
+    assert config["protected_trios"] == ("kimi", "glm", "qwen")
 
 
 def test_queue_config_from_project_config() -> None:

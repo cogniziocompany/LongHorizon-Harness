@@ -114,7 +114,9 @@ def test_manifest_exposes_the_four_tools_under_their_literal_names() -> None:
         assert specs[name]["input_schema"].get("additionalProperties") is False
         assert specs[name]["description"].strip()
     model_props = specs["set_trio_model"]["input_schema"]["properties"]
-    assert set(model_props) == {"trio", "model"}
+    # LHH-QUEUE-PROTECT-DOCS (F3): an explicit ``force`` argument lets the
+    # caller override the protected-trio refusal.  See docs/queue.md.
+    assert set(model_props) == {"trio", "model", "force"}
     capacity_props = specs["set_trio_capacity"]["input_schema"]["properties"]
     assert set(capacity_props) == {"trio", "max_concurrent"}
 

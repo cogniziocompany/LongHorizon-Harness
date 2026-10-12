@@ -108,6 +108,14 @@ _TOP_LEVEL_KEYS = {"run", "queue", "experience", "callers", "asks"}
 _QUEUE_TRIOS = {"kimi", "qwen"}
 # Trios a config MAY define but that are never filled in by default.
 _OPTIONAL_QUEUE_TRIOS = {"glm", "zai", "zaiq", "minimax"}
+# Paxton's standing rule (2026-10-12): the kimi (synthetic) and glm (cloud)
+# trios and the auditor model are never modified at runtime.  Any caller of
+# set_trio_model / PUT /api/queue/trios that targets a protected trio is
+# refused with HTTP 409 unless the request carries ``force: true`` AND the
+# caller is verified as an SSO admin (then the write goes through and records
+# the admin identity as ``updated_by``).  Capacity edits on protected trios
+# remain allowed -- caps are operational, not modelling choices.
+DEFAULT_PROTECTED_TRIOS = ("kimi", "glm", "qwen")
 # Per-role overrides a trio may carry: <role>_agent / <role>_model for the
 # three queue roles. A mixed trio (zaiq: manager+auditor on z.ai, executor
 # on the local qwen lane) is expressed with these; unset roles use the
@@ -733,6 +741,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "occupancy_ignore_dirty",
         "database_url",
         "default_time_limit_minutes",
+        "protected_trios",
     }
     if unknown_queue_keys:
         raise ProjectConfigError(f"unknown [queue] key(s): {_names(unknown_queue_keys)}")
@@ -860,6 +869,21 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         raise ProjectConfigError(
             "[queue].default_time_limit_minutes must be an integer between 1 and 1440"
         )
+    # Paxton's standing rule (2026-10-12): the kimi (synthetic) and glm
+    # (cloud) trios and the auditor model are never modified at runtime.
+    # A protected trio refuses writes from PUT /api/queue/trios and the
+    # set_trio_model MCP tool with HTTP 409 unless ``force: true`` arrives
+    # from a verified SSO admin (then the write proceeds and records the
+    # admin identity). Capacity edits stay allowed: caps are operational.
+    # Default = ["kimi", "glm", "qwen"]; an empty list disables the rule.
+    protected_raw = queue.get("protected_trios", list(DEFAULT_PROTECTED_TRIOS))
+    if not isinstance(protected_raw, list) or not all(
+        isinstance(item, str) and item.strip() for item in protected_raw
+    ):
+        raise ProjectConfigError(
+            "[queue].protected_trios must be an array of non-empty trio names"
+        )
+    protected_trios = tuple(dict.fromkeys(item.strip() for item in protected_raw))
     return {
         "trios": normalized_trios,
         "capacity": normalized_capacity,
@@ -868,6 +892,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "occupancy_ignore_dirty": occupancy_ignore_dirty,
         "database_url": database_url.strip(),
         "default_time_limit_minutes": default_time_limit,
+        "protected_trios": protected_trios,
     }
 
 
