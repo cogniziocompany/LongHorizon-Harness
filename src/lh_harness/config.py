@@ -107,7 +107,7 @@ _RUN_KEYS = {
 _TOP_LEVEL_KEYS = {"run", "queue", "experience", "callers", "asks"}
 _QUEUE_TRIOS = {"kimi", "qwen"}
 # Trios a config MAY define but that are never filled in by default.
-_OPTIONAL_QUEUE_TRIOS = {"glm", "zai", "zaiq"}
+_OPTIONAL_QUEUE_TRIOS = {"glm", "zai", "zaiq", "minimax"}
 # Per-role overrides a trio may carry: <role>_agent / <role>_model for the
 # three queue roles. A mixed trio (zaiq: manager+auditor on z.ai, executor
 # on the local qwen lane) is expressed with these; unset roles use the
@@ -226,6 +226,7 @@ _QUEUE_CAPACITY_KEYS = {
     "glm_max",
     "zai_max",
     "zaiq_max",
+    "minimax_max",
     "min_healthy_keys",
     "key_health_url",
     "poll_seconds",
@@ -368,6 +369,16 @@ auditor = 300
 # model = "glm-5.3:zai"
 # mcp_profile = "ops"
 
+# Optional: dev work on the MiniMax M Plan subscription (flat rate), through the
+# gateway aliases minimax-m3:minimax / minimax-m2.7-highspeed:minimax. An
+# ADDITIONAL trio; it never replaces another.
+# [queue.trios.minimax]
+# agent = "claude_code"
+# model = "minimax-m3:minimax"
+# manager_model = "minimax-m2.7-highspeed:minimax"
+# auditor_model = "minimax-m2.7-highspeed:minimax"
+# mcp_profile = "ops"
+
 # Optional: MIXED trio. Manager and auditor on the direct z.ai coding plan,
 # executor on the local qwen lane. Per-role keys override the trio-wide
 # agent/model for that role only. Count zaiq_max against the local qwen lanes
@@ -390,6 +401,7 @@ auditor = 300
 # glm_max = 1           # concurrent glm runs (only used when the trio is defined)
 # zai_max = 5           # concurrent zai runs (only used when the trio is defined)
 # zaiq_max = 1          # concurrent zaiq runs; shares the local qwen lanes with qwen_max
+# minimax_max = 2       # concurrent minimax runs (only used when the trio is defined)
 # min_healthy_keys = 2  # healthy Ollama Cloud keys required before kimi launches
 # key_health_url = "https://litellm.easybutt0n.ai/health"
 # poll_seconds = 15
@@ -785,6 +797,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "glm_max": 1,
         "zai_max": 5,
         "zaiq_max": 1,
+        "minimax_max": 2,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
@@ -801,6 +814,8 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["zai_max"] = max(0, capacity["zai_max"])
     if isinstance(capacity.get("zaiq_max"), int):
         normalized_capacity["zaiq_max"] = max(0, capacity["zaiq_max"])
+    if isinstance(capacity.get("minimax_max"), int):
+        normalized_capacity["minimax_max"] = max(0, capacity["minimax_max"])
     if isinstance(capacity.get("min_healthy_keys"), int):
         normalized_capacity["min_healthy_keys"] = max(0, capacity["min_healthy_keys"])
     if isinstance(capacity.get("key_health_url"), str):

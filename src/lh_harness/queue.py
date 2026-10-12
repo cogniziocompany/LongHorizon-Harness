@@ -48,7 +48,7 @@ _NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
 # Trios every config carries (a missing one gets a safe fallback spec) and
 # trios that exist only when the config defines them (glm, zai, zaiq).
 _REQUIRED_TRIOS = frozenset({"kimi", "qwen"})
-_OPTIONAL_TRIOS = frozenset({"glm", "zai", "zaiq"})
+_OPTIONAL_TRIOS = frozenset({"glm", "zai", "zaiq", "minimax"})
 _VALID_TRIOS = _REQUIRED_TRIOS | _OPTIONAL_TRIOS
 
 # The requester identity block (task 300).  A JSON object on the entry body
@@ -1039,6 +1039,8 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "zai_max": 5,
         # Only consulted when [queue.trios.zaiq] is defined (mixed z.ai + local qwen).
         "zaiq_max": 1,
+        # Only consulted when [queue.trios.minimax] is defined (MiniMax M Plan).
+        "minimax_max": 2,
         "min_healthy_keys": 2,
         "key_health_url": "",
         "poll_seconds": 15,
@@ -1055,6 +1057,8 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         normalized_capacity["zai_max"] = max(0, capacity["zai_max"])
     if isinstance(capacity.get("zaiq_max"), int):
         normalized_capacity["zaiq_max"] = max(0, capacity["zaiq_max"])
+    if isinstance(capacity.get("minimax_max"), int):
+        normalized_capacity["minimax_max"] = max(0, capacity["minimax_max"])
     if isinstance(capacity.get("min_healthy_keys"), int):
         normalized_capacity["min_healthy_keys"] = max(0, capacity["min_healthy_keys"])
     if isinstance(capacity.get("key_health_url"), str):
