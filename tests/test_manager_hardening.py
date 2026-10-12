@@ -286,7 +286,7 @@ async def test_episode_timeout_is_preserved_and_recovers_in_the_next_round(tmp_p
     assert result["failure_reason"] == ""
     assert result["rounds"][0]["manager_status"]["status"] == "timeout"
     assert result["rounds"][0]["harness_feedback"] == (
-        "Agent 执行超时：Episode timed out after 10s."
+        "Agent timeout：Episode timed out after 10s."
     )
 
 
