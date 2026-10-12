@@ -229,7 +229,8 @@ def test_approval_resolve_rejects_an_out_of_range_round_grant(client, tmp_path: 
 
     response = api.post(
         f"/api/runs/{run_id}/approvals/does-not-matter/resolve",
-        json={"action": "continue", "extra_rounds": MAX_ROUNDS + 1},
+        json={"action": "continue", "extra_rounds": MAX_ROUNDS + 1,
+              "approved_by": "terminal:deploy@ct110", "channel": "terminal"},
     )
 
     assert response.status_code == 422

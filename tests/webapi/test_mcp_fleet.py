@@ -174,6 +174,8 @@ def test_mcp_fleet_resolve_gate_rejects_non_ascii() -> None:
                     "run_id": "run-1",
                     "approval_id": approval.approval_id,
                     "action": "continue",
+                    "approved_by": "terminal:deploy@ct110",
+                    "channel": "terminal",
                     "user_input": "héllo non-ascii",
                 }
             },
@@ -195,7 +197,8 @@ def test_api_resolve_approval_rejects_non_ascii_user_input() -> None:
         response = _post(
             client,
             f"/api/runs/run-1/approvals/{approval.approval_id}/resolve",
-            {"action": "continue", "user_input": "héllo"},
+            {"action": "continue", "user_input": "héllo",
+             "approved_by": "terminal:deploy@ct110", "channel": "terminal"},
         )
         assert response.status_code == 422
         assert "ASCII" in response.json()["detail"]
@@ -214,7 +217,8 @@ def test_api_resolve_approval_accepts_ascii_user_input() -> None:
         response = _post(
             client,
             f"/api/runs/run-1/approvals/{approval.approval_id}/resolve",
-            {"action": "continue", "user_input": "plain ASCII note"},
+            {"action": "continue", "user_input": "plain ASCII note",
+             "approved_by": "terminal:deploy@ct110", "channel": "terminal"},
         )
         assert response.status_code == 200
         data = response.json()
