@@ -842,12 +842,27 @@ class DashboardState:
         approved_by: str = "",
         channel: str = "",
         unattributed: bool = False,
+        identity_source: str = "none",
         extra_rounds: int | None = None,
         command_id: str | None = None,
         expected_revision: int | None = None,
     ) -> bool:
         if not self.control_enabled:
             return False
+        # DR-05a: whenever an approval identity rides this resolve, it must
+        # satisfy the wire contract exactly -- the identity_source here is
+        # stamped by the transport layer (web route / MCP dispatch), never by
+        # the caller payload.  Transports pre-validate and map a refusal to
+        # HTTP 422/403; this re-validation is the last-resort guard so a
+        # forged or relayed identity cannot slip past the shared choke point.
+        # Legacy internal callers that pass no identity at all keep the
+        # pre-DR-05a behaviour unchanged.
+        if approved_by.strip() or channel.strip():
+            from ..caller_auth import validate_resolve_identity
+
+            refusal = validate_resolve_identity(approved_by, channel, identity_source)
+            if refusal is not None:
+                raise ValueError(refusal)
         self._refresh_approval_from_disk(approval_id)
         normalized_action = str(action or "").strip()
         normalized_reason = reason.strip()
@@ -884,9 +899,19 @@ class DashboardState:
         # DR-05a: the approver identity and channel ride on the control-bus
         # command so the worker's resolve can persist them on the record.  Kept
         # out of the payload when empty so pre-upgrade retries compare equal.
-        if approved_by.strip() or channel.strip():
-            payload["approved_by"] = str(approved_by).strip()
-            payload["channel"] = str(channel).strip()
+        approved_by_text = str(approved_by).strip()
+        channel_text = str(channel).strip()
+        # The unattributed marker only ever rides channel "service": a service
+        # resolve is by definition an unattributed operator action (an
+        # authorized service caller resolved the gate on an operator's behalf),
+        # and a non-service resolve can never be flagged unattributed.
+        if channel_text == "service":
+            unattributed = True
+        elif channel_text:
+            unattributed = False
+        if approved_by_text or channel_text:
+            payload["approved_by"] = approved_by_text
+            payload["channel"] = channel_text
             if unattributed:
                 payload["unattributed"] = True
         # The approval id is the durable uniqueness key.  Browser retries may

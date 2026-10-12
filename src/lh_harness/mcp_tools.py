@@ -1417,6 +1417,7 @@ def _resolve_gate(
             approved_by=approved_by_text,
             channel=channel_text,
             unattributed=(channel_text == "service"),
+            identity_source=identity_source,
         )
     except Exception as exc:
         return {"ok": False, "error": str(exc), "code": 409}
