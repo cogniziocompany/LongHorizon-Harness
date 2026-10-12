@@ -2566,6 +2566,15 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
   const [maxRounds, setMaxRounds] = useState('25');
   const [promptLanguage, setPromptLanguage] = useState<'en' | 'zh'>('en');
   const [roundLimit, setRoundLimit] = useState(MAX_TRAJECTORY_ROUNDS);
+  const clampDrawerWidth = (value: number) => {
+    const min = 410;
+    const max = Math.max(min, Math.floor(0.9 * window.innerWidth));
+    return Math.max(min, Math.min(max, Math.round(value)));
+  };
+  const [drawerWidth, setDrawerWidth] = useState<number>(() => {
+    if (typeof window === 'undefined') return 410;
+    return clampDrawerWidth(410);
+  });
   useEffect(() => {
     if (!meta || rolesInitialised.current) return;
     const fallbackAgent = defaultAgent(meta);
@@ -2598,7 +2607,7 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
       ...(effort ? { reasoning_effort: effort } : {}),
     }];
   })) as Record<PublicRole, RoleRuntimeConfig>;
-  return <div className="drawer-backdrop" {...backdrop}><aside className={`details-drawer ${creating ? 'create-drawer' : ''}`} role="dialog" aria-modal="true" aria-label={creating ? text('创建新任务', 'Create new task') : text('会话详情', 'Task details')}>
+  return <div className="drawer-backdrop" {...backdrop}><aside className={`details-drawer ${creating ? 'create-drawer' : ''}`} role="dialog" aria-modal="true" aria-label={creating ? text('创建新任务', 'Create new task') : text('会话详情', 'Task details')} style={{ '--drawer-width': `${drawerWidth}px` } as React.CSSProperties}>
     <div className="drawer-header"><div><div className="drawer-eyebrow">{creating ? text('新任务', 'NEW TASK') : text('会话详情', 'TASK DETAILS')}</div><h2>{creating ? text('创建 LongHorizon 任务', 'Create a LongHorizon task') : text('详情', 'Details')}</h2></div><button className="drawer-close" onClick={onClose} aria-label={text('关闭', 'Close')}><X size={18} /></button></div>
     {creating ? <>
       <p className="drawer-copy">{text('任务会由真实 worker 执行。右侧状态面板会持续显示进度，中间区域只保留可读的步骤结果。', 'A real worker will execute the task. The status panel tracks progress while the conversation shows readable step results.')}</p>
