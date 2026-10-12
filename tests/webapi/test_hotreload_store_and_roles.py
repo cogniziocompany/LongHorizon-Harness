@@ -186,3 +186,37 @@ def test_existing_store_gains_the_role_models_column(tmp_path: Path) -> None:
     assert row["name"] == "kimi" and row["model"] == "m" and row["role_models_set"] is False
     with sqlite3.connect(db_path) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == settings_store.SCHEMA_VERSION
+
+
+def test_queue_config_endpoint_reports_what_the_launcher_enforces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /api/queue/config must show settings-store values, not the file's.
+
+    CT110, 2026-10-12: zai_max was lowered 5 -> 4 at runtime; the launcher
+    honoured it but this endpoint (the read-back everyone uses) still said 5."""
+    from fastapi.testclient import TestClient
+
+    from lh_harness.webapi.server import create_app
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    db_path = _settings_env(tmp_path, monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(CT110_QUEUE_TOML, encoding="utf-8")
+    monkeypatch.setattr("lh_harness.launcher.PROJECT_CONFIG_PATH", path)
+    monkeypatch.setattr("lh_harness.config.PROJECT_CONFIG_PATH", path)
+    _root, _store, supervisor = _fixture(tmp_path / "sup")
+    client = TestClient(create_app(runs_root=root, supervisor=supervisor, probe_open_pr=None))
+
+    before = client.get("/api/queue/config").json()
+    assert before["capacity"]["zai_max"] == 5
+    assert before["trios"]["zaiq"]["executor_model"] == "qwen3.8"
+
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE queue_capacity SET max_concurrent = 4 WHERE trio = 'zai'")
+        db.execute("UPDATE queue_trio SET role_models = ? WHERE name = 'zaiq'", ('{"executor_model": "glm-5.3-flash:zai"}',))
+
+    after = client.get("/api/queue/config").json()
+    assert after["capacity"]["zai_max"] == 4
+    assert after["trios"]["zaiq"]["executor_model"] == "glm-5.3-flash:zai"
+    assert after["trios"]["kimi"]["model"] == "glm-5.2:synthetic-anthropic"
+    assert after["source"] == "settings_store"
