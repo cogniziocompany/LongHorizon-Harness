@@ -1,10 +1,13 @@
 # OV2 ptait08 runtime admission — design proposal (INITIAL, no code, no infra change)
 
 > **Corrections 2026-10-12.** Docs-only corrections of the merged runtime-admission proposal,
-> applied against the cognizioware PR#2 review at commit `d89c556`
-> (`https://github.com/cogniziocompany/cognizioware/blob/d89c5560867485ab877f58c01dde76950ffa365b/deployment/omnigent/runtime-admission-pr130-review.md`).
-> Source of truth: that review doc (fetched verbatim). Every short sha below was verified against
-> actual `gh api` output. This changes prose only; no code, no provisioning, nothing requested.
+> applied against the cognizioware PR#2 review. Current source of truth is the PR#2 head at commit
+> `df8b0cb` (`https://github.com/cogniziocompany/cognizioware/blob/df8b0cb79e39e359eb317e6a8eb9e649790b15f1/deployment/omnigent/`),
+> which is a later commit than the earlier review ref `d89c556` used in the first correction pass.
+> Sources fetched verbatim: `deployment/omnigent/runtime-admission-pr130-review.md`,
+> `deployment/omnigent/hosted-agent-workspaces.md`, and `deployment/omnigent/agent-bindings.json`
+> (the registry seed). Every short sha below was verified against actual `gh api` output. This
+> changes prose only; no code, no provisioning, nothing requested.
 >
 > 1. **Host vs queue.** §6 distinguishes the **Omnigent host/runner** from CT110's Harness
 >    **queue** — different things.
@@ -17,10 +20,20 @@
 >    **host, not the guest**, and states what is unverified for the guest.
 > 6. **Gateway PRs merged.** §2 (ordering rules) notes **PRs 481 and 480 are already merged**.
 > 7. **Short SHAs verified.** §6 carries the `gh api`-verified short SHAs for cognizioware PR2
->    (`d89c556`), claude-code-teams PR29 (`77599bf`), LHH PR127 (`f3338b7`); all matched, no
->    mismatches flagged.
+>    (`d89c556` → re-fetched at `df8b0cb`), claude-code-teams PR29 (`77599bf`), LHH PR127
+>    (`f3338b7`); all matched, no mismatches flagged.
 > 8. **Initial, not cutover.** §1 header marks this **INITIAL** admission, not the final paired-role
 >    cutover.
+> 9. **Shared Omnigent umbrella (6 unregistered slots).** §2 / §9 adds the umbrella
+>    `https://agents.easybutt0n.ai`: families **overseer1, infraops1, devspecops1**, each with a
+>    Claude runtime + an `-op` runtime + one effect writer = **6 slots**, all **UNREGISTERED** (the
+>    `agent-bindings.json` seed shows every `session_id`/`runtime`/`runtimes` as `null`). No live
+>    session ids are invented here.
+> 10. **Host/agent/workspace distinction.** §2 / §10 carries the hosted-family acceptance criteria
+>     from `hosted-agent-workspaces.md` — workspace must hold the admitted branch/repo, role
+>     instructions, effective MCP/model config, and bounded evidence/parent state; equal duties do
+>     not imply sharing one credential or giving every role admin access; an existing independent
+>     Claude process is not auto-imported; plus the existing claude-code-teams migration.
 >
 > **Kept open for Paxton (not resolved):** every account and grant choice remains a decision — see
 > §5. The approval-by-link (Entra) design is preserved unchanged.
@@ -127,9 +140,10 @@ step beneath them until resolved.
    account does **not** narrow the server token, so it is not accepted as the principal. A general
    **admin enrollment API for arbitrary existing PVE guests has not been verified** and should not be
    chosen until verified. **Do not mint any credentials or write tokens into the database** to bridge
-   this gap. *Owner: Paxton chooses the principal; devspecops1 executes.* **[PAXTON DECISION on the
-   principal before devspecops1 executes — the request text is section 3, sent only after Paxton
-   approves it]**
+   this gap. This enrollment happens under the **Shared Omnigent umbrella** (`https://agents.easybutt0n.ai`;
+   see §9): the runtime binds to a stable family workspace and the umbrella is the shared management
+   surface for the three infrastructure-agent families, not a per-role grant. *Owner: Paxton chooses
+   the principal; devspecops1 executes.* **[PAXTON DECISION on the principal before devspecops1 executes — the request text is section 3, sent only after Paxton approves it]**
 5. **Register the gateway route / parent route.** The **Fleet Chat parent channel and verified
    parent/span/tenant binding are mandatory** for every delegated span — the parent route is not
    optional. Register the v2 runtime's route under that parent route so calls from the new key land
@@ -150,10 +164,59 @@ step beneath them until resolved.
 8. **First-workload go/no-go.** Paxton decides when the first real task may run on the new host.
    *Owner: Paxton.* **[PAXTON DECISION]**
 
+9. **Shared Omnigent umbrella: six unregistered slots (docs-only, nothing provisioned).** This
+   proposal describes the *envelope* the v2 runtime will bind into — not a grant this round creates.
+   Source: `cognizioware` PR#2 `deployment/omnigent/hosted-agent-workspaces.md` (fetched verbatim at
+   head `df8b0cb`; `agent-bindings.json` registry seed at the same ref).
+   - The umbrella server `https://agents.easybutt0n.ai` is the shared management umbrella for all
+     three infrastructure-agent families. A deployed server, a successful Microsoft login, or an
+     empty registry entry does **not** by itself fulfill the "admitted workspace" requirement.
+   - **Logical families:** `overseer1`, `infraops1`, `devspecops1`. Each family pairs a Claude
+     runtime with an `-op` runtime and **one active effect writer** — that is **6 runtime slots**
+     total (overseer1 / overseer1-op, infraops1 / infraops1-op, devspecops1 / devspecops1-op).
+   - The registry seed `agent-bindings.json` (ref `df8b0cb`) declares all three families with
+     `session_id: null`, `runtime: null`, and `runtimes: { <name>: {session_id: null} }` for every
+     runtime. **All six slots are UNREGISTERED.** This document states the slots and their `null`
+     state; it invents **no live session ids** and does not label any unconnected slot active.
+   - `overseer1-omi` is management metadata, **not** a seventh reasoning runtime. Each pair keeps
+     separate authenticated principals and sessions, one shared logical inbox/checkpoint, and one
+     active effect writer. Equal duties do not imply sharing one credential between runtimes or
+     giving every role admin access.
+   - **What this round does not do:** provision the isolated OS runtime account, install the
+     qualified client, enroll ptait08, or bind real session ids through the controller. Those are
+     the deployment steps in `hosted-agent-workspaces.md` §Deployment acceptance (item 1 onward);
+     this design document only carries the umbrella shape and the *current gap* (on 2026-10-12 the
+     delivered seed contained only an unbound overseer1).
+
+10. **Host / agent / workspace distinction and acceptance criteria (docs-only).** Carried from
+    `hosted-agent-workspaces.md` so a reviewer sees the hosted-family acceptance criteria this
+    proposal must eventually satisfy. These are the *full deployment* criteria — the v2 runtime is
+    the admission step §1–§8 covers; items below are what the controller enforces afterward.
+    - **Workspace contents (required stable entry).** A runtime's workspace must contain the
+      admitted branch/repo, the role instructions, the effective MCP/model configuration, and
+      bounded evidence/parent state. This is verified against the workspace's contents, not against
+      a deployed server or a Microsoft login.
+    - **Credential separation.** Each pair (e.g. overseer1 / overseer1-op) retains separate
+      authenticated principals and sessions. Equal duties do **not** imply sharing one credential
+      between runtimes, nor giving every role admin access.
+    - **Existing independent processes.** An existing independent Claude process is **not**
+      automatically imported or managed just because the management server is running. Preserve its
+      production history and writer while verifying its connection/migration independently.
+    - **Existing migration (claude-code-teams).** The claude-code-teams PR#29 evidence
+      (`77599bf9817d97bd04e6daf18f89b49901fb33c6`, verified) records the prior hosted-family
+      migration. This proposal does not reopen it; it is carried here only so the reviewer knows the
+      umbrella's acceptance criteria already include that migration lineage.
+    - **The admitted controller.** Additions to the registry seed are applied through the admitted
+      controller — preserving existing session links — once that controller is operational. The
+      updater deliberately preserves an existing registry rather than overwriting live bindings.
+    - **Session binding is real, not fabricated.** A session binds an agent, a host, and a
+      workspace. Before any effect writer moves, verify failover fencing and resume; never fabricate
+      session ids or label an unconnected slot active.
+
 Ordering rules: steps 3–6 may interleave once steps 1–2 are resolved, but step 7 requires all of
-3–6 complete, and step 8 requires step 7's read-back. Gateway PRs **481 and 480 are already
-merged** — PR481 (`c9beba9`, deployment38160892455 succeeded) and PR480 (`5744932`,
-deployment38162461821 succeeded) are not merge choices here; remove any outstanding merge decisions.
+3–6 complete, and step 8 requires step 7's read-back. §9 and §10 describe the umbrella and its
+acceptance criteria; they are the shape the runtime binds into, not steps this round performs.
+Gateway PRs **481 and 480 are already merged** — PR481 (`c9beba9`, deployment38160892455 succeeded) and PR480 (`5744932`, deployment38162461821 succeeded) are not merge choices here; remove any outstanding merge decisions.
 
 ## 3. devspecops1 request text (ready-to-send, placeholders only)
 
@@ -268,9 +331,16 @@ Plain language first: three PRs carry the v2 build evidence, one further PR is t
 ptait08 onboard, and a graphify query found no existing ptait08 admission code anywhere — so this
 proposal does not duplicate or conflict with anything.
 
-- **`cogniziocompany/cognizioware` PR #2** — build evidence per the task context; verified head
-  commit `d89c556` (full `d89c5560867485ab877f58c01dde76950ffa365b`) at the review ref
-  `d89c5560867485ab877f58c01dde76950ffa365b`. The short sha matches the actual commit.
+- **`cogniziocompany/cognizioware` PR #2** — build evidence per the task context. Verified head
+  commit `df8b0cb` (full `df8b0cb79e39e359eb317e6a8eb9e649790b15f1`). A later commit than the
+  earlier round's review ref `d89c556` (full `d89c5560867485ab877f58c01dde76950ffa365b`), which
+  still matches the actual commit. The review doc, `hosted-agent-workspaces.md`, and
+  `agent-bindings.json` (the registry seed) were fetched verbatim at head `df8b0cb`; the short sha
+  matches the actual commit.
+- **`cogniziocompany/cognizioware` shared umbrella server** — fetched verbatim at `df8b0cb`: the
+  umbrella server `https://agents.easybutt0n.ai` is the shared management umbrella for the three
+  infrastructure-agent families (overseer1 / infraops1 / devspecops1). This is a real fetched fact,
+  not a host on this proposal's touch list.
 - **`cogniziocompany/claude-code-teams` PR #29** — build evidence per the task context; verified
   head commit `77599bf` (full `77599bf9817d97bd04e6daf18f89b49901fb33c6`). The short sha matches
   the actual commit.
@@ -280,10 +350,14 @@ proposal does not duplicate or conflict with anything.
   ("Reflect with Manager before parent debrief and bound continuation claims"), base `main`,
   title "Add checkpoint-bound Manager parent debrief boundary". The short sha matches the actual
   commit.
-- **Short-sha verification (all three matched).** Verified via `gh api .../commits/<short>` on
-  2026-10-12 before writing: cognizioware PR2 `d89c556` = `d89c5560867485ab877f58c01dde76950ffa365b`;
-  claude-code-teams PR29 `77599bf` = `77599bf9817d97bd04e6daf18f89b49901fb33c6`; LHH PR127
-  `f3338b7` = `f3338b7a494f21863636fad8fdbabda8d174bfd2`. No mismatches to flag.
+- **Short-sha verification (all three matched, re-verified at `df8b0cb`).** Verified via
+  `gh api .../commits/<short>` on 2026-10-12 before writing: cognizioware PR2 `d89c556` =
+  `d89c5560867485ab877f58c01dde76950ffa365b`; claude-code-teams PR29 `77599bf` =
+  `77599bf9817d97bd04e6daf18f89b49901fb33c6`; LHH PR127 `f3338b7` =
+  `f3338b7a494f21863636fad8fdbabda8d174bfd2`. No mismatches to flag. This pass additionally
+  re-verified the cognizioware PR#2 head: `df8b0cb` = `df8b0cb79e39e359eb317e6a8eb9e649790b15f1`
+  (the current source of truth for points 9–10; `d89c556` is a prior commit on the same PR that
+  still matches the actual commit).
 - **Graphify pre-edit query (required before authoring this file).** This run queried the **live**
   graphify index at `repo::path` for `LongHorizon-Harness::docs/handoffs/ov2-ptait08-runtime-admission.md`
   (the local graphify index, `graphify-out/graph.json`, at `origin/main`). The index registers
