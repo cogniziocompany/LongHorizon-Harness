@@ -2952,6 +2952,24 @@ def create_app(
                 effective = queue_config_from_config(project)
         except Exception:
             pass
+        # Hot reload (LHH-QUEUE-HOTRELOAD): once the settings store is seeded it,
+        # not config.toml, decides trios and per-trio caps. This endpoint is what
+        # the overseer, the fleet page and operators read back, so it must show
+        # what the launcher will actually enforce. On 2026-10-12 a runtime change
+        # of zai_max 5 -> 4 was live in the launcher while this still said 5.
+        if launcher is not None:
+            try:
+                launcher._refresh_queue_config()
+                live = launcher._config if isinstance(launcher._config, dict) else {}
+                if isinstance(live.get("trios"), dict):
+                    effective["trios"] = {
+                        name: dict(spec) for name, spec in live["trios"].items() if isinstance(spec, dict)
+                    }
+                if isinstance(live.get("capacity"), dict):
+                    effective["capacity"] = {**effective.get("capacity", {}), **live["capacity"]}
+                effective["source"] = "settings_store" if launcher._settings_store is not None else "config_file"
+            except Exception:  # noqa: BLE001 - reporting must never break on the store
+                pass
         return effective
 
     @app.get("/api/queue/shadow")
