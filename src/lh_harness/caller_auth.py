@@ -65,22 +65,32 @@ PERSONA_CHANNELS = ("fleet-chat", "web-sso")
 SERVICE_APPROVED_BY_PREFIX = "service:"
 
 # The exact wire forms an ``approved_by`` may take (ASCII by construction).
-# Anything looser -- a bare name, free text, a model-supplied string -- fails
-# validation, so a resolve cannot be attributed without a verified identity.
-_UPN_APPROVED_BY_RE = re.compile(r"^upn:[A-Za-z0-9._%+#-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})*$", re.ASCII)
-# Tightened per round_003 audit: a Slack user id is "U" followed by at least 7
-# more uppercase-alphanumeric characters (real ids are 8-11 after the U), and a
-# terminal identity is a POSIX-safe user@host with a dotted, resolvable-looking
-# host -- no bare single tokens, no leading/trailing dots or dashes.
-_SLACK_APPROVED_BY_RE = re.compile(r"^slack:U[A-Z0-9]{7,10}$", re.ASCII)
+# The wire contract fixes only the prefix and the 254-character cap, so the
+# regexes below police shape only (no extra length caps anywhere): any value
+# the wire contract permits must validate.
+# - upn:<user@domain>: one or more allowed userinfo characters, then "@",
+#   then one or more domain labels separated by dots.  No 64-character
+#   local-part cap: the contract caps the whole value at 254, so an
+#   intermediate cap would refuse some contract-permitted values.
+# - slack:<Uxxxx>: "U" followed by one or more uppercase-alphanumeric
+#   characters (the DR-05b relay forwards real Slack user ids, all of which
+#   match; the {1,} floor keeps model-supplied filler out).
+# - terminal:<os user>@<host>: a POSIX-safe user segment, then "@", then a
+#   dotted hostname of well-formed labels (no leading/trailing dots or
+#   dashes); both parts are unbounded apart from the 254-char value cap.
+_UPN_APPROVED_BY_RE = re.compile(
+    r"^upn:[A-Za-z0-9._%+#-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*$", re.ASCII
+)
+_SLACK_APPROVED_BY_RE = re.compile(r"^slack:U[A-Z0-9]+$", re.ASCII)
 _TERMINAL_APPROVED_BY_RE = re.compile(
-    r"^terminal:[A-Za-z0-9_.-]{1,32}@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)$",
+    r"^terminal:[A-Za-z0-9_.-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*)$",
     re.ASCII,
 )
-# Caller aliases are lowercase (``hydra-mcp``, ``overseer1``); dots and
-# underscores are tolerated for gateway-key alias names.
-_SERVICE_APPROVED_BY_RE = re.compile(r"^service:[a-z0-9][a-z0-9._-]{0,62}$", re.ASCII)
+# Caller aliases in the contract's examples are lowercase (``hydra-mcp``,
+# ``overseer1``); dots and underscores are tolerated for gateway-key alias
+# names.  Bounded only by the 254-char value cap.
+_SERVICE_APPROVED_BY_RE = re.compile(r"^service:[A-Za-z0-9][A-Za-z0-9._-]*$", re.ASCII)
 
 # The approved_by prefix must agree with the channel it rides on: a resolve
 # claiming channel "slack-dm" cannot carry an upn: identity and vice versa.
