@@ -2573,8 +2573,28 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
   };
   const [drawerWidth, setDrawerWidth] = useState<number>(() => {
     if (typeof window === 'undefined') return 410;
+    try {
+      const stored = window.localStorage.getItem('lhh.detailsWidth');
+      if (stored !== null) {
+        const parsed = Number.parseInt(stored, 10);
+        if (Number.isFinite(parsed)) return clampDrawerWidth(parsed);
+      }
+    } catch {
+      // Storage may be disabled (private mode, quota); fall through to default.
+    }
     return clampDrawerWidth(410);
   });
+  const toggleDrawerWidth = () => {
+    if (typeof window === 'undefined') return;
+    const max = clampDrawerWidth(Math.floor(0.9 * window.innerWidth));
+    const next = drawerWidth >= max ? 410 : max;
+    setDrawerWidth(clampDrawerWidth(next));
+    try {
+      window.localStorage.setItem('lhh.detailsWidth', String(next));
+    } catch {
+      // Storage may be disabled; the in-memory state still updates.
+    }
+  };
   useEffect(() => {
     if (!meta || rolesInitialised.current) return;
     const fallbackAgent = defaultAgent(meta);
@@ -2608,7 +2628,7 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
     }];
   })) as Record<PublicRole, RoleRuntimeConfig>;
   return <div className="drawer-backdrop" {...backdrop}><aside className={`details-drawer ${creating ? 'create-drawer' : ''}`} role="dialog" aria-modal="true" aria-label={creating ? text('创建新任务', 'Create new task') : text('会话详情', 'Task details')} style={{ '--drawer-width': `${drawerWidth}px` } as React.CSSProperties}>
-    <div className="drawer-header"><div><div className="drawer-eyebrow">{creating ? text('新任务', 'NEW TASK') : text('会话详情', 'TASK DETAILS')}</div><h2>{creating ? text('创建 LongHorizon 任务', 'Create a LongHorizon task') : text('详情', 'Details')}</h2></div><button className="drawer-close" onClick={onClose} aria-label={text('关闭', 'Close')}><X size={18} /></button></div>
+    <div className="drawer-header"><div><div className="drawer-eyebrow">{creating ? text('新任务', 'NEW TASK') : text('会话详情', 'TASK DETAILS')}</div><h2>{creating ? text('创建 LongHorizon 任务', 'Create a LongHorizon task') : text('详情', 'Details')}</h2></div><button type="button" className="drawer-toggle" onClick={toggleDrawerWidth} aria-label={text('切换面板宽度', 'Toggle panel width')} title={text('切换面板宽度', 'Toggle panel width')}><PanelRight size={18} /></button><button className="drawer-close" onClick={onClose} aria-label={text('关闭', 'Close')}><X size={18} /></button></div>
     {creating ? <>
       <p className="drawer-copy">{text('任务会由真实 worker 执行。右侧状态面板会持续显示进度，中间区域只保留可读的步骤结果。', 'A real worker will execute the task. The status panel tracks progress while the conversation shows readable step results.')}</p>
       <label className="drawer-field"><span>{text('任务', 'Task')}</span><textarea autoFocus value={task} onChange={(event) => setTask(event.target.value)} placeholder={text('请描述 LongHorizon 需要完成的任务', 'What should LongHorizon do?')} /></label>
