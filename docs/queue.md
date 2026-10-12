@@ -188,6 +188,7 @@ Capacity is configured under `[queue.capacity]`:
 | `glm_max` | 1 | Concurrent glm runs allowed. Only used when `[queue.trios.glm]` is defined (see below) |
 | `zai_max` | 5 | Concurrent zai runs allowed. Only used when `[queue.trios.zai]` is defined (see below) |
 | `zaiq_max` | 1 | Concurrent zaiq (mixed) runs. Only used when `[queue.trios.zaiq]` is defined; shares the local qwen lanes with `qwen_max` |
+| `minimax_max` | 2 | Concurrent minimax runs. Only used when `[queue.trios.minimax]` is defined |
 | `min_healthy_keys` | 2 | Healthy Ollama Cloud keys required before kimi launches |
 | `key_health_url` | `""` | URL that returns `{ "healthy_keys": [{"healthy": true}, ...] }` |
 | `poll_seconds` | 15 | Launcher poll interval |
@@ -603,3 +604,25 @@ zaiq_max = 1
 Capacity is per trio, so a `zaiq` run's executor occupies a local qwen lane that `qwen_max` does
 not know about. On a node with two local lanes keep `qwen_max + zaiq_max <= 2`, or accept that a
 third stream queues at the router.
+
+## The optional `minimax` trio (MiniMax M Plan subscription)
+
+An additional lane on the flat-rate MiniMax M Plan, reached through the gateway aliases
+`minimax-m3:minimax`, `minimax-m2.7:minimax` and `minimax-m2.7-highspeed:minimax` (registered on
+the router 2026-10-12, Anthropic-compatible upstream). It replaces nothing.
+
+```toml
+[queue.trios.minimax]
+agent = "claude_code"
+model = "minimax-m3:minimax"                       # executor
+manager_model = "minimax-m2.7-highspeed:minimax"
+auditor_model = "minimax-m2.7-highspeed:minimax"
+mcp_profile = "ops"
+
+[queue.capacity]
+minimax_max = 2
+```
+
+On a node whose settings store is already seeded, add the trio and its cap through the runtime
+path (store rows), not only the file: the file is read once at the first seed. The node's gateway
+key must be allowed the three aliases, or launches fail with 403 "key not allowed to access model".

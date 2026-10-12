@@ -96,7 +96,7 @@ Accepted fields (all persisted on the queue entry):
   an ' at capacity' skip for the entry (launcher.py _check_eligibility)
   and it stays pending, unlaunched, consuming no capacity; _launch and
   _shadow_launch_decision guard the same condition with an 'unknown trio'
-  skip. Supply 'kimi', 'qwen', 'glm', 'zai' or 'zaiq' whenever the task should actually
+  skip. Supply 'kimi', 'qwen', 'glm', 'zai', 'zaiq' or 'minimax' whenever the task should actually
   launch.
 - max_rounds (integer, optional): maximum harness rounds (default 25).
 - priority (integer, optional): higher number = earlier launch within the
@@ -144,6 +144,9 @@ Rules:
   least min_healthy_keys healthy Ollama Cloud keys and counts against kimi_max.
 - trio "qwen" is for QA only (codex backend) and is limited to one concurrent
   run (qwen_max=1).
+- trio "minimax" runs dev work on the MiniMax M Plan subscription (minimax_max,
+  default 2). An additional lane; launches only on a node whose config defines
+  [queue.trios.minimax].
 - trio "zaiq" is the MIXED lane: manager and auditor on z.ai, executor on the
   local qwen lane (zaiq_max, default 1; shares the local lanes with qwen).
   Launches only on a node whose config defines [queue.trios.zaiq].
@@ -521,7 +524,7 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
             {
                 "status": _string_param("Filter by status (comma list): pending, launched, done, failed, blocked.", required=False),
                 "name": _string_param("Only entries whose name contains this text (case-insensitive).", required=False),
-                "trio": _string_param("Only entries for this trio (e.g. qwen, kimi, glm, zai, zaiq).", required=False),
+                "trio": _string_param("Only entries for this trio (e.g. qwen, kimi, glm, zai, zaiq, minimax).", required=False),
                 "limit": _string_param("Page size, 1-500 (default 50).", required=False),
                 "after": _string_param("Cursor from the previous page's next_cursor.", required=False),
                 "queue_id": _string_param("Return this one entry in full (task text included).", required=False),
