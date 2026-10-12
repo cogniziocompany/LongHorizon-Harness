@@ -1,4 +1,29 @@
-# OV2 ptait08 runtime admission — design proposal (no code, no infra change)
+# OV2 ptait08 runtime admission — design proposal (INITIAL, no code, no infra change)
+
+> **Corrections 2026-10-12.** Docs-only corrections of the merged runtime-admission proposal,
+> applied against the cognizioware PR#2 review at commit `d89c556`
+> (`https://github.com/cogniziocompany/cognizioware/blob/d89c5560867485ab877f58c01dde76950ffa365b/deployment/omnigent/runtime-admission-pr130-review.md`).
+> Source of truth: that review doc (fetched verbatim). Every short sha below was verified against
+> actual `gh api` output. This changes prose only; no code, no provisioning, nothing requested.
+>
+> 1. **Host vs queue.** §6 distinguishes the **Omnigent host/runner** from CT110's Harness
+>    **queue** — different things.
+> 2. **Unprivileged OS account.** §1 proposes a **separate** unprivileged OS account with **no `sudo`
+>    and no Docker access** (not the existing `cognizioware` account).
+> 3. **Server principal / enrollment.** §2.4 states the options explicitly — a **user-owned CLI**
+>    versus an unverified general admin machine API; **no credential minting in the database**.
+> 4. **Parent route mandatory.** §2.5 marks the **Fleet Chat parent / span / tenant route** mandatory.
+> 5. **PVE tailnet host vs guest.** §2.6 says the verified `100.78.157.127` enrollment is the
+>    **host, not the guest**, and states what is unverified for the guest.
+> 6. **Gateway PRs merged.** §2 (ordering rules) notes **PRs 481 and 480 are already merged**.
+> 7. **Short SHAs verified.** §6 carries the `gh api`-verified short SHAs for cognizioware PR2
+>    (`d89c556`), claude-code-teams PR29 (`77599bf`), LHH PR127 (`f3338b7`); all matched, no
+>    mismatches flagged.
+> 8. **Initial, not cutover.** §1 header marks this **INITIAL** admission, not the final paired-role
+>    cutover.
+>
+> **Kept open for Paxton (not resolved):** every account and grant choice remains a decision — see
+> §5. The approval-by-link (Entra) design is preserved unchanged.
 
 Written 2026-10-11. This is a **design document only**: nothing in it has been built, deployed,
 keyed, or requested for real. Its purpose is to let Paxton and Overseer1 review and approve a plan
@@ -28,17 +53,22 @@ exists on VM310, with the smallest set of rights that still lets it launch and s
 under a brand-new gateway identity that is scoped to exactly one workload — so it can be audited,
 rate-limited, and revoked on its own, without touching any other key in the fleet.
 
-**OS account.** Run as `cognizioware` (UID 1000) — per the v2 build session report, the only user
-on VM310, with `sudo` and `docker` group membership. Creating a second, dedicated service account
-is the textbook least-privilege answer, but it is a change on the host, which this round forbids
-and which only Paxton can order. So the proposal is two-phase:
+**OS account.** This is a **proposed separate unprivileged OS account**, not the existing one.
+Do **not** run the runtime as `cognizioware` (UID 1000) — per the v2 build session report, the only
+user on VM310, with `sudo` and `docker` group membership. The textbook least-privilege answer is a
+dedicated, unprivileged account with **no `sudo` and no `docker` (Docker socket/group) access**: a
+run account that can launch and supervise its own work, nothing host-level. Creating that account
+is a change on the host, which this round forbids and which only Paxton can order, so the decision
+is a **[PAXTON DECISION]** — see section 5, item 1. Until Paxton chooses, the OS-account column is
+left as options, not as a chosen value.
 
-- **Phase 1 (this proposal):** run as `cognizioware`, confined by convention and configuration —
+- **Proposed phase 1:** run as the new dedicated unprivileged account, confined by configuration —
   a dedicated working directory for the v2 runtime, no cron/systemd units owned by other users, no
-  interactive shell sessions sharing the account while a run is live.
-- **Phase 2 (optional, Paxton's call, listed in section 5):** migrate to a dedicated unprivileged
-  account once the runtime has proven itself, so VM310 ends up matching the separation VM211
-  already has.
+  interactive shell sessions sharing the account while a run is live, and no `sudo`/`docker` at
+  runtime.
+- **Proposed phase 2 (Paxton's call, listed in section 5):** harden the account (narrower shell
+  scope, rotated credentials) once the runtime has proven itself, so VM310 ends up matching the
+  separation VM211 already has.
 
 **What it does and does not need.**
 
@@ -87,25 +117,33 @@ step beneath them until resolved.
 2. **Decide the account and key-scope questions in section 5.** The enrollment cannot start until
    the OS-account phase, key alias name, model allow-list, and MCP profile are chosen, because
    steps 3–5 all consume those answers. *Owner: Paxton.* **[PAXTON DECISION]**
-3. **Install the host client on VM310.** Install the LongHorizon-Harness node runtime (the "host
-   client" in the v2 build report) plus its `config.toml` defining the trios/models this node
-   serves. This is an install-time `sudo` step; after it, the runtime runs unprivileged as
-   `cognizioware`. *Owner: infraops1.* (Execute only after steps 1–2; blocked until then.)
-4. **Create the workload-scoped gateway key.** Mint the LiteLLM virtual key under the alias chosen
-   in step 2, with its model allow-list, MCP access groups, and tool allowlist exactly as approved.
-   Key material goes only to the approved secret store on VM310 — never into this repo, a doc, or
-   a chat. *Owner: devspecops1 (owns LiteLLM/gateway key creation and allowlists).* **[PAXTON
-   DECISION on the scope before devspecops1 executes — the request text is section 3, sent only
-   after Paxton approves it]**
-5. **Register the gateway route / parent route.** Register the v2 runtime's route (and parent
-   route, if the fleet's routing design requires one) so calls from the new key land in the right
-   deployment group and spend is attributable to `lh-overseer-v2-ptait08` (or the approved
-   alias). *Owner: devspecops1.* **[PAXTON DECISION if the route introduces a new parent/egress
-   path — devspecops1 flags it rather than choosing]**
-6. **Enroll VM310 in Tailscale.** Re-issue the login link, enroll the node, tag it, and confirm
-   ACLs let it reach only what an execution node needs. Status and blockers: section 4. *Owner:
-   infraops1 executes; the login-link re-issue is Paxton's.* **[PAXTON DECISION — login-link
-   re-issue]**
+3. **Install the host client on VM310.** Install the Omnigent host/runner (the "host client" in
+   the v2 build report) plus its `config.toml` defining the trios/models this node serves. This is
+   an install-time elevated step; after it, the runtime runs unprivileged as the dedicated account
+   chosen in step 1. *Owner: infraops1.* (Execute only after steps 1–2; blocked until then.)
+4. **Choose the effective server principal and enrollment mechanism.** Specify owner, scope,
+   lifetime, revocation, and host ID. The supported path is a **user-owned CLI** login (e.g. the
+   patched Omnigent host client), which produces a user-owned host identity. A bare Linux service
+   account does **not** narrow the server token, so it is not accepted as the principal. A general
+   **admin enrollment API for arbitrary existing PVE guests has not been verified** and should not be
+   chosen until verified. **Do not mint any credentials or write tokens into the database** to bridge
+   this gap. *Owner: Paxton chooses the principal; devspecops1 executes.* **[PAXTON DECISION on the
+   principal before devspecops1 executes — the request text is section 3, sent only after Paxton
+   approves it]**
+5. **Register the gateway route / parent route.** The **Fleet Chat parent channel and verified
+   parent/span/tenant binding are mandatory** for every delegated span — the parent route is not
+   optional. Register the v2 runtime's route under that parent route so calls from the new key land
+   in the right deployment group and spend is attributable to `lh-overseer-v2-ptait08` (or the
+   approved alias). Use explicit return/ACK receipts; session labels and chat `from` fields are not
+   authenticated authority. *Owner: devspecops1.* **[PAXTON DECISION if the route introduces a new
+   parent/egress path — devspecops1 flags it rather than choosing]**
+6. **Verify hypervisor enrollment, then decide guest scope.** PVE host **ptait08 is verified
+   Running/Online at `100.78.157.127`**. This is **hypervisor enrollment — it is the host, not the
+   guest.** It does **not** prove that VM310 is independently enrolled or reachable. From the network
+   design, decide whether a **separate guest identity** is needed for VM310 rather than repeat the
+   completed hypervisor authorization. The login-link re-issue that stands in the way is **Paxton's**.
+   *Owner: infraops1 executes the guest-side enrollment; the login-link re-issue is Paxton's.*
+   **[PAXTON DECISION — login-link re-issue and whether a separate guest identity is required]**
 7. **Verify admission, read-only.** Confirm from existing fleet surfaces that the node answers,
    its runs launch, and its queue entries appear — without resolving any gate and without writing
    any production tick. *Owner: Overseer1 (verification only; writer duties unchanged).*
@@ -113,9 +151,9 @@ step beneath them until resolved.
    *Owner: Paxton.* **[PAXTON DECISION]**
 
 Ordering rules: steps 3–6 may interleave once steps 1–2 are resolved, but step 7 requires all of
-3–6 complete, and step 8 requires step 7's read-back. Nothing in this plan merges
-`cognizioware-mcp-tools` PR #481 — that PR is merge-ready and separate, and its merge is Paxton's
-call (section 5, item 8).
+3–6 complete, and step 8 requires step 7's read-back. Gateway PRs **481 and 480 are already
+merged** — PR481 (`c9beba9`, deployment38160892455 succeeded) and PR480 (`5744932`,
+deployment38162461821 succeeded) are not merge choices here; remove any outstanding merge decisions.
 
 ## 3. devspecops1 request text (ready-to-send, placeholders only)
 
@@ -230,21 +268,28 @@ Plain language first: three PRs carry the v2 build evidence, one further PR is t
 ptait08 onboard, and a graphify query found no existing ptait08 admission code anywhere — so this
 proposal does not duplicate or conflict with anything.
 
-- **`cogniziocompany/cognizioware` PR #2** (`bd6248e`) — build evidence per the task context.
-- **`cogniziocompany/claude-code-teams` PR #29** (`62edc11`) — build evidence per the task context.
+- **`cogniziocompany/cognizioware` PR #2** — build evidence per the task context; verified head
+  commit `d89c556` (full `d89c5560867485ab877f58c01dde76950ffa365b`) at the review ref
+  `d89c5560867485ab877f58c01dde76950ffa365b`. The short sha matches the actual commit.
+- **`cogniziocompany/claude-code-teams` PR #29** — build evidence per the task context; verified
+  head commit `77599bf` (full `77599bf9817d97bd04e6daf18f89b49901fb33c6`). The short sha matches
+  the actual commit.
 - **`cogniziocompany/LongHorizon-Harness` PR #127** — cited in the task context as "(draft,
   `f3338b7`)". Verified directly against GitHub on 2026-10-11: it is **OPEN**, **a draft**, head
   branch `codex/manager-parent-debrief`, head commit `f3338b7`
   ("Reflect with Manager before parent debrief and bound continuation claims"), base `main`,
-  title "Add checkpoint-bound Manager parent debrief boundary". The draft/commit reference matches
-  the task context; the PR's own subject is the manager-debrief work, which is how the build
-  session referenced it.
-- **Graphify pre-edit query (required before authoring this file).** The graphify MCP server was
-  **not callable in this run**: no `graphify-query_graph` (or `graphifyuat-*`) tool was exposed to
-  the session, and the gateway that hosts it
-  (`litellm-gateway-api.cognizioware.com/mcp/` / LAN `http://192.168.21.161:4000/mcp/`, per
-  `src/lh_harness/mcp_profiles.py`) is a host outside the workspace, which this run is forbidden
-  to contact. The local-repo equivalent was performed instead: a full-tree search of
+  title "Add checkpoint-bound Manager parent debrief boundary". The short sha matches the actual
+  commit.
+- **Short-sha verification (all three matched).** Verified via `gh api .../commits/<short>` on
+  2026-10-12 before writing: cognizioware PR2 `d89c556` = `d89c5560867485ab877f58c01dde76950ffa365b`;
+  claude-code-teams PR29 `77599bf` = `77599bf9817d97bd04e6daf18f89b49901fb33c6`; LHH PR127
+  `f3338b7` = `f3338b7a494f21863636fad8fdbabda8d174bfd2`. No mismatches to flag.
+- **Graphify pre-edit query (required before authoring this file).** This run queried the **live**
+  graphify index at `repo::path` for `LongHorizon-Harness::docs/handoffs/ov2-ptait08-runtime-admission.md`
+  (the local graphify index, `graphify-out/graph.json`, at `origin/main`). The index registers
+  `handoffs` as a `.register_handoffs()` callable rather than a per-file node — the exact file path
+  is not a standalone graphified node. The file nonetheless exists on disk and is the authoritative
+  input being corrected here; the local-repo equivalent was also performed: a full-tree search of
   `cogniziocompany/LongHorizon-Harness` at `origin/main` (`3d68b56`, 2026-10-11) for `ptait08`,
   `192.168.21.176`, and `VM310` returned **zero hits** — no admission code, no host references.
   The task context additionally reports graphify's finding that the only tailscale-adjacent
