@@ -131,7 +131,7 @@ def test_runtime_failure_classifier_keeps_local_episode_timeout_authoritative() 
     assert failure is not None
     assert failure.kind == "timeout"
     assert failure.abort_reason == "provider_timeout"
-    assert failure.user_message == "Agent 执行超时：Episode timed out after 1800s."
+    assert failure.user_message == "Agent timeout：Episode timed out after 1800s."
 
 
 def test_chinese_invalid_api_key_is_classified_as_authentication() -> None:

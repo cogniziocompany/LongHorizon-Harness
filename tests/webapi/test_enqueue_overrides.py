@@ -191,7 +191,8 @@ def test_legacy_roles_string_alias_unchanged(tmp_path: Path, monkeypatch: pytest
     assert entry.model is None
     assert spy.calls == 0
     # Byte-identical legacy precedence: an explicit null roles shadows trio.
-    other = store.create(_body(roles=None, trio="glm"), model_fetch=spy)
+    # Use a distinct name from the first entry (#132 same-name duplicate refusal).
+    other = store.create(_body(name="n2", roles=None, trio="glm"), model_fetch=spy)
     assert other.trio == ""
     assert spy.calls == 0
 
