@@ -1142,11 +1142,13 @@ class Launcher:
                 continue
             run_id = entry.run_id
             if run_id in active:
+                self._clear_parent_wait(entry)
                 self._enforce_time_limit(entry)
                 continue
             status = self.supervisor.status(run_id)
             lifecycle = canonical_lifecycle_status(status.get("status"))
             if lifecycle in ACTIVE_STATUSES:
+                self._clear_parent_wait(entry)
                 continue
             # Maintenance (fc-H4a): a suspend parks the run in the manifest
             # for /api/maintenance/resume.  Leave its entry launched — marking
@@ -1159,6 +1161,27 @@ class Launcher:
             # The supervisor exposes owner/status but not the manager report.
             # Read the durable audit result directly from the run directory.
             report = self._read_run_report(run_id)
+            if (
+                lifecycle == "incomplete"
+                and report.get("status") == "incomplete"
+                and report.get("completion_satisfied") is False
+                and report.get("abort_reason") == "needs_parent_input"
+                and entry.failure_cause != TIME_LIMIT_CAUSE
+            ):
+                # A stopped worker waiting for its parent is still the same
+                # task/attempt. Keep its dedup key and run ID occupied, without
+                # retrying or creating a replacement queue/run owner.
+                if entry.wait_reason != "needs_parent_input":
+                    entry.wait_reason = "needs_parent_input"
+                    entry.reason = "Awaiting parent debrief reconciliation on the existing run."
+                    self._emit_run_event(run_id, "queue.parent_wait", {
+                        "queue_id": entry.queue_id, "run_id": run_id,
+                        "wait_reason": entry.wait_reason,
+                    })
+                entry.last_checked_at = _now()
+                self.queue_store.update(entry)
+                continue
+            self._clear_parent_wait(entry)
             # A cancelled worker can still carry a successful manager audit.
             # Treat the queue entry as done when the run report is satisfied,
             # even if the operator stopped the process.
@@ -1207,6 +1230,12 @@ class Launcher:
             if updated is not None:
                 updated.last_checked_at = _now()
                 self.queue_store.update(updated)
+
+    def _clear_parent_wait(self, entry: QueueEntry) -> None:
+        if entry.wait_reason == "needs_parent_input":
+            entry.wait_reason = None
+            entry.reason = None
+            self.queue_store.update(entry)
 
     def _time_limit_minutes(self, entry: QueueEntry) -> int | None:
         """The entry's own limit, else ``[queue] default_time_limit_minutes``."""
