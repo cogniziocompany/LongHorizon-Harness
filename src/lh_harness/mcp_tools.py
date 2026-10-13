@@ -48,6 +48,7 @@ from .caller_auth import (
     strip_caller_arguments,
     tool_allowed,
 )
+from . import effect_lease, effect_lease_wire
 from .config import _MCP_DISPATCH_TOOL_NAMES as _KNOWN_TOOLS
 from .config import ASK_APPLY_TARGETS, ASK_TOOL_SCOPES
 from .config import _MCP_TOOL_NAMES as _SCOPING_ELIGIBLE_TOOLS
@@ -742,6 +743,65 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
     ]
 
 
+def _mcp_lease_deny(exc: effect_lease.LeaseError) -> dict[str, Any]:
+    detail = {"error": exc.reason, "code": exc.code, "message": exc.message, **exc.detail}
+    return {"ok": False, "error": exc.message, "code": exc.code, "detail": detail}
+
+
+def _mcp_lease_check(
+    lease_gate: Any,
+    *,
+    caller: str | None,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Run the lease gate for an MCP tool call.  Returns None on accept
+    (or when the flag is OFF, or when no gate has been installed);
+    returns a JSON-RPC-style error envelope on deny.
+
+    Family / epoch / action_id are read from the tool's arguments so the
+    MCP surface matches the REST surface verbatim.  ``family`` may be
+    omitted only when the caller's configured family is the same.
+    """
+    if lease_gate is None or not effect_lease.is_enabled():
+        return None
+    family = arguments.get("lease_family")
+    if family is not None and family not in effect_lease.FAMILIES:
+        return _mcp_lease_deny(effect_lease.UnknownFamily(family))
+    epoch = arguments.get("lease_epoch")
+    if epoch is not None and effect_lease_wire.parse_epoch_header(epoch) is None:
+        return _mcp_lease_deny(
+            effect_lease.StaleEpoch(
+                family=family or "",
+                observed_epoch=0,
+                current_epoch=0,
+            )
+        )
+    if caller is None:
+        # No identity: fall back to the operator-configured bearer holder
+        # only when one is set; otherwise stay un-gated.
+        default = effect_lease_wire.bearer_holder()
+        if default is None:
+            return None
+        caller, family = default[0], family or default[1]
+        if family is None:
+            return _mcp_lease_deny(effect_lease.MissingLease(default[1]))
+    if family is None:
+        family = lease_gate.family_for(caller)
+    if family is None:
+        return None  # caller is not declared under a family
+    try:
+        result = lease_gate.check(
+            caller=caller,
+            family=family,
+            observed_epoch=epoch if isinstance(epoch, int) else None,
+            action_id=arguments.get("lease_action"),
+        )
+    except effect_lease.LeaseError as exc:
+        return _mcp_lease_deny(exc)
+    return None
+
+
 def dispatch(
     tool_name: str,
     arguments: dict[str, Any],
@@ -756,6 +816,7 @@ def dispatch(
     ask_runtime: Any = None,
     settings_runtime: Any = None,
     model_fetch: Any = None,
+    lease_gate: Any = None,
 ) -> dict[str, Any]:
     """Run one MCP tool call and return a JSON-RPC style result.
 
@@ -902,6 +963,11 @@ def dispatch(
             "error": f"caller {caller!r} is not allowed to invoke {tool_name}",
             "code": 403,
         }
+    # Effect-lease gate (default OFF). Refuses stale/missing/non-holder with
+    # an error envelope when the flag is on.
+    lease_deny = _mcp_lease_check(lease_gate, caller=caller, tool_name=tool_name, arguments=arguments)
+    if lease_deny is not None:
+        return lease_deny
 
     if tool_name == "harness_enqueue_task":
         # Scoping OFF (no [callers] table configured) reaches here with
