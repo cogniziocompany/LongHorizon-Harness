@@ -362,7 +362,7 @@ def test_api_snapshot_replay_and_artifact(tmp_path: Path) -> None:
     assert applied_snapshot["operator_messages"][0]["status"] == "applied"
     resolved = client.post(
         f"/api/runs/run-1/approvals/{approval.approval_id}/resolve",
-        json={"action": "continue"},
+        json={"action": "continue", "approved_by": "terminal:deploy@ct110", "channel": "terminal"},
     )
     assert resolved.status_code == 200
     assert state.get_approval(approval.approval_id).status == "resolved"
@@ -406,15 +406,16 @@ def test_approval_cannot_be_queued_twice(tmp_path: Path) -> None:
     root, state = _fixture(tmp_path)
     client = TestClient(create_app(state=state, runs_root=root, run_id="run-1"))
     approval = state.create_approval(title="Continue fixture")
+    identity = {"approved_by": "terminal:deploy@ct110", "channel": "terminal"}
     first = client.post(
         f"/api/runs/run-1/approvals/{approval.approval_id}/resolve",
         headers={"Idempotency-Key": "approval-1"},
-        json={"action": "continue"},
+        json={"action": "continue", **identity},
     )
     second = client.post(
         f"/api/runs/run-1/approvals/{approval.approval_id}/resolve",
         headers={"Idempotency-Key": "approval-2"},
-        json={"action": "continue"},
+        json={"action": "continue", **identity},
     )
     assert first.status_code == 200
     assert second.status_code == 409

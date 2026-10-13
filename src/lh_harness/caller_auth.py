@@ -39,6 +39,78 @@ RESOLVE_TOOL = "harness_resolve_gate"
 # ``rest_run_control`` config flag instead of the ``tools`` allowlist.
 REST_RUN_CONTROL_TOOL = "rest_run_control"
 
+# DR-05a: approval identity.  Every gate resolve carries ``approved_by`` (who)
+# and ``channel`` (through what).  ``identity_source`` is set by the transport
+# layer (web routes / MCP dispatch) only, never from the caller payload; the
+# enums below are the only accepted values.
+APPROVED_BY_MAX_CHARS = 254
+
+# How the transport verified the approval identity:
+# - "signed-header": an SSO signed-in header verified by the web layer
+#   (X-Auth-Request-Email / X-Forwarded-Preferred-Username / X-Forwarded-User);
+# - "caller-secret": an A3d signed caller (its verified name is passed through);
+# - "gateway-key:<alias>": the gateway allowed a key under the named alias;
+# - "none": no verified identity reached the transport (relayed/model-supplied).
+APPROVAL_IDENTITY_SOURCES = ("signed-header", "caller-secret", "none")
+# ``gateway-key:<alias>`` is prefix-matched, so it is not in the tuple above.
+GATEWAY_KEY_IDENTITY_SOURCE_PREFIX = "gateway-key:"
+
+# Channel enum: exactly the five values the DR-05a wire contract names.
+APPROVAL_CHANNELS = ("fleet-chat", "slack-dm", "terminal", "web-sso", "service")
+
+# Channels that must present a verified signed-in identity.  A resolve claiming
+# one of them with identity_source "none" is a relayed approval and is refused.
+PERSONA_CHANNELS = ("fleet-chat", "web-sso")
+
+SERVICE_APPROVED_BY_PREFIX = "service:"
+
+# The exact wire forms an ``approved_by`` may take (ASCII by construction).
+# The wire contract fixes only the prefix and the 254-character cap, so the
+# regexes below police shape only (no extra length caps anywhere): any value
+# the wire contract permits must validate.
+# - upn:<user@domain>: one or more allowed userinfo characters, then "@",
+#   then one or more domain labels separated by dots.  No 64-character
+#   local-part cap: the contract caps the whole value at 254, so an
+#   intermediate cap would refuse some contract-permitted values.
+# - slack:<Uxxxx>: "U" followed by one or more uppercase-alphanumeric
+#   characters (the DR-05b relay forwards real Slack user ids, all of which
+#   match; the {1,} floor keeps model-supplied filler out).
+# - terminal:<os user>@<host>: a POSIX-safe user segment, then "@", then a
+#   dotted hostname of well-formed labels (no leading/trailing dots or
+#   dashes); both parts are unbounded apart from the 254-char value cap.
+_UPN_APPROVED_BY_RE = re.compile(
+    r"^upn:[A-Za-z0-9._%+#-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*$", re.ASCII
+)
+_SLACK_APPROVED_BY_RE = re.compile(r"^slack:U[A-Z0-9]+$", re.ASCII)
+_TERMINAL_APPROVED_BY_RE = re.compile(
+    r"^terminal:[A-Za-z0-9_.-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*)$",
+    re.ASCII,
+)
+# Caller aliases in the contract's examples are lowercase (``hydra-mcp``,
+# ``overseer1``); dots and underscores are tolerated for gateway-key alias
+# names.  Bounded only by the 254-char value cap.
+_SERVICE_APPROVED_BY_RE = re.compile(r"^service:[A-Za-z0-9][A-Za-z0-9._-]*$", re.ASCII)
+
+# The approved_by prefix must agree with the channel it rides on: a resolve
+# claiming channel "slack-dm" cannot carry an upn: identity and vice versa.
+# fleet-chat and web-sso are both SSO/web identities, so upn: serves both.
+_PREFIX_FOR_CHANNEL = {
+    "fleet-chat": "upn:",
+    "web-sso": "upn:",
+    "slack-dm": "slack:",
+    "terminal": "terminal:",
+}
+
+
+def valid_approval_identity_source(value: Any) -> bool:
+    """Is ``value`` an identity source a transport may inject?"""
+    if not isinstance(value, str) or not value:
+        return False
+    if value in APPROVAL_IDENTITY_SOURCES:
+        return True
+    return value.startswith(GATEWAY_KEY_IDENTITY_SOURCE_PREFIX)
+
 _CALLER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 _SIGNATURE_SKEW_SECONDS = 300
 _MAX_TS_CHARS = 20
@@ -370,6 +442,88 @@ def run_control_allowed(caller: str, specs: dict[str, dict[str, Any]]) -> bool:
     return bool(specs.get(caller, {}).get("rest_run_control", False))
 
 
+# ------------------------------------------------------------------ DR-05a --
+# Approval identity: who approved (approved_by) and through which channel.
+# Validation lives here so the MCP resolve path and the REST resolve route
+# enforce exactly the same wire contract.
+
+
+def valid_approved_by(value: Any, *, channel: Any) -> bool:
+    """Is ``value`` an ``approved_by`` the channel may present?
+
+    Wire contract (DR-05a): a non-empty string of at most 254 characters in
+    one of the exact wire forms ``upn:<user@domain>``, ``slack:<Uxxxx>``,
+    ``terminal:<os user>@<host>`` or the unattributed operator marker
+    ``service:<caller alias>`` (only valid with ``channel == "service"``).
+    The value must come from a verified transport identity, never from
+    model-supplied text; the strict forms make that auditable.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    text = value.strip()
+    if len(text) > APPROVED_BY_MAX_CHARS:
+        return False
+    if channel == "service":
+        return bool(_SERVICE_APPROVED_BY_RE.match(text))
+    required_prefix = _PREFIX_FOR_CHANNEL.get(str(channel))
+    if required_prefix is not None and not text.startswith(required_prefix):
+        # The identity must match the channel it arrived through: a
+        # slack-dm resolve cannot carry an upn: identity and so on.
+        return False
+    return bool(
+        _UPN_APPROVED_BY_RE.match(text)
+        or _SLACK_APPROVED_BY_RE.match(text)
+        or _TERMINAL_APPROVED_BY_RE.match(text)
+    )
+
+
+def service_identity_source_ok(identity_source: Any) -> bool:
+    """May a ``channel: service`` resolve proceed under this identity source?
+
+    Only an authorized service caller qualifies: the A3d signed caller
+    secret (``caller-secret``) or an allow-listed gateway key alias
+    (``gateway-key:<alias>``).  ``none`` means no verified caller reached
+    the transport, so the resolve is refused as relayed.
+    """
+    if not isinstance(identity_source, str) or not identity_source:
+        return False
+    if identity_source == "caller-secret":
+        return True
+    return identity_source.startswith(GATEWAY_KEY_IDENTITY_SOURCE_PREFIX)
+
+
+def validate_resolve_identity(
+    approved_by: Any,
+    channel: Any,
+    identity_source: Any,
+) -> str | None:
+    """Validate the DR-05a approval-identity trio, returning a refusal reason.
+
+    Returns ``None`` when the trio satisfies the wire contract; otherwise a
+    short reason string.  The caller turns a reason into the right HTTP
+    status: missing/invalid values are 422, relayed approvals are 403.
+    """
+    if approved_by is None or (isinstance(approved_by, str) and not approved_by.strip()) or not isinstance(approved_by, str):
+        return "approved_by and channel are required"
+    if channel is None or (isinstance(channel, str) and not channel.strip()) or not isinstance(channel, str):
+        return "approved_by and channel are required"
+    if channel not in APPROVAL_CHANNELS:
+        return "approved_by and channel are required"
+    if not valid_approved_by(approved_by, channel=channel):
+        return "approved_by and channel are required"
+    identity = str(identity_source or "none")
+    if not valid_approval_identity_source(identity):
+        # An identity source outside the transport enum is unverifiable, so
+        # it must not satisfy a channel that requires a verified identity.
+        identity = "none"
+    if channel in PERSONA_CHANNELS and identity == "none":
+        return "relayed approval refused"
+    if channel == "service":
+        if not service_identity_source_ok(identity):
+            return "relayed approval refused"
+    return None
+
+
 def emit_caller_audit(runs_root: Any, event: dict[str, Any]) -> bool:
     """Append one audit event to ``<runs_root>/queue/caller_audit.jsonl``.
 
@@ -553,6 +707,12 @@ def header_names() -> dict[str, str]:
 
 __all__ = [
     "ANON_CALLER",
+    "APPROVED_BY_MAX_CHARS",
+    "APPROVAL_CHANNELS",
+    "APPROVAL_IDENTITY_SOURCES",
+    "GATEWAY_KEY_IDENTITY_SOURCE_PREFIX",
+    "PERSONA_CHANNELS",
+    "SERVICE_APPROVED_BY_PREFIX",
     "CALLER_ARGUMENT_KEYS",
     "ASK_SIG_FIELDS",
     "NonceCache",
@@ -575,6 +735,10 @@ __all__ = [
     "may_delete_entry",
     "resolve_mcp_caller",
     "resolve_rest_caller",
+    "service_identity_source_ok",
+    "validate_resolve_identity",
+    "valid_approved_by",
+    "valid_approval_identity_source",
     "rounds_clamp_violation",
     "run_control_allowed",
     "strip_caller_arguments",
