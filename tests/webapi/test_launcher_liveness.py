@@ -49,8 +49,8 @@ def test_heartbeat_reports_lease_tick_and_holder(tmp_path: Path) -> None:
     _write_lease(root, ts=1700000000.0, pid=1234, host="ct110")
     result = heartbeat()
 
-    assert len(result) == 6
-    runs, active, cap, queue_len, launcher_tick_at, lease_holder = result
+    assert len(result) == 7
+    runs, active, cap, queue_len, _review_verdicts, launcher_tick_at, lease_holder = result
     assert launcher_tick_at == 1700000000.0
     assert lease_holder == {"pid": 1234, "host": "ct110"}
 
@@ -61,8 +61,8 @@ def test_heartbeat_without_lease_reports_none(tmp_path: Path) -> None:
     heartbeat = _registered_heartbeat()
 
     result = heartbeat()
-    assert len(result) == 6
-    _, _, _, queue_len, launcher_tick_at, lease_holder = result
+    assert len(result) == 7
+    _, _, _, queue_len, _review_verdicts, launcher_tick_at, lease_holder = result
     assert launcher_tick_at is None
     assert lease_holder is None
 
@@ -81,8 +81,12 @@ def test_heartbeat_liveness_fields_reach_fleet_payload(tmp_path: Path) -> None:
         lambda endpoint, payload, gzip_body=True: posted.append((endpoint, payload))
     )
 
-    runs, active, cap, queue_len, launcher_tick_at, lease_holder = _registered_heartbeat()()
-    reporter.queue_heartbeat(runs, active, cap, queue_len, launcher_tick_at, lease_holder)
+    runs, active, cap, queue_len, _review_verdicts, launcher_tick_at, lease_holder = (
+        _registered_heartbeat()()
+    )
+    reporter.queue_heartbeat(
+        runs, active, cap, queue_len, _review_verdicts, launcher_tick_at, lease_holder
+    )
 
     endpoint, body = posted[-1]
     assert endpoint == "/harness/heartbeat"
@@ -101,8 +105,12 @@ def test_heartbeat_liveness_fields_absent_when_no_lease(tmp_path: Path) -> None:
         lambda endpoint, payload, gzip_body=True: posted.append((endpoint, payload))
     )
 
-    runs, active, cap, queue_len, launcher_tick_at, lease_holder = _registered_heartbeat()()
-    reporter.queue_heartbeat(runs, active, cap, queue_len, launcher_tick_at, lease_holder)
+    runs, active, cap, queue_len, _review_verdicts, launcher_tick_at, lease_holder = (
+        _registered_heartbeat()()
+    )
+    reporter.queue_heartbeat(
+        runs, active, cap, queue_len, _review_verdicts, launcher_tick_at, lease_holder
+    )
 
     _, body = posted[-1]
     assert body["liveness"] == {"launcher_tick_at": None, "lease_holder": None}
