@@ -1746,6 +1746,11 @@ class Launcher:
                 base_check=entry.base_check or None,
                 workspace_base_mode=base.mode,
                 workspace_base_summary=base.summary(),
+                # Reporting slice B: queue provenance stamped onto every LLM
+                # request the worker makes, so Langfuse-side usage can be
+                # grouped by queue entry and trio.
+                queue_id=entry.queue_id,
+                trio=entry.trio,
             )
             run_id = str(created.get("id") or "")
         except Exception as exc:
