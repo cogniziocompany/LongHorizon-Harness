@@ -630,6 +630,20 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Unique id for this run. Defaults to a timestamp + short uuid. All run data goes under <runs-root>/<run-id>/.",
     )
+    # Reporting slice B: queue provenance stamped onto every LLM request's
+    # LiteLLM metadata (run_id/queue_id/trio/role/round) so Langfuse-side
+    # reporting can group usage by trio and role. Set by the supervisor for
+    # queue-triggered launches; direct launches leave them unset.
+    run_parser.add_argument(
+        "--queue-id",
+        default=None,
+        help="Internal: queue entry id this run was launched from (stamped onto LLM request metadata).",
+    )
+    run_parser.add_argument(
+        "--trio",
+        default=None,
+        help="Internal: queue trio name this run was launched from (stamped onto LLM request metadata).",
+    )
     run_parser.add_argument(
         "--workspace",
         default=run_default("workspace"),
@@ -2086,6 +2100,8 @@ def _run_command(args: argparse.Namespace) -> int:
                 gateway_mcp_servers=(
                     graphify_servers_for_task(task) if gateway_configured() else ()
                 ),
+                queue_id=getattr(args, "queue_id", None),
+                trio=getattr(args, "trio", None),
             )
         return agent_cache[key]
 
@@ -2570,6 +2586,8 @@ def _build_agent(
     allow_auditor_write_mcp: bool = False,
     task: str = "",
     gateway_mcp_servers: tuple[str, ...] = (),
+    queue_id: str | None = None,
+    trio: str | None = None,
 ):
     if name == "codex":
         from .adapters.codex import CodexAdapter
@@ -2610,6 +2628,9 @@ def _build_agent(
             run_dir=run_dir,
             allow_auditor_write_mcp=allow_auditor_write_mcp,
             task=task,
+            # Reporting slice B: queue provenance for LLM request metadata.
+            queue_id=queue_id,
+            trio=trio,
         )
         if model is not None:
             kwargs["model"] = model

@@ -1872,6 +1872,8 @@ class RunSupervisor:
         base_check: str | None = None,
         workspace_base_mode: str | None = None,
         resume: bool = False,
+        queue_id: str | None = None,
+        trio: str | None = None,
     ) -> list[str]:
         # Always launch through the interpreter that owns this supervisor.
         # A PATH lookup can select an older globally installed console script
@@ -1907,6 +1909,13 @@ class RunSupervisor:
             command.append(f"--base-check={base_check}")
         if workspace_base_mode:
             command.append(f"--workspace-base-mode={workspace_base_mode}")
+        # Reporting slice B: queue provenance for the worker's LLM request
+        # metadata. The equals spelling keeps values attached to their option,
+        # matching the flags above.
+        if queue_id:
+            command.append(f"--queue-id={queue_id}")
+        if trio:
+            command.append(f"--trio={trio}")
         for role in _ROLE_KEYS:
             spec = (role_configs or {}).get(role)
             if not spec:
@@ -1940,6 +1949,12 @@ class RunSupervisor:
         workspace_base_summary: str | None = None,
         _recover_reservation: bool = False,
         idempotency_key: str | None = None,
+        # Reporting slice B: queue provenance stamped onto every LLM request
+        # the launched worker makes (LiteLLM metadata run_id/queue_id/trio/
+        # role/round). Only queue-triggered launches supply these; other call
+        # sites default to None.
+        queue_id: str | None = None,
+        trio: str | None = None,
     ) -> dict[str, Any]:
         """Create one worker, replaying a durable result for request retries."""
 
@@ -1961,6 +1976,8 @@ class RunSupervisor:
                 base_check=base_check,
                 workspace_base_mode=workspace_base_mode,
                 workspace_base_summary=workspace_base_summary,
+                queue_id=queue_id,
+                trio=trio,
             )
         request = {
             "task": task,
@@ -2056,6 +2073,8 @@ class RunSupervisor:
                 workspace_base_summary=workspace_base_summary,
                 _recover_reservation=bool(existing),
                 _idempotency_fingerprint=fingerprint,
+                queue_id=queue_id,
+                trio=trio,
             )
             self._write_idempotency(
                 path,
@@ -2098,6 +2117,8 @@ class RunSupervisor:
         workspace_base_summary: str | None = None,
         _recover_reservation: bool = False,
         _idempotency_fingerprint: str | None = None,
+        queue_id: str | None = None,
+        trio: str | None = None,
     ) -> dict[str, Any]:
         if self.attached_only:
             raise ValueError("this API is attached to an existing worker and cannot create runs")
@@ -2151,6 +2172,8 @@ class RunSupervisor:
                 youtrack_issue_id=youtrack_issue_id,
                 _recover_reservation=_recover_reservation,
                 _idempotency_fingerprint=_idempotency_fingerprint,
+                queue_id=queue_id,
+                trio=trio,
             )
 
     def _create_run_once_reserved(
@@ -2178,6 +2201,8 @@ class RunSupervisor:
         youtrack_issue_id: str | None = None,
         _recover_reservation: bool,
         _idempotency_fingerprint: str | None,
+        queue_id: str | None = None,
+        trio: str | None = None,
     ) -> dict[str, Any]:
         workspace_path.mkdir(parents=True, exist_ok=True)
         # Re-resolve after mkdir: a pre-existing symlink or a concurrently
@@ -2230,6 +2255,8 @@ class RunSupervisor:
             mcp_profile=mcp_profile,
             base_check=base_check,
             workspace_base_mode=workspace_base_mode,
+            queue_id=queue_id,
+            trio=trio,
         )
         started_at = time.time()
         # Reserve the run before launching a process.  This closes the orphan
@@ -2267,6 +2294,13 @@ class RunSupervisor:
         # unset.  Validation is lenient so integrations can pass any ticket id.
         if youtrack_issue_id:
             reservation["youtrack_issue_id"] = str(youtrack_issue_id)[:64]
+        # Reporting slice B: durable queue provenance, so a run's LLM request
+        # metadata (queue_id/trio) can be reconciled against the queue entry
+        # after the fact.  Omitted when unset (direct launches).
+        if queue_id:
+            reservation["queue_id"] = str(queue_id)[:100]
+        if trio:
+            reservation["trio"] = str(trio)[:100]
         return self._launch_worker(
             run_id=run_id,
             run_dir=run_dir,
@@ -3184,6 +3218,13 @@ class RunSupervisor:
                 ),
                 _recover_reservation=recover_reservation,
                 _idempotency_fingerprint=idempotency_fingerprint,
+                # Reporting slice B: a retried run keeps its queue provenance
+                # (from the owner record) so its LLM request metadata stays
+                # attributable to the same queue entry and trio.
+                queue_id=(
+                    str(owner.get("queue_id")) if owner.get("queue_id") else None
+                ),
+                trio=str(owner.get("trio")) if owner.get("trio") else None,
             )
             # ``retry`` deliberately starts a fresh run directory from the
             # saved task/config; it does not carry over round state.
@@ -3271,6 +3312,10 @@ class RunSupervisor:
                 if owner.get("workspace_base_mode")
                 else None
             ),
+            # Reporting slice B: keep queue provenance across an in-place
+            # continue, exactly like the workspace-base mode above.
+            queue_id=str(owner.get("queue_id")) if owner.get("queue_id") else None,
+            trio=str(owner.get("trio")) if owner.get("trio") else None,
             resume=True,
         )
         reservation = {

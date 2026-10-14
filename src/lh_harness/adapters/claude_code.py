@@ -56,6 +56,8 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         run_dir: str | None = None,
         allow_auditor_write_mcp: bool = False,
         task: str = "",
+        queue_id: str | None = None,
+        trio: str | None = None,
     ) -> None:
         policy = policy_for_role(role)
         effort = normalise_reasoning_effort(reasoning_effort)
@@ -209,6 +211,11 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         self.policy = policy
         self.reasoning_effort = effort
         self.run_id = run_id
+        # Queue provenance for request metadata (reporting slice B): the
+        # launcher stamps the entry's queue id and trio onto the worker, and
+        # every LLM request below carries them for per-trio reporting.
+        self.queue_id = queue_id
+        self.trio = trio
         # Snapshot-only exclusions: unlike hidden_paths these are not denied
         # to the agent — the guard just refrains from walking directories that
         # legitimately churn (build outputs) during an audit window.
@@ -235,8 +242,32 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         # LiteLLM maps x-litellm-session-id to the Langfuse session (one session
         # per harness run; the episode stays in the lh-session/ tag). Headers
         # are newline-separated, one "Name: value" per line.
+        #
+        # Reporting slice B: the five reporting metadata keys (run_id,
+        # queue_id, trio, role, round) ride the same header channel. The task
+        # assumed the LiteLLM request-body "metadata" field, but Claude Code
+        # owns its HTTP body and exposes no body hook, so the single attach
+        # point uses the documented header convention instead: LiteLLM's
+        # Langfuse integration merges request headers named "langfuse_*" into
+        # the logged generation metadata (docs.litellm.ai/docs/proxy/logging,
+        # "Logging Metadata to Langfuse"; litellm <= v1.100.x
+        # integrations/langfuse/langfuse.py add_metadata_from_header). Values
+        # are the same non-secret ids the tags already carry.
+        metadata_headers = [
+            f"langfuse_run_id: {self.run_id}",
+            f"langfuse_queue_id: {_metadata_value(self.queue_id)}",
+            f"langfuse_trio: {_metadata_value(self.trio)}",
+            f"langfuse_role: {self.role}",
+            f"langfuse_round: {_extract_round_tag(label)}",
+        ]
         return {
-            "ANTHROPIC_CUSTOM_HEADERS": f"x-litellm-tags: {tags}\nx-litellm-session-id: {self.run_id}"
+            "ANTHROPIC_CUSTOM_HEADERS": "\n".join(
+                [
+                    f"x-litellm-tags: {tags}",
+                    f"x-litellm-session-id: {self.run_id}",
+                    *metadata_headers,
+                ]
+            )
         }
 
     def episode_session_id(self, label: str) -> str:
@@ -365,6 +396,16 @@ def episode_session_id(run_id: str | None, label: str, role: str) -> str:
 def _extract_round_tag(label: str) -> str:
     match = re.match(r"round_\d+", label)
     return match.group(0) if match else "round_unknown"
+
+
+def _metadata_value(value: str | None) -> str:
+    """Queue-sourced metadata values keep a stable placeholder when unset.
+
+    Direct (non-queue) launches have no queue id or trio; the reporting side
+    reads empty strings as NULL, so an explicit marker keeps the header count
+    (and therefore the request shape) identical on every launch path.
+    """
+    return value if value else "unknown"
 
 
 def _record_profile_resolution(
