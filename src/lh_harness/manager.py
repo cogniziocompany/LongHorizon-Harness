@@ -75,6 +75,7 @@ from .auditor_agent import (
 )
 from .auditor_snapshot import (
     SnapshotInfo,
+    SnapshotIsolationError,
     create_isolated_snapshot,
     remove_isolated_snapshot,
     write_snapshot_info,
@@ -808,37 +809,60 @@ async def _run_impl(
             duration_ms=executor_result.duration_ms,
         )
 
-        # HARNESS-AUDITOR-ISOLATION: before the auditor launches, create a
-        # read-only worktree snapshot of the executor HEAD and pin the
+        # HARNESS-AUDITOR-ISOLATION: before the auditor launches, build an
+        # *independent full clone* of the executor HEAD and pin the
         # executor HEAD to ``refs/lh-harness/<run_id>/round_<n>``. The
-        # auditor then operates inside the snapshot; its ``workspace_path``
+        # auditor then operates inside the clone; its ``workspace_path``
         # is rewired to the snapshot path so a deny-list bypass (or a
         # local git rewrite the deny list could miss) cannot touch the
         # executor's live workspace or .git. The original workspace_path
         # is restored after the audit completes.
-        snapshot_info = create_isolated_snapshot(
-            original_executor_workspace,
-            run_id=run_id,
-            round_index=round_index,
-        )
-        write_snapshot_info(round_dir, snapshot_info)
-        if snapshot_info is not None:
-            auditor_workspace_path = snapshot_info.snapshot_path
+        #
+        # Fail-closed (operator correction round_001): the previous
+        # implementation silently fell back to ``config.workspace_path``
+        # when snapshot creation returned ``None``.  That meant a broken
+        # clone or pin failure launched the auditor against the executor
+        # workspace directly.  We now raise ``SnapshotIsolationError``
+        # on any isolation failure; the caller must abort the round
+        # rather than risk running the auditor against the live tree.
+        try:
+            snapshot_info = create_isolated_snapshot(
+                original_executor_workspace,
+                run_id=run_id,
+                round_index=round_index,
+            )
+        except SnapshotIsolationError as exc:
+            logger.error(
+                "auditor isolation failed for run=%s round=%s: %s",
+                run_id, round_index, exc,
+            )
             _append_event(
                 events_path,
-                "auditor_snapshot_created",
+                "auditor_isolation_failed",
                 {
                     "round": round_index,
                     "run_id": run_id,
-                    "snapshot_path": snapshot_info.snapshot_path,
-                    "snapshot_sha": snapshot_info.snapshot_head_sha,
-                    "executor_head_sha": snapshot_info.executor_head_sha,
-                    "local_ref": snapshot_info.local_ref,
-                    "mode": snapshot_info.mode,
+                    "error": str(exc),
                 },
             )
-        else:
-            auditor_workspace_path = config.workspace_path
+            gate.abort_reason = "auditor_isolation_failed"
+            gate.failure_reason = f"auditor isolation could not be established: {exc}"
+            break
+        write_snapshot_info(round_dir, snapshot_info)
+        auditor_workspace_path = snapshot_info.snapshot_path
+        _append_event(
+            events_path,
+            "auditor_snapshot_created",
+            {
+                "round": round_index,
+                "run_id": run_id,
+                "snapshot_path": snapshot_info.snapshot_path,
+                "snapshot_sha": snapshot_info.snapshot_head_sha,
+                "executor_head_sha": snapshot_info.executor_head_sha,
+                "local_ref": snapshot_info.local_ref,
+                "mode": snapshot_info.mode,
+            },
+        )
 
         # The auditor audits only the just-finished subtask. Its natural
         # language report becomes the trusted intermediate state for later rounds.
@@ -869,9 +893,8 @@ async def _run_impl(
         # workspace or .git. The auditor agent identity stays the same; only
         # its runtime ``workspace_path`` is swapped for the audit window.
         previous_auditor_workspace = getattr(auditor_for_step, "workspace_path", None)
+        auditor_for_step.workspace_path = auditor_workspace_path
         try:
-            if snapshot_info is not None:
-                auditor_for_step.workspace_path = auditor_workspace_path
             auditor_result = await _run_role_episode(
                 auditor_for_step,
                 auditor_prompt,

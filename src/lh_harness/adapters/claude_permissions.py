@@ -57,6 +57,12 @@ AUDITOR_NETWORK_GIT_DENY: tuple[str, ...] = (
 # snapshot, so any of these in the executor workspace are denied outright.
 # The list mirrors the network deny tuple's -C / --git-dir variants so the
 # auditor cannot pivot the operation at another working tree either.
+#
+# ``update-ref`` (and the ``--stdin`` / ``-d`` / ``--no-deref`` variants) are
+# the reference-writing family that the operator correction flagged as
+# missing from the round-001 list.  An auditor that bypasses Write/Edit
+# but still has Bash can otherwise rewrite any ref (HEAD, branch,
+# refs/lh-harness/...) without going through checkout/reset.
 AUDITOR_LOCAL_GIT_DENY: tuple[str, ...] = (
     "Bash(git checkout*)",
     "Bash(git reset*)",
@@ -67,6 +73,11 @@ AUDITOR_LOCAL_GIT_DENY: tuple[str, ...] = (
     "Bash(git commit*)",
     "Bash(git rebase*)",
     "Bash(git merge*)",
+    # Reference-writing family (covers update-ref, update-ref --stdin,
+    # update-ref -d, symbolic-ref, etc.).  ``git symbolic-ref`` is included
+    # because it rewrites HEAD-style refs without going through checkout.
+    "Bash(git update-ref*)",
+    "Bash(git symbolic-ref*)",
     # Variants that point git at a different directory via -C or --git-dir.
     "Bash(git -C * checkout*)",
     "Bash(git -C * reset*)",
@@ -77,6 +88,8 @@ AUDITOR_LOCAL_GIT_DENY: tuple[str, ...] = (
     "Bash(git -C * commit*)",
     "Bash(git -C * rebase*)",
     "Bash(git -C * merge*)",
+    "Bash(git -C * update-ref*)",
+    "Bash(git -C * symbolic-ref*)",
     "Bash(git --git-dir* checkout*)",
     "Bash(git --git-dir* reset*)",
     "Bash(git --git-dir* switch*)",
@@ -86,6 +99,30 @@ AUDITOR_LOCAL_GIT_DENY: tuple[str, ...] = (
     "Bash(git --git-dir* commit*)",
     "Bash(git --git-dir* rebase*)",
     "Bash(git --git-dir* merge*)",
+    "Bash(git --git-dir* update-ref*)",
+    "Bash(git --git-dir* symbolic-ref*)",
+)
+
+# Deny rules for filesystem mutation channels that could reverse the
+# snapshot's chmod a-w protection (the executor workspace must stay
+# untouched even if a Bash subprocess ignores the audit's tool deny layer).
+# These complement ``_WRITE_TOOLS`` (Write/Edit/NotebookEdit) which already
+# blocks Claude's own file-mutation tools.
+AUDITOR_FS_DENY: tuple[str, ...] = (
+    # chmod/chown would let the auditor reverse the read-only chmod applied
+    # to the snapshot by ``auditor_snapshot._chmod_readonly``.
+    "Bash(chmod*)",
+    "Bash(chown*)",
+    # rm -rf / unlink would let the auditor destroy the snapshot, the
+    # pinned ref, or attempt to delete files inside the executor tree
+    # (the executor path is not exposed to the auditor but defense in
+    # depth still applies).  ``Bash(rm*)`` catches rm, rm -rf, etc.
+    "Bash(rm*)",
+    "Bash(unlink*)",
+    # install / cp -r / mv would let it move or copy files into / out of
+    # the snapshot path in ways the deny list does not anticipate.
+    "Bash(install*)",
+    "Bash(mv*)",
 )
 
 # Environment variables that make any network git operation fail fast for the
@@ -154,6 +191,7 @@ def policy_for_role(role: str) -> ClaudeRolePolicy:
                 "Agent",
                 *AUDITOR_NETWORK_GIT_DENY,
                 *AUDITOR_LOCAL_GIT_DENY,
+                *AUDITOR_FS_DENY,
             ),
             load_computer_mcp=True,
             workspace_read_only=True,

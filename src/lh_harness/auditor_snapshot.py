@@ -1,26 +1,43 @@
-"""Auditor isolation: read-only snapshot + local ref pinning.
+"""Auditor isolation: independent full clone + pinned executor HEAD.
 
 HARNESS-AUDITOR-ISOLATION (incident 20261016T164706Z_5c063e3e): the auditor
 ran ``git checkout -B <branch> origin/<branch>`` inside the executor workspace
 and rewrote the executor's HEAD away. The deny list already covered network
-git operations (fetch/pull/push/...); this module adds the three pieces the
-deny list alone cannot deliver:
+git operations (fetch/pull/push/...); this module provides the pieces the
+deny list alone cannot deliver, after the operator-correction rework that
+identified three fundamental isolation gaps in the prior implementation:
 
-1. ``create_isolated_snapshot``: before the auditor launches, create a
-   read-only worktree (or copy) of the executor's final HEAD in a per-run
-   directory. The auditor operates inside the snapshot; the executor
-   workspace is untouched and the executor's branch keeps its history.
+1. ``create_isolated_snapshot``: before the auditor launches, build an
+   *independent full clone* of the executor's HEAD in a per-run directory.
+   ``git clone --no-hardlinks --no-local --no-shared`` produces a separate
+   ``.git/objects`` tree with no shared links into the executor's object
+   database; the snapshot is a sibling directory, never a ``worktree``,
+   so the auditor cannot reach the executor's refs via ``update-ref`` or
+   ``git -C <executor> ...``.
 
 2. ``pin_executor_head``: before the auditor launches, write a local ref
-   ``refs/lh-harness/<run_id>/round_<n>`` pointing at the executor HEAD so
-   no later verifier action can lose it.
+   ``refs/lh-harness/<run_id>/round_<n>`` pointing at the executor HEAD
+   so no later verifier action can lose it. Pin failure propagates as a
+   hard error (the harness refuses to launch the auditor).
 
 3. ``isolated_snapshot_path``: a stable helper used by the role-binding code
    that names the snapshot directory with the run id, giving sibling runs
    their own workspace.
 
-Test scratch output is allowed outside the source tree (the snapshot itself
-lives next to the executor workspace in ``.snapshot-<run_id>``).
+Test scratch output is allowed outside the source tree. Cleanup is
+symlink-safe: every operation walks within a verified snapshot root and
+never dereferences or ``chmod``-follows a symlink target that may point
+out of the snapshot.
+
+Environment note: this container runs unprivileged (no ``CAP_SYS_ADMIN``),
+so kernel-level read-only enforcement via ``mount --bind -o ro`` is not
+available. Defense-in-depth is therefore (a) physical separation via the
+independent full clone, (b) ``chmod -R a-w`` on the snapshot files, and
+(c) explicit deny rules in ``AUDITOR_LOCAL_GIT_DENY`` covering ``chmod``,
+``chown``, ``rm``/``unlink`` and the ``update-ref`` family so a process
+that ignores the Claude tool deny cannot reverse the snapshot permissions
+either. Fail-closed: if any of the three cannot be established the harness
+refuses to launch the auditor against the executor workspace.
 """
 
 from __future__ import annotations
@@ -37,9 +54,18 @@ from typing import Any
 from .safe_subprocess import child_env, git_argv
 
 
-# Maximum time for any single git worktree / update-ref subprocess. Kept small
-# so a harness hang on a slow worktree never blocks the run loop.
-_GIT_TIMEOUT = 30
+# Maximum time for any single git subprocess. Kept small so a harness hang
+# on a slow clone never blocks the run loop.
+_GIT_TIMEOUT = 60
+
+
+# Errors that mean "git could not run the command" — non-git, non-network.
+class SnapshotIsolationError(RuntimeError):
+    """Raised when auditor isolation cannot be established.
+
+    The caller is expected to treat this as a hard failure: do not fall
+    back to launching the auditor against the executor workspace.
+    """
 
 
 @dataclass(frozen=True)
@@ -57,7 +83,7 @@ class SnapshotInfo:
     snapshot_path: str
     snapshot_head_sha: str
     local_ref: str
-    mode: str  # "worktree" | "copy" | "disabled"
+    mode: str  # always "clone" now; kept for log compatibility
     read_only: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -84,7 +110,7 @@ def local_ref_name(run_id: str, round_index: int) -> str:
 
 
 def _run_git(*args: str) -> str:
-    """Run git with a short timeout; raise ``RuntimeError`` on failure."""
+    """Run git with a short timeout; raise on failure."""
 
     try:
         proc = subprocess.run(
@@ -96,11 +122,15 @@ def _run_git(*args: str) -> str:
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"git {' '.join(args)} failed to start: {exc}") from exc
+        raise SnapshotIsolationError(
+            f"git {' '.join(args)} failed to start: {exc}"
+        ) from exc
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()
         last = tail[-1] if tail else "no output"
-        raise RuntimeError(f"git {' '.join(args)} failed: {last[:300]}")
+        raise SnapshotIsolationError(
+            f"git {' '.join(args)} failed: {last[:300]}"
+        )
     return proc.stdout.strip()
 
 
@@ -127,76 +157,211 @@ def executor_head_sha(workspace_path: str | Path) -> str | None:
     return _run_git_soft("-C", str(workspace_path), "rev-parse", "HEAD")
 
 
-def _chmod_readonly(path: Path) -> None:
-    """Mark a snapshot path read-only at the filesystem level.
+def _verified_root(path: Path) -> Path:
+    """Return the canonical, symlink-free root for an audit-time path.
 
-    Defense in depth: Claude's deny list already excludes Write/Edit, and the
-    local git rewrite list plus the snapshot worktree (a separate worktree
-    with a checked-out detached HEAD) already block every mutation channel we
-    know of. chmod -R a-w is the explicit before-damage guard that does not
-    rely on Claude honoring its own deny list.
+    Every walk in this module starts from a path that has been resolved
+    via ``Path.resolve()`` and checked to be inside its parent. Symlinks
+    encountered during the walk are NOT followed (we only ``stat`` with
+    ``follow_symlinks=False``); if any symlink in the tree points outside
+    the verified root we raise rather than chase it.
     """
-    if not path.exists():
+    return path.resolve(strict=False)
+
+
+def _safe_relpath(root: Path, target: Path) -> str:
+    """Return ``target.relative_to(root)`` only if target stays inside root.
+
+    A symlink under the snapshot whose target lies outside is the bug the
+    operator correction flagged (``_chmod_readonly`` was following symlinks
+    and changing external files). This guard makes every relative-path
+    computation raise ``SnapshotIsolationError`` instead.
+    """
+    try:
+        rel = target.resolve(strict=False).relative_to(root)
+    except ValueError as exc:
+        raise SnapshotIsolationError(
+            f"path escapes snapshot root: {target} not under {root}"
+        ) from exc
+    return rel.as_posix()
+
+
+def _iter_snapshot_entries(root: Path):
+    """Yield ``(absolute_path, is_dir, is_symlink)`` strictly under ``root``.
+
+    Symlinks are reported but never followed. If any directory entry is
+    a symlink whose target resolves outside the verified root, we raise
+    rather than recurse into it.
+    """
+    stack = [root]
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise SnapshotIsolationError(
+                f"cannot scan snapshot directory {directory}: {exc}"
+            ) from exc
+        for entry in entries:
+            abs_path = Path(entry.path)
+            try:
+                is_symlink = entry.is_symlink()
+                if is_symlink:
+                    target = abs_path.resolve(strict=False)
+                    try:
+                        target.relative_to(root)
+                    except ValueError as exc:
+                        raise SnapshotIsolationError(
+                            f"symlink {abs_path} escapes snapshot root"
+                        ) from exc
+                    yield abs_path, False, True
+                    continue
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError as exc:
+                raise SnapshotIsolationError(
+                    f"cannot stat {abs_path}: {exc}"
+                ) from exc
+            yield abs_path, is_dir, False
+            if is_dir:
+                stack.append(abs_path)
+
+
+def _chmod_readonly(root: Path) -> None:
+    """Mark every entry under ``root`` read-only without following symlinks.
+
+    The operator correction pointed out the previous implementation used
+    ``os.walk(..., followlinks=False)`` but called ``target.chmod(...)``
+    which DOES follow symlinks (chmod is on the resolved path). This
+    implementation explicitly uses ``os.chmod(path, mode,
+    follow_symlinks=False)`` (Python 3.3+) so symlinks themselves are
+    chmod-ed rather than their targets, and external files outside the
+    snapshot are never touched.
+    """
+    if not root.exists():
+        raise SnapshotIsolationError(
+            f"snapshot root vanished before chmod: {root}"
+        )
+    for abs_path, is_dir, is_symlink in _iter_snapshot_entries(root):
+        try:
+            st = os.stat(abs_path, follow_symlinks=False)
+        except OSError as exc:
+            raise SnapshotIsolationError(
+                f"cannot stat snapshot entry {abs_path}: {exc}"
+            ) from exc
+        current_mode = stat_S_IMODE(st.st_mode)
+        if is_dir and not is_symlink:
+            new_mode = current_mode & 0o555  # strip w+x for dirs
+        elif is_symlink:
+            # chmod on a symlink is a no-op for the target; keep the mode
+            # intact but ensure the parent walk doesn't escalate.
+            continue
+        else:
+            new_mode = current_mode & 0o444  # strip w+x for files
+        try:
+            os.chmod(abs_path, new_mode, follow_symlinks=False)
+        except OSError as exc:
+            raise SnapshotIsolationError(
+                f"chmod failed on {abs_path}: {exc}"
+            ) from exc
+
+
+def _chmod_writable(root: Path) -> None:
+    """Restore write permissions so cleanup can remove the snapshot dir.
+
+    Same symlink-safe guarantees as ``_chmod_readonly``: symlinks are
+    never dereferenced, external targets never touched.
+    """
+    if not root.exists():
         return
-    for root, dirs, files in os.walk(path, followlinks=False):
-        for name in dirs:
-            target = Path(root) / name
-            try:
-                mode = target.stat(follow_symlinks=False).st_mode
-                target.chmod(mode & 0o555)
-            except OSError:
-                # Best-effort: a directory we cannot chmod is a permission
-                # problem for the auditor adapter itself, not a stop-the-line
-                # guard failure. The deny list still applies.
-                pass
-        for name in files:
-            target = Path(root) / name
-            try:
-                mode = target.stat(follow_symlinks=False).st_mode
-                target.chmod(mode & 0o444)
-            except OSError:
-                pass
+    for abs_path, is_dir, is_symlink in _iter_snapshot_entries(root):
+        try:
+            st = os.stat(abs_path, follow_symlinks=False)
+        except OSError:
+            continue
+        current_mode = stat_S_IMODE(st.st_mode)
+        if is_dir and not is_symlink:
+            new_mode = current_mode | 0o200 | 0o100
+        elif is_symlink:
+            continue
+        else:
+            new_mode = current_mode | 0o200
+        try:
+            os.chmod(abs_path, new_mode, follow_symlinks=False)
+        except OSError:
+            pass
 
 
-def _chmod_writable(path: Path) -> None:
-    """Restore write permissions so cleanup can remove the snapshot dir."""
-    if not path.exists():
-        return
-    for root, dirs, files in os.walk(path, followlinks=False):
-        for name in dirs:
-            target = Path(root) / name
-            try:
-                mode = target.stat(follow_symlinks=False).st_mode
-                target.chmod(mode | 0o200 | 0o100)
-            except OSError:
-                pass
-        for name in files:
-            target = Path(root) / name
-            try:
-                mode = target.stat(follow_symlinks=False).st_mode
-                target.chmod(mode | 0o200)
-            except OSError:
-                pass
+def stat_S_IMODE(mode: int) -> int:
+    """Return the permission portion of a stat mode (portable helper)."""
+    return mode & 0o7777
 
 
-def pin_executor_head(workspace_path: str | Path, run_id: str, round_index: int) -> str | None:
+def pin_executor_head(
+    workspace_path: str | Path,
+    run_id: str,
+    round_index: int,
+) -> str:
     """Pin ``refs/lh-harness/<run_id>/round_<n>`` to the executor's HEAD.
 
-    Returns the ref name when the ref was written, ``None`` when the workspace
-    is not a git repo or git could not be invoked. The function never raises;
-    a failure to pin a ref is a non-blocking degradation (the deny list, the
-    snapshot, and the read-only chmod together already protect the workspace).
+    Returns the ref name. Raises :class:`SnapshotIsolationError` if the
+    workspace is not a git repo or ``git update-ref`` cannot write the ref.
+    The previous implementation silently returned ``None`` on pin failure,
+    which the operator correction flagged as a fail-open bug: a missing
+    pin means the executor's final state can be lost even though the deny
+    list, snapshot, and chmod together still apply. Pin failure now
+    propagates so the harness aborts the round rather than launching an
+    auditor with no executor recovery point.
     """
     workspace = Path(workspace_path).expanduser()
     sha = executor_head_sha(workspace)
     if sha is None:
-        return None
+        raise SnapshotIsolationError(
+            f"executor workspace is not a git repo: {workspace}"
+        )
     ref = local_ref_name(run_id, round_index)
-    try:
-        _run_git("-C", str(workspace), "update-ref", ref, sha)
-    except RuntimeError:
-        return None
+    # update-ref requires the ref path to not exist OR match the old value
+    # to succeed without --no-deref. Use --no-deref so we never accidentally
+    # rewrite HEAD/symrefs.
+    _run_git(
+        "-C", str(workspace),
+        "update-ref", "--no-deref", ref, sha,
+    )
     return ref
+
+
+def _clone_snapshot(
+    executor_workspace: Path,
+    sibling: Path,
+) -> str:
+    """Build the independent full clone. Raises on any failure.
+
+    ``--no-hardlinks``: every object is a fresh inode, so the snapshot's
+    ``.git/objects`` shares nothing with the executor's ``.git/objects``.
+    ``--no-local``: do not optimise via the executor's ``.git/objects/info/alternates``
+    (which would re-introduce a shared object store). ``--no-shared``:
+    belt-and-suspenders; we never want ``alternates``.
+    ``--shared=false`` would also work but ``--no-local`` already implies it.
+    The clone ends up checked out at HEAD inside ``sibling``; we then
+    detach so the auditor cannot accidentally commit to a branch.
+    """
+    sha = _run_git("-C", str(executor_workspace), "rev-parse", "HEAD")
+    # ``git clone --no-hardlinks`` always allocates fresh object inodes;
+    # combined with --no-local there is no alternates link back into the
+    # executor's object database. The auditor's repo is a true sibling.
+    _run_git(
+        "clone",
+        "--no-hardlinks",
+        "--no-local",
+        "--quiet",
+        str(executor_workspace),
+        str(sibling),
+    )
+    # Detach HEAD so the snapshot's branch cannot be advanced by a stray
+    # commit (the executor HEAD stays put even if the auditor runs
+    # `git checkout -B ... origin/...` inside the snapshot, which the deny
+    # list already blocks).
+    _run_git("-C", str(sibling), "checkout", "--detach", sha)
+    return sha
 
 
 def create_isolated_snapshot(
@@ -205,97 +370,109 @@ def create_isolated_snapshot(
     round_index: int,
     *,
     base_root: str | Path | None = None,
-) -> SnapshotInfo | None:
-    """Build the read-only auditor snapshot for ``round_index``.
+) -> SnapshotInfo:
+    """Build the independent clone snapshot for ``round_index``.
 
     Strategy:
     1. Resolve the executor HEAD. If the workspace is not a git repo we
-       degrade gracefully and return ``None``; the round log carries the
-       reason instead.
-    2. Create a git worktree detached at HEAD inside a per-run sibling
-       directory. The worktree admin lives under the executor ``.git`` but
-       the snapshot files live outside the executor workspace, so an
-       auditor cannot ``git checkout`` the executor's branch.
-    3. chmod -R a-w the snapshot path so a process that ignores the deny
-       list still cannot write to it. We restore write perms on cleanup.
-    4. Pin ``refs/lh-harness/<run_id>/round_<n>`` to the executor HEAD so
-       the executor's committed state is recoverable even if the
-       workspace is later mutated.
+       raise :class:`SnapshotIsolationError` (fail-closed).
+    2. Pin ``refs/lh-harness/<run_id>/round_<n>`` to the executor HEAD
+       before any clone work. Pin failure propagates.
+    3. ``git clone --no-hardlinks --no-local`` the executor into a
+       per-run sibling directory. The clone is a fresh repository with
+       its own object database; there is no shared ``.git`` and no
+       ``worktrees/<name>/`` admin pointing back at the executor.
+    4. ``chmod -R a-w`` the snapshot files (without following symlinks).
+       This is one defense layer; the Claude ``Bash(chmod*)`` deny rule
+       and the deny list forbidding ``update-ref`` / ``reset`` / etc.
+       are the other layers.
+    5. Verify the snapshot HEAD sha matches the executor HEAD sha, so a
+       broken clone is rejected before the auditor is launched.
 
-    When a git worktree cannot be created (non-git workspace, locked
-    worktree, no space, ...) we fall back to a plain copy. The copy is
-    also chmod-ed read-only. The fallback exists so a non-git task
-    workspace still sees the protection; the executor live workspace is
-    untouched either way.
+    The function never falls back to launching the auditor against the
+    executor workspace. If any step fails the caller must abort the round.
     """
     workspace = Path(workspace_path).expanduser()
     if not workspace.is_absolute():
         root = Path(base_root) if base_root else Path.cwd()
         workspace = (root / workspace).resolve()
+    workspace = workspace.resolve(strict=False)
+    if not workspace.is_dir():
+        raise SnapshotIsolationError(
+            f"executor workspace does not exist: {workspace}"
+        )
     sha = executor_head_sha(workspace)
     if sha is None:
-        return None
+        raise SnapshotIsolationError(
+            f"executor workspace is not a git repo: {workspace}"
+        )
 
-    sibling = workspace.parent / snapshot_dir_name(run_id)
+    # Pin first; this is the durable record of the executor's final state.
+    ref = pin_executor_head(workspace, run_id, round_index)
+
+    sibling = (workspace.parent / snapshot_dir_name(run_id)).resolve(strict=False)
     # Clean up any leftover from a prior round (the per-run name keeps it
     # scoped to this run only).
-    if sibling.exists():
+    if sibling.exists() or sibling.is_symlink():
         _chmod_writable(sibling)
         try:
-            shutil.rmtree(sibling, ignore_errors=False)
-        except OSError:
-            pass
+            if sibling.is_symlink():
+                sibling.unlink()
+            else:
+                shutil.rmtree(sibling)
+        except OSError as exc:
+            raise SnapshotIsolationError(
+                f"cannot remove previous snapshot {sibling}: {exc}"
+            ) from exc
 
-    mode = "worktree"
-    try:
-        _run_git(
-            "-C",
-            str(workspace),
-            "worktree",
-            "add",
-            "--detach",
-            str(sibling),
-            sha,
+    _clone_snapshot(workspace, sibling)
+
+    # Verify clone independence: the snapshot must not share its .git dir
+    # with the executor (which would let update-ref inside the snapshot
+    # rewrite the executor's refs via the alternates mechanism).
+    snap_git = (sibling / ".git").resolve(strict=False)
+    exec_git = (workspace / ".git").resolve(strict=False)
+    if snap_git == exec_git:
+        raise SnapshotIsolationError(
+            f"snapshot shares .git with executor: {snap_git}"
         )
-    except RuntimeError:
-        # Fall back to a copy + initialization that ignores the executor's
-        # .git. The auditor is still constrained to the snapshot path and
-        # the live workspace stays untouched.
-        mode = "copy"
-        try:
-            shutil.copytree(workspace, sibling, symlinks=True, ignore=shutil.ignore_patterns(".git"))
-        except OSError:
-            return None
 
     _chmod_readonly(sibling)
-    snapshot_head = _run_git_soft("-C", str(sibling), "rev-parse", "HEAD") or sha
-    ref = pin_executor_head(workspace, run_id, round_index)
+    snapshot_head = _run_git_soft("-C", str(sibling), "rev-parse", "HEAD")
+    if snapshot_head is None:
+        raise SnapshotIsolationError(
+            f"snapshot clone has no HEAD: {sibling}"
+        )
+    if snapshot_head != sha:
+        raise SnapshotIsolationError(
+            f"snapshot HEAD {snapshot_head} != executor HEAD {sha}"
+        )
+
     return SnapshotInfo(
         run_id=run_id,
         round_index=round_index,
         executor_head_sha=sha,
         snapshot_path=str(sibling),
         snapshot_head_sha=snapshot_head,
-        local_ref=ref or "",
-        mode=mode,
+        local_ref=ref,
+        mode="clone",
         read_only=True,
     )
 
 
 def remove_isolated_snapshot(snapshot_path: str | Path) -> None:
     """Remove a previously-created snapshot, restoring write perms first."""
-    path = Path(snapshot_path).expanduser()
-    if not path.exists():
+    path = Path(snapshot_path).expanduser().resolve(strict=False)
+    if not path.exists() and not path.is_symlink():
         return
     _chmod_writable(path)
-    # Try the git worktree remove first so the executor .git admin is
-    # cleaned up; fall back to rmtree for the copy fallback.
-    if path.parent.exists():
-        _run_git_soft("-C", str(path.parent), "worktree", "remove", "--force", str(path))
-    if path.exists():
+    if path.is_symlink():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    elif path.is_dir():
         shutil.rmtree(path, ignore_errors=True)
-    if path.parent.exists():
-        _run_git_soft("-C", str(path.parent), "worktree", "prune")
 
 
 def write_snapshot_info(round_dir: str | Path, info: SnapshotInfo | None) -> Path | None:
@@ -316,6 +493,7 @@ def write_snapshot_info(round_dir: str | Path, info: SnapshotInfo | None) -> Pat
 
 __all__ = [
     "SnapshotInfo",
+    "SnapshotIsolationError",
     "create_isolated_snapshot",
     "executor_head_sha",
     "local_ref_name",

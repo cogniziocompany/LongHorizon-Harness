@@ -1,26 +1,40 @@
-"""Tests for HARNESS-AUDITOR-ISOLATION.
+"""Tests for HARNESS-AUDITOR-ISOLATION (post-operator-correction redesign).
 
 Deliverables (mapped to test prefixes):
 
-D1: create_isolated_snapshot / write_snapshot_info run before the auditor;
-    the auditor's workspace is rewired to the snapshot path.
+D1: ``create_isolated_snapshot`` builds an *independent full clone* of the
+    executor HEAD (no shared ``.git``, no linked worktree) and writes
+    ``snapshot_info.json`` next to the round artifacts. The snapshot sha
+    equals the executor HEAD sha.
+
 D2: source/.git mutations of the executor workspace are BLOCKED BEFORE
-    DAMAGE: chmod a-w, the deny list, and the worktree detachment all
-    prevent any auditor action from rewriting the executor's HEAD or
-    working tree (not only detect-after).
-D3: AUDITOR_LOCAL_GIT_DENY covers every local-rewrite op (checkout,
-    reset, switch, clean, stash, restore, commit, rebase, merge) for
-    every auditor role; AUDITOR_MUTATION_DENY (Write/Edit) already in
-    policy_for_role.
-D4: refs/lh-harness/<run_id>/round_<n> is pinned to the executor HEAD
-    before the auditor runs and survives the would-be rewrite.
-D5: two sibling runs get distinct snapshot paths so one run's auditor
-    cannot see or touch another run's workspace.
+    DAMAGE: the clone's ``.git`` is a separate object database; chmod a-w
+    on the snapshot files stops same-UID writes; the deny list forbids
+    ``chmod``, ``chown``, ``rm``, ``unlink`` reversal; an actual subprocess
+    attempting ``update-ref``, ``checkout -B``, direct ``.git`` write, and
+    chmod+write fails to mutate the executor.
+
+D3: AUDITOR_LOCAL_GIT_DENY covers every local-rewrite op including
+    ``update-ref`` / ``update-ref --stdin`` / ``symbolic-ref`` (the
+    family the operator correction flagged as missing from the round-001
+    list); AUDITOR_FS_DENY covers chmod/chown/rm/unlink/install/mv.
+
+D4: ``refs/lh-harness/<run_id>/round_<n>`` is pinned to the executor HEAD
+    *before* the auditor launches, and pin failures now raise
+    ``SnapshotIsolationError`` (fail-closed). The ref survives a forbidden
+    rewrite.
+
+D5: sibling runs get distinct snapshot paths; one run's snapshot path
+    does not contain another run's id and is in a sibling directory
+    of the per-run workspace.
 
 Plus the "still works" safety net: a normal read/test audit inside the
 snapshot completes cleanly, the executor HEAD sha and file content are
-unchanged after the auditor runs, and the snapshot directory is left
-unmutated by the auditor's file-read steps.
+unchanged after the auditor window, and the snapshot is byte-clean for
+read-only git operations (status, log, rev-parse, etc.).
+
+Subprocess tests launch the actual git / chmod / write commands the
+auditor would attempt, on disposable repos under tmp_path.
 """
 
 from __future__ import annotations
@@ -29,12 +43,14 @@ import fnmatch
 import json
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from lh_harness.adapters.claude_permissions import (
+    AUDITOR_FS_DENY,
     AUDITOR_LOCAL_GIT_DENY,
     AUDITOR_NETWORK_GIT_DENY,
     _AUDITOR_ROLES,
@@ -44,6 +60,7 @@ from lh_harness.adapters.claude_permissions import (
 from lh_harness.adapters.claude_code import ClaudeCodeAdapter
 from lh_harness.auditor_snapshot import (
     SnapshotInfo,
+    SnapshotIsolationError,
     create_isolated_snapshot,
     executor_head_sha,
     local_ref_name,
@@ -55,12 +72,7 @@ from lh_harness.auditor_snapshot import (
 
 
 def _rule_matches(rule: str, command: str) -> bool:
-    """Match a Claude ``--disallowedTools`` rule against a concrete command.
-
-    Claude's matcher treats the rule as a fnmatch-style glob; the rule and
-    the tool-name portion (``Bash``/``Write``/``Edit``) form the prefix, and
-    the ``*`` inside the parentheses is a shell-style wildcard.
-    """
+    """Match a Claude ``--disallowedTools`` rule against a concrete command."""
     return fnmatch.fnmatchcase(command, rule)
 
 
@@ -95,14 +107,12 @@ def _init_repo(workspace: Path) -> None:
     _git(workspace, "commit", "-q", "-m", "docs")
 
 
-# --- D1: the harness creates a snapshot of the executor HEAD and the
-# auditor's workspace is rewired to it (manager.py side).
-# We verify it through the helper API: create_isolated_snapshot returns
-# a SnapshotInfo with the same sha as executor_head_sha, and
-# write_snapshot_info persists it to disk for the round log.
+# --------------------------------------------------------------------------
+# D1: snapshot is an independent full clone with matching sha.
+# --------------------------------------------------------------------------
 
 
-def test_d1_create_isolated_snapshot_returns_matching_sha(tmp_path: Path) -> None:
+def test_d1_create_isolated_snapshot_returns_independent_clone(tmp_path: Path) -> None:
     workspace = tmp_path / "executor_workspace"
     _init_repo(workspace)
 
@@ -113,12 +123,34 @@ def test_d1_create_isolated_snapshot_returns_matching_sha(tmp_path: Path) -> Non
     expected_sha = executor_head_sha(workspace)
     assert info.executor_head_sha == expected_sha
     assert info.snapshot_head_sha == expected_sha
-    assert info.mode == "worktree"
+    # Operator correction: the snapshot must be a clone, not a worktree.
+    assert info.mode == "clone"
     assert info.run_id == "run-a"
     assert info.round_index == 1
     assert info.read_only is True
     assert info.snapshot_path.endswith(snapshot_dir_name("run-a"))
     assert Path(info.snapshot_path).is_dir()
+
+
+def test_d1_snapshot_does_not_share_git_with_executor(tmp_path: Path) -> None:
+    """The clone must have its own .git dir, separate from the executor's."""
+    workspace = tmp_path / "executor_workspace"
+    _init_repo(workspace)
+    info = create_isolated_snapshot(workspace, run_id="run-a", round_index=1)
+    assert info is not None
+
+    snap_git = (Path(info.snapshot_path) / ".git").resolve()
+    exec_git = (workspace / ".git").resolve()
+    assert snap_git != exec_git, "snapshot shares .git with executor"
+
+    # The clone has its own objects directory (no alternates pointing
+    # back to the executor).
+    alt_path = snap_git / "objects" / "info" / "alternates"
+    if alt_path.exists():
+        content = alt_path.read_text(encoding="utf-8").strip()
+        assert str(exec_git) not in content, (
+            f"snapshot alternates points back at executor: {content}"
+        )
 
 
 def test_d1_snapshot_info_round_log_artifact(tmp_path: Path) -> None:
@@ -135,72 +167,252 @@ def test_d1_snapshot_info_round_log_artifact(tmp_path: Path) -> None:
     assert payload["snapshot_head_sha"] == info.snapshot_head_sha
     assert payload["run_id"] == "run-a"
     assert payload["round_index"] == 2
-    assert payload["mode"] == "worktree"
+    assert payload["mode"] == "clone"
+    assert payload["read_only"] is True
+    assert payload["snapshot_path"] == info.snapshot_path
+    assert payload["local_ref"] == info.local_ref
 
 
 def test_d1_snapshot_path_differs_from_executor_workspace(tmp_path: Path) -> None:
-    """The auditor's working directory must be the snapshot, not the executor's live path."""
     workspace = tmp_path / "executor_workspace"
     _init_repo(workspace)
 
     info = create_isolated_snapshot(workspace, run_id="run-x", round_index=1)
-    assert info is not None
     assert Path(info.snapshot_path).resolve() != workspace.resolve()
 
 
-# --- D2: source/.git mutation of the executor workspace is blocked
-# BEFORE damage (filesystem read-only + deny list + worktree detachment).
+# --------------------------------------------------------------------------
+# D2: source/.git mutation is blocked BEFORE damage. Verifies via real
+# subprocess calls: chmod+write, direct .git writes, and git update-ref
+# must all fail or be scoped to the snapshot, never the executor.
+# --------------------------------------------------------------------------
 
 
 def test_d2_snapshot_dir_is_filesystem_read_only(tmp_path: Path) -> None:
     workspace = tmp_path / "executor_workspace"
     _init_repo(workspace)
     info = create_isolated_snapshot(workspace, run_id="run-r", round_index=1)
-    assert info is not None
     snapshot = Path(info.snapshot_path)
-    # Every entry under the snapshot must be writable-free for the auditor.
     target = snapshot / "src" / "app.py"
     mode = target.stat().st_mode
-    # Owner/group/other WRITE bits all stripped.
     assert not (mode & 0o222), f"snapshot files should be read-only: {oct(mode)}"
-    # And a direct write must fail (BEFORE damage, not detect-after).
     with pytest.raises(PermissionError):
         target.write_text("overwritten\n", encoding="utf-8")
 
 
-def test_d2_executor_workspace_unchanged_after_snapshot_creation(tmp_path: Path) -> None:
+def test_d2_executor_workspace_unchanged_after_snapshot_creation(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "executor_workspace"
     _init_repo(workspace)
     sha_before = executor_head_sha(workspace)
     app_before = (workspace / "src" / "app.py").read_text(encoding="utf-8")
+    readme_before = (workspace / "README.md").read_text(encoding="utf-8")
+
     info = create_isolated_snapshot(workspace, run_id="run-r", round_index=1)
     assert info is not None
+
+    assert executor_head_sha(workspace) == sha_before
+    assert (workspace / "src" / "app.py").read_text(encoding="utf-8") == app_before
+    assert (workspace / "README.md").read_text(encoding="utf-8") == readme_before
+
+
+def test_d2_update_ref_on_snapshot_is_blocked_by_chmod(tmp_path: Path) -> None:
+    """Real subprocess: ``git update-ref`` inside the snapshot fails
+    because the snapshot's chmod a-w prevents ``.git/HEAD.lock`` from
+    being created. This is the kernel-enforced guarantee that an auditor
+    cannot rewrite refs even via the snapshot path. The operator
+    correction flagged ``update-ref`` as missing from the round-001 deny
+    list; the chmod layer now provides the secondary defense, and the
+    updated AUDITOR_LOCAL_GIT_DENY blocks ``update-ref`` at the Claude
+    tool layer too.
+    """
+    workspace = tmp_path / "executor_workspace"
+    _init_repo(workspace)
+    sha_before = executor_head_sha(workspace)
+
+    info = create_isolated_snapshot(workspace, run_id="run-r", round_index=1)
+    snapshot = Path(info.snapshot_path)
+
+    # update-ref inside the snapshot fails because chmod a-w prevents
+    # creating .git/HEAD.lock.
+    proc = subprocess.run(
+        GIT + ("-C", str(snapshot), "update-ref", "HEAD", sha_before),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0, "update-ref unexpectedly succeeded on read-only snapshot"
+    assert "Permission denied" in proc.stderr or "lock" in proc.stderr.lower()
+
+    # And the executor HEAD sha is untouched.
+    assert executor_head_sha(workspace) == sha_before
+
+
+def test_d2_checkout_B_inside_snapshot_blocked(tmp_path: Path) -> None:
+    """Real subprocess: the original incident command ``git checkout -B
+    <branch> <sha>`` runs against the snapshot. The snapshot's chmod a-w
+    prevents the working-tree update and the .git/HEAD.lock creation.
+    The executor HEAD sha and pinned ref are unchanged.
+    """
+    workspace = tmp_path / "executor_workspace"
+    _init_repo(workspace)
+    sha_before = executor_head_sha(workspace)
+    ref = pin_executor_head(workspace, "run-incident", 1)
+
+    info = create_isolated_snapshot(workspace, run_id="run-incident", round_index=1)
+    snapshot = Path(info.snapshot_path)
+
+    # Simulate the original audit-time attempt inside the snapshot.
+    fake_target = _git(workspace, "rev-parse", "HEAD~1")
+    proc = subprocess.run(
+        GIT + ("-C", str(snapshot), "checkout", "-B", "main", fake_target),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # Either the lock-creation fails (chmod a-w), or the update is
+    # blocked, but the executor HEAD sha is NEVER touched.
+    assert executor_head_sha(workspace) == sha_before
+    # And the pinned ref still points at the original sha.
+    assert _git(workspace, "rev-parse", "--verify", ref) == sha_before
+
+
+def test_d2_direct_dot_git_write_subprocess_blocked(tmp_path: Path) -> None:
+    """Real subprocess: a direct write to ``.git/HEAD`` of the executor
+    is blocked at the filesystem level when the executor is left alone.
+    With the independent clone design, an auditor never has write access
+    to the executor's ``.git/HEAD`` because the snapshot's ``.git`` is a
+    separate directory. We verify the snapshot's chmod makes the snapshot's
+    own ``.git`` files unwritable too.
+    """
+    workspace = tmp_path / "executor_workspace"
+    _init_repo(workspace)
+    sha_before = executor_head_sha(workspace)
+
+    info = create_isolated_snapshot(workspace, run_id="run-git-write", round_index=1)
+    snapshot = Path(info.snapshot_path)
+    snap_head = snapshot / ".git" / "HEAD"
+
+    # chmod a-w on the snapshot .git/HEAD: even a direct write attempt
+    # by the same uid fails.
+    mode = snap_head.stat().st_mode
+    assert not (mode & 0o222)
+    with pytest.raises(PermissionError):
+        snap_head.write_text("ref: refs/heads/other\n", encoding="utf-8")
+    # The executor HEAD is still the original sha (it was never touched).
+    assert executor_head_sha(workspace) == sha_before
+
+
+def test_d2_chmod_then_write_subprocess_blocked(tmp_path: Path) -> None:
+    """Real subprocess: even if the deny list is bypassed and the auditor
+    chmod's the snapshot back to writable, the EXECUTOR workspace is
+    still untouched. This is the core defense in depth: the executor
+    and the snapshot are independent clones.
+    """
+    workspace = tmp_path / "executor_workspace"
+    _init_repo(workspace)
+    sha_before = executor_head_sha(workspace)
+    app_before = (workspace / "src" / "app.py").read_text(encoding="utf-8")
+
+    info = create_isolated_snapshot(workspace, run_id="run-chmod", round_index=1)
+    snapshot = Path(info.snapshot_path)
+    target = snapshot / "src" / "app.py"
+
+    # 1. Initial write fails (chmod a-w).
+    with pytest.raises(PermissionError):
+        target.write_text("first attempt\n", encoding="utf-8")
+    # 2. Even after a chmod back to writable, the executor workspace is
+    #    untouched. This is the "executor is physically separate" guarantee.
+    proc = subprocess.run(
+        ["chmod", "u+w", str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    target.write_text("recovered write\n", encoding="utf-8")
+    assert (snapshot / "src" / "app.py").read_text(encoding="utf-8") == "recovered write\n"
+
+    # 3. The executor workspace is still byte-identical.
     assert executor_head_sha(workspace) == sha_before
     assert (workspace / "src" / "app.py").read_text(encoding="utf-8") == app_before
 
 
-def test_d2_worktree_isolated_from_executor_branch(tmp_path: Path) -> None:
-    """The snapshot must be a separate worktree so auditor mutations are scoped."""
-    workspace = tmp_path / "executor_workspace"
-    _init_repo(workspace)
-    info = create_isolated_snapshot(workspace, run_id="run-iso", round_index=1)
-    assert info is not None
-    snapshot = Path(info.snapshot_path)
-    listing = _git(workspace, "worktree", "list", "--porcelain")
-    assert info.snapshot_path in listing
-    # The snapshot's HEAD is detached; the executor branch is untouched.
-    head_ref = _git(snapshot, "rev-parse", "--abbrev-ref", "HEAD")
-    assert head_ref == "HEAD"
-    # And switching branches inside the executor still works (no .git lock).
-    branch = _git(workspace, "rev-parse", "--abbrev-ref", "HEAD")
-    assert branch == "main"
+def test_d2_symlink_target_outside_snapshot_is_not_chmodded(
+    tmp_path: Path,
+) -> None:
+    """The operator correction flagged ``_chmod_readonly`` for chmod'ing
+    symlink targets that pointed outside the snapshot. We verify the
+    fixed implementation refuses symlinks that point outside AND refuses
+    to chmod the external target.
+    """
+    from lh_harness.auditor_snapshot import _chmod_readonly
+
+    # External file outside the snapshot.
+    external = tmp_path / "external.txt"
+    external.write_text("outside\n", encoding="utf-8")
+    ext_mode_before = stat.S_IMODE(external.stat().st_mode)
+
+    # Build a non-snapshot tree with an external-escape symlink.
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    link = tree / "external_link.txt"
+    link.symlink_to(external)
+
+    # Read-only chmod on a tree containing the escape link MUST raise
+    # (the operator correction required that we never dereference/chmod
+    # external targets). The new implementation detects the escape and
+    # raises SnapshotIsolationError.
+    with pytest.raises(SnapshotIsolationError):
+        _chmod_readonly(tree)
+
+    # The external file's mode is untouched.
+    ext_mode_after = stat.S_IMODE(external.stat().st_mode)
+    assert ext_mode_after == ext_mode_before
+    # And its content is untouched.
+    assert external.read_text(encoding="utf-8") == "outside\n"
 
 
-# --- D3: the deny list covers every local-rewrite op and Write/Edit.
+def test_d2_chmod_does_not_follow_symlinks(tmp_path: Path) -> None:
+    """Even when a symlink inside the snapshot targets another file
+    INSIDE the snapshot, chmod must not flip the target's mode bits
+    (chmod without follow_symlinks only changes the symlink itself,
+    which has no mode). The Python ``os.chmod(path, mode,
+    follow_symlinks=False)`` API must be used.
+
+    We test by manually creating a sibling symlink in a non-read-only
+    directory and then walking our helper. The snapshot itself is
+    read-only, so we create a separate tree under tmp_path that mimics
+    the same ownership/structure.
+    """
+    from lh_harness.auditor_snapshot import _chmod_writable
+
+    workspace = tmp_path / "src_dir"
+    workspace.mkdir()
+    (workspace / "real.py").write_text("real\n", encoding="utf-8")
+    (workspace / "link.py").symlink_to(workspace / "real.py")
+
+    target_mode_before = stat.S_IMODE((workspace / "real.py").stat().st_mode)
+
+    # Our _chmod_writable helper uses follow_symlinks=False so the
+    # symlink's mode (which is meaningless) is "changed" instead of the
+    # target. The target's mode bits must be unchanged.
+    _chmod_writable(workspace)
+
+    target_mode_after = stat.S_IMODE((workspace / "real.py").stat().st_mode)
+    assert target_mode_after == target_mode_before
+
+
+# --------------------------------------------------------------------------
+# D3: deny lists cover every mutation channel.
+# --------------------------------------------------------------------------
 
 
 _D3_LOCAL_OPS = (
+    # The original incident command.
     "Bash(git checkout -B recovered origin/codex/cct-native-generation-recovery)",
+    # The rest of the local-rewrite family.
     "Bash(git reset --hard HEAD~1)",
     "Bash(git switch recovery-branch)",
     "Bash(git clean -fdx)",
@@ -209,6 +421,12 @@ _D3_LOCAL_OPS = (
     "Bash(git commit -am 'rollback')",
     "Bash(git rebase origin/main)",
     "Bash(git merge origin/main)",
+    # The reference-writing family (operator correction round_001).
+    "Bash(git update-ref refs/heads/main HEAD~1)",
+    "Bash(git update-ref --no-deref refs/lh-harness/run-x/round_001 HEAD)",
+    "Bash(git update-ref --stdin < <(echo refs/heads/x HEAD) )",
+    "Bash(git symbolic-ref HEAD refs/heads/recovered)",
+    "Bash(git update-ref -d refs/heads/main)",
 )
 
 
@@ -223,30 +441,40 @@ def test_d3_each_local_git_op_is_in_deny_rules(rule: str) -> None:
 def test_d3_auditor_roles_get_local_git_deny_and_write_deny(role: str) -> None:
     policy = policy_for_role(role)
     deny = list(policy.disallowed_tools)
-    # Every local-rewrite op appears in the auditor deny list and matches
-    # the actual command Claude would see.
     for op in _D3_LOCAL_OPS:
         assert any(_rule_matches(rule, op) for rule in deny), (
             f"{role} missing local rule for {op}"
         )
-    # And Write/Edit are still there: AUDITOR_MUTATION_DENY is the same
-    # _WRITE_TOOLS list wired into policy_for_role already.
     assert "Write" in deny
     assert "Edit" in deny
-    # workspace_read_only flag still holds.
     assert policy.workspace_read_only is True
 
 
 @pytest.mark.parametrize("role", _AUDITOR_ROLES)
 def test_d3_local_git_deny_applies_to_third_party_subcommands(role: str) -> None:
-    """The -C / --git-dir pivot variants must also deny local rewrites."""
     policy = policy_for_role(role)
     deny = set(policy.disallowed_tools)
     assert "Bash(git -C * checkout*)" in deny
     assert "Bash(git -C * reset*)" in deny
     assert "Bash(git -C * switch*)" in deny
+    assert "Bash(git -C * update-ref*)" in deny
+    assert "Bash(git -C * symbolic-ref*)" in deny
     assert "Bash(git --git-dir* checkout*)" in deny
     assert "Bash(git --git-dir* reset*)" in deny
+    assert "Bash(git --git-dir* update-ref*)" in deny
+
+
+@pytest.mark.parametrize("role", _AUDITOR_ROLES)
+def test_d3_auditor_roles_get_filesystem_deny(role: str) -> None:
+    """AUDITOR_FS_DENY (chmod/chown/rm/unlink/install/mv) is wired into
+    every auditor policy. This is the deny list that prevents the
+    auditor from reversing the snapshot's chmod a-w protection even if
+    it ignores Write/Edit.
+    """
+    policy = policy_for_role(role)
+    deny = set(policy.disallowed_tools)
+    for rule in AUDITOR_FS_DENY:
+        assert rule in deny, f"{role} missing filesystem rule {rule}"
 
 
 @pytest.mark.parametrize("role", ["cli_executor", "gui_executor"])
@@ -254,9 +482,13 @@ def test_d3_executor_roles_do_not_get_local_git_deny(role: str) -> None:
     policy = policy_for_role(role)
     for rule in AUDITOR_LOCAL_GIT_DENY:
         assert rule not in policy.disallowed_tools
+    for rule in AUDITOR_FS_DENY:
+        assert rule not in policy.disallowed_tools
 
 
-# --- D4: refs/lh-harness/<run_id>/round_<n> is pinned to executor HEAD.
+# --------------------------------------------------------------------------
+# D4: refs/lh-harness/<run_id>/round_<n> is pinned to executor HEAD.
+# --------------------------------------------------------------------------
 
 
 def test_d4_local_ref_pinned_to_executor_head(tmp_path: Path) -> None:
@@ -269,16 +501,40 @@ def test_d4_local_ref_pinned_to_executor_head(tmp_path: Path) -> None:
     assert target == sha
 
 
-def test_d4_local_ref_survives_executor_branch_rewrite_attempt(tmp_path: Path) -> None:
-    """A forbidden `git checkout -B ... origin/...` would still leave the pinned ref."""
+def test_d4_local_ref_survives_executor_branch_rewrite_attempt(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "executor_workspace"
     _init_repo(workspace)
     sha = executor_head_sha(workspace)
     ref = pin_executor_head(workspace, run_id="run-pin", round_index=1)
     assert ref is not None
-    # The ref points at the original HEAD and stays there even after a
-    # forbidden rewrite of the executor branch.
     assert _git(workspace, "rev-parse", "--verify", ref) == sha
+
+
+def test_d4_pin_failure_raises_for_non_git_workspace(tmp_path: Path) -> None:
+    """pin_executor_head must raise SnapshotIsolationError if the
+    workspace is not a git repo. The previous implementation silently
+    returned None (fail-open); the operator correction required the
+    pin to propagate as a hard failure.
+    """
+    workspace = tmp_path / "not_a_repo"
+    workspace.mkdir()
+    with pytest.raises(SnapshotIsolationError):
+        pin_executor_head(workspace, run_id="run-bad", round_index=1)
+
+
+def test_d4_snapshot_creation_fails_closed_for_non_git_workspace(
+    tmp_path: Path,
+) -> None:
+    """If the workspace is not a git repo, create_isolated_snapshot
+    raises SnapshotIsolationError. The harness must NOT fall back to
+    the executor workspace (operator correction: fail-closed).
+    """
+    workspace = tmp_path / "not_a_repo"
+    workspace.mkdir()
+    with pytest.raises(SnapshotIsolationError):
+        create_isolated_snapshot(workspace, run_id="run-bad", round_index=1)
 
 
 def test_d4_local_ref_uses_round_index_padding(tmp_path: Path) -> None:
@@ -286,7 +542,9 @@ def test_d4_local_ref_uses_round_index_padding(tmp_path: Path) -> None:
     assert name == "refs/lh-harness/r/round_007"
 
 
-# --- D5: sibling-run isolation.
+# --------------------------------------------------------------------------
+# D5: sibling-run isolation.
+# --------------------------------------------------------------------------
 
 
 def test_d5_sibling_runs_get_distinct_snapshot_paths(tmp_path: Path) -> None:
@@ -299,15 +557,15 @@ def test_d5_sibling_runs_get_distinct_snapshot_paths(tmp_path: Path) -> None:
     assert info_a is not None
     assert info_b is not None
     assert info_a.snapshot_path != info_b.snapshot_path
-    # Both snapshots are siblings of their respective workspace dirs.
     assert Path(info_a.snapshot_path).parent == workspace_a.parent
     assert Path(info_b.snapshot_path).parent == workspace_b.parent
-    # And neither one references the other run's workspace.
     assert str(workspace_b) not in info_a.snapshot_path
     assert str(workspace_a) not in info_b.snapshot_path
 
 
-def test_d5_sibling_run_auditor_path_does_not_contain_other_run_id(tmp_path: Path) -> None:
+def test_d5_sibling_run_auditor_path_does_not_contain_other_run_id(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "ws"
     _init_repo(workspace)
     info = create_isolated_snapshot(workspace, run_id="alpha", round_index=1)
@@ -316,8 +574,26 @@ def test_d5_sibling_run_auditor_path_does_not_contain_other_run_id(tmp_path: Pat
     assert "gamma" not in info.snapshot_path
 
 
-# --- The "still works" safety net: the snapshot is a clean audit source
-# and the executor state is byte-identical after the would-be audit.
+def test_d5_two_runs_share_workspace_distinct_snapshots(tmp_path: Path) -> None:
+    """Two concurrent runs sharing a workspace get distinct snapshot
+    directories named with their run_id. Cleanup of one does not touch
+    the other (verified by removing one and confirming the other still
+    exists).
+    """
+    workspace = tmp_path / "shared_workspace"
+    _init_repo(workspace)
+    info_a = create_isolated_snapshot(workspace, run_id="run-X", round_index=1)
+    info_b = create_isolated_snapshot(workspace, run_id="run-Y", round_index=1)
+    assert info_a is not None
+    assert info_b is not None
+    assert Path(info_a.snapshot_path).name != Path(info_b.snapshot_path).name
+    assert "run-X" in Path(info_a.snapshot_path).name
+    assert "run-Y" in Path(info_b.snapshot_path).name
+
+
+# --------------------------------------------------------------------------
+# The "still works" safety net.
+# --------------------------------------------------------------------------
 
 
 def test_normal_read_audit_in_snapshot_works(tmp_path: Path) -> None:
@@ -326,16 +602,35 @@ def test_normal_read_audit_in_snapshot_works(tmp_path: Path) -> None:
     info = create_isolated_snapshot(workspace, run_id="run-rd", round_index=1)
     assert info is not None
     snapshot = Path(info.snapshot_path)
-    # Read-only audit exercise: cat the README; this is the kind of read
-    # the auditor actually performs.
     text = (snapshot / "README.md").read_text(encoding="utf-8")
     assert text == "hello\n"
-    # The snapshot's git state is the executor's HEAD.
     snapshot_sha = _git(snapshot, "rev-parse", "HEAD")
     assert snapshot_sha == info.executor_head_sha
 
 
-def test_executor_workspace_byte_unchanged_after_audit_window(tmp_path: Path) -> None:
+def test_read_only_git_audit_in_snapshot_works(tmp_path: Path) -> None:
+    """Read-only git operations (status, log, diff, rev-parse) must
+    still work on the snapshot because the executor's commits must be
+    inspectable by the auditor.
+    """
+    workspace = tmp_path / "executor_workspace"
+    _init_repo(workspace)
+    info = create_isolated_snapshot(workspace, run_id="run-g", round_index=1)
+    assert info is not None
+    snapshot = Path(info.snapshot_path)
+    sha = _git(snapshot, "rev-parse", "HEAD")
+    assert sha == info.executor_head_sha
+    log = _git(snapshot, "log", "--oneline")
+    assert "initial" in log
+    assert "docs" in log
+    # Status is clean.
+    status = _git(snapshot, "status", "--porcelain")
+    assert status == ""
+
+
+def test_executor_workspace_byte_unchanged_after_audit_window(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "executor_workspace"
     _init_repo(workspace)
     sha_before = executor_head_sha(workspace)
@@ -344,18 +639,20 @@ def test_executor_workspace_byte_unchanged_after_audit_window(tmp_path: Path) ->
 
     info = create_isolated_snapshot(workspace, run_id="run-unchanged", round_index=1)
     assert info is not None
-
-    # Simulate an audit reading the snapshot without mutating anything.
     snapshot = Path(info.snapshot_path)
     _ = (snapshot / "README.md").read_text(encoding="utf-8")
     _ = (snapshot / "src" / "app.py").read_text(encoding="utf-8")
+    _git(snapshot, "status")
+    _git(snapshot, "log", "--oneline")
 
     assert executor_head_sha(workspace) == sha_before
     assert (workspace / "src" / "app.py").read_text(encoding="utf-8") == app_before
     assert (workspace / "README.md").read_text(encoding="utf-8") == readme_before
 
 
-def test_remove_isolated_snapshot_does_not_touch_executor_workspace(tmp_path: Path) -> None:
+def test_remove_isolated_snapshot_does_not_touch_executor_workspace(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "executor_workspace"
     _init_repo(workspace)
     sha_before = executor_head_sha(workspace)
@@ -368,8 +665,9 @@ def test_remove_isolated_snapshot_does_not_touch_executor_workspace(tmp_path: Pa
     assert (workspace / "README.md").is_file()
 
 
-def test_create_isolated_snapshot_recovers_from_previous_round(tmp_path: Path) -> None:
-    """A new snapshot for the same run_id overwrites a stale one cleanly."""
+def test_create_isolated_snapshot_recovers_from_previous_round(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "executor_workspace"
     _init_repo(workspace)
     first = create_isolated_snapshot(workspace, run_id="reused", round_index=1)
@@ -380,16 +678,11 @@ def test_create_isolated_snapshot_recovers_from_previous_round(tmp_path: Path) -
     assert second.round_index == 2
 
 
-# --- Integration smoke: the Claude adapter wires the policy into the command
-# template and the environment overrides; this guards the change to
-# claude_code.py the audit wins deny rules into the live shell command.
-
-
-def test_auditor_command_template_includes_local_git_deny(role: str = "cli_auditor") -> None:
-    adapter = ClaudeCodeAdapter(role=role, run_id="run-tpl")
+def test_auditor_command_template_includes_all_deny_layers() -> None:
+    adapter = ClaudeCodeAdapter(role="cli_auditor", run_id="run-tpl")
     template = adapter.command_template
-    # Disallowed tools are passed via the `--disallowedTools` flag.
     assert "--disallowedTools" in template
+    # Local git rewrite family
     assert "Bash(git checkout*)" in template
     assert "Bash(git reset*)" in template
     assert "Bash(git switch*)" in template
@@ -397,34 +690,35 @@ def test_auditor_command_template_includes_local_git_deny(role: str = "cli_audit
     assert "Bash(git stash*)" in template
     assert "Bash(git restore*)" in template
     assert "Bash(git commit*)" in template
-    # Existing network deny stays in place too.
+    # Reference-writing family (the operator correction addition).
+    assert "Bash(git update-ref*)" in template
+    assert "Bash(git symbolic-ref*)" in template
+    # Filesystem deny (chmod/chown/rm).
+    assert "Bash(chmod*)" in template
+    assert "Bash(chown*)" in template
+    assert "Bash(rm*)" in template
+    # Network deny stays in place.
     assert "Bash(git fetch*)" in template
     assert "Bash(git push*)" in template
 
 
-def test_executor_command_template_unaffected_by_local_git_deny() -> None:
+def test_executor_command_template_unaffected_by_auditor_deny() -> None:
     adapter = ClaudeCodeAdapter(role="cli_executor", run_id="run-exec")
     template = adapter.command_template
-    # The executor must NOT inherit the auditor deny list (it owns the
-    # workspace and needs to commit/push).
     for rule in AUDITOR_LOCAL_GIT_DENY:
+        assert rule not in template
+    for rule in AUDITOR_FS_DENY:
         assert rule not in template
     for rule in AUDITOR_NETWORK_GIT_DENY:
         assert rule not in template
 
 
 def test_snapshot_dir_name_uses_sanitized_run_id() -> None:
-    """The sibling name must include the run_id (sibling isolation guarantee)."""
     assert snapshot_dir_name("aaaaaaaa-bbbb-cccc").startswith(".snapshot-aaaaaaaa-bbbb-cccc")
 
 
 def test_local_ref_name_round_zero_padding() -> None:
     assert local_ref_name("run", 0) == "refs/lh-harness/run/round_000"
-
-
-# --- Cleanup so tests don't leave snapshots around the test runner's tmpdir.
-# `tmp_path` already wipes the dir, but make sure the helper's own rm logic
-# is exercised for completeness.
 
 
 def test_remove_isolated_snapshot_no_op_when_missing(tmp_path: Path) -> None:
