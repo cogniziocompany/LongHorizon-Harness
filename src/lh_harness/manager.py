@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .adapters.base import AgentAdapter
+from .adapters.cli_agent import CommandAgentAdapter
+from .auditor_launch import active_auditor_launch, prepare_auditor_launch
+from .safe_subprocess import AuditorBoundaryUnavailable
 from .adapters.claude_permissions import is_git_internal_metadata_path
 from .safe_subprocess import git_argv
 from .agent_logs import (
@@ -901,6 +904,7 @@ async def _run_impl(
                 env,
                 auditor_budget,
                 live_trajectory_path=str(round_dir / "auditor_raw_trajectory.jsonl"),
+                require_auditor_isolation=True,
             )
         finally:
             if previous_auditor_workspace is not None:
@@ -1380,15 +1384,27 @@ async def _run_role_episode(
     budget: EpisodeBudget,
     *,
     live_trajectory_path: str | None = None,
+    require_auditor_isolation: bool = False,
 ) -> EpisodeResult:
     """Normalize cooperative cancellation for every adapter implementation."""
     started = time.monotonic()
+    isolation_token = None
     try:
+        if require_auditor_isolation:
+            if not isinstance(agent, CommandAgentAdapter):
+                raise AuditorBoundaryUnavailable("auditor adapter has no enforced command launch path")
+            isolation_token = active_auditor_launch.set(await prepare_auditor_launch(env))
         return await agent.run_episode(
             prompt,
             env,
             budget,
             live_trajectory_path=live_trajectory_path,
+        )
+    except AuditorBoundaryUnavailable as exc:
+        return EpisodeResult(
+            status="error", error=str(exc),
+            duration_ms=int((time.monotonic() - started) * 1000),
+            metadata={"auditor_isolation_failed": True, "missing_prerequisite": "read_only_mount_boundary"},
         )
     except asyncio.CancelledError:
         return EpisodeResult(
@@ -1397,6 +1413,9 @@ async def _run_role_episode(
             duration_ms=int((time.monotonic() - started) * 1000),
             metadata={"cancelled": True},
         )
+    finally:
+        if isolation_token is not None:
+            active_auditor_launch.reset(isolation_token)
 
 
 async def _auditor_report_with_format_repair(
@@ -1440,6 +1459,7 @@ async def _auditor_report_with_format_repair(
         env,
         repair_budget,
         live_trajectory_path=str(round_dir / "auditor_format_repair_raw_trajectory.jsonl"),
+        require_auditor_isolation=True,
     )
     _save_role_result(
         round_dir,

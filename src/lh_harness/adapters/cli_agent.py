@@ -11,6 +11,7 @@ from collections.abc import Callable
 from pathlib import PurePath
 
 from ..environment.base import Environment
+from ..auditor_launch import active_auditor_launch
 from ..environment.remote_files import write_remote_text
 from ..episode_stats import summarize_episode
 from ..runtime_signals import detect_runtime_signals
@@ -147,6 +148,9 @@ class CommandAgentAdapter:
         }
         if stall_window is not None and _env_supports_stall_watchdog(env):
             exec_kwargs["no_output_stall_seconds"] = stall_window
+        isolation = active_auditor_launch.get()
+        if isolation is not None:
+            command = isolation.command(command)
         result = await env.exec(command, **exec_kwargs)  # type: ignore[arg-type]
         duration_ms = int((time.monotonic() - start) * 1000)
         stalled = result.termination_reason == "stall"
