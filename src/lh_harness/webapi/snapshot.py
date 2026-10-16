@@ -387,6 +387,72 @@ def build_snapshot(state: DashboardState, *, run_id: str | None = None) -> dict[
     failure_reason = report.get("failure_reason")
     if failure_reason is not None:
         failure_reason = str(failure_reason)
+    # Surface the round-extension history so the configured ceiling (``max_rounds``
+    # above) and the effective ceiling can never silently disagree.  The
+    # decision events are emitted by ``_human_gate`` and replayed through the
+    # same EventTailer; only the explicit positive amounts count as grants.
+    extension_history: list[dict[str, Any]] = []
+    seen_approval_ids: set[str] = set()
+    for item in events:
+        if not isinstance(item, dict):
+            continue
+        # The EventTailer envelope wraps each record with a ``legacy`` block
+        # that preserves the original ``event`` name; the payload fields live
+        # under ``payload``.  Older records exposed those flat, so check both.
+        legacy = item.get("legacy") if isinstance(item.get("legacy"), dict) else {}
+        event_name = legacy.get("event") if isinstance(legacy, dict) else None
+        if event_name is None:
+            event_name = item.get("event")
+        if event_name != "round_extension_decision":
+            continue
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        if not payload:
+            # Older flat record: read the fields directly from the envelope.
+            payload = {
+                "approval_id": item.get("approval_id"),
+                "round": item.get("round"),
+                "outcome": item.get("outcome"),
+                "requested_extra_rounds": item.get("requested_extra_rounds"),
+                "granted_extra_rounds": item.get("granted_extra_rounds"),
+                "round_budget": item.get("round_budget"),
+                "replayed": item.get("replayed"),
+            }
+        approval_id = str(payload.get("approval_id") or "").strip()
+        granted = payload.get("granted_extra_rounds")
+        try:
+            granted_int = int(granted) if granted is not None else 0
+        except (TypeError, ValueError):
+            granted_int = 0
+        replayed = bool(payload.get("replayed")) or (
+            approval_id in seen_approval_ids and granted_int > 0
+        )
+        extension_history.append(
+            {
+                "approval_id": approval_id,
+                "round": payload.get("round"),
+                "outcome": payload.get("outcome"),
+                "requested_extra_rounds": payload.get("requested_extra_rounds"),
+                "granted_extra_rounds": granted_int,
+                "round_budget": payload.get(
+                    "post_grant_round_budget", payload.get("round_budget")
+                ),
+                "replayed": replayed,
+                "occurred_at": item.get("ts"),
+            }
+        )
+        if approval_id:
+            seen_approval_ids.add(approval_id)
+    granted_total = sum(
+        int(item.get("granted_extra_rounds") or 0)
+        for item in extension_history
+        if int(item.get("granted_extra_rounds") or 0) > 0
+    )
+    configured_max = provenance.get("max_rounds")
+    effective_max_rounds: int | None
+    if isinstance(configured_max, int):
+        effective_max_rounds = configured_max + granted_total
+    else:
+        effective_max_rounds = None
     return {
         "schema_version": 1,
         "run": {
@@ -416,6 +482,11 @@ def build_snapshot(state: DashboardState, *, run_id: str | None = None) -> dict[
         "events": events,
         "approvals": approvals,
         "operator_messages": operator_messages,
+        # Effective ceiling = configured budget + explicitly granted extras.
+        # ``max_rounds`` in ``run`` is the durable provenance value and stays
+        # stable; the union is what the gate actually enforced.
+        "effective_max_rounds": effective_max_rounds,
+        "extension_history": extension_history,
         "controls": {
             "can_inject": bool(raw.get("control_enabled")),
             # Approval/instruction control can attach directly to a worker,
