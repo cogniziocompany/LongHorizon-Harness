@@ -269,8 +269,9 @@ def _user_namespace_actually_isolating() -> bool:
             "try:\n"
             "    p.write_text('overwrite')\n"
             "    sys.exit(0)\n"
-            "except Exception:\n"
-            "    sys.exit(1)\n"
+            "except PermissionError:\n"
+            "    print('LH_PERMISSION_DENIED', flush=True)\n"
+            "    sys.exit(77)\n"
         )
         probe = _subprocess.run(
             [_find_executable("unshare") or "unshare",
@@ -280,7 +281,12 @@ def _user_namespace_actually_isolating() -> bool:
             check=False,
             timeout=10,
         )
-        return probe.returncode != 0  # write was rejected -> real boundary
+        # A failed launcher/interpreter is not evidence of write isolation.
+        return (
+            probe.returncode == 77
+            and probe.stdout.strip() == "LH_PERMISSION_DENIED"
+            and probe_file.read_text() == "owned-by-harness\n"
+        )
     finally:
         try:
             os.chmod(scratch_dir, 0o700)
