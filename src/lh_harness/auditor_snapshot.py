@@ -1,4 +1,4 @@
-"""Auditor isolation: independent full clone + pinned executor HEAD.
+"""Auditor isolation: independent full clone, OS-level UID boundary, fail-closed.
 
 HARNESS-AUDITOR-ISOLATION (incident 20261016T164706Z_5c063e3e): the auditor
 ran ``git checkout -B <branch> origin/<branch>`` inside the executor workspace
@@ -24,20 +24,52 @@ identified three fundamental isolation gaps in the prior implementation:
    that names the snapshot directory with the run id, giving sibling runs
    their own workspace.
 
-Test scratch output is allowed outside the source tree. Cleanup is
-symlink-safe: every operation walks within a verified snapshot root and
-never dereferences or ``chmod``-follows a symlink target that may point
-out of the snapshot.
+4. ``auditor_boundary_required()`` / ``AuditorBoundaryKind``: gatekeeper
+   that refuses to launch the auditor unless an OS-level boundary
+   (separate-UID process via ``unshare -U`` / ``setpriv --reuid`` /
+   ``runuser`` *or* a separate-UID launcher the deployment already
+   provides) is available. Same-UID ``chmod a-w`` is *advisory*, not a
+   kernel boundary, so fail-closed is mandatory — see the long note
+   below.
 
-Environment note: this container runs unprivileged (no ``CAP_SYS_ADMIN``),
-so kernel-level read-only enforcement via ``mount --bind -o ro`` is not
-available. Defense-in-depth is therefore (a) physical separation via the
-independent full clone, (b) ``chmod -R a-w`` on the snapshot files, and
-(c) explicit deny rules in ``AUDITOR_LOCAL_GIT_DENY`` covering ``chmod``,
-``chown``, ``rm``/``unlink`` and the ``update-ref`` family so a process
-that ignores the Claude tool deny cannot reverse the snapshot permissions
-either. Fail-closed: if any of the three cannot be established the harness
-refuses to launch the auditor against the executor workspace.
+OS-level boundary: why this is mandatory.
+
+``chmod a-w`` on a snapshot owned by the same uid as the auditor process
+is not a security boundary. The auditor can ``chmod`` the snapshot back to
+writable from inside the harness, ignore ``Bash(chmod*)`` deny rules, and
+write a file directly via Python ``open(..., "w")``. The operator probe
+at commit ``d47ac73`` confirmed ``same_uid_can_rewrite_snapshot=true``,
+``same_uid_can_rewrite_executor_directly=true``. To make
+``is_writable_to_auditor_subprocess==false``, the auditor MUST run under
+a different uid (a separate-UID subprocess or a user-namespace
+subprocess) so the kernel permission check rejects even direct file
+operations. ``safe_subprocess.launch_auditor_subprocess`` is the single
+launch point that enforces this.
+
+Test scratch output is allowed outside the source tree. Cleanup is
+symlink-safe: every walk starts from a path that has been resolved via
+``Path.resolve()`` and refuses to follow symlinks whose targets escape
+the verified root.
+
+Defense in depth applied at every layer the harness owns:
+
+  (a) independent full clone (no shared ``.git``, no alternates),
+  (b) ``chmod -R a-w`` on snapshot files (advisory; defeated by a
+      same-UID reverse-chmod, which is why (c) and (d) are required),
+  (c) explicit deny rules in ``AUDITOR_LOCAL_GIT_DENY`` covering
+      ``checkout``/``reset``/``switch``/``clean``/``stash``/
+      ``restore``/``commit``/``rebase``/``merge``/``update-ref``/
+      ``symbolic-ref`` and the same family under ``-C``/``--git-dir``,
+  (d) filesystem-deny covering ``chmod``/``chown``/``rm``/``unlink``/
+      ``install``/``mv`` so a Bash subprocess cannot reverse (b),
+  (e) the auditor subprocess runs under a different uid so the kernel
+      rejects direct file ``open(..., "w")`` writes regardless of any
+      Python or bash layer.
+
+Fail-closed: if (a) cannot be performed, the ``update-ref`` pin cannot
+be written, *or* (e) cannot be established, the harness refuses to
+launch the auditor against the executor workspace. See
+``safe_subprocess.auditor_boundary_required``.
 """
 
 from __future__ import annotations

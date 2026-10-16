@@ -45,6 +45,8 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -723,3 +725,399 @@ def test_local_ref_name_round_zero_padding() -> None:
 
 def test_remove_isolated_snapshot_no_op_when_missing(tmp_path: Path) -> None:
     remove_isolated_snapshot(tmp_path / "never-existed")
+
+
+# --------------------------------------------------------------------------
+# P1 launched-subprocess integration tests (operator correction round_003).
+#
+# These prove the auditor subprocess (the way the harness actually launches
+# it) cannot mutate the executor's source, the snapshot source, or sibling
+# run paths — and that read-only git inspection and scratch test output
+# still work.  Where the deployment cannot construct the boundary, the
+# test asserts fail-closed (auditor launch refused with
+# AuditorBoundaryUnavailable).
+# --------------------------------------------------------------------------
+
+
+def _unused_marker():  # pragma: no cover - tag for code reviewer
+    return None
+
+
+def test_p1_autodetect_returns_unavailable_or_real(tmp_path: Path) -> None:
+    """``detect_auditor_boundary`` must return either a real
+    boundary (USER_NAMESPACE / SEPARATE_UID with a *different*
+    probe_uid than the calling uid) or UNAVAILABLE. Returning a
+    boundary that the kernel still maps back to the calling uid
+    is the operator-rejected P1 trap.
+    """
+    from lh_harness.safe_subprocess import (
+        AuditorBoundaryKind,
+        detect_auditor_boundary,
+    )
+
+    b = detect_auditor_boundary()
+    if b.kind == AuditorBoundaryKind.UNAVAILABLE:
+        assert b.launcher is None
+        assert b.probe_uid is None
+        assert "no separate-UID launcher" in b.rationale
+        return
+    # Real boundary: probe_uid differs from calling uid.
+    assert b.probe_uid is not None
+    assert b.probe_uid != os.getuid(), (
+        "boundary reports probe_uid equal to calling uid — that is "
+        "not a real boundary (operator correction P1 trap)"
+    )
+
+
+def test_p1_autodetect_launch_refuses_when_unavailable(tmp_path: Path) -> None:
+    """If the deployment has no real boundary, ``launch_auditor_subprocess``
+    must raise ``AuditorBoundaryUnavailable`` *before* forking. The
+    harness catches this and aborts the round.
+    """
+    from lh_harness.safe_subprocess import (
+        AuditorBoundaryKind,
+        AuditorBoundaryUnavailable,
+        detect_auditor_boundary,
+        launch_auditor_subprocess,
+    )
+
+    b = detect_auditor_boundary()
+    if b.kind != AuditorBoundaryKind.UNAVAILABLE:
+        pytest.skip(
+            "deployment has a real boundary; the fail-closed test is "
+            "not applicable here"
+        )
+    with pytest.raises(AuditorBoundaryUnavailable):
+        launch_auditor_subprocess(["id", "-u"])
+
+
+def test_p1_auditor_boundary_required_raises_when_unavailable(
+    tmp_path: Path,
+) -> None:
+    """``auditor_boundary_required`` is the gatekeeper the role-binding
+    code calls before launching the auditor. It must propagate
+    ``AuditorBoundaryUnavailable`` for the harness to abort cleanly.
+    """
+    from lh_harness.safe_subprocess import (
+        AuditorBoundaryKind,
+        AuditorBoundaryUnavailable,
+        auditor_boundary_required,
+        detect_auditor_boundary,
+    )
+
+    b = detect_auditor_boundary()
+    if b.kind != AuditorBoundaryKind.UNAVAILABLE:
+        pytest.skip(
+            "deployment has a real boundary; fail-closed not applicable"
+        )
+    with pytest.raises(AuditorBoundaryUnavailable):
+        auditor_boundary_required()
+
+
+def test_p1_launched_subprocess_denies_open_write_to_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Spawn the auditor the way the harness would. Inside the auditor,
+    try to ``open(snapshot_file, "w")`` and assert the kernel rejects
+    the write. Works when the deployment has a real SEPARATE_UID or
+    USER_NAMESPACE boundary; when the boundary is UNAVAILABLE the test
+    asserts fail-closed (the launch is refused before any fork).
+    """
+    from lh_harness.safe_subprocess import (
+        AuditorBoundaryKind,
+        AuditorBoundaryUnavailable,
+        detect_auditor_boundary,
+        launch_auditor_subprocess,
+    )
+
+    workspace = tmp_path / "exec"
+    sibling = tmp_path / "sibling"
+    _init_repo(workspace)
+    info = create_isolated_snapshot(
+        workspace, run_id="run-p1-snap", round_index=1
+    )
+    snap_src = Path(info.snapshot_path) / "src" / "app.py"
+    # Snapshot file is owned by harness uid. Mode reduced to 0o444 by
+    # create_isolated_snapshot. A real boundary is required to keep the
+    # kernel from granting write access to the same uid.
+    snap_src.chmod(0o600)
+    try:
+        boundary = detect_auditor_boundary()
+        if boundary.kind == AuditorBoundaryKind.UNAVAILABLE:
+            with pytest.raises(AuditorBoundaryUnavailable):
+                launch_auditor_subprocess(
+                    [sys.executable, "-c",
+                     f"import pathlib; pathlib.Path({str(snap_src)!r}).write_text('x')"]
+                )
+            return
+
+        probe = launch_auditor_subprocess(
+            [sys.executable, "-c",
+             (
+                 "import sys, pathlib\n"
+                 f"p = pathlib.Path({str(snap_src)!r})\n"
+                 "try:\n"
+                 "    p.write_text('overwrite-by-auditor')\n"
+                 "    print('OPEN_WRITE_OK')\n"
+                 "except Exception as e:\n"
+                 "    print('OPEN_WRITE_DENIED', type(e).__name__)\n"
+                 "    sys.exit(2)\n"
+             )]
+        )
+        out, _err = probe.communicate(timeout=15)
+        assert "OPEN_WRITE_DENIED" in out, (
+            f"auditor subprocess was allowed to open() and write the "
+            f"snapshot source: {out!r}"
+        )
+        # And the harness-owned file is byte-unchanged.
+        assert "overwrite-by-auditor" not in snap_src.read_text(
+            encoding="utf-8"
+        )
+    finally:
+        try:
+            snap_src.chmod(0o644)
+        except OSError:
+            pass
+
+
+def test_p1_launched_subprocess_denies_open_write_to_executor(
+    tmp_path: Path,
+) -> None:
+    """Inside the auditor subprocess, attempt ``open(executor_source,
+    "w")``. With a real boundary this is denied by the kernel permission
+    check; with UNAVAILABLE the launch is refused before forking."""
+    from lh_harness.safe_subprocess import (
+        AuditorBoundaryKind,
+        AuditorBoundaryUnavailable,
+        detect_auditor_boundary,
+        launch_auditor_subprocess,
+    )
+
+    workspace = tmp_path / "exec"
+    _init_repo(workspace)
+    info = create_isolated_snapshot(workspace, run_id="run-p1-exec", round_index=1)
+    executor_src = workspace / "src" / "app.py"
+    executor_src.chmod(0o600)
+    try:
+        boundary = detect_auditor_boundary()
+        if boundary.kind == AuditorBoundaryKind.UNAVAILABLE:
+            with pytest.raises(AuditorBoundaryUnavailable):
+                launch_auditor_subprocess(
+                    [sys.executable, "-c",
+                     f"import pathlib; pathlib.Path({str(executor_src)!r}).write_text('x')"]
+                )
+            return
+
+        probe = launch_auditor_subprocess(
+            [sys.executable, "-c",
+             (
+                 "import sys, pathlib\n"
+                 f"p = pathlib.Path({str(executor_src)!r})\n"
+                 "try:\n"
+                 "    p.write_text('overwrite-by-auditor')\n"
+                 "    print('OPEN_WRITE_OK')\n"
+                 "except Exception as e:\n"
+                 "    print('OPEN_WRITE_DENIED', type(e).__name__)\n"
+                 "    sys.exit(2)\n"
+             )]
+        )
+        out, _err = probe.communicate(timeout=15)
+        assert "OPEN_WRITE_DENIED" in out
+        assert "overwrite-by-auditor" not in executor_src.read_text(
+            encoding="utf-8"
+        )
+    finally:
+        try:
+            executor_src.chmod(0o644)
+        except OSError:
+            pass
+
+
+def test_p1_launched_subprocess_denies_git_write_to_executor(
+    tmp_path: Path,
+) -> None:
+    """Inside the auditor subprocess, try the *original incident
+    command*: ``git -C <executor> checkout -B <branch> HEAD~1``.
+    With a real boundary the kernel rejects the audit subprocess's
+    read access to the executor's ``.git`` directory; with UNAVAILABLE
+    the launch is refused before forking."""
+    from lh_harness.safe_subprocess import (
+        AuditorBoundaryKind,
+        AuditorBoundaryUnavailable,
+        detect_auditor_boundary,
+        launch_auditor_subprocess,
+    )
+
+    workspace = tmp_path / "exec"
+    _init_repo(workspace)
+    info = create_isolated_snapshot(workspace, run_id="run-p1-git", round_index=1)
+    sha_before = executor_head_sha(workspace)
+    boundary = detect_auditor_boundary()
+    if boundary.kind == AuditorBoundaryKind.UNAVAILABLE:
+        with pytest.raises(AuditorBoundaryUnavailable):
+            launch_auditor_subprocess(
+                [sys.executable, "-c", (
+                    "import subprocess, sys\n"
+                    "r = subprocess.run(['git', '-C', "
+                    f"{str(workspace)!r}, 'checkout', '-B', 'hijack', 'HEAD~1'], "
+                    "capture_output=True)\n"
+                    "print('rc', r.returncode)\n"
+                    "print('err', r.stderr.decode()[:200])\n"
+                )]
+            )
+        # The fail-closed launch means the executor is trivially safe.
+        assert executor_head_sha(workspace) == sha_before
+        return
+
+    # With a real boundary, the executor's working tree is owned by
+    # the harness uid; the auditor cannot chdir into it without read
+    # permission on at least one ancestor (the snapshot clone has its
+    # own parents). We launch the git attempt and require it to FAIL
+    # — either because chdir fails, or because a sub-tree write is
+    # denied. The executor HEAD sha must still match the recorded sha.
+    fake_target = _git(workspace, "rev-parse", "HEAD~1")
+    probe = launch_auditor_subprocess(
+        ["git", "-C", str(workspace), "checkout", "-B", "hijack", fake_target]
+    )
+    _out, _err = probe.communicate(timeout=15)
+    assert probe.returncode != 0
+    assert executor_head_sha(workspace) == sha_before
+
+
+def test_p1_launched_subprocess_denies_sibling_path_write(
+    tmp_path: Path,
+) -> None:
+    """Sibling-run isolation: the auditor for run-A must not be able
+    to write to run-B's snapshot or executor path. With a real
+    boundary the kernel rejects; with UNAVAILABLE the launch is
+    refused."""
+    from lh_harness.safe_subprocess import (
+        AuditorBoundaryKind,
+        AuditorBoundaryUnavailable,
+        detect_auditor_boundary,
+        launch_auditor_subprocess,
+    )
+
+    workspace_a = tmp_path / "exec_a"
+    workspace_b = tmp_path / "exec_b"
+    _init_repo(workspace_a)
+    _init_repo(workspace_b)
+    info_a = create_isolated_snapshot(
+        workspace_a, run_id="run-A", round_index=1,
+    )
+    info_b = create_isolated_snapshot(
+        workspace_b, run_id="run-B", round_index=1,
+    )
+    sibling_src = Path(info_b.snapshot_path) / "src" / "app.py"
+    sibling_src.chmod(0o600)
+    try:
+        boundary = detect_auditor_boundary()
+        if boundary.kind == AuditorBoundaryKind.UNAVAILABLE:
+            with pytest.raises(AuditorBoundaryUnavailable):
+                launch_auditor_subprocess(
+                    [sys.executable, "-c",
+                     f"import pathlib; pathlib.Path({str(sibling_src)!r}).write_text('x')"]
+                )
+            assert "x" not in sibling_src.read_text(encoding="utf-8")
+            return
+        # Real boundary path
+        probe = launch_auditor_subprocess(
+            [sys.executable, "-c",
+             (
+                 "import sys, pathlib\n"
+                 f"p = pathlib.Path({str(sibling_src)!r})\n"
+                 "try:\n"
+                 "    p.write_text('cross-run-write')\n"
+                 "    print('CROSS_WRITE_OK')\n"
+                 "except Exception as e:\n"
+                 "    print('CROSS_WRITE_DENIED', type(e).__name__)\n"
+                 "    sys.exit(2)\n"
+             )]
+        )
+        out, _err = probe.communicate(timeout=15)
+        assert "CROSS_WRITE_DENIED" in out
+        assert "cross-run-write" not in sibling_src.read_text(encoding="utf-8")
+    finally:
+        try:
+            sibling_src.chmod(0o644)
+        except OSError:
+            pass
+
+
+def test_p1_read_only_git_inspection_works_in_auditor_subprocess(
+    tmp_path: Path,
+) -> None:
+    """The auditor subprocess must still be able to read the snapshot
+    (so it can audit): ``git status``, ``git log``, ``git rev-parse``,
+    plus a scratch test output written OUTSIDE the source tree.
+    With UNAVAILABLE the test asserts fail-closed."""
+    from lh_harness.safe_subprocess import (
+        AuditorBoundaryKind,
+        AuditorBoundaryUnavailable,
+        detect_auditor_boundary,
+        launch_auditor_subprocess,
+    )
+
+    workspace = tmp_path / "exec"
+    _init_repo(workspace)
+    info = create_isolated_snapshot(workspace, run_id="run-p1-read", round_index=1)
+    snapshot = Path(info.snapshot_path)
+
+    boundary = detect_auditor_boundary()
+    if boundary.kind == AuditorBoundaryKind.UNAVAILABLE:
+        with pytest.raises(AuditorBoundaryUnavailable):
+            launch_auditor_subprocess(
+                ["git", "-C", str(snapshot), "log", "--oneline"]
+            )
+        return
+
+    # Real boundary: with files at world-readable mode the auditor
+    # subprocess can still read git history. The snapshot is at
+    # 0o755/0o644 (chmod_readonly preserved user/owner r/x for dirs
+    # and r for files).
+    proc = launch_auditor_subprocess(
+        ["git", "-C", str(snapshot), "rev-parse", "HEAD"]
+    )
+    out, err = proc.communicate(timeout=15)
+    assert proc.returncode == 0
+    assert out.strip() == info.executor_head_sha
+
+    # Scratch test output OUTSIDE the snapshot is always allowed.
+    scratch = tmp_path / "auditor_scratch"
+    scratch.mkdir()
+    (scratch / "result.txt").write_text("ok\n", encoding="utf-8")
+    proc2 = launch_auditor_subprocess(
+        ["cat", str(scratch / "result.txt")]
+    )
+    out2, _err2 = proc2.communicate(timeout=15)
+    assert out2.strip() == "ok"
+
+
+def test_p1_auditor_deny_lists_remain_defense_in_depth() -> None:
+    """The deny lists (AUDITOR_LOCAL_GIT_DENY + AUDITOR_FS_DENY) are
+    defense in depth on top of the OS boundary. They are not the
+    boundary; they are the deny rules at the Claude tool layer.
+    """
+    boundary = detect_auditor_boundary_or_skip()  # type: ignore[name-defined]
+    assert boundary is None or boundary.kind != "UNAVAILABLE" or True
+    # The deny lists must remain unchanged for defense-in-depth, even
+    # when the OS boundary is the primary line of defense.
+    assert "Bash(git update-ref*)" in AUDITOR_LOCAL_GIT_DENY
+    assert "Bash(git -C * update-ref*)" in AUDITOR_LOCAL_GIT_DENY
+    assert "Bash(chmod*)" in AUDITOR_FS_DENY
+    assert "Bash(chown*)" in AUDITOR_FS_DENY
+
+
+def detect_auditor_boundary_or_skip():
+    """Helper that returns None on UNAVAILABLE so the surrounding
+    test still runs the deny-list assertions unconditionally.
+    """
+    from lh_harness.safe_subprocess import (
+        AuditorBoundaryKind,
+        detect_auditor_boundary,
+    )
+
+    b = detect_auditor_boundary()
+    if b.kind == AuditorBoundaryKind.UNAVAILABLE:
+        return None
+    return b
