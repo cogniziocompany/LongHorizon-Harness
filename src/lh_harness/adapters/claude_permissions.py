@@ -50,6 +50,44 @@ AUDITOR_NETWORK_GIT_DENY: tuple[str, ...] = (
     "Bash(git --git-dir* lfs*)",
 )
 
+# Deny rules for auditor local git operations that can rewrite the executor's
+# branch, refs, or working tree (task: HARNESS-AUDITOR-ISOLATION, incident
+# 20261016T164706Z_5c063e3e).  The executor's HEAD is recorded into a local
+# ref before the auditor launches and the auditor runs on a read-only
+# snapshot, so any of these in the executor workspace are denied outright.
+# The list mirrors the network deny tuple's -C / --git-dir variants so the
+# auditor cannot pivot the operation at another working tree either.
+AUDITOR_LOCAL_GIT_DENY: tuple[str, ...] = (
+    "Bash(git checkout*)",
+    "Bash(git reset*)",
+    "Bash(git switch*)",
+    "Bash(git clean*)",
+    "Bash(git stash*)",
+    "Bash(git restore*)",
+    "Bash(git commit*)",
+    "Bash(git rebase*)",
+    "Bash(git merge*)",
+    # Variants that point git at a different directory via -C or --git-dir.
+    "Bash(git -C * checkout*)",
+    "Bash(git -C * reset*)",
+    "Bash(git -C * switch*)",
+    "Bash(git -C * clean*)",
+    "Bash(git -C * stash*)",
+    "Bash(git -C * restore*)",
+    "Bash(git -C * commit*)",
+    "Bash(git -C * rebase*)",
+    "Bash(git -C * merge*)",
+    "Bash(git --git-dir* checkout*)",
+    "Bash(git --git-dir* reset*)",
+    "Bash(git --git-dir* switch*)",
+    "Bash(git --git-dir* clean*)",
+    "Bash(git --git-dir* stash*)",
+    "Bash(git --git-dir* restore*)",
+    "Bash(git --git-dir* commit*)",
+    "Bash(git --git-dir* rebase*)",
+    "Bash(git --git-dir* merge*)",
+)
+
 # Environment variables that make any network git operation fail fast for the
 # auditor role. GIT_CONFIG_COUNT overrides are injected via the env and cause git
 # to reject credential helpers and redirect helpers, preventing any network op.
@@ -115,6 +153,7 @@ def policy_for_role(role: str) -> ClaudeRolePolicy:
                 *_WRITE_TOOLS,
                 "Agent",
                 *AUDITOR_NETWORK_GIT_DENY,
+                *AUDITOR_LOCAL_GIT_DENY,
             ),
             load_computer_mcp=True,
             workspace_read_only=True,
