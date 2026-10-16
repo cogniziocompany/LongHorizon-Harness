@@ -173,13 +173,17 @@ def make_human_hook(
         parts = list(injections)
         if resolved.user_input.strip():
             parts.append(resolved.user_input.strip())
+        # Pass the operator's explicit extra_rounds (0 means "no extension")
+        # together with the approval id so the manager can record a decision
+        # receipt and stop at the gate when the budget is exhausted.  The
+        # historical ``resolved.extra_rounds or default_extra_rounds`` form
+        # silently granted the configured budget on a bare "Continue" click,
+        # which is the bug this hook fixes.
         return {
             "action": resolved.action,  # "continue" | "stop"
             "instructions": "\n".join(parts),
-            # The operator's own choice wins; 0 falls back to the caller's
-            # default, which in turn falls back to the manager's configured
-            # budget.  Without this the dialog's round input was ignored.
-            "extra_rounds": resolved.extra_rounds or default_extra_rounds,
+            "extra_rounds": resolved.extra_rounds,
+            "approval_id": approval.approval_id,
             "reason": resolved.reason,
         }
 
