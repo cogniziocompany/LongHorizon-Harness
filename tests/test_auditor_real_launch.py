@@ -70,8 +70,20 @@ def _make_git_repo(workspace: Path) -> None:
     fixture-style probes). Each test owns its repo and tears it down on
     exit.
     """
+    # The disposable-repo fixture needs to resolve a ``git`` binary even when
+    # the host the test runs on supplies a stripped or empty ambient PATH
+    # (the CI worktree under ``tests/conftest.py`` inherits a service-style
+    # PATH that does not always carry ``/usr/bin/git``). Build the
+    # subprocess env from a guaranteed ``git`` location so the test does
+    # not depend on the runner's PATH landing inside the helper's naked
+    # ``subprocess.run`` call.
+    git_bin = shutil.which("git") or "/usr/bin/git"
+    git_dir = os.path.dirname(git_bin)
+    base_path = os.environ.get("PATH", "")
+    if git_dir and git_dir not in base_path.split(":"):
+        base_path = f"{git_dir}:{base_path}" if base_path else git_dir
     env = {
-        "PATH": os.environ.get("PATH", ""),
+        "PATH": base_path,
         "HOME": str(workspace),
         "GIT_AUTHOR_NAME": "Auditor Test",
         "GIT_AUTHOR_EMAIL": "audit@example.com",
