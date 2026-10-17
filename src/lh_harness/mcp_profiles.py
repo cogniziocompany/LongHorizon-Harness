@@ -20,6 +20,92 @@ MCP_LAN_GATEWAY_URL = "http://192.168.21.161:4000/mcp/"
 
 _MCP_USER_PROFILES_FILE = "mcp_profiles.json"
 
+# Backoffice / finance / CRM profile families (Paxton 2026-10-17).  These are
+# gated behind `BACKOFFICE_PROFILES_ENABLED` (env: LH_HARNESS_BACKOFFICE_PROFILES_ENABLED
+# or [run] backoffice_profiles_enabled in .lh-harness/config.toml).  Default is
+# false so no live credentials are required for any existing caller; turning
+# the flag on registers the families with `list_available_profiles()` and lets
+# `resolve_profile()` find them by name.  The server names below are STRINGS
+# at this layer; gateway-side registration is a separate infra task.
+BACKOFFICE_PROFILE_NAMES: frozenset[str] = frozenset(
+    {"dev", "backoffice", "finance", "crm_monday", "crm_dynamics"}
+)
+
+_BACKOFFICE_FAMILIES: dict[str, dict[str, Any]] = {
+    "dev": {
+        "description": "Git-first code work; superset of audit, no fleet/ssh.",
+        "servers": (
+            "kb",
+            "guides",
+            "skills",
+            "memory",
+            "langfuse_mcp",
+            "github",
+            "youtrack",
+        ),
+        "read_only": False,
+    },
+    "backoffice": {
+        "description": (
+            "M365 mail/calendar/SharePoint, PPTX/DOCX/XLSX, HTML spec, web, research."
+        ),
+        "servers": (
+            "kb",
+            "guides",
+            "skills",
+            "memory",
+            "langfuse_mcp",
+            "ms365",
+            "pptx",
+            "htmlspec",
+            "web",
+            "research",
+        ),
+        "read_only": False,
+    },
+    "finance": {
+        "description": (
+            "QuickBooks + reporting DB (read). Write tools gated at executor."
+        ),
+        "servers": (
+            "kb",
+            "guides",
+            "skills",
+            "memory",
+            "langfuse_mcp",
+            "quickbooks",
+            "reporting_db",
+        ),
+        "read_only": True,
+    },
+    "crm_monday": {
+        "description": "Monday.com boards/items/updates.",
+        "servers": (
+            "kb",
+            "guides",
+            "skills",
+            "memory",
+            "langfuse_mcp",
+            "monday",
+        ),
+        "read_only": False,
+    },
+    "crm_dynamics": {
+        "description": "Microsoft Dataverse / Dynamics 365 / XRM.",
+        "servers": (
+            "kb",
+            "guides",
+            "skills",
+            "memory",
+            "langfuse_mcp",
+            "dataverse",
+            "d365",
+            "xrm",
+        ),
+        "read_only": False,
+    },
+}
+
 # Built-in profile aliases.  These are the gateway's real `general_settings.mcp_aliases`
 # (cognizioware-mcp-tools infrastructure/litellm-config.yaml, verified 2026-09-07) — dash-free
 # on purpose (LiteLLM splits tool names on the first dash) — plus `langfuse_mcp`, which has no
@@ -153,6 +239,62 @@ def _builtin_profile(name: str, *, reason: str = "built-in") -> McpProfile:
     )
 
 
+def _backoffice_profile(name: str) -> McpProfile:
+    """Materialise a backoffice-family profile by name.
+
+    Caller must check `_backoffice_profiles_enabled()` first; this helper
+    assumes the family is visible and just shapes the dataclass.
+    """
+    spec = _BACKOFFICE_FAMILIES[name]
+    return McpProfile(
+        name=name,
+        description=spec["description"],
+        servers=tuple(spec["servers"]) if spec["servers"] is not None else None,
+        read_only=spec["read_only"],
+        source="built-in",
+        reason="backoffice family",
+    )
+
+
+def _read_backoffice_flag_from_config(config_path: Path | str | None) -> bool:
+    """Read `[run] backoffice_profiles_enabled = true` from project config.
+
+    Tolerant of a missing file or missing key; returns False in both cases.
+    """
+    if config_path is None:
+        source = Path(".lh-harness/config.toml")
+    else:
+        source = Path(config_path)
+    if not source.is_file():
+        return False
+    try:
+        with source.open("rb") as fh:
+            payload = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    run = payload.get("run", {})
+    if not isinstance(run, dict):
+        return False
+    return bool(run.get("backoffice_profiles_enabled", False))
+
+
+def _backoffice_profiles_enabled(config_path: Path | str | None = None) -> bool:
+    """True only when the env var or project config opts in.
+
+    Env var: ``LH_HARNESS_BACKOFFICE_PROFILES_ENABLED`` accepts
+    ``1/true/yes/on`` (case-insensitive).  Project config:
+    ``[run] backoffice_profiles_enabled = true``.  Env wins when both are set.
+    """
+    env = os.environ.get("LH_HARNESS_BACKOFFICE_PROFILES_ENABLED", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    return _read_backoffice_flag_from_config(config_path)
+
+
 def _load_user_profiles() -> dict[str, McpProfile]:
     """Load user-level profiles from ~/.lh-harness/mcp_profiles.json."""
     path = _state_root() / _MCP_USER_PROFILES_FILE
@@ -271,7 +413,8 @@ def list_available_profiles(
 ) -> list[dict[str, Any]]:
     """Return all profile names visible on this node for GET /api/meta.
 
-    The result never includes the gateway key.
+    The result never includes the gateway key.  Backoffice families are only
+    appended when ``BACKOFFICE_PROFILES_ENABLED`` is true.
     """
     builtin = [
         {
@@ -297,6 +440,19 @@ def list_available_profiles(
                     "description": profile.description,
                     "read_only": profile.read_only,
                     "source": source_label,
+                }
+            )
+    if _backoffice_profiles_enabled(project_config_path):
+        for name, spec in _BACKOFFICE_FAMILIES.items():
+            if name in seen:
+                continue
+            seen.add(name)
+            result.append(
+                {
+                    "name": name,
+                    "description": spec["description"],
+                    "read_only": spec["read_only"],
+                    "source": "built-in",
                 }
             )
     return result
@@ -328,9 +484,13 @@ def resolve_profile(
     config = config or {}
     user_profiles = _load_user_profiles()
     project_profiles = _load_project_profiles(project_config_path)
+    backoffice_enabled = _backoffice_profiles_enabled(project_config_path)
     all_profiles: dict[str, McpProfile] = {}
     for name in _BUILTINS:
         all_profiles[name] = _builtin_profile(name)
+    if backoffice_enabled:
+        for name in BACKOFFICE_PROFILE_NAMES:
+            all_profiles[name] = _backoffice_profile(name)
     for source, profiles in (("user", user_profiles), ("project", project_profiles)):
         for name, profile in profiles.items():
             all_profiles.setdefault(name, profile)
