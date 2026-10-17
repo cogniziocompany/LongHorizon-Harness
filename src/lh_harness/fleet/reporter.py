@@ -259,6 +259,26 @@ class FleetReporter:
             return
         self._post("/harness/events", [envelope.to_dict()], gzip_body=True)
 
+    def send_trios(self, payload: dict[str, Any]) -> None:
+        """Queue one ``/harness/trios`` envelope to fleet-admin when enabled.
+
+        The trio summary is small and stable, so gzip would burn CPU for
+        nothing — ``gzip_body=False`` keeps the signed-bytes path identical
+        to the unsigned body.  Failures inside :meth:`_post` are swallowed
+        with a single warning so a misconfigured trio payload never poisons
+        the run's worker thread; the reporter is best-effort telemetry and
+        must stay out of the launcher's hot path.
+
+        No-op when the reporter was never enabled (URL/NODE/KEY all required
+        at construction), exactly like the other ``queue_*`` helpers.
+        """
+        if not self._enabled or self._queue is None:
+            return
+        try:
+            self._post("/harness/trios", payload, gzip_body=False)
+        except Exception as exc:
+            logger.warning("fleet reporter trios send failed: %s", exc)
+
     def queue_heartbeat(
         self,
         runs: list[dict[str, Any]],
