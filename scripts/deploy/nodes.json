@@ -40,7 +40,7 @@
       "description": "Finance-only harness node for CFO1 (finance repos, finance-scoped credentials).",
       "ctId": 111,
       "hostname": "cct-cfo-harness-01",
-      "pveHost": "corsairai300",
+      "pveHost": "ptait07",
       "githubEnvironment": "ct111-prod",
       "concurrencyGroup": "deploy-ct111",
       "wheelArtifact": "ct111-wheel",
@@ -57,7 +57,7 @@
       },
       "workflowDefaults": {
         "webUrl": null,
-        "pveHost": "corsairai300",
+        "pveHost": "ptait07",
         "pveSshUser": "root",
         "ctId": "111"
       }

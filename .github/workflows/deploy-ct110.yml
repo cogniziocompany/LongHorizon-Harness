@@ -200,7 +200,7 @@ jobs:
       # is assigned per install) and resolves to '' when CT111_WEB_URL is
       # unset — the "Require target configuration" step then fails the run.
       CT110_WEB_URL: ${{ vars[format('{0}_WEB_URL', inputs.target == 'ct111' && 'CT111' || 'CT110')] || (inputs.target != 'ct111' && 'http://192.168.21.168:8799' || '') }}
-      PVE_HOST: ${{ vars[format('{0}_PVE_HOST', inputs.target == 'ct111' && 'CT111' || 'CT110')] || 'corsairai300' }}
+      PVE_HOST: ${{ vars[format('{0}_PVE_HOST', inputs.target == 'ct111' && 'CT111' || 'CT110')] || (inputs.target == 'ct111' && 'ptait07' || 'corsairai300') }}
       PVE_USER: ${{ vars[format('{0}_PVE_SSH_USER', inputs.target == 'ct111' && 'CT111' || 'CT110')] || 'root' }}
       CT_ID: ${{ vars[format('{0}_CT_ID', inputs.target == 'ct111' && 'CT111' || 'CT110')] || (inputs.target == 'ct111' && '111' || '110') }}
     steps:
