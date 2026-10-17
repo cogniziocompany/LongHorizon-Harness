@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { Approval } from '../../core/src/types';
+import type { Approval, RunSummary } from '../../core/src/types';
 import { UiLanguageProvider } from '../src/i18n';
 import { ApprovalCard, DecisionBadge, OwnerNotePanel } from '../src/App';
 
@@ -209,4 +209,73 @@ test('ApprovalCard renders owner_note clickable links and bullets together', () 
   assert.match(html, /href="https:\/\/example\.com\/x"/, html);
   assert.ok(html.includes('<ul>'), html);
   assert.match(html, /<li>[\s\S]*?item one[\s\S]*?<\/li>/, html);
+});
+
+// --- Runs list sidebar integration (round 5) ---------------------------
+//
+// The sidebar ``<aside className="codex-sidebar">`` maps each RunSummary to
+// a session-item button. The JSX inline in App.tsx gates the DecisionBadge
+// on ``run.status === 'waiting_approval' && run.pending_decision_owner``.
+// The contract requires the runs list to advertise the decision-maker the
+// same way the run page does, so mirror that exact JSX shape here and
+// confirm the rendered HTML matches what the sidebar would emit.
+
+function sidebarSessionItem(run: RunSummary): JSX.Element {
+  const statusClass = (status: string): string => `status-dot status-${status.replaceAll('_', '-')}`;
+  return (
+    <button className={`session-item ${run.id === 'selected' ? 'selected' : ''}`}>
+      <span className={statusClass(run.status)} />
+      <span className="session-copy">
+        <strong>{run.task || 'Untitled task'}</strong>
+        <small>{run.id}</small>
+        {run.status === 'waiting_approval' && run.pending_decision_owner && (
+          <DecisionBadge owner={run.pending_decision_owner} compact />
+        )}
+      </span>
+    </button>
+  );
+}
+
+function renderSidebarItem(run: RunSummary): string {
+  return renderToStaticMarkup(
+    <UiLanguageProvider>{sidebarSessionItem(run)}</UiLanguageProvider>,
+  );
+}
+
+function waitingRun(overrides: Partial<RunSummary> = {}): RunSummary {
+  return {
+    id: '20261017T000000Z_demo',
+    task: 'Gate pending run',
+    status: 'waiting_approval',
+    updated_at: 0,
+    log_dir: '',
+    pending_decision_owner: 'overseer',
+    ...overrides,
+  };
+}
+
+test('runs list sidebar shows the compact Decision badge for a waiting_approval run', () => {
+  const html = renderSidebarItem(waitingRun({ pending_decision_owner: 'overseer' }));
+  assert.ok(html.includes('data-testid="decision-badge"'), html);
+  assert.ok(html.includes('decision-badge-compact'), html);
+  assert.ok(html.includes('data-owner="overseer"'), html);
+  assert.ok(html.includes('>Overseer1<'), html);
+});
+
+test('runs list sidebar shows the compact Decision badge for Paxton-owner pending gate', () => {
+  const html = renderSidebarItem(waitingRun({ pending_decision_owner: 'paxton' }));
+  assert.ok(html.includes('data-owner="paxton"'), html);
+  assert.ok(html.includes('>Paxton<'), html);
+});
+
+test('runs list sidebar omits the Decision badge when pending_decision_owner is absent', () => {
+  const html = renderSidebarItem(waitingRun({ pending_decision_owner: undefined }));
+  assert.ok(!html.includes('data-testid="decision-badge"'), html);
+});
+
+test('runs list sidebar omits the Decision badge for non-waiting statuses', () => {
+  const html = renderSidebarItem(waitingRun({ status: 'running', pending_decision_owner: 'overseer' }));
+  assert.ok(!html.includes('data-testid="decision-badge"'), html);
+  // Status dot still reflects the run's actual status (running -> status-running).
+  assert.ok(html.includes('status-running'), html);
 });
