@@ -42,6 +42,14 @@ export interface Approval {
   extra_rounds?: number;
   created_at: number;
   resolved_at: number | null;
+  /** LHH-GATE-OWNER-NOTE: who decides this gate.  'overseer' (default) | 'paxton' | 'requester' | 'any'. */
+  owner?: string;
+  /** LHH-GATE-OWNER-NOTE: free-form markdown explaining the gate. Optional. Empty string => panel hidden. */
+  owner_note?: string;
+  /** LHH-GATE-OWNER-NOTE: actor label of whoever last wrote the note. */
+  owner_set_by?: string;
+  /** LHH-GATE-OWNER-NOTE: epoch seconds when the note was last written. */
+  owner_set_at?: number | null;
 }
 
 export interface OperatorMessage {
@@ -99,6 +107,19 @@ export interface RunSummary {
   max_rounds?: number;
   prompt_language?: 'en' | 'zh';
   contention?: WorkspaceContention;
+  /**
+   * LHH-GATE-OWNER-NOTE: when ``status === 'waiting_approval'``, the owner's
+   * decision label (e.g. 'overseer', 'paxton', 'requester', 'any').  Empty /
+   * undefined when no gate is pending.  Surfaced so the runs list can render
+   * a "Decision: Overseer1" badge without loading the full snapshot.
+   */
+  pending_decision_owner?: string;
+  /**
+   * LHH-GATE-OWNER-NOTE: when a gate is pending AND a note was attached, the
+   * markdown owner_note (rendered in the runs list summary at most as a hint).
+   * Full note panel always reads from the snapshot.
+   */
+  pending_decision_owner_note?: string;
 }
 
 export interface Snapshot {

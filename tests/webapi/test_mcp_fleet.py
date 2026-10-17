@@ -69,6 +69,7 @@ def test_mcp_fleet_tools_manifest(client_fixture: Any = None) -> None:
             "harness_list_queue",
             "harness_run_status",
             "harness_resolve_gate",
+            "harness_annotate_run_gate",
             "harness_list_contentions",
             # Task 235: read-only overseer-state tools over the migrated
             # apparatus archive (unprefixed, per the FIX).

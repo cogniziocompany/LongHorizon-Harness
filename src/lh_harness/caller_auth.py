@@ -34,6 +34,12 @@ ANON_CALLER = "anon"
 # The MCP tool that unlocks the REST resolve route (POST
 # /api/runs/{run_id}/approvals/{approval_id}/resolve).
 RESOLVE_TOOL = "harness_resolve_gate"
+# The MCP tool that unlocks the REST annotate route (POST
+# /api/runs/{run_id}/approvals/{approval_id}/annotate).  Annotating
+# publishes the "who decides and why" metadata on a pending gate WITHOUT
+# resolving it -- so its trust requirement sits one step below RESOLVE_TOOL
+# (a caller may be able to label a gate without being able to decide one).
+ANNOTATE_TOOL = "harness_annotate_run_gate"
 # Pseudo-tool naming the overseer-only REST run-control routes (POST /api/runs,
 # POST /api/runs/{id}/abort, /stop, /resume).  Gated on the caller's
 # ``rest_run_control`` config flag instead of the ``tools`` allowlist.
@@ -537,7 +543,7 @@ def may_delete_entry(
     """
     if caller == ANON_CALLER:
         return False
-    if spec and RESOLVE_TOOL in (spec.get("tools") or []):
+    if spec and (RESOLVE_TOOL in (spec.get("tools") or []) or ANNOTATE_TOOL in (spec.get("tools") or [])):
         return True
     return bool(entry is not None and entry.requested_by == caller)
 
@@ -564,6 +570,7 @@ __all__ = [
     "verify_ask_request",
     "REST_RUN_CONTROL_TOOL",
     "RESOLVE_TOOL",
+    "ANNOTATE_TOOL",
     "caller_configs_or_defaults",
     "canonical_timestamp",
     "compute_signature",
