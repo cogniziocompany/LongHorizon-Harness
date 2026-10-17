@@ -40,6 +40,7 @@ from ..launcher import (
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
 from ..caller_auth import (
     ANON_CALLER,
+    ANNOTATE_TOOL,
     RESOLVE_TOOL,
     caller_configs_or_defaults,
     captured_secret,
@@ -1649,11 +1650,11 @@ def create_app(
             return None
         caller = resolve_rest_caller(request.headers, caller_specs)
         if caller == ANON_CALLER:
-            if tool == RESOLVE_TOOL:
+            if tool in (RESOLVE_TOOL, ANNOTATE_TOOL):
                 emit_refusal_audit(runs_root, caller=caller, tool=tool, run_id=run_id)
             raise HTTPException(status_code=401, detail="invalid or missing caller identity")
         if not tool_allowed(caller, tool, caller_specs):
-            if tool == RESOLVE_TOOL:
+            if tool in (RESOLVE_TOOL, ANNOTATE_TOOL):
                 emit_refusal_audit(
                     runs_root,
                     caller=caller,
@@ -3679,15 +3680,15 @@ def create_app(
     ) -> dict[str, Any]:
         # LHH-GATE-OWNER-NOTE: set or update the gate's decision-maker
         # badge (``owner``) and free-form description (``owner_note``)
-        # WITHOUT resolving the gate.  The endpoint reuses the resolve
-        # caller's allowlist (``harness_resolve_gate``): writing the note
-        # is part of the gate-publishing surface, so the same caller trust
-        # that may render a decision is the only one allowed to label one.
-        # A resolved gate is read-only on the writer surface -- once the
-        # decision is in, the badge is frozen -- which is why the pre-check
-        # below answers 409 even if the storage layer is happy to persist
-        # the row for the historical record.
-        caller = _scoped_caller(request, RESOLVE_TOOL, run_id=run_id)
+        # WITHOUT resolving the gate.  This route lives on its own MCP-tool
+        # allowlist (``harness_annotate_run_gate``) so a caller may be
+        # granted the ability to label pending gates without being granted
+        # the ability to decide them.  The pre-check below keeps the
+        # "resolved gate is read-only on the writer surface" rule: once the
+        # decision is in, the badge is frozen, which is why we answer 409
+        # even if the storage layer is happy to persist the row for the
+        # historical record.
+        caller = _scoped_caller(request, ANNOTATE_TOOL, run_id=run_id)
         state_for_run = _state_or_404(registry, run_id)
         if supervisor is not None and not supervisor.can_control(run_id):
             raise HTTPException(status_code=409, detail="run is not accepting approvals")
