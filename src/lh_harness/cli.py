@@ -909,6 +909,42 @@ def main(argv: list[str] | None = None) -> int:
 
     add_command("check-update", "Check PyPI for a newer LongHorizon-Harness release")
 
+    retention_parser = add_command(
+        "retention",
+        "Run disk-retention sweeps (dry-run by default; --apply to actually move/delete)",
+    )
+    retention_parser.add_argument(
+        "--runs-root",
+        default=run_default("runs_root", _DEFAULT_RUNS_ROOT),
+        help="Base directory holding harness run folders (default: the same path the web server uses).",
+    )
+    retention_parser.add_argument(
+        "--worktree-dirs",
+        nargs="*",
+        default=[],
+        help="Parent directories of parked work trees. The sweep removes idle trees under each.",
+    )
+    retention_parser.add_argument(
+        "--npm-cache",
+        default=os.environ.get("LH_HARNESS_NPM_CACHE_DIR"),
+        help="Path to the npm cache directory (skipped when unset).",
+    )
+    retention_parser.add_argument(
+        "--pip-cache",
+        default=os.environ.get("LH_HARNESS_PIP_CACHE_DIR"),
+        help="Path to the pip cache directory (skipped when unset).",
+    )
+    retention_parser.add_argument(
+        "--report",
+        default=None,
+        help="Write the JSON report to this path (default: <runs-root>/_retention-report.json).",
+    )
+    retention_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually move/delete. The default is dry-run; run once, read the report, then re-run with --apply.",
+    )
+
     try:
         args = parser.parse_args(raw_argv)
     except SystemExit:
@@ -957,6 +993,8 @@ def main(argv: list[str] | None = None) -> int:
         return _init_command(args)
     if args.command == "check-update":
         return _check_update_command()
+    if args.command == "retention":
+        return _retention_command(args)
 
     parser.print_help()
     return 2
@@ -2548,6 +2586,80 @@ def _build_env(spec: str, *, tmp_dir: str | None = None):
 
         return LocalEnvironment(tmp_dir=tmp_dir)
     raise ValueError(f"Unknown env: {spec}")
+
+
+def _retention_command(args: argparse.Namespace) -> int:
+    """`lh-harness retention`.  Dry-run by default; --apply to actually move/delete.
+
+    The CLI is the operator entry point for the disk-retention sweeps
+    (CT110-DISK).  The first real prune is documented in the PR as an
+    operator step — never automated by a run.
+    """
+
+    import json
+    from pathlib import Path
+
+    from .disk_retention import (
+        RetainMode,
+        config_from_runtime,
+        prune_caches_report,
+        prune_runs_report,
+        prune_worktrees_report,
+    )
+    from .settings_store import active_runtime
+
+    mode = RetainMode.dry() if not getattr(args, "apply", False) else RetainMode.live()
+    cfg = config_from_runtime(active_runtime())
+    runs_root = Path(str(args.runs_root)).expanduser().resolve()
+    report_path = (
+        Path(str(args.report)).expanduser().resolve()
+        if args.report
+        else runs_root / "_retention-report.json"
+    )
+
+    runs_payload = prune_runs_report(
+        runs_root,
+        config=cfg,
+        mode=mode,
+    )
+    worktrees_payload = prune_worktrees_report(
+        list(args.worktree_dirs or []),
+        config=cfg,
+        mode=mode,
+    )
+    cache_paths: list[tuple[str, str]] = []
+    if args.npm_cache:
+        cache_paths.append(("npm", str(args.npm_cache)))
+    if args.pip_cache:
+        cache_paths.append(("pip", str(args.pip_cache)))
+    caches_payload = prune_caches_report(
+        cache_paths,
+        config=cfg,
+        mode=mode,
+    )
+
+    payload = {
+        "schema_version": 1,
+        "mode": "apply" if not mode.dry_run else "dry-run",
+        "config": {
+            "run_max_age_days": cfg.run_max_age_days,
+            "worktree_max_age_days": cfg.worktree_max_age_days,
+            "npm_cache_max_bytes": cfg.npm_cache_max_bytes,
+            "pip_cache_max_bytes": cfg.pip_cache_max_bytes,
+            "warn_pct": cfg.warn_pct,
+            "pause_pct": cfg.pause_pct,
+            "resume_pct": cfg.resume_pct,
+        },
+        "runs": runs_payload,
+        "worktrees": worktrees_payload,
+        "caches": caches_payload,
+    }
+    from .disk_retention.runs import write_report as _write_report
+
+    _write_report(report_path, payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    print(f"\nreport written to {report_path}", file=sys.stderr)
+    return 0
 
 
 def _build_agent(
