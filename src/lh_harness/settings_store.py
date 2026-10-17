@@ -177,6 +177,58 @@ CATALOG: tuple[SettingSpec, ...] = (
     SettingSpec("LH_HARNESS_LOG_LEVEL", "Log level of the service", False),
     SettingSpec("SEQ_URL", "Seq log ingest URL", False),
     SettingSpec("SEQ_API_KEY", "Seq API key", True, kind="credential", restriction="seq"),
+    # LHH-CT110-DISK: every disk-retention threshold is configurable so an
+    # operator can dial them in from the admin screen without redeploying.
+    # The loader (lh_harness.disk_retention.config) reads them by name; the
+    # descriptions are what the admin screen shows next to each field.
+    SettingSpec(
+        "LH_HARNESS_DISK_RUN_MAX_AGE_DAYS",
+        "Prune harness run folders older than this many days (default 14)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_DISK_WORKTREE_MAX_AGE_DAYS",
+        "Prune parked work trees idle more than this many days (default 7)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_DISK_CACHE_MAX_BYTES",
+        "Fallback byte cap for npm and pip caches (default 4 GiB); 0 or negative disables the cap",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_DISK_NPM_CACHE_MAX_BYTES",
+        "npm cache byte cap (default: LH_HARNESS_DISK_CACHE_MAX_BYTES)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_DISK_PIP_CACHE_MAX_BYTES",
+        "pip cache byte cap (default: LH_HARNESS_DISK_CACHE_MAX_BYTES)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_DISK_WARN_PCT",
+        "Disk usage percent that triggers a warning (default 80)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_DISK_PAUSE_PCT",
+        "Disk usage percent that pauses new launches (default 90)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_DISK_RESUME_PCT",
+        "Disk usage percent under which the launcher auto-resumes (default 85)",
+        False,
+        restart=False,
+    ),
 )
 CATALOG_BY_NAME = {spec.name: spec for spec in CATALOG}
 
