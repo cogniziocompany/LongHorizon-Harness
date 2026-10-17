@@ -78,10 +78,18 @@ def _make_git_repo(workspace: Path) -> None:
     # not depend on the runner's PATH landing inside the helper's naked
     # ``subprocess.run`` call.
     git_bin = shutil.which("git") or "/usr/bin/git"
+    base_dirs: list[str] = []
     git_dir = os.path.dirname(git_bin)
-    base_path = os.environ.get("PATH", "")
-    if git_dir and git_dir not in base_path.split(":"):
-        base_path = f"{git_dir}:{base_path}" if base_path else git_dir
+    if git_dir:
+        base_dirs.append(git_dir)
+    for entry in os.environ.get("PATH", "").split(":"):
+        if entry and entry not in base_dirs:
+            base_dirs.append(entry)
+    if "/usr/bin" not in base_dirs:
+        base_dirs.append("/usr/bin")
+    if "/bin" not in base_dirs:
+        base_dirs.append("/bin")
+    base_path = ":".join(base_dirs)
     env = {
         "PATH": base_path,
         "HOME": str(workspace),
