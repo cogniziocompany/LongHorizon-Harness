@@ -268,3 +268,256 @@ def test_send_trios_noop_when_only_url_set() -> None:
     with patch.object(reporter, "_post") as post:
         reporter.send_trios(payload)
     post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Slice B launcher-side trio push (FLEET-TRIOS-B)
+#
+# These tests exercise ``Launcher._push_trios_if_due``: the trigger that
+# decides WHEN to ship the ``/harness/trios`` envelope the slice-A
+# builder+reporter already know how to emit.  The launcher always builds
+# a payload via ``build_trios_payload`` and always calls
+# ``FleetReporter.send_trios`` — the reporter itself already no-ops on
+# disable and swallows its own ``_post`` errors.  A fake reporter that
+# records calls (and is enabled) lets the tests assert on what the
+# launcher actually decides to ship; a fake clock lets them step the
+# 600 s heartbeat window without sleeping.
+# ---------------------------------------------------------------------------
+
+
+class _FakeReporter:
+    """Records ``send_trios`` calls without touching the network."""
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.calls: list[dict[str, Any]] = []
+
+    def send_trios(self, payload: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        self.calls.append(payload)
+
+
+class _FakeQueueStore:
+    """Minimal stand-in for the queue_store: returns the entry list as-is."""
+
+    def __init__(self, entries: list[Any]) -> None:
+        self._entries = entries
+
+    def list(self) -> list[Any]:
+        return self._entries
+
+
+def _make_launcher(
+    *,
+    config: dict[str, Any] | None = None,
+    reporter: _FakeReporter | None = None,
+    clock_values: list[float] | None = None,
+) -> Any:
+    """Build a Launcher wired to a fake reporter + fake clock.
+
+    The returned launcher has ``_settings_store = None`` so the
+    bootstrap/refresh paths are inert; we want to exercise
+    ``_push_trios_if_due`` in isolation, not the full launch pass.
+    ``clock_values`` is a hand-rolled monotonic clock: each call returns
+    the next value, so a test can simulate ``T`` seconds passing with
+    a single ``clock_values`` list.
+    """
+
+    from lh_harness.launcher import Launcher
+
+    cfg = config or _config()
+    if clock_values is None:
+        clock_values = [0.0]
+    clock_iter = iter(clock_values)
+    fake_reporter = reporter if reporter is not None else _FakeReporter()
+    # Bypass __init__: the constructor wires the settings DB seed, the
+    # supervisor, the queue store — none of which matter for the trio
+    # push trigger.  Build the object with ``__new__`` and set only the
+    # attributes the trigger reads.
+    launcher = Launcher.__new__(Launcher)
+    launcher._config = cfg
+    launcher._settings_store = None
+    launcher._trios_last_pushed_sha = None
+    launcher._trios_last_pushed_at = None
+    launcher._trios_reporter_factory = lambda: fake_reporter
+    launcher._trios_clock = lambda: next(clock_iter)
+    launcher._trios_node_name = "ct110-test"
+    launcher.queue_store = _FakeQueueStore([])
+    return launcher, fake_reporter
+
+
+def test_push_trios_first_call_ships_start_payload() -> None:
+    """The very first ``_push_trios_if_due`` always ships (start trigger)."""
+
+    launcher, reporter = _make_launcher()
+    launcher._push_trios_if_due(active={})
+    assert len(reporter.calls) == 1
+    payload = reporter.calls[0]
+    assert payload["schema"] == SCHEMA
+    assert payload["node"] == "ct110-test"
+    # The debounce window is now seeded; the launcher knows the last sha.
+    assert launcher._trios_last_pushed_sha == payload["configSha256"]
+
+
+def test_push_trios_does_not_repush_same_sha_within_heartbeat_window() -> None:
+    """600 s debounce: same sha -> no second push."""
+
+    launcher, reporter = _make_launcher(clock_values=[0.0, 1.0, 599.0])
+    launcher._push_trios_if_due(active={})  # start push
+    launcher._push_trios_if_due(active={})  # same sha, ~1 s elapsed
+    launcher._push_trios_if_due(active={})  # same sha, ~599 s elapsed
+    assert len(reporter.calls) == 1
+
+
+def test_push_trios_repushes_when_sha_changes() -> None:
+    """A new ``configSha256`` forces an immediate push, regardless of clock."""
+
+    launcher, reporter = _make_launcher(clock_values=[0.0, 1.0])
+    launcher._push_trios_if_due(active={})  # start push
+    assert len(reporter.calls) == 1
+    # Mutate config so the sha moves.
+    new_cfg = copy.deepcopy(_config())
+    new_cfg["trios"]["mixed"]["manager_model"] = "different-model"
+    launcher._config = new_cfg
+    launcher._push_trios_if_due(active={})  # sha moved -> push now
+    assert len(reporter.calls) == 2
+    assert reporter.calls[0]["configSha256"] != reporter.calls[1]["configSha256"]
+
+
+def test_push_trios_heartbeats_when_window_elapses_with_same_sha() -> None:
+    """After ``>= 600 s`` with the same sha, the heartbeat re-pushes."""
+
+    launcher, reporter = _make_launcher(clock_values=[0.0, 600.0])
+    launcher._push_trios_if_due(active={})  # start push at t=0
+    assert len(reporter.calls) == 1
+    # Advance to exactly 600 s with no config change -> heartbeat push.
+    launcher._push_trios_if_due(active={})
+    assert len(reporter.calls) == 2
+    assert reporter.calls[0]["configSha256"] == reporter.calls[1]["configSha256"]
+
+
+def test_push_trios_noop_when_reporter_disabled() -> None:
+    """A disabled reporter means no calls to ``send_trios`` ever."""
+
+    disabled = _FakeReporter(enabled=False)
+    launcher, _ = _make_launcher(reporter=disabled, clock_values=[0.0, 600.0, 1200.0])
+    launcher._push_trios_if_due(active={})
+    launcher._push_trios_if_due(active={})
+    launcher._push_trios_if_due(active={})
+    assert disabled.calls == []
+
+
+def test_push_trios_noop_when_factory_returns_none() -> None:
+    """``get_reporter()`` returning ``None`` (no env) means no push."""
+
+    from lh_harness.launcher import Launcher
+
+    launcher = Launcher.__new__(Launcher)
+    launcher._config = _config()
+    launcher._settings_store = None
+    launcher._trios_last_pushed_sha = None
+    launcher._trios_last_pushed_at = None
+    launcher._trios_reporter_factory = lambda: None  # not configured
+    launcher._trios_clock = lambda: 0.0
+    launcher._trios_node_name = "ct110-test"
+    launcher.queue_store = _FakeQueueStore([])
+    launcher._push_trios_if_due(active={})
+    # No state recorded either — the launcher treats "no reporter" as
+    # "nothing to do", not as "push failed".
+    assert launcher._trios_last_pushed_sha is None
+    assert launcher._trios_last_pushed_at is None
+
+
+def test_push_trios_never_raises_on_factory_exception() -> None:
+    """A raising ``get_reporter`` factory must never abort the launch pass."""
+
+    from lh_harness.launcher import Launcher
+
+    launcher = Launcher.__new__(Launcher)
+    launcher._config = _config()
+    launcher._settings_store = None
+    launcher._trios_last_pushed_sha = None
+    launcher._trios_last_pushed_at = None
+
+    def boom() -> Any:
+        raise RuntimeError("reporter init blew up")
+
+    launcher._trios_reporter_factory = boom
+    launcher._trios_clock = lambda: 0.0
+    launcher._trios_node_name = "ct110-test"
+    launcher.queue_store = _FakeQueueStore([])
+    # Must NOT raise.
+    launcher._push_trios_if_due(active={})
+
+
+def test_push_trios_never_raises_on_send_trios_exception() -> None:
+    """A reporter that itself raises is double-wrapped; launcher survives."""
+
+    class _RaisingReporter:
+        enabled = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def send_trios(self, payload: dict[str, Any]) -> None:
+            self.calls += 1
+            raise RuntimeError("send blew up")
+
+    from lh_harness.launcher import Launcher
+
+    raising = _RaisingReporter()
+    launcher = Launcher.__new__(Launcher)
+    launcher._config = _config()
+    launcher._settings_store = None
+    launcher._trios_last_pushed_sha = None
+    launcher._trios_last_pushed_at = None
+    launcher._trios_reporter_factory = lambda: raising
+    launcher._trios_clock = lambda: 0.0
+    launcher._trios_node_name = "ct110-test"
+    launcher.queue_store = _FakeQueueStore([])
+    launcher._push_trios_if_due(active={})
+    assert raising.calls == 1
+    # The push did not commit a sha — a raise aborts the bookkeeping too.
+    assert launcher._trios_last_pushed_sha is None
+
+
+def test_push_trios_counts_launched_runs_per_trio() -> None:
+    """The payload's ``live`` rows reflect ``_remaining_capacity``'s walk."""
+
+    from types import SimpleNamespace
+
+    from lh_harness.launcher import Launcher
+
+    # Two launched entries in ``lite`` (matched by run_id), one in
+    # ``mixed``, and one pending in ``lite`` (must NOT count).
+    launched_lite = SimpleNamespace(status="launched", run_id="r1", trio="lite")
+    launched_lite_2 = SimpleNamespace(status="launched", run_id="r2", trio="lite")
+    launched_mixed = SimpleNamespace(status="launched", run_id="r3", trio="mixed")
+    pending_lite = SimpleNamespace(status="pending", run_id=None, trio="lite")
+    fake_reporter = _FakeReporter()
+    launcher = Launcher.__new__(Launcher)
+    launcher._config = _config()
+    launcher._settings_store = None
+    launcher._trios_last_pushed_sha = None
+    launcher._trios_last_pushed_at = None
+    launcher._trios_reporter_factory = lambda: fake_reporter
+    launcher._trios_clock = lambda: 0.0
+    launcher._trios_node_name = "ct110-test"
+    launcher.queue_store = _FakeQueueStore(
+        [launched_lite, launched_lite_2, launched_mixed, pending_lite]
+    )
+    active = {"r1": {}, "r2": {}, "r3": {}}
+    launcher._push_trios_if_due(active=active)
+    assert len(fake_reporter.calls) == 1
+    by_name = {row["name"]: row for row in fake_reporter.calls[0]["trios"]}
+    assert by_name["lite"]["live"] == 2
+    assert by_name["mixed"]["live"] == 1
+
+
+def test_push_trios_uses_production_default_for_heartbeat() -> None:
+    """The launcher's debounce window is the documented 600 s default."""
+
+    from lh_harness.launcher import _TRIOS_HEARTBEAT_SECONDS
+
+    assert _TRIOS_HEARTBEAT_SECONDS == 600.0
