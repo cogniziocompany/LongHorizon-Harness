@@ -89,6 +89,13 @@ button, input, textarea, select { font-family: inherit; }
 .codex-mark, .welcome-mark { color: var(--codex-green); font-size: 21px; }
 .new-task-button { display: flex; align-items: center; width: 100%; margin: 11px 0 9px; padding: 10px 11px; border: 1px solid #3b3b3b; border-radius: 8px; color: #ededed; background: #242424; font-size: 13px; text-align: left; }
 .new-task-button:hover { background: #303030; border-color: #4a4a4a; }
+.task-segments { display: flex; gap: 4px; margin: 0 2px 8px; flex-wrap: wrap; }
+.task-segment { display: inline-flex; align-items: center; gap: 5px; padding: 5px 8px; border: 1px solid transparent; border-radius: 6px; color: #b3b3b3; background: transparent; font-size: 11px; cursor: pointer; }
+.task-segment:hover { border-color: #3b3b3b; color: #f2f2f2; }
+.task-segment.active { border-color: #4a4a4a; color: #f2f2f2; background: rgba(255, 255, 255, .06); }
+.task-segment-count { color: #6f6f6f; font-size: 10px; font-variant-numeric: tabular-nums; }
+.task-segment.active .task-segment-count { color: #d4d4d4; }
+.task-list-inner { display: contents; }
 .session-search { display: flex; align-items: center; gap: 8px; margin: 4px 2px 15px; padding: 8px 9px; border: 1px solid transparent; border-radius: 7px; color: #8f8f8f; background: #222; }
 .session-search:focus-within { border-color: #4b4b4b; }
 .session-search input { min-width: 0; width: 100%; border: 0; outline: 0; color: #ddd; background: transparent; font-size: 12px; }
