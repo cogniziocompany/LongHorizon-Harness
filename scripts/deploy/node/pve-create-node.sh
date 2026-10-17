@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Create one LongHorizon-Harness node LXC on a Proxmox host (run as root on the PVE host).
 #
-#   pve-create-node.sh <ctid> <hostname> <ip> [storage] [template] [bridge]
+#   pve-create-node.sh [--dry-run] <ctid> <hostname> <ip> [storage] [template] [bridge]
 #   e.g. pve-create-node.sh 111 cct-cfo-harness-01 <ip> local-lvm
+#
+# --dry-run  print every action the script would take, the resolved template, and the
+#            full pct create/set/start command line, then exit 0 without touching the
+#            host (no pct create, no pct start, no arping probe). Useful for reviewing
+#            inputs in PR review and for the dry-run fixture test.
 #
 # ctid, hostname and ip are REQUIRED and have no defaults (a node's IP is assigned per
 # install; nothing in this repo may guess it).  Sizing mirrors CT110: unprivileged
@@ -37,6 +42,9 @@
 #     CT with `pct exec`/`pct enter` from the PVE host, which is the only path it needs.
 set -euo pipefail
 
+DRY_RUN="no"
+if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=yes; shift; fi
+
 CTID="${1:?ctid (e.g. 111)}"; NAME="${2:?hostname (e.g. cct-cfo-harness-01)}"; IP="${3:?ip (IPv4, no CIDR suffix)}"
 STORAGE="${4:-local-lvm}"; TEMPLATE="${5:-}"; BRIDGE="${6:-vmbr0}"
 GW="${LH_NODE_GATEWAY:-192.168.21.1}"; CIDR="${LH_NODE_CIDR:-24}"
@@ -47,6 +55,24 @@ SWAP="${LH_NODE_SWAP_MB:-512}"; ROOTFS_GB="${LH_NODE_ROOTFS_GB:-50}"
 NESTING="${LH_NODE_NESTING:-1}"
 
 abort() { echo "ABORT: $*" >&2; exit 1; }
+
+if [ "$DRY_RUN" = yes ]; then
+  echo "DRY-RUN: no changes will be made to the PVE host."
+  echo "  ctid=$CTID  hostname=$NAME  ip=$IP/$CIDR  gw=$GW  dns=$DNS  search=$SEARCH"
+  echo "  storage=$STORAGE  bridge=$BRIDGE  template_storage=$TEMPLATE_STORAGE"
+  echo "  cores=$CORES  memory=$MEMORY  swap=$SWAP  rootfs=${ROOTFS_GB}G  nesting=$NESTING"
+  echo "  -- would resolve template, run arping + cluster-id + ip-link checks, then:"
+  echo "    pct create $CTID <template> --hostname $NAME --ostype debian --unprivileged 1 \\"
+  echo "      --features nesting=$NESTING --cores $CORES --memory $MEMORY --swap $SWAP \\"
+  echo "      --rootfs $STORAGE:$ROOTFS_GB \\"
+  echo "      --net0 name=eth0,bridge=$BRIDGE,ip=$IP/$CIDR,gw=$GW \\"
+  echo "      --nameserver $DNS --searchdomain $SEARCH --onboot 1 \\"
+  echo "      --description 'LongHorizon-Harness node ($NAME). Runbook: scripts/deploy/node/README.md in cogniziocompany/LongHorizon-Harness.'"
+  echo "    pct set $CTID --nameserver $DNS --searchdomain $SEARCH"
+  echo "    pct start $CTID"
+  echo "    (then poll getent hosts deb.debian.org inside the CT for up to 30s)"
+  exit 0
+fi
 
 [ "$(id -u)" -eq 0 ] || abort "run as root on the PVE host"
 command -v pct >/dev/null 2>&1 || abort "pct not found - this is not a Proxmox VE host"
