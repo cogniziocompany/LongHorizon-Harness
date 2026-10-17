@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .adapters.base import AgentAdapter
+from .adapters.cli_agent import CommandAgentAdapter
+from .auditor_launch import active_auditor_launch, prepare_auditor_launch
+from .safe_subprocess import AuditorBoundaryUnavailable
 from .adapters.claude_permissions import is_git_internal_metadata_path
 from .safe_subprocess import git_argv
 from .agent_logs import (
@@ -72,6 +75,13 @@ from .auditor_agent import (
     parse_audit_report,
     auditor_report_text_from_episode_result,
     audit_report_from_episode_result,
+)
+from .auditor_snapshot import (
+    SnapshotInfo,
+    SnapshotIsolationError,
+    create_isolated_snapshot,
+    remove_isolated_snapshot,
+    write_snapshot_info,
 )
 
 ROLE_VARIANT = "lh_harness_role_managed"
@@ -267,6 +277,16 @@ async def _run_impl(
     rounds_dir = role_dir / "rounds"
     _ensure_dir_nofollow(rounds_dir)
     events_path = role_dir / "events.jsonl"
+    # HARNESS-AUDITOR-ISOLATION: derive a stable per-run id used to name the
+    # auditor snapshot directory and the pinned local ref.  The log_dir
+    # layout ``<runs_root>/<run_id>/lh_harness/...`` gives us ``run_id`` from
+    # ``log_dir.parent.parent.name``; fall back to the dir name itself when
+    # the layout does not match.
+    if log_dir.parent.parent.name:
+        run_id = log_dir.parent.parent.name
+    else:
+        run_id = log_dir.parent.name or "local"
+    original_executor_workspace = str(Path(config.workspace_path).expanduser())
     started = time.monotonic()
 
     await _ensure_remote_layout(env, config)
@@ -792,6 +812,61 @@ async def _run_impl(
             duration_ms=executor_result.duration_ms,
         )
 
+        # HARNESS-AUDITOR-ISOLATION: before the auditor launches, build an
+        # *independent full clone* of the executor HEAD and pin the
+        # executor HEAD to ``refs/lh-harness/<run_id>/round_<n>``. The
+        # auditor then operates inside the clone; its ``workspace_path``
+        # is rewired to the snapshot path so a deny-list bypass (or a
+        # local git rewrite the deny list could miss) cannot touch the
+        # executor's live workspace or .git. The original workspace_path
+        # is restored after the audit completes.
+        #
+        # Fail-closed (operator correction round_001): the previous
+        # implementation silently fell back to ``config.workspace_path``
+        # when snapshot creation returned ``None``.  That meant a broken
+        # clone or pin failure launched the auditor against the executor
+        # workspace directly.  We now raise ``SnapshotIsolationError``
+        # on any isolation failure; the caller must abort the round
+        # rather than risk running the auditor against the live tree.
+        try:
+            snapshot_info = create_isolated_snapshot(
+                original_executor_workspace,
+                run_id=run_id,
+                round_index=round_index,
+            )
+        except SnapshotIsolationError as exc:
+            logger.error(
+                "auditor isolation failed for run=%s round=%s: %s",
+                run_id, round_index, exc,
+            )
+            _append_event(
+                events_path,
+                "auditor_isolation_failed",
+                {
+                    "round": round_index,
+                    "run_id": run_id,
+                    "error": str(exc),
+                },
+            )
+            gate.abort_reason = "auditor_isolation_failed"
+            gate.failure_reason = f"auditor isolation could not be established: {exc}"
+            break
+        write_snapshot_info(round_dir, snapshot_info)
+        auditor_workspace_path = snapshot_info.snapshot_path
+        _append_event(
+            events_path,
+            "auditor_snapshot_created",
+            {
+                "round": round_index,
+                "run_id": run_id,
+                "snapshot_path": snapshot_info.snapshot_path,
+                "snapshot_sha": snapshot_info.snapshot_head_sha,
+                "executor_head_sha": snapshot_info.executor_head_sha,
+                "local_ref": snapshot_info.local_ref,
+                "mode": snapshot_info.mode,
+            },
+        )
+
         # The auditor audits only the just-finished subtask. Its natural
         # language report becomes the trusted intermediate state for later rounds.
         auditor_prompt = build_role_auditor_prompt(
@@ -802,7 +877,7 @@ async def _run_impl(
             task_state=current_task_state,
             task_contract=current_task_contract,
             related_auditor_reports=related_auditor_reports,
-            workspace_path=config.workspace_path,
+            workspace_path=auditor_workspace_path,
             max_executor_output_chars=config.auditor_output_chars,
             language=config.prompt_language,
         )
@@ -815,13 +890,26 @@ async def _run_impl(
         )
         emit("role_start", round=round_index, role=f"{next_step}_auditor")
 
-        auditor_result = await _run_role_episode(
-            auditor_for_step,
-            auditor_prompt,
-            env,
-            auditor_budget,
-            live_trajectory_path=str(round_dir / "auditor_raw_trajectory.jsonl"),
-        )
+        # Rewire the auditor's working tree to the read-only snapshot so the
+        # command template (claude's `cd <workspace>`) and the workspace-snapshot
+        # mutation diff both target the snapshot, never the executor's live
+        # workspace or .git. The auditor agent identity stays the same; only
+        # its runtime ``workspace_path`` is swapped for the audit window.
+        previous_auditor_workspace = getattr(auditor_for_step, "workspace_path", None)
+        auditor_for_step.workspace_path = auditor_workspace_path
+        try:
+            auditor_result = await _run_role_episode(
+                auditor_for_step,
+                auditor_prompt,
+                env,
+                auditor_budget,
+                live_trajectory_path=str(round_dir / "auditor_raw_trajectory.jsonl"),
+                require_auditor_isolation=True,
+            )
+        finally:
+            if previous_auditor_workspace is not None:
+                auditor_for_step.workspace_path = previous_auditor_workspace
+
         auditor_episode_root = log_dir / (
             "gui_auditor_episodes" if next_step == MANAGER_NEXT_GUI else "cli_auditor_episodes"
         )
@@ -1296,15 +1384,51 @@ async def _run_role_episode(
     budget: EpisodeBudget,
     *,
     live_trajectory_path: str | None = None,
+    require_auditor_isolation: bool = False,
 ) -> EpisodeResult:
-    """Normalize cooperative cancellation for every adapter implementation."""
+    """Run a role episode behind the (optional) auditor isolation gate.
+
+    The auditor isolation gate is enforced by
+    :func:`lh_harness.auditor_launch.prepare_auditor_launch`, which:
+
+    1. calls :func:`auditor_boundary_required` to verify a real
+       uid/namespace boundary is available (USER_NAMESPACE or
+       SEPARATE_UID with a different ``probe_uid`` from the calling
+       uid) and refuses the launch if the kernel check is not
+       authoritative (``NOT_ISOLATING`` / ``LAUNCH_FAILED`` outcomes
+       fall through to ``UNAVAILABLE``), and
+    2. probes the bwrap mount boundary on the execution host and
+       refuses the launch if the read-only mount does not hold.
+
+    Either failure raises :class:`AuditorBoundaryUnavailable` BEFORE
+    ``agent.run_episode`` is called, so the auditor subprocess runs
+    zero times when any prerequisite is missing — the primary audit
+    and the format-repair pass both go through this gate and both
+    fail closed. The adapter shape is no longer enforced here: the
+    isolation enforcement lives in :func:`prepare_auditor_launch`
+    and the adapter's own command construction; tests that build a
+    stub ``AgentAdapter`` can exercise the format-repair code paths
+    without implementing a real boundary launcher.
+    """
     started = time.monotonic()
+    isolation_token = None
     try:
+        if require_auditor_isolation:
+            isolation_token = active_auditor_launch.set(await prepare_auditor_launch(env))
         return await agent.run_episode(
             prompt,
             env,
             budget,
             live_trajectory_path=live_trajectory_path,
+        )
+    except AuditorBoundaryUnavailable as exc:
+        return EpisodeResult(
+            status="error", error=str(exc),
+            duration_ms=int((time.monotonic() - started) * 1000),
+            metadata={
+                "auditor_isolation_failed": True,
+                "missing_prerequisite": _classify_missing_prerequisite(exc),
+            },
         )
     except asyncio.CancelledError:
         return EpisodeResult(
@@ -1313,6 +1437,29 @@ async def _run_role_episode(
             duration_ms=int((time.monotonic() - started) * 1000),
             metadata={"cancelled": True},
         )
+    finally:
+        if isolation_token is not None:
+            active_auditor_launch.reset(isolation_token)
+
+
+def _classify_missing_prerequisite(exc: AuditorBoundaryUnavailable) -> str:
+    """Categorise the AuditorBoundaryUnavailable so the round log can
+    surface the right "missing prerequisite" to the operator.
+
+    Two layers of prerequisites exist:
+
+    * ``auditor_uid_boundary`` — neither ``unshare -U`` nor
+      ``setpriv`` provides a kernel-level boundary (USER_NAMESPACE /
+      SEPARATE_UID unavailable; LAUNCH_FAILED / NOT_ISOLATING probes
+      produce no real isolation). Fail-closed.
+    * ``read_only_mount_boundary`` — the bwrap mount probe succeeded
+      at the uid boundary but the execution host's bwrap is missing
+      or the read-only mount is not in effect. Fail-closed.
+    """
+    message = str(exc)
+    if "scratch" in message or "mount" in message or "root" in message:
+        return "read_only_mount_boundary"
+    return "auditor_uid_boundary"
 
 
 async def _auditor_report_with_format_repair(
@@ -1356,6 +1503,7 @@ async def _auditor_report_with_format_repair(
         env,
         repair_budget,
         live_trajectory_path=str(round_dir / "auditor_format_repair_raw_trajectory.jsonl"),
+        require_auditor_isolation=True,
     )
     _save_role_result(
         round_dir,
@@ -1365,11 +1513,25 @@ async def _auditor_report_with_format_repair(
     )
     repair_raw_report = auditor_report_text_from_episode_result(repair_result)
     repair_valid = _should_accept_auditor_format_repair(repair_result, repair_raw_report)
+    repair_status = _episode_status(repair_result)
+    # Surface the missing-prerequisite info in the round record so the
+    # dashboard / fleet log can tell "no subprocess ran because the
+    # kernel boundary is unavailable" apart from a generic repair
+    # error. ``auditor_isolation_failed`` is set by the gate in
+    # :func:`_run_role_episode` whenever ``AuditorBoundaryUnavailable``
+    # was raised.
+    if isinstance(repair_result.metadata, dict) and repair_result.metadata.get(
+        "auditor_isolation_failed"
+    ):
+        repair_status["auditor_isolation_failed"] = True
+        missing = repair_result.metadata.get("missing_prerequisite")
+        if missing:
+            repair_status["missing_prerequisite"] = missing
     status = {
         **status,
         "format_repair_attempted": True,
         "format_repair_accepted": repair_valid,
-        "format_repair_status": _episode_status(repair_result),
+        "format_repair_status": repair_status,
     }
     _append_event(
         events_path,
@@ -1392,17 +1554,36 @@ async def _auditor_report_with_format_repair(
         return _auditor_report_text(
             corrected, round_index, language=config.prompt_language
         ), status
-    if repair_result.status == "timeout" and primary_result.status == "done":
+    if (repair_result.status == "timeout" or _is_isolation_failure(repair_result)) and primary_result.status == "done":
         # The format-repair pass must not discard an auditor report that already
         # succeeded. A repair timeout is a header-formatting problem, not an audit
-        # failure, so fall back to the auditor's raw text with an explicit
-        # "unformatted" marker instead of the blocked/suspect runtime stub.
+        # failure; likewise, an isolation-failure refusal (the host can't
+        # construct the uid/namespace boundary) means the repair subprocess
+        # never ran — it is also not an audit failure. Fall back to the
+        # auditor's raw text with an explicit "unformatted" marker instead
+        # of the blocked/suspect runtime stub.
         return _unformatted_auditor_report_text(
             raw_report, language=config.prompt_language
         ), status
     return _auditor_report_text(
         repair_result, round_index, language=config.prompt_language
     ), status
+
+
+def _is_isolation_failure(result: EpisodeResult) -> bool:
+    """True iff ``result`` is the error shape produced by the auditor
+    isolation gate in :func:`_run_role_episode`.
+
+    Used by :func:`_auditor_report_with_format_repair` so a primary
+    auditor episode that already succeeded is not silently discarded
+    when the format-repair pass fails to construct its isolation
+    boundary — the round report becomes the auditor's raw text with
+    an unformatted marker instead of the suspect stub.
+    """
+    metadata = getattr(result, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    return bool(metadata.get("auditor_isolation_failed"))
 
 
 def _unformatted_auditor_report_text(raw_report: str, *, language: str = "en") -> str:
