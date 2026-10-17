@@ -35,15 +35,16 @@ elif [
 ]:
     pass  # src tree itself, nothing to do
 else:
-    for _p in [
-        p
-        for p in sys.path
-        if p
-        and "site-packages" in p
-        and (Path(p) / "lh_harness").exists()
-        and Path(p).resolve() != Path(_SRC).resolve().parent
-    ]:
-        sys.path.remove(_p)
+    # ``_SRC`` is now at the front of sys.path; ``import lh_harness`` will
+    # resolve to this checkout ahead of any later site-packages copy. A
+    # stale ``lh_harness`` directory in site-packages would still win for
+    # ``PYTHONSTARTUP`` / interactive REPL pre-imports, and keeping
+    # site-packages here also means third-party packages (fastapi, etc.)
+    # stay importable. The pre-existing recopy was overly aggressive and
+    # silently broke the test run on hosts where site-packages owns a
+    # stale lh_harness; we now leave sys.path alone. Imports of lh_harness
+    # already come from this checkout via the sys.path.insert(0, _SRC).
+    pass
 
 # TASK 211: a test run launched from inside a harness run inherits the
 # service's own fleet-reporter environment (LH_HARNESS_FLEET_URL/KEY/...).

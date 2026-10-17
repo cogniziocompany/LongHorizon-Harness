@@ -144,6 +144,36 @@ class AuditorBoundaryKind(_enum.Enum):
     UNAVAILABLE = "unavailable"
 
 
+class NamespaceProbeOutcome(_enum.Enum):
+    """Tri-state outcome of the ``unshare -U`` kernel-isolation probe.
+
+    ``ISOLATING`` — the probe entered the user namespace AND the inner
+    process was denied a write to a harness-owned 0600 file. The kernel
+    permission check is therefore the trustworthy boundary; this is the
+    only outcome the harness treats as a real boundary.
+
+    ``NOT_ISOLATING`` — the probe entered the user namespace AND the
+    write succeeded, meaning the inner uid maps back to the calling uid
+    and the boundary is illusory. The harness refuses on this path
+    (``audit_uid_boundary`` was satisfied but the kernel check is not
+    real).
+
+    ``LAUNCH_FAILED`` — the probe never produced an authorative result:
+    the launcher could not be executed, the interpreter crashed, the
+    probe timed out, or the script exited with a non-permission
+    exception. The harness cannot claim the boundary is unavailable
+    on this evidence — the inner error is launch-side, not the
+    kernel — so ``auditor_boundary_required`` treats it the same as
+    ``ISOLATING`` only when a separate evidence path proves isolation
+    (a previously cached boundary or a different launcher). Otherwise
+    it falls back to ``UNAVAILABLE`` and surfaces the launch error.
+    """
+
+    ISOLATING = "isolating"
+    NOT_ISOLATING = "not_isolating"
+    LAUNCH_FAILED = "launch_failed"
+
+
 @_dataclasses.dataclass(frozen=True)
 class AuditorBoundary:
     """Detected OS-level isolation boundary for the auditor subprocess.
@@ -211,11 +241,23 @@ def _try_user_namespace() -> AuditorBoundary | None:
     file owned by the harness, forking the auditor subprocess, and
     asserting the write fails inside the namespace. This catches the
     "mapped to same uid" trap that a simple ``id -u`` probe misses.
+
+    The tri-state ``_user_namespace_actually_isolating`` distinguishes
+    successful entry + EACCES (real isolation) from any other nonzero
+    outcome (probe launch failure or the P1 unmapped-to-calling-uid
+    trap). Both non-isolating outcomes make us return ``None`` so the
+    caller falls through to ``UNAVAILABLE`` and the harness fails
+    closed.
     """
     unshare = _find_executable("unshare")
     if unshare is None:
         return None
-    if not _user_namespace_actually_isolating():
+    outcome = _user_namespace_actually_isolating()
+    if outcome is not NamespaceProbeOutcome.ISOLATING:
+        # Either NOT_ISOLATING (P1 trap) or LAUNCH_FAILED (probe
+        # could not produce an authoritative write result). Both must
+        # refuse the auditor launch; we deliberately do NOT silently
+        # fall back to the parent-uid chmod/deny-list surface.
         return None
     # Final verification: read back the inner uid via id -u; the value
     # is informational only because the write-test above has already
@@ -246,13 +288,30 @@ def _try_user_namespace() -> AuditorBoundary | None:
     )
 
 
-def _user_namespace_actually_isolating() -> bool:
-    """True iff a 0600 harness-owned file is unwritable inside ``unshare -U``.
+def _user_namespace_actually_isolating() -> NamespaceProbeOutcome:
+    """Tri-state: did the probe demonstrate kernel-level write isolation?
 
-    The inner uid under ``unshare -U`` may map back to the calling uid
-    depending on kernel config, in which case the kernel permission
-    check still grants write access. The only authoritative test is to
-    actually try the write.
+    The only authoritative test of a user-namespace boundary is to
+    try a write from inside the namespace and see the kernel reject
+    it. The probe distinguishes three outcomes:
+
+    * ``ISOLATING`` — the inner process entered the user namespace and
+      the kernel rejected the write with ``PermissionError`` (EACCES).
+      This is the real boundary; ``detect_auditor_boundary`` accepts
+      it.
+    * ``NOT_ISOLATING`` — the inner process entered the user namespace
+      but the write succeeded (the inner uid mapped back to the
+      calling uid, so the kernel permission check was ineffective).
+      This is the operator-rejected P1 trap and we MUST refuse to
+      launch the auditor here.
+    * ``LAUNCH_FAILED`` — the probe never produced an authorative
+      answer: the launcher could not be executed, the script
+      crashed with a non-permission exception, or the probe timed
+      out. We deliberately do NOT treat this as evidence of
+      isolation or of its absence: a launch failure has nothing to
+      say about whether the kernel would deny the write. The
+      ``detect_auditor_boundary`` orchestrator returns
+      ``UNAVAILABLE`` on this path so the harness fails closed.
     """
     import sys as _sys
     import tempfile as _tempfile
@@ -272,6 +331,16 @@ def _user_namespace_actually_isolating() -> bool:
             "except PermissionError:\n"
             "    print('LH_PERMISSION_DENIED', flush=True)\n"
             "    sys.exit(77)\n"
+            "except Exception as exc:\n"
+            # Any non-permission exception is a probe-side failure: log
+            # it as ``LH_PROBE_ERROR`` so callers can tell launch
+            # failures (missing binary, interpreter crash, kernel
+            # denied the namespace itself) apart from genuine EACCES
+            # on the write to the harness-owned file.  We deliberately
+            # exit 2 (``probe launch error``) rather than 77
+            # (permission denied) so the outer probe rejects it.
+            "    print('LH_PROBE_ERROR', type(exc).__name__, flush=True)\n"
+            "    sys.exit(2)\n"
         )
         probe = _subprocess.run(
             [_find_executable("unshare") or "unshare",
@@ -281,12 +350,22 @@ def _user_namespace_actually_isolating() -> bool:
             check=False,
             timeout=10,
         )
-        # A failed launcher/interpreter is not evidence of write isolation.
-        return (
-            probe.returncode == 77
-            and probe.stdout.strip() == "LH_PERMISSION_DENIED"
-            and probe_file.read_text() == "owned-by-harness\n"
-        )
+        stdout = (probe.stdout or "").strip()
+        if probe.returncode == 77 and stdout == "LH_PERMISSION_DENIED":
+            return NamespaceProbeOutcome.ISOLATING
+        if probe.returncode == 0 and probe_file.read_text() != "owned-by-harness\n":
+            # Inner process claimed success AND wrote to the file: that
+            # is the unmap-to-calling-uid trap.
+            return NamespaceProbeOutcome.NOT_ISOLATING
+        if stdout == "LH_PROBE_ERROR":
+            # Probe reached the inner script but the write produced a
+            # non-permission error (e.g. FileNotFoundError). This is a
+            # probe-side launch failure, distinct from EACCES.
+            return NamespaceProbeOutcome.LAUNCH_FAILED
+        # Anything else (rc=127 missing unshare, timeout, ``[Errno 1]
+        # Operation not permitted`` from the kernel refusing the
+        # namespace creation itself) is also a launch failure.
+        return NamespaceProbeOutcome.LAUNCH_FAILED
     finally:
         try:
             os.chmod(scratch_dir, 0o700)
@@ -488,6 +567,7 @@ __all__ = [
     "AuditorBoundaryKind",
     "AuditorBoundary",
     "AuditorBoundaryUnavailable",
+    "NamespaceProbeOutcome",
     "audit_uid_boundary",
     "auditor_boundary_required",
     "child_env",

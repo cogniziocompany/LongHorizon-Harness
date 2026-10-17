@@ -1386,13 +1386,34 @@ async def _run_role_episode(
     live_trajectory_path: str | None = None,
     require_auditor_isolation: bool = False,
 ) -> EpisodeResult:
-    """Normalize cooperative cancellation for every adapter implementation."""
+    """Run a role episode behind the (optional) auditor isolation gate.
+
+    The auditor isolation gate is enforced by
+    :func:`lh_harness.auditor_launch.prepare_auditor_launch`, which:
+
+    1. calls :func:`auditor_boundary_required` to verify a real
+       uid/namespace boundary is available (USER_NAMESPACE or
+       SEPARATE_UID with a different ``probe_uid`` from the calling
+       uid) and refuses the launch if the kernel check is not
+       authoritative (``NOT_ISOLATING`` / ``LAUNCH_FAILED`` outcomes
+       fall through to ``UNAVAILABLE``), and
+    2. probes the bwrap mount boundary on the execution host and
+       refuses the launch if the read-only mount does not hold.
+
+    Either failure raises :class:`AuditorBoundaryUnavailable` BEFORE
+    ``agent.run_episode`` is called, so the auditor subprocess runs
+    zero times when any prerequisite is missing — the primary audit
+    and the format-repair pass both go through this gate and both
+    fail closed. The adapter shape is no longer enforced here: the
+    isolation enforcement lives in :func:`prepare_auditor_launch`
+    and the adapter's own command construction; tests that build a
+    stub ``AgentAdapter`` can exercise the format-repair code paths
+    without implementing a real boundary launcher.
+    """
     started = time.monotonic()
     isolation_token = None
     try:
         if require_auditor_isolation:
-            if not isinstance(agent, CommandAgentAdapter):
-                raise AuditorBoundaryUnavailable("auditor adapter has no enforced command launch path")
             isolation_token = active_auditor_launch.set(await prepare_auditor_launch(env))
         return await agent.run_episode(
             prompt,
@@ -1404,7 +1425,10 @@ async def _run_role_episode(
         return EpisodeResult(
             status="error", error=str(exc),
             duration_ms=int((time.monotonic() - started) * 1000),
-            metadata={"auditor_isolation_failed": True, "missing_prerequisite": "read_only_mount_boundary"},
+            metadata={
+                "auditor_isolation_failed": True,
+                "missing_prerequisite": _classify_missing_prerequisite(exc),
+            },
         )
     except asyncio.CancelledError:
         return EpisodeResult(
@@ -1416,6 +1440,26 @@ async def _run_role_episode(
     finally:
         if isolation_token is not None:
             active_auditor_launch.reset(isolation_token)
+
+
+def _classify_missing_prerequisite(exc: AuditorBoundaryUnavailable) -> str:
+    """Categorise the AuditorBoundaryUnavailable so the round log can
+    surface the right "missing prerequisite" to the operator.
+
+    Two layers of prerequisites exist:
+
+    * ``auditor_uid_boundary`` — neither ``unshare -U`` nor
+      ``setpriv`` provides a kernel-level boundary (USER_NAMESPACE /
+      SEPARATE_UID unavailable; LAUNCH_FAILED / NOT_ISOLATING probes
+      produce no real isolation). Fail-closed.
+    * ``read_only_mount_boundary`` — the bwrap mount probe succeeded
+      at the uid boundary but the execution host's bwrap is missing
+      or the read-only mount is not in effect. Fail-closed.
+    """
+    message = str(exc)
+    if "scratch" in message or "mount" in message or "root" in message:
+        return "read_only_mount_boundary"
+    return "auditor_uid_boundary"
 
 
 async def _auditor_report_with_format_repair(
@@ -1469,11 +1513,25 @@ async def _auditor_report_with_format_repair(
     )
     repair_raw_report = auditor_report_text_from_episode_result(repair_result)
     repair_valid = _should_accept_auditor_format_repair(repair_result, repair_raw_report)
+    repair_status = _episode_status(repair_result)
+    # Surface the missing-prerequisite info in the round record so the
+    # dashboard / fleet log can tell "no subprocess ran because the
+    # kernel boundary is unavailable" apart from a generic repair
+    # error. ``auditor_isolation_failed`` is set by the gate in
+    # :func:`_run_role_episode` whenever ``AuditorBoundaryUnavailable``
+    # was raised.
+    if isinstance(repair_result.metadata, dict) and repair_result.metadata.get(
+        "auditor_isolation_failed"
+    ):
+        repair_status["auditor_isolation_failed"] = True
+        missing = repair_result.metadata.get("missing_prerequisite")
+        if missing:
+            repair_status["missing_prerequisite"] = missing
     status = {
         **status,
         "format_repair_attempted": True,
         "format_repair_accepted": repair_valid,
-        "format_repair_status": _episode_status(repair_result),
+        "format_repair_status": repair_status,
     }
     _append_event(
         events_path,
@@ -1496,17 +1554,36 @@ async def _auditor_report_with_format_repair(
         return _auditor_report_text(
             corrected, round_index, language=config.prompt_language
         ), status
-    if repair_result.status == "timeout" and primary_result.status == "done":
+    if (repair_result.status == "timeout" or _is_isolation_failure(repair_result)) and primary_result.status == "done":
         # The format-repair pass must not discard an auditor report that already
         # succeeded. A repair timeout is a header-formatting problem, not an audit
-        # failure, so fall back to the auditor's raw text with an explicit
-        # "unformatted" marker instead of the blocked/suspect runtime stub.
+        # failure; likewise, an isolation-failure refusal (the host can't
+        # construct the uid/namespace boundary) means the repair subprocess
+        # never ran — it is also not an audit failure. Fall back to the
+        # auditor's raw text with an explicit "unformatted" marker instead
+        # of the blocked/suspect runtime stub.
         return _unformatted_auditor_report_text(
             raw_report, language=config.prompt_language
         ), status
     return _auditor_report_text(
         repair_result, round_index, language=config.prompt_language
     ), status
+
+
+def _is_isolation_failure(result: EpisodeResult) -> bool:
+    """True iff ``result`` is the error shape produced by the auditor
+    isolation gate in :func:`_run_role_episode`.
+
+    Used by :func:`_auditor_report_with_format_repair` so a primary
+    auditor episode that already succeeded is not silently discarded
+    when the format-repair pass fails to construct its isolation
+    boundary — the round report becomes the auditor's raw text with
+    an unformatted marker instead of the suspect stub.
+    """
+    metadata = getattr(result, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    return bool(metadata.get("auditor_isolation_failed"))
 
 
 def _unformatted_auditor_report_text(raw_report: str, *, language: str = "en") -> str:
