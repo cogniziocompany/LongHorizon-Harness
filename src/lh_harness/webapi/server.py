@@ -1413,6 +1413,12 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
     durable state already carried one, because deriving it otherwise would
     require a per-run rounds/events read, which is exactly the cost this path
     exists to avoid.
+
+    LHH-GATE-OWNER-NOTE: callers may pass ``runs_root`` to enable a bounded
+    read of each waiting_approval row's ``approvals.jsonl`` so the runs list
+    can surface the pending decision's ``owner`` + (capped) ``owner_note``
+    without loading the full snapshot.  ``runs_root=None`` skips that read;
+    the badge simply won't appear (non-blocking).
     """
 
     row: dict[str, Any] = {
@@ -1433,6 +1439,50 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
     if isinstance(item.get("round"), int) and not isinstance(item.get("round"), bool):
         row["round"] = item["round"]
     return row
+
+
+def _attach_pending_decision(row: dict[str, Any], *, runs_root: Any) -> None:
+    """Best-effort bounded read for the runs-list badge.
+
+    Mutates ``row`` in place to add ``pending_decision_owner`` /
+    ``pending_decision_owner_note`` when the run has a pending approval.
+    Stays no-op on any filesystem or JSONL failure so the runs list still
+    renders when the approval file is missing or malformed — the badge is
+    advisory, not load-bearing.  Reads from the tail of ``approvals.jsonl``
+    and returns on the FIRST pending record.
+    """
+
+    if row.get("status") != "waiting_approval":
+        return
+    run_id = row.get("id")
+    if not isinstance(run_id, str) or not run_id or runs_root is None:
+        return
+    approvals_path = Path(runs_root) / run_id / "role_orchestration" / "approvals.jsonl"
+    if not approvals_path.is_file():
+        return
+    try:
+        with approvals_path.open("r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("status") != "pending":
+            continue
+        owner = record.get("owner")
+        if isinstance(owner, str) and owner.strip():
+            row["pending_decision_owner"] = owner
+        note = record.get("owner_note")
+        if isinstance(note, str) and note.strip():
+            row["pending_decision_owner_note"] = note[:4000]
+        return
 
 
 def _summary_from_full(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -3087,6 +3137,12 @@ def create_app(
             if status_filter:
                 items = [item for item in items if str(item.get("status") or "") in status_filter]
             result = [_build_summary_projection(item) for item in items]
+            # LHH-GATE-OWNER-NOTE: one bounded per-row approval tail read for
+            # waiting_approval rows so the runs list badge has its data. The
+            # read is small (a single file, tail-first scan, early break on
+            # first pending record).
+            for row in result:
+                _attach_pending_decision(row, runs_root=registry.runs_root)
             return {"runs": result}
 
         result: list[dict[str, Any]] = []

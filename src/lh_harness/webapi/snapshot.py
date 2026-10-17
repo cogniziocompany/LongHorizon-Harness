@@ -282,6 +282,27 @@ def build_run_summary(item: dict[str, Any], *, state: DashboardState | None = No
         "updated_at": item.get("mtime", 0.0),
         "log_dir": item.get("log_dir", ""),
     }
+    # LHH-GATE-OWNER-NOTE: when the run is ``waiting_approval``, surface the
+    # FIRST pending approval's owner + owner_note so the runs list can render
+    # a "Decision: {owner}" badge without having to load the full snapshot.
+    # Only set when a pending approval exists; absent values stay None so the
+    # UI knows there is no gate to advertise.
+    if state is not None and status == "waiting_approval":
+        try:
+            for approval in state.list_approvals():
+                if approval.get("status") == "pending":
+                    owner = approval.get("owner")
+                    if owner:
+                        summary["pending_decision_owner"] = str(owner)
+                    owner_note = approval.get("owner_note")
+                    if isinstance(owner_note, str) and owner_note.strip():
+                        # Bounded so the summary row never carries an
+                        # unbounded payload (the full note panel reads from
+                        # the snapshot, not from this summary hint).
+                        summary["pending_decision_owner_note"] = owner_note[:4000]
+                    break
+        except (OSError, ValueError, RuntimeError):
+            pass
     summary.update(_provenance(*provenance_sources))
     if state is not None:
         try:
