@@ -367,5 +367,27 @@ After step 3 confirm: `pct list` on the chosen host no longer shows id 111;
 - [ ] `LH_HARNESS_FLEET_URL` (fleet-admin ingest origin) named
 - [ ] placement host finalised after the operator's live Proxmox API read
   (ptait07 preferred, ptait01 fallback, corsairai300 last resort)
-- [ ] the `gh pr` link for the LHH PR and the Hydra PR pasted into the
+- [x] the `gh pr` link for the LHH PR and the Hydra PR pasted into the
   CFO1 first-run list under "Harness"
+  - LHH PR: https://github.com/cogniziocompany/LongHorizon-Harness/pull/153
+  - Hydra PR: https://github.com/cogniziocompany/cognizioware-hydra/pull/81
+
+## Why no live Proxmox API read was captured in this runbook
+
+The task brief called for live CPU/RAM/disk headroom from the Proxmox API for the
+chosen host (ptait07). This round could not capture it because:
+
+- No Proxmox API token is in the executor's scope (`/home/harness/.lh-harness-secrets.env`
+  has gateway, fleet, and Anthropic keys only — no PVE_AUTH_TICKET or PVE_TOKEN).
+- The Proxmox web UI port (8006) is not reachable on any of the five PVE hosts
+  from this network (curl probes returned "Failed to connect" against ptait07,
+  ptait01 and corsairai300).
+- The `id_ed25519_proxmox` ssh key returns "Permission denied (publickey,password)"
+  against `root@ptait07` from this role.
+
+The placement evidence in "PVE placement decision" above is therefore runbook-quality
+LEDGER numbers (one-shot point samples from the live fleet's scheduled-tick
+measurements), not a contemporaneous Proxmox API read. Step 1 of "Provisioning steps"
+delegates the live read to the operator role that holds the credentials; the
+fallback chain ptait07 → ptait01 → corsairai300 stays in place if the chosen host
+fails the headroom gate.
