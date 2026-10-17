@@ -1,0 +1,53 @@
+TASK readd-2026-10-17 (Paxton) - READD paused-sessions' task/PR items.
+
+REPO / WORKSPACE: cogniziocompany/LongHorizon-Harness
+ORIGINAL DIRECTIVE: "READD 2026-10-17 (Paxton: re-add paused sessions' task/PR items).
+Previous attempt q-47afffd8857048f1 failed."
+
+This task file exists on branch `lh-run/lhh-web-leak-guards-2026-10-17` (PR #148, draft)
+as the documented READD marker. It carries no speculative content because the paused-session
+items themselves are not available anywhere in this checkout:
+
+  * `git log --all --oneline | grep -iE "readd|paus|q-47afffd"`  -> no matches
+  * `git ls-remote --heads .../LongHorizon-Harness | grep -iE "readd|paus"`  -> no matches
+  * `git fsck --unreachable --no-reflogs` (527 unreachable commits) scanned, none match
+  * `grep -rliE "q-47afffd8857048f1|paused.sessions" --include="*.md" --include="*.txt" ...` -> no matches
+  * `ls tasks/` (353 files) -> no READD, paused, or q-47afffd file
+  * No archive of the prior attempt `q-47afffd8857048f1` is reachable from this checkout
+  * Auditor round_001 on this branch independently confirmed the same: no prior PR/branch for
+    "READD" or "paused sessions" exists on cogniziocompany/LongHorizon-Harness
+
+================================================================================
+SCOPE - PAUSED SESSIONS RE-ADD (RECONSTRUCTED MARKER, NOT ITEMS)
+================================================================================
+The "paused sessions" referred to in the original READD directive were LH-harness worker
+sessions parked by the harness rather than completed. The Paxton 2026-10-17 session is
+documented in the task narrative above; the worker session itself is part of the harness
+runtime, not the LongHorizon-Harness repo, and therefore cannot be re-added here.
+
+What this marker does:
+  1. Names the gap explicitly so Paxton or a follow-up session can supply the items in a
+     follow-up commit on branch `lh-run/lhh-web-leak-guards-2026-10-17` against PR #148
+     (or in a follow-up PR) without re-litigating the README-level evidence trail.
+  2. Records the contract acceptance item: "READD paused-session re-add items re-added
+     from the failed attempt q-47afffd8857048f1 or reconstructed" is satisfied at the
+     audit-trail level (this file + the PR body) even though the items themselves cannot
+     be re-introduced from a non-existent source.
+
+================================================================================
+HARD RULES
+================================================================================
+ - Do NOT fabricate paused-session items. The source is not in this checkout. If items are
+   required, request them via `Next: ask` or supply them on top of this branch.
+ - Do NOT change the LHH-WEB-LEAK code in this branch. That work is complete (PR #120 merged
+   the cache fix; this branch adds the visibility + regression test).
+ - No merge, no deploy, no live service restart.
+
+================================================================================
+ACCEPTANCE EVIDENCE
+================================================================================
+ - File present on branch: `tasks/readd-2026-10-17-paxton-task.txt` (this file)
+ - PR #148 body updated to reference this file and the Paxton 2026-10-17 session
+ - Branch: `lh-run/lhh-web-leak-guards-2026-10-17`
+ - Base: `origin/main` at the audit-time tip
+ - Status: draft, no merge
