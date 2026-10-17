@@ -3670,6 +3670,69 @@ def create_app(
             "revision": state_for_run.control_bus.revision(),
         }
 
+    @app.post("/api/runs/{run_id}/approvals/{approval_id}/annotate")
+    def annotate_gate_approval(
+        run_id: str,
+        approval_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        # LHH-GATE-OWNER-NOTE: set or update the gate's decision-maker
+        # badge (``owner``) and free-form description (``owner_note``)
+        # WITHOUT resolving the gate.  The endpoint reuses the resolve
+        # caller's allowlist (``harness_resolve_gate``): writing the note
+        # is part of the gate-publishing surface, so the same caller trust
+        # that may render a decision is the only one allowed to label one.
+        # A resolved gate is read-only on the writer surface -- once the
+        # decision is in, the badge is frozen -- which is why the pre-check
+        # below answers 409 even if the storage layer is happy to persist
+        # the row for the historical record.
+        caller = _scoped_caller(request, RESOLVE_TOOL, run_id=run_id)
+        state_for_run = _state_or_404(registry, run_id)
+        if supervisor is not None and not supervisor.can_control(run_id):
+            raise HTTPException(status_code=409, detail="run is not accepting approvals")
+
+        existing = state_for_run.get_approval(approval_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="approval not found")
+        if existing.status == "resolved":
+            raise HTTPException(status_code=409, detail="approval is already resolved")
+
+        owner_raw = body.get("owner")
+        note_raw = body.get("owner_note")
+        if owner_raw is None and note_raw is None:
+            raise HTTPException(
+                status_code=422,
+                detail="at least one of 'owner' or 'owner_note' is required",
+            )
+        if owner_raw is not None and not isinstance(owner_raw, str):
+            raise HTTPException(status_code=422, detail="owner must be a string")
+        if note_raw is not None and not isinstance(note_raw, str):
+            raise HTTPException(status_code=422, detail="owner_note must be a string")
+
+        actor = caller or "overseer1"
+        snapshot = state_for_run.annotate_gate(
+            approval_id,
+            owner=owner_raw,
+            owner_note=note_raw,
+            actor=actor,
+        )
+        if snapshot is None:
+            # _refresh_approval_from_disk raced the in-memory store: the
+            # approval disappeared between the pre-check above and the
+            # annotate call.  Surface that as 404 so callers can retry.
+            raise HTTPException(status_code=404, detail="approval not found")
+        snapshot_cache.invalidate(run_id)
+        return {
+            "ok": True,
+            "approval_id": approval_id,
+            "status": "accepted",
+            "owner": snapshot.get("owner"),
+            "owner_note": snapshot.get("owner_note", ""),
+            "owner_set_by": snapshot.get("owner_set_by", ""),
+            "owner_set_at": snapshot.get("owner_set_at"),
+        }
+
     @app.post("/api/runs/{run_id}/abort")
     def abort(run_id: str, request: Request) -> dict[str, Any]:
         _run_control_caller(request)
