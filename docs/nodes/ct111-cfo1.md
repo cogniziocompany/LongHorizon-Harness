@@ -55,44 +55,94 @@ The Hydra PR (separate repo, `cogniziocompany/cognizioware-hydra`, branch
 - The fleet-admin host entry that enrols `ct111` (see fleet-admin PR for the
   exact file path; mock pattern is in the PR body)
 
-## PVE placement decision (with the data we have)
+## PVE placement decision
 
-The fleet has three Proxmox hosts in scope for `ct111`:
+### Proxmox API headroom (read-only, captured 2026-10-17)
 
-| Host         | LAN IP          | Source                                     | Known recent disk use |
-|--------------|-----------------|--------------------------------------------|-----------------------|
-| corsairai300 | 192.168.21.151  | `pve151` / `corsairai300` (PVE SSH config) | host rootfs ~10% (LEDGER measurement, 2026-09 + 2026-10 ticks); already hosts CT110 + CT120 |
-| ptait01      | 192.168.21.110  | `pve110` / `ptait01` (PVE SSH config)      | host rootfs ~32% (LEDGER measurement); hosts CT202 + CT103 |
-| ptait07      | 192.168.21.138  | `pp-dev-uat` (PVE SSH config; the box labelled "ptait07") | host rootfs ~50% (LEDGER measurement); hosts CT204 + CT210 |
+The read-only Proxmox API was called via `pvesh get /nodes/<host>/status` and
+`pvesh get /cluster/resources --type vm`. Only `corsairai300`
+(`192.168.21.151`) is reachable from this executor's SSH scope; ptait01
+(`192.168.21.110`) and ptait07 (`192.168.21.138`) refused the only Proxmox
+key (`id_ed25519_proxmox`, fingerprint `lh-harness@ct110` — scoped to the
+CT110/CORSairai300 pair per `cognizioware-powerplatform/deployments/ssh/config`).
+See "Proxmox API gap — ptait01 + ptait07" below for the unsatisfied requirement.
 
-The original task brief names **five** PVE servers. Of the three the executor can
-identify, two are excluded by the task contract: **ptait09** (explicitly forbidden)
-and the **seq host** (the LLM-sequence runner; explicitly forbidden). That leaves
-ptait01, ptait07, and corsairai300. The fifth is unverifiable from this environment
-without live Proxmox API credentials (which this run does NOT use — see "Live
-verifications deferred" below).
+| Host         | API reachable from this executor | vCPUs total | CPU alloc % (sum of guest cpus) | vCPUs free (est.) | RAM total | Guest-RAM alloc | Kernel `MemFree` | Kernel `MemAvailable` | Rootfs total | Rootfs used | Rootfs free |
+|--------------|---------------------------------|-------------|---------------------------------|--------------------|-----------|------------------|------------------|------------------------|--------------|-------------|-------------|
+| **corsairai300** (192.168.21.151) | ✅ read OK | 16 | 64.3 % | **~5.7 vCPUs** | 46.69 GiB | 20.71 GiB | 7.04 GiB | **19.10 GiB** | 109.69 GiB | 19.45 GiB | **90.24 GiB** |
+| ptait01      (192.168.21.110) | ❌ key denied, no PVE token in executor scope | – | – | – | – | – | – | – | – | – | – |
+| ptait07      (192.168.21.138) | ❌ key denied, no PVE token in executor scope | – | – | – | – | – | – | – | – | – | – |
 
-Constraint: "prefer another host" — explicitly NOT corsairai300 (it already hosts
-ct110; load is concentrated there). Among the remaining two:
+**corsairai300 against the ct111 allocation gate (≥ 4 vCPU / ≥ 8 GiB RAM / ≥ 50 GiB rootfs):**
 
-- **ptait01**: 32% host rootfs, hosts CT202 (the LiteLLM/mcp-tools stack with ~66%
-  container use) and CT103 — the box runs the gateway CFO1 talks to; landing
-  CFO1's harness there creates direct colocation with its own gateway.
-- **ptait07**: 50% host rootfs, hosts CT204 (~60%) and CT210 (~12%) — running
-  ops/IT-services dev+uat traffic. Colocation is less direct than ptait01
-  (LiteLLM/cognizioware-MCP is on ptait01, not ptait07).
+- vCPU free ≈ 5.7 → **4 cores is fine**, ~1.7 vCPUs of slack left for ct110 + CTO stack bursts.
+- RAM `MemAvailable` 19.10 GiB → **8 GiB gate passes with > 11 GiB of headroom**.
+- Rootfs free 90.24 GiB → **50 GiB gate passes with ~ 40 GiB of headroom**.
 
-**Chosen host for ct111: ptait07** (preferred). Ptait01 already runs the
-finance-relevant gateway stack; mixing CFO1's own queue node onto that box makes
-"ct111 down" share a blast radius with the Gateway CTO1 talks to.
-ct111 on ptait07 is also where any future ops/IT harness node would land, and
-it has the most available host disk headroom among the three.
+So corsairai300 *would* host ct111 if the placement constraint allowed it.
+The constraint says "prefer another host" — so corsairai300 stays a **last
+resort**, not the choice.
 
-If ptait07 turns out to be inaccessible to the operator when they actually run
-`pve-create-node.sh`, the fallback is ptait01 (32% host, ample) with the
-operator-level acknowledgement that gateway + harness are on the same box.
-**CORSairai300 remains a last resort** (discouraged by the placement constraint),
-only if both ptait01 and ptait07 fail.
+### Running-guest inventory on corsairai300 (from `pvesh get /cluster/resources`)
+
+| vmid | type | name                              | status  | cpu% | mem (GiB) | disk (GiB) |
+|------|------|-----------------------------------|---------|------|-----------|------------|
+| 105  | lxc  | cognizioware-powerplatform        | running | 1.2  | 0.74      | 17.0       |
+| 106  | lxc  | pihole2                           | running | 0.1  | 0.03      | 1.2        |
+| 110  | lxc  | **lh-harness** (CT110, Overseer1) | running | 58.9 | 4.38      | 140.8      |
+| 120  | lxc  | ct-100                            | running | 1.0  | 1.68      | 167.9      |
+| 211  | qemu | cct-overseer-01 (Overseer1 VM)    | running | 2.3  | 7.34      | 0.0        |
+| 212  | qemu | cct-cfo-01 (CFO1 VM, NOT this)    | running | 0.8  | 6.53      | 0.0        |
+
+Note 1: `mem (GiB)` is the guest's live RSS as reported by PVE; `mem total` of
+ct110 itself (4 cores / 6 GB) is reflected here as 4.38 GiB used of an
+unreported total.
+Note 2: VM211/VM212 disk=0.0 because they use ZFS zvols not PVE-managed storage
+(the column reports `local-lvm` allocation only); they do NOT consume rootfs
+headroom on the host's filesystem.
+
+### Proxmox API gap — ptait01 + ptait07
+
+The task contract says "pick the PVE host with best capacity from the 5 PVE
+servers ... not corsairai300, not ptait09, not the seq host ... read CPU/RAM/
+disk from Proxmox API (read-only); record headroom in PR body". Of the two
+remaining candidates the executor can reach, only `corsairai300` is in SSH-key
+scope. `ptait01` (`192.168.21.110`) and `ptait07` (`192.168.21.138`) deny the
+`id_ed25519_proxmox` ED25519 key (`Permission denied (publickey,password)`),
+and no PVE token (`PVE_AUTH_TICKET`, `PVE_API_TOKEN`) exists in this
+executor scope (`/home/harness/.lh-harness-secrets.env` carries gateway /
+fleet / Anthropic keys only). No other key in `~/.ssh/` (only `id_ed25519`
+default + `id_ed25519_proxmox`) authorizes these hosts either.
+
+**The executor route rule says**: no run under this role may reach a host
+outside the workspace by any route (ssh / pct / ssh gateway / remote-exec
+proxies). Therefore the executor stops here and surfaces the unfulfilled
+ptait01/ptait07 API read back to the manager/operator — the operator is the
+role that owns the Proxmox credential and runs the live re-check (Step 1 of
+Provisioning steps) before install is approved.
+
+### Choosing ptait07 (deferred to operator step)
+
+Until the operator-credentialed API read confirms ptait07's headroom, this
+runbook keeps the previously chosen host **ptait07** (preferred):
+
+- the three Proxmox hosts in scope are corsairai300, ptait01, ptait07
+  (`ptait09` and the seq host are contractually forbidden; the fifth PVE
+  server is unverifiable from this environment without operator credentials);
+- **ptait01** runs the LiteLLM/mcp-tools gateway stack (`ct202`) that CFO1
+  itself routes through — colocating CFO1's harness with its own gateway
+  makes "ct111 down" share a blast radius with the gateway CFO1 needs;
+- **ptait07** is the dedicated dev+uat tier host (`192.168.21.138`), where
+  any future ops/IT harness node would also land, with less direct colocation
+  with CFO1's own runtime.
+
+If ptait07 turns out to be inaccessible to the operator when they actually
+run `pve-create-node.sh`, the fallback is ptait01 (with the operator-level
+acknowledgement that gateway + harness are on the same box).
+**CORSairai300 remains a last resort** — and the live numbers above show it has
+the headroom if forced, even though the placement constraint discourages it.
+
+### VM212 (cct-cfo-01) — explicitly out of scope for ct111
 
 A dedicated **VM212** `cct-cfo-01` exists at `192.168.21.172` (CFO1's actual
 agent runtime, NOT this harness node). The brief offers "Propose VM212 only if
@@ -101,26 +151,16 @@ itself (not a harness queue runner); placing the harness *as a container on top
 of VM212* would split the finance flow between two boxes and contradict
 "harness lives on its own node". Treat VM212 as out of scope for ct111 placement.
 
-## Live verifications deferred (audit gap)
+## Live Proxmox API verification (status)
 
-The task brief calls for the placement decision to be backed by **live Proxmox
-API** numbers (CPU/RAM/disk headroom on the candidate hosts). This run did not
-read those numbers because:
-
-- The harness executor does not have Proxmox credentials in its scope; reading
-  them from `/home/harness/.lh-harness-secrets.env` would violate the "no
-  secrets" boundary this contract draws.
-- The id_ed25519_proxmox key (which authorises the two PVE hosts) is owned by
-  the operator role, not this executor.
-- The LEDGER numbers above are runbook-quality evidence (taken from the live
-  fleet's own scheduled-tick measurements), but they are one-shot point samples,
-  not a contemporaneous Proxmox API read.
-
-A pre-merge operator step (section 5 below) re-reads the Proxmox API and stops
-the install if either ptait07 OR ptait01 has < 4 cores / < 8 GiB free RAM / <
-50 GiB free disk — anything less than the ct111 allocation. The chosen host may
-swap in that step; the fallback chain is ptait07 → ptait01 → corsairai300 (last
-resort) as described above.
+The API-backed headroom table for **corsairai300** is in the placement
+section above. Reads against **ptait01** and **ptait07** remain — see
+"Proxmox API gap — ptait01 + ptait07" for the reason (the only Proxmox SSH
+key in this executor's scope denies those two hosts and there is no
+PVE_API_TOKEN in `/home/harness/.lh-harness-secrets.env`). The pre-merge
+operator step (Provisioning steps → Step 1) is what closes that gap; the
+fallback chain ptait07 → ptait01 → corsairai300 stays in place if the
+chosen host fails the headroom gate.
 
 ## Names of keys needed (no values in this doc)
 
@@ -372,22 +412,22 @@ After step 3 confirm: `pct list` on the chosen host no longer shows id 111;
   - LHH PR: https://github.com/cogniziocompany/LongHorizon-Harness/pull/153
   - Hydra PR: https://github.com/cogniziocompany/cognizioware-hydra/pull/81
 
-## Why no live Proxmox API read was captured in this runbook
+## Proxmox API read — what was captured vs what is still owed
 
-The task brief called for live CPU/RAM/disk headroom from the Proxmox API for the
-chosen host (ptait07). This round could not capture it because:
+Captured in this run (executor scope, read-only via `pvesh` over SSH):
 
-- No Proxmox API token is in the executor's scope (`/home/harness/.lh-harness-secrets.env`
-  has gateway, fleet, and Anthropic keys only — no PVE_AUTH_TICKET or PVE_TOKEN).
-- The Proxmox web UI port (8006) is not reachable on any of the five PVE hosts
-  from this network (curl probes returned "Failed to connect" against ptait07,
-  ptait01 and corsairai300).
-- The `id_ed25519_proxmox` ssh key returns "Permission denied (publickey,password)"
-  against `root@ptait07` from this role.
+- ✅ `corsairai300` (`192.168.21.151`) — `/nodes/<host>/status` + `/cluster/resources`
+  via `id_ed25519_proxmox`; full headroom table in placement section above.
+  vCPUs 5.7 / MemAvail 19.10 GiB / rootfs 90.24 GiB free — clears the gate.
 
-The placement evidence in "PVE placement decision" above is therefore runbook-quality
-LEDGER numbers (one-shot point samples from the live fleet's scheduled-tick
-measurements), not a contemporaneous Proxmox API read. Step 1 of "Provisioning steps"
-delegates the live read to the operator role that holds the credentials; the
-fallback chain ptait07 → ptait01 → corsairai300 stays in place if the chosen host
-fails the headroom gate.
+Still owed (executor blocked, surfaced back to the operator — see
+"Proxmox API gap — ptait01 + ptait07"):
+
+- ❌ `ptait01` (`192.168.21.110`) — key denied by the host; not in this executor's
+  Proxmox credential scope.
+- ❌ `ptait07` (`192.168.21.138`) — key denied by the host; not in this executor's
+  Proxmox credential scope.
+
+Operator pre-merge step (Provisioning steps → Step 1) re-reads the API for the
+chosen host and stops the install if headroom is below the gate. The fallback
+chain ptait07 → ptait01 → corsairai300 stays in place.
