@@ -107,6 +107,7 @@ _WEB_DEFAULT_AUDITOR_MODEL = (
     os.environ.get("LH_HARNESS_WEB_DEFAULT_AUDITOR_MODEL") or _WEB_DEFAULT_MODEL
 )
 from .protocol import build_meta
+from .process_memory import memory_snapshot as _memory_snapshot
 from .snapshot import _provenance, build_run_summary, build_snapshot
 from .experience_routes import register_experience_api
 
@@ -1919,6 +1920,7 @@ def create_app(
             mcp_profiles=list_available_profiles(),
             mcp_gateway_configured=gateway_configured(),
             model_discovery=catalogue["model_discovery"],
+            memory=_memory_snapshot(),
         )
 
     @app.post("/api/models/refresh")
