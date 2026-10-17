@@ -40,6 +40,7 @@ def build_meta(
     launcher_stalled: bool = False,
     launcher_stall_cycles: int | None = None,
     build: dict[str, Any] | None = None,
+    memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the stable handshake payload used by both clients."""
 
@@ -104,4 +105,10 @@ def build_meta(
     # the package version does not change between commits.
     if build is not None:
         result["build"] = build
+    # Process memory (LHH-WEB-LEAK follow-up): the web process RSS so an
+    # Overseer tick can alert before the host OOM-killer fires.  Always
+    # included so the field is never absent for a healthy process; the
+    # dict shape is documented in webapi/process_memory.py.
+    if memory is not None:
+        result["memory"] = memory
     return result
