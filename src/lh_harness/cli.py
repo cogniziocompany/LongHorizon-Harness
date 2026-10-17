@@ -909,6 +909,51 @@ def main(argv: list[str] | None = None) -> int:
 
     add_command("check-update", "Check PyPI for a newer LongHorizon-Harness release")
 
+    # LHH-SESSION-CONTEXT-ARTIFACTS: SDK/CLI producer stub.  Accepts a
+    # packet file and POSTs it to /api/artifacts; prints the assigned id.
+    artifact_parser = add_command(
+        "artifact",
+        "Manage session-context artifacts (POST a packet, fetch an artifact).",
+    )
+    artifact_sub = artifact_parser.add_subparsers(dest="artifact_command")
+    artifact_push_parser = artifact_sub.add_parser(
+        "push",
+        help="POST a ContextPacket file to /api/artifacts and print the resulting id.",
+    )
+    artifact_push_parser.add_argument(
+        "--packet",
+        required=True,
+        help="Path to the ContextPacket JSON file (see docs/design/session-context-artifacts.md).",
+    )
+    artifact_push_parser.add_argument(
+        "--lh-base",
+        default="",
+        help="LongHorizon-Harness base URL (overrides LH_HARNESS_BASE_URL).",
+    )
+    artifact_push_parser.add_argument(
+        "--bearer-env",
+        default="LH_HARNESS_WEB_TOKEN",
+        help="Name of the environment variable holding the bearer token.",
+    )
+    artifact_get_parser = artifact_sub.add_parser(
+        "get",
+        help="GET one artifact by id and print its JSON.",
+    )
+    artifact_get_parser.add_argument(
+        "artifact_id",
+        help="Canonical art-<hex> id (the value ``artifact push`` printed).",
+    )
+    artifact_get_parser.add_argument(
+        "--lh-base",
+        default="",
+        help="LongHorizon-Harness base URL (overrides LH_HARNESS_BASE_URL).",
+    )
+    artifact_get_parser.add_argument(
+        "--bearer-env",
+        default="LH_HARNESS_WEB_TOKEN",
+        help="Name of the environment variable holding the bearer token.",
+    )
+
     try:
         args = parser.parse_args(raw_argv)
     except SystemExit:
@@ -957,6 +1002,11 @@ def main(argv: list[str] | None = None) -> int:
         return _init_command(args)
     if args.command == "check-update":
         return _check_update_command()
+    if args.command == "artifact":
+        if not getattr(args, "artifact_command", None):
+            artifact_parser.print_help()
+            return 2
+        return _artifact_command(args)
 
     parser.print_help()
     return 2
@@ -1499,6 +1549,77 @@ def _broken_install_message(exc: ImportError) -> str:
         "Reinstall with `pip install --force-reinstall lh-harness`. "
         f"({exc})"
     )
+
+
+def _artifact_command(args: argparse.Namespace) -> int:
+    """``lh-harness artifact push`` / ``artifact get`` (LHH-SESSION-CONTEXT-ARTIFACTS).
+
+    Thin wrapper around the artifacts API so the SDK/CLI producer does not
+    have to speak HTTP.  The bearer is read from a configured env var name
+    (default ``LH_HARNESS_WEB_TOKEN``) and never echoed.
+    """
+    import json as _json
+    import urllib.error as _urllib_error
+    import urllib.request as _urllib_request
+    from pathlib import Path as _Path
+
+    base = (args.lh_base or os.environ.get("LH_HARNESS_BASE_URL") or "").strip()
+    token = os.environ.get(args.bearer_env or "LH_HARNESS_WEB_TOKEN", "").strip()
+    if not base:
+        print("--lh-base or LH_HARNESS_BASE_URL is required", file=sys.stderr)
+        return 2
+    if not token:
+        print(
+            f"bearer not found in ${args.bearer_env}; refusing to push without auth",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.artifact_command == "push":
+        path = _Path(args.packet)
+        if not path.is_file():
+            print(f"packet file not found: {path}", file=sys.stderr)
+            return 2
+        try:
+            body = path.read_text(encoding="utf-8")
+            payload = _json.loads(body)
+        except (OSError, _json.JSONDecodeError, UnicodeDecodeError) as exc:
+            print(f"could not read packet: {exc}", file=sys.stderr)
+            return 2
+        url = base.rstrip("/") + "/api/artifacts"
+        req = _urllib_request.Request(
+            url,
+            data=_json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+            method="POST",
+            headers={
+                "authorization": f"Bearer {token}",
+                "content-type": "application/json",
+            },
+        )
+        try:
+            with _urllib_request.urlopen(req, timeout=30) as response:  # noqa: S310
+                data = response.read().decode("utf-8")
+        except _urllib_error.HTTPError as exc:
+            print(f"HTTP {exc.code}: {exc.read().decode('utf-8', errors='replace')}", file=sys.stderr)
+            return 1
+        print(data)
+        return 0
+    if args.artifact_command == "get":
+        url = base.rstrip("/") + f"/api/artifacts/{args.artifact_id}"
+        req = _urllib_request.Request(
+            url,
+            method="GET",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        try:
+            with _urllib_request.urlopen(req, timeout=30) as response:  # noqa: S310
+                data = response.read().decode("utf-8")
+        except _urllib_error.HTTPError as exc:
+            print(f"HTTP {exc.code}: {exc.read().decode('utf-8', errors='replace')}", file=sys.stderr)
+            return 1
+        print(data)
+        return 0
+    return 2
 
 
 def _dashboard_command(args: argparse.Namespace) -> int:

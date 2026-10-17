@@ -109,8 +109,42 @@ KNOWN_REQUEST_KEYS = frozenset(
         "dedup_key",
         "requester",
         "time_limit_minutes",
+        "artifact_ids",
     }
 )
+
+# Validation rule (LHH-SESSION-CONTEXT-ARTIFACTS): the enqueue accepts an
+# ``artifact_ids`` list. Each id must match the canonical ``art-<hex>`` form
+# used by ``lh_harness.artifacts.safe_artifact_id``; a list with anything
+# else is refused with HTTP 422 (the same ValueError path the rest of the
+# validation uses).  Git is optional -- no path or repo constraint is
+# enforced.
+_MAX_ARTIFACT_IDS = 64
+
+
+def _validate_artifact_ids(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, bool) or not isinstance(value, list):
+        raise ValueError("artifact_ids must be a list of strings")
+    if len(value) > _MAX_ARTIFACT_IDS:
+        raise ValueError("artifact_ids has too many entries")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        if isinstance(raw, bool) or not isinstance(raw, str):
+            raise ValueError("artifact_ids must contain only strings")
+        token = raw.strip()
+        if not token:
+            raise ValueError("artifact_ids must contain non-empty strings")
+        # Inline check: matches safe_artifact_id (``art-`` + 8..64 hex).
+        if not re.fullmatch(r"^art-[0-9a-f]{8,64}$", token):
+            raise ValueError(f"artifact_id {token!r} is not a valid art-<hex> id")
+        if token in seen:
+            raise ValueError(f"artifact_id {token!r} is duplicated in artifact_ids")
+        seen.add(token)
+        cleaned.append(token)
+    return cleaned
 
 # Per-task wall-clock limit (task fc-H2): minutes from launch after which the
 # launcher stops the run.  Optional; ``None`` means no limit.
@@ -313,6 +347,12 @@ class QueueEntry:
     # backend, persists them fully).
     model: str | None = None
     roles: dict[str, dict[str, Any]] | None = None
+    # LHH-SESSION-CONTEXT-ARTIFACTS: ``artifact_ids`` is a list of context
+    # packet ids attached at enqueue time.  The launching agent reads them
+    # from the run boundary as continuity context.  Empty list on legacy
+    # entries; valid values are validated by ``_validate_artifact_ids``
+    # against the canonical ``art-<hex>`` form.  Git is optional.
+    artifact_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -354,6 +394,7 @@ class QueueEntry:
             "time_limit_minutes",
             "model",
             "roles",
+            "artifact_ids",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -978,6 +1019,7 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "dedup_key": _validate_dedup_key(body.get("dedup_key")),
         "requester": requester_block,
         "time_limit_minutes": validate_time_limit_minutes(body.get("time_limit_minutes")),
+        "artifact_ids": _validate_artifact_ids(body.get("artifact_ids")),
     }
 
 
@@ -1666,6 +1708,10 @@ class QueueStore:
             time_limit_minutes=entry.time_limit_minutes,
             model=entry.model,
             roles=copy.deepcopy(entry.roles),
+            # Carry the artifact_ids through the retry (continuity tokens stay
+            # valid across retries); the queue store's default factory
+            # protects a legacy None.
+            artifact_ids=list(entry.artifact_ids or []),
             not_before=float(not_before) if not_before is not None else None,
             wait_reason=str(wait_reason)[:64] if (not_before is not None and wait_reason) else None,
         )

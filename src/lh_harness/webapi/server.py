@@ -80,6 +80,13 @@ from ..queue import (
     validate_time_limit_minutes,
     _select_queue_store,
 )
+from ..artifacts import (
+    ArtifactStore,
+    ArtifactValidationError,
+    ArtifactConflictError,
+    safe_artifact_id,
+    _select_artifact_store,
+)
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..workspace_guard import WorkspaceBaseError, probe_open_pr_gh, resolve_run_base
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
@@ -1687,6 +1694,11 @@ def create_app(
     # default config even when a non-ValueError config error skips the stores.
     queue_config = default_queue_config()
     queue_store: QueueStore | PgQueueStore | None = None
+    # Session-context artifacts (LHH-SESSION-CONTEXT-ARTIFACTS) live beside
+    # the queue: a ContextPacket POST is independent of a queue entry, but
+    # the queue can attach ``artifact_ids`` on enqueue.  The store is the
+    # same file-backed run.
+    artifact_store: ArtifactStore | None = _select_artifact_store(runs_root, None)
     if runs_root is not None:
         try:
             from ..config import PROJECT_CONFIG_PATH, load_run_defaults
@@ -1762,6 +1774,7 @@ def create_app(
     build_info()
     app.state.registry = registry
     app.state.queue_store = queue_store
+    app.state.artifact_store = artifact_store
     app.state.auth_token = token
     app.state.allowed_origins = origins
     app.state.bind_host = bind_host
@@ -1930,6 +1943,254 @@ def create_app(
         """
 
         return _meta_response(request, force_models=True)
+
+    # ------------------------------------------------------------------
+    # Session context artifacts (LHH-SESSION-CONTEXT-ARTIFACTS).
+    #
+    # Two routes back the first slice:
+    #   POST /api/artifacts            — store a ContextPacket, return id
+    #   GET  /api/artifacts/<id>       — read the stored packet as JSON
+    #   GET  /api/artifacts/<id>/raw   — same payload, content-type=application/json
+    #
+    # The queue's ``artifact_ids`` attachment is documented in
+    # docs/design/session-context-artifacts.md and is enforced on POST
+    # /api/queue below.
+    # ------------------------------------------------------------------
+
+    def _public_artifact_view(artifact: ArtifactStore) -> dict[str, Any]:
+        view = artifact.to_dict()
+        # The packet section may contain large body fields (transcript_delta,
+        # evidence.data_uri); the public view keeps the metadata but exposes
+        # only the parsed packet through the canonical API surface.
+        return view
+
+    @app.post("/api/artifacts")
+    def create_artifact(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        if artifact_store is None:
+            raise HTTPException(status_code=501, detail="artifacts require a configured runs root")
+        try:
+            artifact, created = artifact_store.create(body)
+        except ArtifactConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ArtifactValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # Idempotent re-POST returns 200 with the same id (HTTP semantics for
+        # "already exists" — the producer asked the same question twice).
+        payload = _public_artifact_view(artifact)
+        payload["idempotent"] = not created
+        status_code = 201 if created else 200
+        return JSONResponse(payload, status_code=status_code)
+
+    @app.get("/api/artifacts/{artifact_id}")
+    def read_artifact(artifact_id: str) -> dict[str, Any]:
+        if artifact_store is None:
+            raise HTTPException(status_code=501, detail="artifacts require a configured runs root")
+        if not safe_artifact_id(artifact_id):
+            raise HTTPException(status_code=400, detail="artifact_id is not valid")
+        artifact = artifact_store.get(artifact_id)
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        return _public_artifact_view(artifact)
+
+    @app.get("/api/artifacts/{artifact_id}/raw")
+    def read_artifact_raw(artifact_id: str) -> Response:
+        if artifact_store is None:
+            raise HTTPException(status_code=501, detail="artifacts require a configured runs root")
+        if not safe_artifact_id(artifact_id):
+            raise HTTPException(status_code=400, detail="artifact_id is not valid")
+        artifact = artifact_store.get(artifact_id)
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        payload = json.dumps(artifact.packet, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return Response(content=payload, media_type="application/json")
+
+    # Read-only HTML render for the artifact (no JS execution; sandboxed HTML
+    # evidence is rendered in a sandboxed iframe).
+    _INLINE_RASTER_HTML = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".avif": "image/avif",
+        ".bmp": "image/bmp",
+        ".ico": "image/x-icon",
+    }
+
+    def _escape_html(value: str) -> str:
+        return (
+            str(value or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    def _render_markdown_safe(text: str) -> str:
+        """Tiny safe markdown: paragraphs, fenced code, inline code, bold.
+
+        Used only for the read-only artifact page.  The output escapes first
+        and only re-introduces a small set of tags (paragraph, fenced code,
+        inline code, strong) so an agent-supplied packet cannot run script
+        or inject raw HTML.
+
+        This is intentionally simpler than GitHub-flavored markdown.  The
+        design calls out a markdown renderer for the next slice; for now the
+        render page is deliberately narrow.
+        """
+        return _escape_html(text)
+
+    @app.get("/artifacts/{artifact_id}")
+    def render_artifact(artifact_id: str) -> Response:
+        if artifact_store is None:
+            raise HTTPException(status_code=501, detail="artifacts require a configured runs root")
+        if not safe_artifact_id(artifact_id):
+            raise HTTPException(status_code=400, detail="artifact_id is not valid")
+        artifact = artifact_store.get(artifact_id)
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        view = artifact.to_dict()
+        packet = artifact.packet
+        plan_rows = "".join(
+            f"<tr><td>{_escape_html(str(item.get('id') or ''))}</td>"
+            f"<td>{_render_markdown_safe(str(item.get('text') or ''))}</td></tr>"
+            for item in (packet.get("plan") or [])
+            if isinstance(item, dict)
+        )
+        decision_rows = "".join(
+            f"<tr><td>{_escape_html(str(item.get('ts') or ''))}</td>"
+            f"<td>{_escape_html(str(item.get('what') or ''))}</td>"
+            f"<td>{_escape_html(str(item.get('why') or ''))}</td></tr>"
+            for item in (packet.get("decisions") or [])
+            if isinstance(item, dict)
+        )
+        file_rows = "".join(
+            f"<li><code>{_escape_html(str(item.get('path') or ''))}</code>"
+            f" &mdash; {_escape_html(str(item.get('action') or ''))}"
+            + (f" ({_escape_html(str(item.get('lines') or ''))})" if item.get('lines') else "")
+            + "</li>"
+            for item in (packet.get("files_touched") or [])
+            if isinstance(item, dict)
+        )
+        link_rows = "".join(
+            f"<li><a href=\"{_escape_html(str(item.get('url') or '#'))}\" rel=\"noopener noreferrer\">"
+            f"{_escape_html(str(item.get('label') or item.get('url') or ''))}</a></li>"
+            for item in (packet.get("links") or [])
+            if isinstance(item, dict)
+        )
+        evidence_blocks: list[str] = []
+        for item in (packet.get("evidence") or []):
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "")
+            label = _escape_html(str(item.get("label") or ""))
+            if kind == "command":
+                exit_code = item.get("exit_code")
+                badge = (
+                    f"<span class=\"evidence-badge evidence-ok\">exit {exit_code}</span>"
+                    if exit_code == 0
+                    else f"<span class=\"evidence-badge evidence-fail\">exit {exit_code}</span>"
+                )
+                evidence_blocks.append(
+                    f"<section class=\"evidence\"><header><strong>{label}</strong> {badge}</header>"
+                    f"<pre><code>{_escape_html(str(item.get('text') or ''))}</code></pre></section>"
+                )
+            elif kind == "image":
+                media_type = str(item.get("media_type") or "").strip().lower()
+                data_uri = str(item.get("data_uri") or "")
+                # Only inline safe raster types; everything else is a
+                # download link, never an inline iframe.
+                is_inline = media_type in set(_INLINE_RASTER_HTML.values())
+                if is_inline and data_uri.startswith("data:"):
+                    evidence_blocks.append(
+                        f"<section class=\"evidence\"><header><strong>{label}</strong></header>"
+                        f"<img src=\"{_escape_html(data_uri)}\" alt=\"{label}\" /></section>"
+                    )
+                else:
+                    evidence_blocks.append(
+                        f"<section class=\"evidence\"><header><strong>{label}</strong></header>"
+                        f"<p><a href=\"{_escape_html(data_uri or '#')}\" rel=\"noopener noreferrer\">"
+                        f"download evidence</a></p></section>"
+                    )
+            elif kind == "html":
+                # Sandboxed iframe: srcdoc with the agent-supplied HTML, no
+                # script execution allowed.  This mirrors the GitHub gist
+                # trust model for HTML evidence.
+                body_html = str(item.get("html") or item.get("text") or "")
+                evidence_blocks.append(
+                    f"<section class=\"evidence\"><header><strong>{label}</strong></header>"
+                    f"<iframe sandbox=\"\" srcdoc=\"{_escape_html(body_html)}\""
+                    f" referrerpolicy=\"no-referrer\"></iframe></section>"
+                )
+            else:
+                evidence_blocks.append(
+                    f"<section class=\"evidence\"><header><strong>{label}</strong></header>"
+                    f"<pre><code>{_escape_html(str(item.get('text') or ''))}</code></pre></section>"
+                )
+        transcript_rows = "".join(
+            f"<article class=\"transcript-row transcript-{_escape_html(str(item.get('role') or 'system'))}\">"
+            f"<header><small>{_escape_html(str(item.get('role') or ''))}</small> "
+            f"<time>{_escape_html(str(item.get('ts') or ''))}</time></header>"
+            f"<pre><code>{_escape_html(str(item.get('text') or ''))}</code></pre>"
+            f"</article>"
+            for item in (packet.get("transcript_delta") or [])
+            if isinstance(item, dict)
+        )
+        body = f"""<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\" />
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+<meta name=\"referrer\" content=\"no-referrer\" />
+<title>{_escape_html(view['title'] or view['kind'])} &mdash; artifact {view['artifact_id']}</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 2rem auto; max-width: 960px; padding: 0 1rem; color: #1a202c; }}
+h1, h2 {{ color: #111827; }}
+.artifact-meta {{ color: #4b5563; font-size: 0.9rem; }}
+.artifact-summary {{ background: #f9fafb; border: 1px solid #e5e7eb; padding: 1rem; border-radius: 6px; }}
+table {{ width: 100%; border-collapse: collapse; margin: 1rem 0; }}
+th, td {{ text-align: left; border-bottom: 1px solid #e5e7eb; padding: 0.4rem 0.6rem; vertical-align: top; }}
+pre, code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+pre {{ background: #0f172a; color: #e2e8f0; padding: 1rem; overflow-x: auto; border-radius: 6px; }}
+img {{ max-width: 100%; height: auto; }}
+iframe {{ width: 100%; min-height: 320px; border: 1px solid #e5e7eb; border-radius: 6px; }}
+.evidence {{ border: 1px solid #e5e7eb; padding: 1rem; margin: 1rem 0; border-radius: 6px; background: #fff; }}
+.evidence-badge {{ display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75rem; }}
+.evidence-ok {{ background: #dcfce7; color: #166534; }}
+.evidence-fail {{ background: #fee2e2; color: #991b1b; }}
+.transcript-row {{ border-bottom: 1px dashed #e5e7eb; padding: 0.6rem 0; }}
+.transcript-row pre {{ background: #f3f4f6; color: #111827; }}
+</style>
+</head>
+<body>
+<header>
+<h1>{_escape_html(view['title'] or view['kind'])}</h1>
+<div class=\"artifact-meta\">
+<strong>{_escape_html(view['kind'])}</strong> &middot;
+artifact id <code>{_escape_html(view['artifact_id'])}</code> &middot;
+producer <em>{_escape_html(view['producer']['agent'])}</em>
+@{_escape_html(view['producer']['host'])}
+{f" (ref {_escape_html(view['producer']['session_ref'])})" if view['producer']['session_ref'] else ""} &middot;
+captured_at <time>{_escape_html(str(view['producer']['captured_at']))}</time> &middot;
+visibility <code>{_escape_html(view['visibility'])}</code>
+</div>
+</header>
+<section class=\"artifact-summary\"><h2>Summary</h2><p>{_render_markdown_safe(view['summary'])}</p></section>
+{('<section><h2>Plan</h2><table><thead><tr><th>id</th><th>text</th></tr></thead><tbody>' + plan_rows + '</tbody></table></section>') if plan_rows else ''}
+{('<section><h2>Decisions</h2><table><thead><tr><th>ts</th><th>what</th><th>why</th></tr></thead><tbody>' + decision_rows + '</tbody></table></section>') if decision_rows else ''}
+{('<section><h2>Files touched</h2><ul>' + file_rows + '</ul></section>') if file_rows else ''}
+{('<section><h2>Links</h2><ul>' + link_rows + '</ul></section>') if link_rows else ''}
+<section><h2>Evidence</h2>{''.join(evidence_blocks) if evidence_blocks else '<p><em>none</em></p>'}</section>
+{('<section><h2>Transcript delta</h2>' + transcript_rows + '</section>') if transcript_rows else ''}
+<footer><p class=\"artifact-meta\">
+sha256 <code>{_escape_html(view['packet_sha256'])}</code> &middot;
+bytes {view['bytes']} &middot;
+redactions {view['redaction_count']} &middot;
+created <time>{_escape_html(str(view['created_at']))}</time>
+</p></footer>
+</body>
+</html>"""
+        return Response(content=body, media_type="text/html; charset=utf-8")
 
     @app.post("/api/queue")
     def create_queue_entry(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
