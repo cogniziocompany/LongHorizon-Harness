@@ -1868,6 +1868,47 @@ def create_app(
                 launcher_stall_cycles = launcher.stall_cycles or None
             except Exception:
                 pass
+        # LHH-CT110-DISK: report disk usage in the same handshake the
+        # dashboard already polls.  The check is cheap (one statvfs call)
+        # and never blocks on I/O.  ``runs_root`` is the same path the
+        # launcher checks; surfacing the same value keeps the two views
+        # consistent.  A failure is reported as ``ok`` so a transient
+        # statvfs error does not flash a red banner.
+        disk: dict[str, Any] = {"state": "ok", "percent_used": 0.0, "skip_reason": None}
+        try:
+            from ..disk_retention import (
+                DiskRetentionConfig,
+                check_disk,
+                config_from_runtime,
+                format_warning_event,
+            )
+            from ..settings_store import active_runtime
+            disk_runs_root = None
+            if launcher is not None:
+                disk_runs_root = getattr(getattr(launcher, "supervisor", None), "runs_root", None)
+            if disk_runs_root is None and queue_store is not None:
+                disk_runs_root = getattr(queue_store, "runs_root", None)
+            if disk_runs_root is not None:
+                cfg = config_from_runtime(active_runtime())
+                sticky = bool(getattr(launcher, "_disk_full_sticky", False)) if launcher is not None else False
+                state = check_disk(disk_runs_root, config=cfg, previously_paused=sticky)
+                disk = state.to_dict()
+                # Emit a one-shot warning event for the operator/overseer
+                # the first time the state moves to warn; the dashboard
+                # picks the state up via /api/meta; the event is for the
+                # log/seq ingest.
+                if state.state == "warn" and launcher is not None and not getattr(launcher, "_disk_warn_emitted", False):
+                    try:
+                        from ..seq_logging import get_seq_logger
+                        get_seq_logger().info("disk.warning", extra=format_warning_event(state))
+                    except Exception:
+                        pass
+                    launcher._disk_warn_emitted = True
+                if state.state in ("ok", "resumed"):
+                    if launcher is not None:
+                        launcher._disk_warn_emitted = False
+        except Exception:
+            pass
         return build_meta(
             endpoint=endpoint,
             fleet_configured=bool(reporter is not None and reporter.configured),
@@ -1919,6 +1960,7 @@ def create_app(
             mcp_profiles=list_available_profiles(),
             mcp_gateway_configured=gateway_configured(),
             model_discovery=catalogue["model_discovery"],
+            disk=disk,
         )
 
     @app.post("/api/models/refresh")
