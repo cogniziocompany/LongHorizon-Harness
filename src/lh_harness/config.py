@@ -73,6 +73,15 @@ _ROLE_NAMES = {
     "final_response",
 }
 _TIMEOUT_NAMES = {"manager", "gui_executor", "cli_executor", "auditor"}
+# Sub-keys of ``[run.context]`` (task T-B): rule-based tool-output trimming.
+# The off switch is grouped with its bounds so a single ``[run.context]``
+# block carries everything the trimmer needs.
+_CONTEXT_KEYS = {
+    "tool_output_trimming_enabled",
+    "tool_output_keep_last_n",
+    "tool_output_max_turns_old",
+    "tool_output_truncation_chars",
+}
 _RUN_KEYS = {
     "agent",
     "model",
@@ -98,6 +107,7 @@ _RUN_KEYS = {
     "worker_memory_max",
     "roles",
     "timeouts",
+    "context",
 }
 # Top-level tables a project config.toml may carry. [experience] is the
 # instance's optional MSCE level-3 override (read by lh_harness.experience.seed,
@@ -323,6 +333,22 @@ manager = 300
 gui_executor = 1800
 cli_executor = 1800
 auditor = 300
+
+# Rule-based tool-output trimming (task T-B). After an episode finishes the
+# harness walks its parsed trajectory and clears old tool results by rule:
+# the last ``tool_output_keep_last_n`` tool results keep their original text;
+# any other tool result older than ``tool_output_max_turns_old`` turns AND
+# longer than ``tool_output_truncation_chars`` is reduced to its first
+# ``tool_output_truncation_chars`` characters plus the one-line stub
+# "[tool output cleared: <tool> <bytes> bytes, turn <k>]". Everything else
+# outside the kept window becomes the stub alone. No LLM summarisation runs
+# before this; any existing summarisation (when configured) runs only after.
+# Set ``tool_output_trimming_enabled = false`` to disable end-to-end.
+[run.context]
+tool_output_trimming_enabled = true
+tool_output_keep_last_n = 4
+tool_output_max_turns_old = 3
+tool_output_truncation_chars = 500
 
 [run.roles.manager]
 # agent = "codex"
@@ -984,6 +1010,37 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         raise ProjectConfigError(f"unknown timeout role(s): {_names(unknown_timeouts)}")
     for role, value in timeouts.items():
         defaults[f"{role}_timeout"] = _positive_int(value, f"run.timeouts.{role}")
+
+    # T-B: rule-based tool-output trimming. The four keys live under
+    # ``[run.context]`` (a sub-table so the off switch sits next to its
+    # bounds). Defaults match the task description (N=4, M=3, 500 chars,
+    # enabled=true) and are the values ``TrimmingConfig`` itself uses when
+    # callers build it without a payload, so omitting the table is
+    # equivalent to leaving the keys unset.
+    context = run.get("context", {})
+    if not isinstance(context, dict):
+        raise ProjectConfigError("[run.context] must be a TOML table")
+    unknown_context = set(context) - _CONTEXT_KEYS
+    if unknown_context:
+        raise ProjectConfigError(f"unknown [run.context] key(s): {_names(unknown_context)}")
+    if "tool_output_keep_last_n" in context:
+        defaults["tool_output_keep_last_n"] = _non_negative_int(
+            context["tool_output_keep_last_n"], "run.context.tool_output_keep_last_n"
+        )
+    if "tool_output_max_turns_old" in context:
+        defaults["tool_output_max_turns_old"] = _non_negative_int(
+            context["tool_output_max_turns_old"], "run.context.tool_output_max_turns_old"
+        )
+    if "tool_output_truncation_chars" in context:
+        defaults["tool_output_truncation_chars"] = _positive_int(
+            context["tool_output_truncation_chars"],
+            "run.context.tool_output_truncation_chars",
+        )
+    if "tool_output_trimming_enabled" in context:
+        defaults["tool_output_trimming_enabled"] = _boolean(
+            context["tool_output_trimming_enabled"],
+            "run.context.tool_output_trimming_enabled",
+        )
     return defaults
 
 
@@ -1014,6 +1071,18 @@ def _positive_int(value: Any, name: str) -> int:
         raise ProjectConfigError(f"{name} must be an integer of at least 1")
     if name.endswith("max_rounds") and value > MAX_ROUNDS:
         raise ProjectConfigError(f"{name} must be at most {MAX_ROUNDS}")
+    return value
+
+
+def _non_negative_int(value: Any, name: str) -> int:
+    """Like ``_positive_int`` but zero is allowed.
+
+    Used by ``[run.context]`` where a zero ``keep_last_n`` is a legitimate
+    "trim everything" choice and a zero ``max_turns_old`` is "always
+    consider results old enough for the truncation path".
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProjectConfigError(f"{name} must be a non-negative integer")
     return value
 
 
