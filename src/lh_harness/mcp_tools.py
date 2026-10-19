@@ -34,6 +34,7 @@ from typing import Any
 
 from .caller_auth import (
     ANON_CALLER,
+    ANNOTATE_TOOL,
     RESOLVE_TOOL,
     ask_caller_specs,
     ask_scope_allowed,
@@ -182,6 +183,18 @@ _RESOLVE_GATE_DESCRIPTION = """Resolve an operator gate for a running harness ru
 
 user_input must be plain ASCII. Any non-ASCII character is rejected because
 MCP/chat clients cannot safely transmit formatting bytes through the gateway.
+"""
+
+_ANNOTATE_GATE_DESCRIPTION = """Set or update the decision-maker metadata on a pending gate.
+
+LHH-GATE-OWNER-NOTE: writes ``owner`` (one of overseer, paxton, requester,
+any) and an optional ``owner_note`` (markdown, <= 4000 chars) onto a pending
+approval WITHOUT resolving the gate.  Use this so any user opening the run
+sees WHO is expected to answer the gate and WHY it is held -- "Decision:
+Overseer1" badge plus a free-form description panel -- instead of asking in
+chat.  Idempotent: re-calling overwrites the badge/note and rewrites the
+audit stamp (``owner_set_by``/``owner_set_at``) to the latest verified
+caller.  A resolved gate is read-only here (409).
 """
 
 _LIST_CONTENTIONS_DESCRIPTION = """List current workspace contentions reported by the launcher.
@@ -557,6 +570,22 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
             },
         ),
         _tool_spec(
+            "harness_annotate_run_gate",
+            _ANNOTATE_GATE_DESCRIPTION,
+            {
+                "run_id": _string_param("Run whose gate should be annotated.", required=True),
+                "approval_id": _string_param("Gate/approval identifier from the run snapshot.", required=True),
+                "owner": _string_param(
+                    "Decision-maker label: one of overseer, paxton, requester, any.",
+                    required=False,
+                ),
+                "owner_note": _string_param(
+                    "Free-form markdown description (<= 4000 chars) of why the gate is held.",
+                    required=False,
+                ),
+            },
+        ),
+        _tool_spec(
             "harness_list_contentions",
             _LIST_CONTENTIONS_DESCRIPTION,
             {},
@@ -880,6 +909,15 @@ def dispatch(
             return _run_status(arguments, registry=registry, supervisor=supervisor)
         if tool_name == "harness_resolve_gate":
             return _resolve_gate(arguments, registry=registry, supervisor=supervisor)
+        if tool_name == "harness_annotate_run_gate":
+            # Scoping OFF: no verified identity to stamp as actor; the REST
+            # twin stays caller-stamped via the X-Harness-Caller header.
+            return _annotate_gate(
+                arguments,
+                registry=registry,
+                supervisor=supervisor,
+                actor=None,
+            )
         if tool_name == "harness_list_contentions":
             return _list_contentions(runs_root=_runs_root(registry, supervisor))
         return {"ok": False, "error": f"unknown tool {tool_name}", "code": 404}
@@ -890,7 +928,7 @@ def dispatch(
     if caller == ANON_CALLER:
         return {"ok": False, "error": "invalid or missing caller identity", "code": 401}
     if not tool_allowed(caller, tool_name, specs):
-        if tool_name == RESOLVE_TOOL:
+        if tool_name in (RESOLVE_TOOL, ANNOTATE_TOOL):
             emit_refusal_audit(
                 _runs_root(registry, supervisor),
                 caller=caller,
@@ -921,6 +959,15 @@ def dispatch(
         return _run_status(arguments, registry=registry, supervisor=supervisor)
     if tool_name == "harness_resolve_gate":
         return _resolve_gate(arguments, registry=registry, supervisor=supervisor)
+    if tool_name == "harness_annotate_run_gate":
+        # Stamp the verified caller as the actor of the annotation so the
+        # snapshot's ``owner_set_by`` mirrors the REST route's behaviour.
+        return _annotate_gate(
+            arguments,
+            registry=registry,
+            supervisor=supervisor,
+            actor=caller,
+        )
     if tool_name == "harness_list_contentions":
         return _list_contentions(runs_root=_runs_root(registry, supervisor))
     # Unreachable: every scoping-eligible tool is dispatched above (the config
@@ -1568,6 +1615,72 @@ def _resolve_gate(arguments: dict[str, Any], *, registry: Any, supervisor: Any) 
     if not ok:
         return {"ok": False, "error": "approval is missing, resolved, or read-only", "code": 409}
     return {"ok": True, "approval_id": approval_id, "status": "accepted"}
+
+
+def _annotate_gate(arguments: dict[str, Any], *, registry: Any, supervisor: Any, actor: str | None = None) -> dict[str, Any]:
+    """Set/update a pending gate's ``owner``/``owner_note`` without resolving.
+
+    LHH-GATE-OWNER-NOTE: mirrors the REST ``/annotate`` route contract --
+    404 on unknown approval, 409 on resolved/read-only, 422 on neither field
+    provided, validation errors reproduce on bad shapes.  The handler does
+    NOT change gate status; resolving the gate is still done through
+    ``resolve_approval``.  The actual storage lives in
+    ``RunState.annotate_gate`` (round 1 data-model layer).
+
+    ``actor`` is the verified-caller name when per-caller scoping is ON;
+    when scoping is OFF (no [callers] table, or no verified caller's name
+    in the arguments) we fall back to ``"overseer1"`` so the audit trail
+    stays attributable, matching the REST ``/annotate`` route's behaviour.
+    """
+    run_id = _bounded(arguments.get("run_id"), field="run_id", max_chars=128, required=True)
+    approval_id = _bounded(arguments.get("approval_id"), field="approval_id", max_chars=128, required=True)
+    state = registry.state_for(run_id)
+    if state is None:
+        return {"ok": False, "error": "run not found", "code": 404}
+    if supervisor is not None and not supervisor.can_control(run_id):
+        return {"ok": False, "error": "run is not accepting approvals", "code": 409}
+
+    # Run the same read-side reconciliation the REST ``/annotate`` route
+    # uses: ``get_approval`` calls ``_apply_pending_resolutions`` which
+    # projects any pending control-bus resolve onto the approval and
+    # persists the resolved snapshot.  Skipping this leaves the in-memory
+    # approval showing "pending" while the decision is already on the
+    # control bus, so the resolved-gate check below would miss and the
+    # handler would happily re-write the badge on a frozen gate.
+    existing = state.get_approval(approval_id)
+    if existing is None:
+        return {"ok": False, "error": "approval not found", "code": 404}
+    if str(getattr(existing, "status", "")) == "resolved":
+        # The data layer is happy to keep history once a gate is resolved;
+        # the contract says the badge is frozen on a resolved gate, so we
+        # surface 409 even when storage would succeed.
+        return {"ok": False, "error": "approval is already resolved", "code": 409}
+
+    owner_raw = arguments.get("owner")
+    note_raw = arguments.get("owner_note")
+    if owner_raw is None and note_raw is None:
+        return {
+            "ok": False,
+            "error": "at least one of 'owner' or 'owner_note' is required",
+            "code": 422,
+        }
+    if owner_raw is not None and not isinstance(owner_raw, str):
+        return {"ok": False, "error": "owner must be a string", "code": 422}
+    if note_raw is not None and not isinstance(note_raw, str):
+        return {"ok": False, "error": "owner_note must be a string", "code": 422}
+
+    actor_text = actor or "overseer1"
+    snapshot = state.annotate_gate(
+        approval_id,
+        owner=owner_raw,
+        owner_note=note_raw,
+        actor=actor_text,
+    )
+    return {
+        "ok": True,
+        "approval_id": approval_id,
+        "approval": snapshot,
+    }
 
 
 # --------------------------------------------------------------------- R5 --

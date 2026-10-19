@@ -1571,7 +1571,7 @@ export default function App() {
       <aside className="codex-sidebar">
         <div className="codex-brand"><span className="codex-mark"><Sparkles size={14} /></span><span>LongHorizon</span><div className="ui-language-switch" role="group" aria-label={text('界面语言', 'Interface language')}><button type="button" className={language === 'zh' ? 'active' : ''} aria-pressed={language === 'zh'} onClick={() => setLanguage('zh')} title="中文">中</button><button type="button" className={language === 'en' ? 'active' : ''} aria-pressed={language === 'en'} onClick={() => setLanguage('en')} title="English">EN</button></div></div>
         <button className="new-task-button" onClick={() => { setCreatingNew(true); setDetailsOpen(true); }} disabled={!canCreateRun}><Plus size={14} />{text('新任务', 'New task')}</button>
-        <TaskListSidebar
+<TaskListSidebar
           runs={runs}
           runId={runId}
           search={search}
@@ -1715,7 +1715,7 @@ export function TaskListSidebar({
         {visible.map((run) => (
           <button key={run.id} type="button" className={`session-item ${run.id === runId ? 'selected' : ''}`} data-run-id={run.id} data-run-status={run.status} onClick={() => onSelectRun(run.id)}>
             <span className={statusClass(run.status)} />
-            <span className="session-copy"><strong>{run.task || 'Untitled task'}</strong><small>{run.id}</small></span>
+            <span className="session-copy"><strong>{run.task || 'Untitled task'}</strong><small>{run.id}</small>{run.status === 'waiting_approval' && run.pending_decision_owner && <DecisionBadge owner={run.pending_decision_owner} compact />}</span>
           </button>
         ))}
         {!visible.length && <div className="sidebar-empty">{text('暂无会话', 'No tasks yet')}</div>}
@@ -2250,6 +2250,98 @@ function TrajectoryDetail({ data, error, onRetry }: { data: TrajectoryView | nul
   </div>;
 }
 
+// ----------------------------------------------------------------- gate
+// LHH-GATE-OWNER-NOTE: surface the decision-maker on a pending approval so
+// any operator viewing a ``waiting_approval`` run sees WHO is expected to
+// answer it (Overseer1 / Paxton / requester / any) and WHY (a free-form
+// markdown ``owner_note`` written by the same writer).  The badge + panel
+// are read-only here; writes go through the existing API/MCP annotate
+// surface (rounds 1–3) and are out of scope for this component.
+
+type GateOwner = 'overseer' | 'paxton' | 'requester' | 'any' | (string & {});
+
+function gateOwnerLabel(owner: string | undefined): string {
+  const normalised = String(owner || 'overseer').toLowerCase();
+  switch (normalised) {
+    case 'overseer':
+      return 'Overseer1';
+    case 'paxton':
+      return 'Paxton';
+    case 'requester':
+      return 'requester';
+    case 'any':
+      return 'any';
+    default:
+      return normalised;
+  }
+}
+
+export function DecisionBadge({ owner, compact = false }: { owner: string | undefined; compact?: boolean }): JSX.Element | null {
+  if (!owner) return null;
+  const label = gateOwnerLabel(owner);
+  return (
+    <span
+      className={`decision-badge decision-badge-${compact ? 'compact' : 'inline'}`}
+      data-testid="decision-badge"
+      data-owner={owner}
+      aria-label={`Decision: ${label}`}
+    >
+      <span className="decision-badge-key">{compact ? '' : 'Decision: '}</span>
+      <strong className="decision-badge-value">{label}</strong>
+    </span>
+  );
+}
+
+export function OwnerNotePanel({ note, setBy }: { note: string | undefined; setBy: string | undefined }): JSX.Element | null {
+  const trimmed = typeof note === 'string' ? note.trim() : '';
+  const [open, setOpen] = useState(trimmed.length > 0);
+  useEffect(() => {
+    // Collapse the panel when a writer clears the note.
+    if (!trimmed) setOpen(false);
+  }, [trimmed]);
+  if (!trimmed) return null;
+  const toggle = () => setOpen((value) => !value);
+  const blocks = trimmed.split(/\n{2,}/u).filter(Boolean);
+  return (
+    <section className="owner-note" data-testid="owner-note-panel" aria-label="Description">
+      <button
+        type="button"
+        className="owner-note-toggle"
+        onClick={toggle}
+        aria-expanded={open}
+        aria-controls={`owner-note-body-${setBy || 'na'}`}
+      >
+        <span>{open ? '▼' : '▶'}</span>
+        <span>Description</span>
+        {setBy ? <span className="owner-note-author">· {setBy}</span> : null}
+      </button>
+      {open && (
+        <div className="owner-note-body" id={`owner-note-body-${setBy || 'na'}`} data-testid="owner-note-body">
+          {blocks.map((block, index) => {
+            const lines = block.split('\n');
+            if (lines.length && lines.every((line) => /^[-*]\s+/u.test(line))) {
+              return (
+                <ul key={index}>
+                  {lines.map((line, lineIndex) => (
+                    <li key={lineIndex}>{inlineMessageText(line.replace(/^[-*]\s+/u, ''))}</li>
+                  ))}
+                </ul>
+              );
+            }
+            return (
+              <p key={index}>
+                {lines.map((line, lineIndex) => (
+                  <span key={lineIndex}>{inlineMessageText(line)}{lineIndex < lines.length - 1 && <br />}</span>
+                ))}
+              </p>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function inlineMessageText(text: string): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern = /(`[^`]+`|\*\*[^*]+\*\*|https?:\/\/[^\s<>"'`]+)/giu;
@@ -2291,7 +2383,7 @@ function MessageText({ text }: { text: string }) {
   })}</div>;
 }
 
-function ApprovalCard({ approval, busy, userInput, onUserInput, extraRounds, onExtraRounds, onApprove }: { approval: Snapshot['approvals'][number]; busy: boolean; userInput: string; onUserInput: (value: string) => void; extraRounds: string; onExtraRounds: (value: string) => void; onApprove: (id: string, action: string, userInput?: string, extraRounds?: number) => void }) {
+export function ApprovalCard({ approval, busy, userInput, onUserInput, extraRounds, onExtraRounds, onApprove }: { approval: Snapshot['approvals'][number]; busy: boolean; userInput: string; onUserInput: (value: string) => void; extraRounds: string; onExtraRounds: (value: string) => void; onApprove: (id: string, action: string, userInput?: string, extraRounds?: number) => void }) {
   const { text } = useUiLanguage();
   const options = approval.options.length ? approval.options : [{ value: 'continue', label: 'Continue' }, { value: 'stop', label: 'Stop', style: 'danger' }];
   const completed = approval.context?.trigger === 'completed' || approval.title === 'Task complete. Continue the run?';
@@ -2305,7 +2397,7 @@ function ApprovalCard({ approval, busy, userInput, onUserInput, extraRounds, onE
   const roundsValue = extraRounds.trim();
   const roundsInvalid = roundsValue !== '' && !(/^\d+$/.test(roundsValue) && Number(roundsValue) >= 1 && Number(roundsValue) <= MAX_ROUNDS);
   const roundsPayload = () => (roundsValue === '' || roundsInvalid ? undefined : Number(roundsValue));
-  return <article className="approval-card" id={approvalElementId(approval.approval_id)}><div className="message-avatar approval-avatar"><AlertTriangle size={12} /></div><div className="message-body"><div className="message-meta"><strong>{title}</strong><span className="approval-label">{text('需要你的输入', 'Input required')}</span></div><MessageText text={message} />{approval.allow_input && <textarea className="approval-input" value={userInput} onChange={(event) => onUserInput(event.target.value)} placeholder={inputPlaceholder} disabled={busy} />}{allowRounds && <label className="approval-rounds">{text('继续时追加轮数', 'Extra rounds when continuing')}<input type="number" min={1} max={MAX_ROUNDS} step={1} value={extraRounds} disabled={busy} placeholder={text('留空＝沿用原本的轮数上限', 'Blank = keep the configured round budget')} onChange={(event) => onExtraRounds(event.target.value)} /><span className={roundsInvalid ? 'approval-rounds-error' : 'approval-rounds-note'}>{roundsInvalid ? text(`请输入 1 到 ${MAX_ROUNDS} 之间的整数`, `Enter a whole number from 1 to ${MAX_ROUNDS}`) : text('只影响“继续运行”', 'Only affects “Continue run”')}</span></label>} {approval.answers.length > 0 && <div className="approval-answers" aria-label={text('快速回答', 'Quick answers')}>{approval.answers.map((answer) => <button type="button" key={answer} disabled={busy || roundsInvalid} onClick={() => onApprove(approval.approval_id, 'continue', answer, roundsPayload())}>{answer}</button>)}</div>}<div className="approval-actions">{options.map((option) => <button key={option.value} disabled={busy || (roundsInvalid && option.value !== 'stop')} className={option.style === 'danger' ? 'danger-text' : ''} onClick={() => onApprove(approval.approval_id, option.value, undefined, option.value === 'stop' ? undefined : roundsPayload())}>{optionLabel(option.label)}</button>)}</div></div></article>;
+  return <article className="approval-card" id={approvalElementId(approval.approval_id)}><div className="message-avatar approval-avatar"><AlertTriangle size={12} /></div><div className="message-body"><div className="message-meta"><strong>{title}</strong><span className="approval-label">{text('需要你的输入', 'Input required')}</span><DecisionBadge owner={approval.owner} /></div><OwnerNotePanel note={approval.owner_note} setBy={approval.owner_set_by} /><MessageText text={message} />{approval.allow_input && <textarea className="approval-input" value={userInput} onChange={(event) => onUserInput(event.target.value)} placeholder={inputPlaceholder} disabled={busy} />}{allowRounds && <label className="approval-rounds">{text('继续时追加轮数', 'Extra rounds when continuing')}<input type="number" min={1} max={MAX_ROUNDS} step={1} value={extraRounds} disabled={busy} placeholder={text('留空＝沿用原本的轮数上限', 'Blank = keep the configured round budget')} onChange={(event) => onExtraRounds(event.target.value)} /><span className={roundsInvalid ? 'approval-rounds-error' : 'approval-rounds-note'}>{roundsInvalid ? text(`请输入 1 到 ${MAX_ROUNDS} 之间的整数`, `Enter a whole number from 1 to ${MAX_ROUNDS}`) : text('只影响“继续运行”', 'Only affects “Continue run”')}</span></label>} {approval.answers.length > 0 && <div className="approval-answers" aria-label={text('快速回答', 'Quick answers')}>{approval.answers.map((answer) => <button type="button" key={answer} disabled={busy || roundsInvalid} onClick={() => onApprove(approval.approval_id, 'continue', answer, roundsPayload())}>{answer}</button>)}</div>}<div className="approval-actions">{options.map((option) => <button key={option.value} disabled={busy || (roundsInvalid && option.value !== 'stop')} className={option.style === 'danger' ? 'danger-text' : ''} onClick={() => onApprove(approval.approval_id, option.value, undefined, option.value === 'stop' ? undefined : roundsPayload())}>{optionLabel(option.label)}</button>)}</div></div></article>;
 }
 
 // ---------------------------------------------------------------- Queue --

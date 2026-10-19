@@ -98,6 +98,38 @@ class ApprovalOption:
         return {"value": self.value, "label": self.label, "style": self.style}
 
 
+# LHH-GATE-OWNER-NOTE: the canonical set of values for the ``owner`` badge on
+# a pending gate.  ``requester`` means the original requester of the run
+# decides; ``any`` deliberately signals ambiguity to viewers.  Anything that
+# is not in this set is normalised to ``"overseer"`` by ``annotate_gate``
+# below so legacy records never crash the renderer.
+_GATE_OWNERS: frozenset[str] = frozenset({"overseer", "paxton", "requester", "any"})
+_DEFAULT_GATE_OWNER = "overseer"
+_OWNER_NOTE_MAX_CHARS = 4000
+
+
+def _clean_gate_owner(value: Any) -> str:
+    """Coerce a caller-provided owner value into the canonical enum."""
+
+    text = str(value or "").strip().lower()
+    if text in _GATE_OWNERS:
+        return text
+    return _DEFAULT_GATE_OWNER
+
+
+def _clean_owner_note(value: Any) -> str:
+    """Bound and normalise an owner_note string to ASCII-printable markdown."""
+
+    if value is None:
+        return ""
+    text = str(value)
+    if len(text) > _OWNER_NOTE_MAX_CHARS:
+        text = text[:_OWNER_NOTE_MAX_CHARS]
+    # Drop NUL bytes only; markdown is otherwise free-form text, so we do not
+    # enforce ASCII here (the renderer is responsible for safe display).
+    return text.replace("\x00", "")
+
+
 @dataclass
 class Approval:
     """A single human-in-the-loop checkpoint (a question with options).
@@ -127,6 +159,16 @@ class Approval:
     extra_rounds: int = 0  # 0 -> use the manager's configured budget
     created_at: float = field(default_factory=time.time)
     resolved_at: float | None = None
+    # LHH-GATE-OWNER-NOTE: who decides this gate and why.  ``owner`` defaults
+    # to "overseer" (Overseer1) for backwards compatibility; ``owner_note`` is
+    # free-form markdown up to 4000 chars and is intentionally optional.  The
+    # audit fields ``owner_set_by`` / ``owner_set_at`` record who wrote the
+    # note last (operator/MCP caller label) and when, so subsequent viewers
+    # always know the provenance of the decision badge text.
+    owner: str = "overseer"
+    owner_note: str = ""
+    owner_set_by: str = ""
+    owner_set_at: float | None = None
 
     @property
     def round_index(self) -> int:
@@ -151,6 +193,10 @@ class Approval:
             "extra_rounds": self.extra_rounds,
             "created_at": self.created_at,
             "resolved_at": self.resolved_at,
+            "owner": self.owner,
+            "owner_note": self.owner_note,
+            "owner_set_by": self.owner_set_by,
+            "owner_set_at": self.owner_set_at,
         }
 
 
@@ -984,6 +1030,10 @@ class DashboardState:
             extra_rounds=_normalise_extra_rounds(record.get("extra_rounds")),
             created_at=float(record.get("created_at", time.time())),
             resolved_at=float(record["resolved_at"]) if record.get("resolved_at") else None,
+            owner=_clean_gate_owner(record.get("owner")),
+            owner_note=_clean_owner_note(record.get("owner_note")),
+            owner_set_by=str(record.get("owner_set_by", "") or ""),
+            owner_set_at=float(record["owner_set_at"]) if record.get("owner_set_at") else None,
         )
 
     def _refresh_approval_from_disk(self, approval_id: str) -> None:
@@ -1090,6 +1140,51 @@ class DashboardState:
             snapshot = approval.to_dict()
         self._persist_approval(snapshot)
         return True
+
+    def annotate_gate(
+        self,
+        approval_id: str,
+        *,
+        owner: Any = None,
+        owner_note: Any = None,
+        actor: Any = None,
+    ) -> dict[str, Any] | None:
+        """Set/update the gate ``owner`` and ``owner_note`` without resolving.
+
+        LHH-GATE-OWNER-NOTE: Overseer1 can use this to publish a decision
+        badge ("Decision: Paxton") and a free-form description on a pending
+        gate so any user opening the run snapshot sees WHO is expected to
+        answer and WHY it is held, without needing to ask in chat.  The
+        method does NOT change the gate status; resolving the gate is still
+        done through ``resolve_approval``.
+
+        Returns the updated approval dict on success, ``None`` when no such
+        approval is known.  The caller should translate ``None`` to 404.
+        """
+
+        if not isinstance(approval_id, str) or not approval_id:
+            return None
+        self._refresh_approval_from_disk(approval_id)
+        new_owner = _clean_gate_owner(owner) if owner is not None else None
+        new_note = _clean_owner_note(owner_note) if owner_note is not None else None
+        actor_text = "" if actor is None else str(actor).strip()[:_OWNER_NOTE_MAX_CHARS]
+        now = time.time()
+        with self._lock:
+            approval = self._approvals.get(approval_id)
+            if approval is None:
+                return None
+            if new_owner is not None:
+                approval.owner = new_owner
+            if new_note is not None:
+                approval.owner_note = new_note
+            # Audit metadata is rewritten on every annotate call so the
+            # viewer knows exactly which MCP caller placed the note last;
+            # skipping would freeze the badge in time after the first edit.
+            approval.owner_set_by = actor_text
+            approval.owner_set_at = now
+            snapshot = approval.to_dict()
+        self._persist_approval(snapshot)
+        return snapshot
 
     def _overlay_pending_resolutions(self, merged: dict[str, dict[str, Any]]) -> None:
         """Project pending control-bus resolves into read-only approval records.

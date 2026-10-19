@@ -142,6 +142,7 @@ _MCP_TOOL_NAMES = frozenset(
         "harness_list_queue",
         "harness_run_status",
         "harness_resolve_gate",
+        "harness_annotate_run_gate",
         "harness_list_contentions",
     }
 )

@@ -40,6 +40,7 @@ from ..launcher import (
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
 from ..caller_auth import (
     ANON_CALLER,
+    ANNOTATE_TOOL,
     RESOLVE_TOOL,
     caller_configs_or_defaults,
     captured_secret,
@@ -1412,6 +1413,12 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
     durable state already carried one, because deriving it otherwise would
     require a per-run rounds/events read, which is exactly the cost this path
     exists to avoid.
+
+    LHH-GATE-OWNER-NOTE: callers may pass ``runs_root`` to enable a bounded
+    read of each waiting_approval row's ``approvals.jsonl`` so the runs list
+    can surface the pending decision's ``owner`` + (capped) ``owner_note``
+    without loading the full snapshot.  ``runs_root=None`` skips that read;
+    the badge simply won't appear (non-blocking).
     """
 
     row: dict[str, Any] = {
@@ -1432,6 +1439,50 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
     if isinstance(item.get("round"), int) and not isinstance(item.get("round"), bool):
         row["round"] = item["round"]
     return row
+
+
+def _attach_pending_decision(row: dict[str, Any], *, runs_root: Any) -> None:
+    """Best-effort bounded read for the runs-list badge.
+
+    Mutates ``row`` in place to add ``pending_decision_owner`` /
+    ``pending_decision_owner_note`` when the run has a pending approval.
+    Stays no-op on any filesystem or JSONL failure so the runs list still
+    renders when the approval file is missing or malformed — the badge is
+    advisory, not load-bearing.  Reads from the tail of ``approvals.jsonl``
+    and returns on the FIRST pending record.
+    """
+
+    if row.get("status") != "waiting_approval":
+        return
+    run_id = row.get("id")
+    if not isinstance(run_id, str) or not run_id or runs_root is None:
+        return
+    approvals_path = Path(runs_root) / run_id / "role_orchestration" / "approvals.jsonl"
+    if not approvals_path.is_file():
+        return
+    try:
+        with approvals_path.open("r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("status") != "pending":
+            continue
+        owner = record.get("owner")
+        if isinstance(owner, str) and owner.strip():
+            row["pending_decision_owner"] = owner
+        note = record.get("owner_note")
+        if isinstance(note, str) and note.strip():
+            row["pending_decision_owner_note"] = note[:4000]
+        return
 
 
 def _summary_from_full(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1649,11 +1700,11 @@ def create_app(
             return None
         caller = resolve_rest_caller(request.headers, caller_specs)
         if caller == ANON_CALLER:
-            if tool == RESOLVE_TOOL:
+            if tool in (RESOLVE_TOOL, ANNOTATE_TOOL):
                 emit_refusal_audit(runs_root, caller=caller, tool=tool, run_id=run_id)
             raise HTTPException(status_code=401, detail="invalid or missing caller identity")
         if not tool_allowed(caller, tool, caller_specs):
-            if tool == RESOLVE_TOOL:
+            if tool in (RESOLVE_TOOL, ANNOTATE_TOOL):
                 emit_refusal_audit(
                     runs_root,
                     caller=caller,
@@ -3128,6 +3179,12 @@ def create_app(
             if status_filter:
                 items = [item for item in items if str(item.get("status") or "") in status_filter]
             result = [_build_summary_projection(item) for item in items]
+            # LHH-GATE-OWNER-NOTE: one bounded per-row approval tail read for
+            # waiting_approval rows so the runs list badge has its data. The
+            # read is small (a single file, tail-first scan, early break on
+            # first pending record).
+            for row in result:
+                _attach_pending_decision(row, runs_root=registry.runs_root)
             return {"runs": result}
 
         result: list[dict[str, Any]] = []
@@ -3710,6 +3767,69 @@ def create_app(
             "status": "accepted",
             "idempotency_key": _bounded_command_id(request.headers.get("Idempotency-Key")),
             "revision": state_for_run.control_bus.revision(),
+        }
+
+    @app.post("/api/runs/{run_id}/approvals/{approval_id}/annotate")
+    def annotate_gate_approval(
+        run_id: str,
+        approval_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        # LHH-GATE-OWNER-NOTE: set or update the gate's decision-maker
+        # badge (``owner``) and free-form description (``owner_note``)
+        # WITHOUT resolving the gate.  This route lives on its own MCP-tool
+        # allowlist (``harness_annotate_run_gate``) so a caller may be
+        # granted the ability to label pending gates without being granted
+        # the ability to decide them.  The pre-check below keeps the
+        # "resolved gate is read-only on the writer surface" rule: once the
+        # decision is in, the badge is frozen, which is why we answer 409
+        # even if the storage layer is happy to persist the row for the
+        # historical record.
+        caller = _scoped_caller(request, ANNOTATE_TOOL, run_id=run_id)
+        state_for_run = _state_or_404(registry, run_id)
+        if supervisor is not None and not supervisor.can_control(run_id):
+            raise HTTPException(status_code=409, detail="run is not accepting approvals")
+
+        existing = state_for_run.get_approval(approval_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="approval not found")
+        if existing.status == "resolved":
+            raise HTTPException(status_code=409, detail="approval is already resolved")
+
+        owner_raw = body.get("owner")
+        note_raw = body.get("owner_note")
+        if owner_raw is None and note_raw is None:
+            raise HTTPException(
+                status_code=422,
+                detail="at least one of 'owner' or 'owner_note' is required",
+            )
+        if owner_raw is not None and not isinstance(owner_raw, str):
+            raise HTTPException(status_code=422, detail="owner must be a string")
+        if note_raw is not None and not isinstance(note_raw, str):
+            raise HTTPException(status_code=422, detail="owner_note must be a string")
+
+        actor = caller or "overseer1"
+        snapshot = state_for_run.annotate_gate(
+            approval_id,
+            owner=owner_raw,
+            owner_note=note_raw,
+            actor=actor,
+        )
+        if snapshot is None:
+            # _refresh_approval_from_disk raced the in-memory store: the
+            # approval disappeared between the pre-check above and the
+            # annotate call.  Surface that as 404 so callers can retry.
+            raise HTTPException(status_code=404, detail="approval not found")
+        snapshot_cache.invalidate(run_id)
+        return {
+            "ok": True,
+            "approval_id": approval_id,
+            "status": "accepted",
+            "owner": snapshot.get("owner"),
+            "owner_note": snapshot.get("owner_note", ""),
+            "owner_set_by": snapshot.get("owner_set_by", ""),
+            "owner_set_at": snapshot.get("owner_set_at"),
         }
 
     @app.post("/api/runs/{run_id}/abort")
