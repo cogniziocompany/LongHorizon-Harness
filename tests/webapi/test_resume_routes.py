@@ -54,7 +54,7 @@ def _stopped_run(client: TestClient, process: FakeProcess) -> str:
     created = client.post("/api/runs", json={"task": "long job", "max_rounds": 4})
     assert created.status_code == 200
     run_id = created.json()["run"]["id"]
-    assert client.post(f"/api/runs/{run_id}/stop", json={}).status_code == 200
+    assert client.post(f"/api/runs/{run_id}/stop", json={"reason": "test stop"}).status_code == 200
     process.returncode = -15
     # Poll until the supervisor reconciles the stopped process to a terminal
     # status and the snapshot offers resume.  A single snapshot may still see
@@ -174,7 +174,7 @@ def test_a_resumed_run_can_be_stopped_again_over_http(client) -> None:
     process.returncode = None
 
     assert api.post(f"/api/runs/{run_id}/resume", json=_RESUME_ACK).status_code == 200
-    stopped = api.post(f"/api/runs/{run_id}/stop", json={})
+    stopped = api.post(f"/api/runs/{run_id}/stop", json={"reason": "test stop"})
 
     assert stopped.status_code == 200
     assert stopped.json()["command_id"] == "lifecycle-stop@1"
@@ -192,14 +192,14 @@ def test_the_snapshot_reports_a_stop_that_has_not_taken_effect(client) -> None:
     assert "requested_action" not in idle
     assert "stop_requested_at" not in idle
 
-    assert api.post(f"/api/runs/{run_id}/stop", json={}).status_code == 200
+    assert api.post(f"/api/runs/{run_id}/stop", json={"reason": "test stop"}).status_code == 200
     stopping = api.get(f"/api/runs/{run_id}/snapshot").json()["run"]
 
     assert stopping["status"] == "stopping"
     assert stopping["requested_action"] == "stop"
     assert isinstance(stopping["stop_requested_at"], (int, float))
 
-    assert api.post(f"/api/runs/{run_id}/abort", json={}).status_code == 200
+    assert api.post(f"/api/runs/{run_id}/abort", json={"reason": "test abort"}).status_code == 200
     escalated = api.get(f"/api/runs/{run_id}/snapshot").json()["run"]
 
     assert escalated["requested_action"] == "abort", "an escalation must be observable"

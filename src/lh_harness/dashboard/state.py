@@ -1104,6 +1104,7 @@ class DashboardState:
                     )
                 except (ImportError, OSError):
                     pass
+            result_payload: dict[str, Any] = {"approval_id": approval_id}
             if action == "stop":
                 # Resolving an end-of-round gate with "stop" is an explicit
                 # operator cancellation, not a worker crash.  Persist that
@@ -1127,7 +1128,51 @@ class DashboardState:
                     return updated
 
                 self.control_bus.update_status(mark_operator_stop)
-            self.control_bus.receipt(command, "applied", result={"approval_id": approval_id})
+                # LHH-QUEUE-OUTCOMES: a "stop" carries a structured outcome
+                # the queue store records. The rationale prefix ``done:`` /
+                # ``blocked:`` maps to ``done_at_gate`` / ``blocked``; any
+                # other rationale (or no rationale) is the audit-gap case
+                # we mark ``needs_followup``. The actual write happens in
+                # the manager / web stop route -- here we surface the
+                # mapping as part of the receipt so the audit trail in the
+                # control-bus log shows why this stop was classed the way
+                # it was.
+                result_payload["stop_outcome"] = self._classify_stop_outcome(
+                    approval.context.get("trigger", ""), approval.reason
+                )
+            self.control_bus.receipt(command, "applied", result=result_payload)
+
+    @staticmethod
+    def _classify_stop_outcome(trigger: str, reason: str) -> str:
+        """Map a stop's (trigger, reason) pair to a structured queue outcome.
+
+        LHH-QUEUE-OUTCOMES: the structured outcome of a ``resolve_approval``
+        stop is derived from the operator's rationale:
+        - rationale starts with ``done:`` -> ``done_at_gate`` (operator
+          accepted the gate as the final deliverable)
+        - rationale starts with ``blocked:`` -> ``blocked`` (parked on
+          something outside the launcher)
+        - rationale names a follow-up (``followup:`` / ``retry:``) -> maps
+          to ``cancelled`` AND surfaces the need for a separate
+          ``followup_queue_id`` stamp; the caller is expected to enqueue
+          the follow-up through the queue API.
+        - no rationale (or an unrecognised one without a follow-up) is the
+          audit-gap case the ct110 review flagged: ``needs_followup``.
+
+        Returns one of the ``_VALID_OUTCOMES`` strings defined on
+        ``queue.py``. Pure (no side effects, no state mutation); the
+        manager / web stop route reads this mapping and stamps the
+        outcome onto the queue entry.
+        """
+        text = (reason or "").strip()
+        lowered = text.lower()
+        if lowered.startswith("done:"):
+            return "done_at_gate"
+        if lowered.startswith("blocked:"):
+            return "blocked"
+        if lowered.startswith("followup:") or lowered.startswith("retry:"):
+            return "cancelled"
+        return "needs_followup"
 
     def update_approval_context(self, approval_id: str, **updates: Any) -> bool:
         """Update live setup/progress metadata and append a durable snapshot."""

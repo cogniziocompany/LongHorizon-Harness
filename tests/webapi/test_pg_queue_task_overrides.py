@@ -85,11 +85,21 @@ def _body(**overrides: Any) -> dict[str, Any]:
 
 def test_column_list_covers_both_overrides_append_only() -> None:
     columns = pg_queue._QUEUE_COLUMNS
-    # Append-only after the migration-006 column, so the 001..006 row shape
-    # (and every existing assertion zipping columns to values) is untouched.
-    assert columns[-3] == "time_limit_minutes"
-    assert columns[-2:] == OVERRIDE_COLUMNS
+    # Append-only after the migration-006 column. LHH-QUEUE-OUTCOMES then
+    # appends five more columns (outcome / outcome_reason / followup_queue_id /
+    # stopped_by / stop_reason) so the row shape stays monotonically extended;
+    # existing 001..006 assertions zipping columns to values remain valid.
+    assert "time_limit_minutes" in columns
+    assert columns[columns.index("time_limit_minutes") + 1 : columns.index("time_limit_minutes") + 3] == OVERRIDE_COLUMNS
+    assert columns[-5:] == (
+        "outcome",
+        "outcome_reason",
+        "followup_queue_id",
+        "stopped_by",
+        "stop_reason",
+    )
     assert _OVERRIDE_COLUMNS_SQL_MARKERS()
+    assert _OUTCOME_COLUMNS_SQL_MARKERS()
 
 
 def _OVERRIDE_COLUMNS_SQL_MARKERS() -> bool:
@@ -101,6 +111,19 @@ def _OVERRIDE_COLUMNS_SQL_MARKERS() -> bool:
         # Marker comment so the applied statement is greppable in any
         # statement log, exactly like the migrations/*.sql header comments.
         and "LHH-QUEUE-HOTRELOAD R9" in sql
+    )
+
+
+def _OUTCOME_COLUMNS_SQL_MARKERS() -> bool:
+    """LHH-QUEUE-OUTCOMES migration markers: the outcome columns are added in
+    a separate in-code migration so a fresh Postgres install carries them
+    without a separate migrations/*.sql file."""
+    sql = pg_queue._MIGRATION_QUEUE_OUTCOMES_SQL
+    return (
+        "ALTER TABLE harness.queue" in sql
+        and "ADD COLUMN IF NOT EXISTS outcome VARCHAR(64)" in sql
+        and "ADD COLUMN IF NOT EXISTS followup_queue_id VARCHAR(128)" in sql
+        and "LHH-QUEUE-OUTCOMES" in sql
     )
 
 

@@ -1172,6 +1172,54 @@ def _emit_run_created_event(
         pass
 
 
+# LHH-QUEUE-OUTCOMES: bound on the stop ``reason`` body parameter so a
+# stray 1MB error message never lands on the run control log.
+_MAX_RUN_CONTROL_REASON_CHARS = 4000
+
+
+def _find_queue_entry_for_run(queue_store: Any, run_id: str) -> Any | None:
+    """Return the queue entry that launched ``run_id``, or ``None``.
+
+    Mirrors the ``time_limit`` route's lookup: it picks the entry with the
+    latest ``launched_at`` so a re-queue that ran twice picks the most
+    recent launch. ``None`` when no entry ever launched this run.
+    """
+    matches = [entry for entry in queue_store.list() if entry.run_id == run_id]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: float(item.launched_at or 0.0))
+
+
+def _append_run_control_event(
+    registry: StateRegistry, run_id: str, event_type: str, payload: dict[str, Any]
+) -> None:
+    """Append a structured event to the run's ``role_orchestration/events.jsonl``.
+
+    LHH-QUEUE-OUTCOMES: the web stop / abort / time_limit routes stamp an
+    event onto the run control log alongside any queue-side write so the
+    operator-facing snapshot shows the same data without a separate query.
+    The append is best-effort: a read-only / unusual log layout must not undo
+    the supervisor action that triggered it.
+    """
+    try:
+        if registry is None or registry.supervisor is None:
+            return
+        role_dir = registry.supervisor._run_logs_dir(run_id) / "role_orchestration"
+        if not role_dir.is_dir():
+            return
+        record = {
+            "schema_version": 2,
+            "event_id": f"{run_id}:{event_type}-{time.time():.6f}",
+            "type": event_type,
+            "ts": time.time(),
+            "run_id": run_id,
+            "payload": payload,
+        }
+        _append_jsonl(role_dir / "events.jsonl", record)
+    except Exception:
+        pass
+
+
 def _snapshot_for(registry: StateRegistry, state: DashboardState, run_id: str) -> dict[str, Any]:
     """Overlay durable Supervisor lifecycle state on the log projection.
 
@@ -3111,6 +3159,48 @@ def create_app(
         records = queue_store.read_shadow_records(since=since_ts)
         return {"ok": True, "count": len(records), "events": records}
 
+    @app.get("/api/queue/needs_followup")
+    def list_queue_needs_followup(request: Request) -> dict[str, Any]:
+        """LHH-QUEUE-OUTCOMES audit surface: entries that ended without a follow-up commit.
+
+        Returns ``{"ok": true, "entries": [<QueueEntry dict>], "count": N}``.
+        The query is read-only and side-effect free; an empty list is a 200,
+        not a 404, so a freshly-purged queue never confuses paginators.
+
+        Declared BEFORE the ``/api/queue/{queue_id}`` route so FastAPI's
+        match order routes ``needs_followup`` here (a fixed path beats a
+        path-with-parameter when both are present).
+        """
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        _scoped_caller(request, "harness_list_queue")
+        entries = queue_store.list_needs_followup()
+        return {
+            "ok": True,
+            "count": len(entries),
+            "entries": [entry.to_dict() for entry in entries],
+        }
+
+    @app.get("/api/queue/outcome/{outcome}")
+    def list_queue_by_outcome(outcome: str, request: Request) -> dict[str, Any]:
+        """LHH-QUEUE-OUTCOMES audit surface: entries whose ``outcome`` matches the given value."""
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        _scoped_caller(request, "harness_list_queue")
+        from ..queue import _validate_outcome  # lazy: web-only path
+
+        try:
+            validated = _validate_outcome(outcome)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        entries = queue_store.list_by_outcome(validated)
+        return {
+            "ok": True,
+            "outcome": validated,
+            "count": len(entries),
+            "entries": [entry.to_dict() for entry in entries],
+        }
+
     @app.get("/api/queue/{queue_id}")
     def get_queue_entry(queue_id: str, request: Request) -> dict[str, Any]:
         """One full queue entry (task text included) for callers paging with view=summary."""
@@ -3844,15 +3934,85 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/stop")
-    def stop(run_id: str, request: Request) -> dict[str, Any]:
-        _run_control_caller(request)
-        _state_or_404(registry, run_id)
+    def stop(
+        run_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        """Stop a run (LHH-QUEUE-OUTCOMES).
+
+        Body: ``{"reason": str >= 1 char, "outcome": "cancelled"|"needs_followup"|"failed"|"done_at_gate"|"blocked" (optional)}``
+
+        The reason is REQUIRED (400 without): a SIGTERM stop with no reason was
+        the audit gap ct110 flagged.  The authenticated caller (from the
+        [callers] table, ``None`` when scoping is off) is recorded as
+        ``stopped_by`` on the queue entry AND on the run control log inside
+        ``role_orchestration/events.jsonl``.
+        """
+        caller = _run_control_caller(request)
+        # State ownership is checked first so the foreign-run guard (the
+        # state registry only knows the runs the supervisor attached) wins
+        # over the body validation -- a stop for a run that does not exist
+        # in this process must answer 404, not 400.
+        state_for_run = _state_or_404(registry, run_id)
+        reason_raw = body.get("reason")
+        if not isinstance(reason_raw, str) or not reason_raw.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="reason is required (string, non-empty; describe why this run is stopping)",
+            )
+        reason = reason_raw.strip()[:_MAX_RUN_CONTROL_REASON_CHARS]
+        outcome_hint = body.get("outcome")
+        if outcome_hint is not None:
+            from ..queue import _validate_outcome  # lazy: web-only path
+
+            try:
+                outcome_hint = _validate_outcome(outcome_hint)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         if supervisor is None:
             raise HTTPException(status_code=501, detail="stop requires the standalone Web supervisor")
         try:
-            return {"ok": True, **supervisor.stop(run_id)}
+            result = supervisor.stop(run_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # LHH-QUEUE-OUTCOMES: record the actor + reason on the queue entry
+        # AND on the run control log. The queue entry is the durable record;
+        # the run control log gives the operator-facing snapshot the same
+        # data without a separate query.
+        if queue_store is not None and result.get("ok") is True:
+            entry = _find_queue_entry_for_run(queue_store, run_id)
+            if entry is not None:
+                try:
+                    queue_store.record_outcome(
+                        entry.queue_id,
+                        outcome=outcome_hint or "cancelled",
+                        outcome_reason=reason,
+                        stopped_by=caller or "anonymous",
+                        stop_reason=reason,
+                    )
+                except ValueError as exc:
+                    # An invalid outcome mapping (422 here) must not undo
+                    # the supervisor stop -- the run is already stopping.
+                    # Surface the issue on the events log so the audit picks
+                    # it up without rolling the stop back.
+                    _append_run_control_event(
+                        registry,
+                        run_id,
+                        "stop.outcome_record_error",
+                        {"queue_id": entry.queue_id, "error": str(exc)[:200]},
+                    )
+        _append_run_control_event(
+            registry,
+            run_id,
+            "run.stop",
+            {
+                "reason": reason,
+                "stopped_by": caller or "anonymous",
+                "outcome": outcome_hint or "cancelled",
+            },
+        )
+        return {"ok": True, "stopped_by": caller or "anonymous", "outcome": outcome_hint or "cancelled", **result}
 
     @app.post("/api/runs/{run_id}/time_limit")
     def set_time_limit(
