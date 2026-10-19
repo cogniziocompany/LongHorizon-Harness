@@ -40,6 +40,7 @@ def build_meta(
     launcher_stalled: bool = False,
     launcher_stall_cycles: int | None = None,
     build: dict[str, Any] | None = None,
+    disk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the stable handshake payload used by both clients."""
 
@@ -104,4 +105,11 @@ def build_meta(
     # the package version does not change between commits.
     if build is not None:
         result["build"] = build
+    # LHH-CT110-DISK: disk state (warn/paused/ok) is surfaced in the same
+    # handshake the dashboard already polls.  ``state`` is "paused" while
+    # the launcher is refusing new launches; ``warn`` once usage crosses
+    # the warn threshold; ``ok`` otherwise.  ``percent_used`` is the only
+    # numeric field the dashboard plots.
+    if disk is not None:
+        result["disk"] = disk
     return result

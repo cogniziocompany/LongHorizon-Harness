@@ -1381,6 +1381,47 @@ class Launcher:
             return f"maintenance launch pause: suspend {suspend_id}"
         return "maintenance launch pause"
 
+    def _disk_full_skip_reason(self) -> str | None:
+        """LHH-CT110-DISK: pause new launches while the disk is at/over ``pause_pct``.
+
+        The pause is sticky: once the launcher sees a disk-full reading, it
+        keeps refusing until a fresh check sees usage below ``resume_pct``.
+        This matches the documented hysteresis between
+        :data:`disk_check.SKIP_REASON_DISK_FULL` and the resume threshold.
+        A misconfigured retention subsystem (missing settings DB, no runs
+        root) fails open — a transient disk-check error must never freeze
+        the launcher.
+        """
+
+        runs_root = getattr(self.supervisor, "runs_root", None)
+        if not runs_root:
+            return None
+        try:
+            from .disk_retention import (
+                DiskRetentionConfig,
+                config_from_runtime,
+                disk_skip_reason as _disk_skip_reason,
+            )
+            from .settings_store import active_runtime
+        except Exception:  # noqa: BLE001 - retention package not importable: never freeze launches
+            return None
+        try:
+            cfg = config_from_runtime(active_runtime())
+        except Exception:  # noqa: BLE001
+            return None
+        sticky = bool(getattr(self, "_disk_full_sticky", False))
+        try:
+            reason = _disk_skip_reason(runs_root, config=cfg, sticky_pause=sticky)
+        except Exception:  # noqa: BLE001
+            return None
+        if reason is not None:
+            # Remember the sticky pause for the next pass; the resume is
+            # only cleared by a fresh check returning None.
+            self._disk_full_sticky = True
+            return reason
+        self._disk_full_sticky = False
+        return None
+
     def _check_eligibility(
         self,
         entry: QueueEntry,
@@ -1393,6 +1434,9 @@ class Launcher:
         pause_reason = self._maintenance_pause_skip_reason()
         if pause_reason is not None:
             return pause_reason
+        disk_reason = self._disk_full_skip_reason()
+        if disk_reason is not None:
+            return disk_reason
         waiting_reason = self._waiting_skip_reason(entry)
         if waiting_reason is not None:
             return waiting_reason
@@ -1746,6 +1790,11 @@ class Launcher:
                 base_check=entry.base_check or None,
                 workspace_base_mode=base.mode,
                 workspace_base_summary=base.summary(),
+                # Reporting slice B: queue provenance stamped onto every LLM
+                # request the worker makes, so Langfuse-side usage can be
+                # grouped by queue entry and trio.
+                queue_id=entry.queue_id,
+                trio=entry.trio,
             )
             run_id = str(created.get("id") or "")
         except Exception as exc:

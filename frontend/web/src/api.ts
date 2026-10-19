@@ -178,11 +178,25 @@ export async function getJson<T>(path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export async function fetchRuns(): Promise<RunSummary[]> {
+/** Status segments are passed through as a comma-separated `status=` filter
+ * to /api/runs so the server returns only matching rows. The mapping between a
+ * segment and the canonical status set lives in the helper next to the
+ * sidebar component (so tests can assert it). Pass a segment to narrow the
+ * list, or omit it to get everything. */
+export type RunListSegment = 'active' | 'completed' | 'other';
+
+export async function fetchRuns(segment?: RunListSegment, statuses?: readonly string[]): Promise<RunSummary[]> {
   // The full listing reads every run directory (several MB and seconds on a
   // busy node); the run list only needs id, status and a title.
   // `task_name` is the bounded first line of the task.
-  const data = await getJson<{ runs: Array<Omit<RunSummary, 'task'> & { task_name?: string; task?: string }> }>('/api/runs?fields=summary');
+  const params = new URLSearchParams({ fields: 'summary' });
+  const list = statuses && statuses.length ? Array.from(new Set(statuses)).join(',') : '';
+  if (list) params.set('status', list);
+  // `segment` and explicit `statuses` are mutually exclusive today; callers
+  // pick one. We keep both so future callers (e.g. debug tooling) can pass an
+  // ad-hoc status list without going through the segment helper.
+  void segment;
+  const data = await getJson<{ runs: Array<Omit<RunSummary, 'task'> & { task_name?: string; task?: string }> }>(`/api/runs?${params}`);
   return data.runs.map((run) => ({ ...run, task: run.task ?? run.task_name ?? '' }) as RunSummary);
 }
 

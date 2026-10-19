@@ -208,6 +208,84 @@ function stoppingLifecycle(status: unknown): boolean {
   return new Set(['stopping', 'aborting', 'stop_requested', 'abort_requested']).has(String(status ?? '').trim().toLowerCase());
 }
 
+/** Canonical segment for the left-sidebar task list filter.
+ *
+ * The mapping is the single source of truth shared by the UI pills,
+ * the per-segment counts, and the `/api/runs?status=…` request issued by
+ * `fetchRuns()`. Every status in the canonical vocabulary must map to
+ * exactly one of `'active' | 'completed' | 'other'`; the unit test in
+ * `test/taskListFilter.test.tsx` enforces this contract.
+ *
+ *   Active    = running, starting/creating, waiting_approval, stopping/aborting
+ *               (in-transition stop values so a running run never disappears
+ *               mid-lifecycle), and the queued/pending/suspended variants.
+ *   Completed = the terminal "done" family.
+ *   Other     = anything terminal-but-not-completed (failed/error/cancelled/etc).
+ *
+ * Unknown / blank statuses fall through to `'other'` so the total counts are
+ * preserved across refresh — a run with an unfamiliar backend value stays
+ * visible instead of vanishing.
+ */
+export type SegmentId = 'active' | 'completed' | 'other' | 'all';
+
+export function statusSegment(status: unknown): Exclude<SegmentId, 'all'> {
+  const normalised = String(status ?? '').trim().toLowerCase();
+  if (!normalised) return 'other';
+  if (normalised === 'running' || normalised === 'idle' || normalised === 'pending'
+    || normalised === 'queued' || normalised === 'queueing' || normalised === 'launching'
+    || normalised === 'suspended' || normalised === 'waiting_approval'
+    || normalised === 'starting' || normalised === 'creating'
+    || normalised === 'stopping' || normalised === 'aborting'
+    || normalised === 'stop_requested' || normalised === 'abort_requested') {
+    return 'active';
+  }
+  if (normalised === 'completed' || normalised === 'complete' || normalised === 'succeeded'
+    || normalised === 'success' || normalised === 'done' || normalised === 'finished') {
+    return 'completed';
+  }
+  // failure/terminal-non-completed family + unknown values
+  return 'other';
+}
+
+/** Concrete status values that belong to each segment; exported so tests and
+ * the server-side filter both reach for the same canonical set. */
+export const SEGMENT_STATUSES: Record<Exclude<SegmentId, 'all'>, readonly string[]> = {
+  active: [
+    'running', 'idle', 'pending', 'queued', 'queueing', 'launching',
+    'suspended', 'waiting_approval',
+    'starting', 'creating', 'stopping', 'aborting',
+    'stop_requested', 'abort_requested',
+  ],
+  completed: ['completed', 'complete', 'succeeded', 'success', 'done', 'finished'],
+  // Anything not listed above falls through to `other`; we still enumerate the
+  // canonical terminal-non-completed values so the server filter is precise.
+  other: ['failed', 'failure', 'blocked', 'incomplete', 'cancelled', 'canceled', 'stopped', 'aborted', 'error'],
+};
+
+/** Read/write the chosen segment from localStorage with a try/catch fallback. */
+const SEGMENT_STORAGE_KEY = 'lh-harness.taskListSegment';
+
+export function loadStoredSegment(): SegmentId {
+  if (typeof window === 'undefined') return 'active';
+  try {
+    const raw = window.localStorage.getItem(SEGMENT_STORAGE_KEY);
+    if (raw === 'active' || raw === 'completed' || raw === 'other' || raw === 'all') return raw;
+  } catch {
+    // localStorage may be disabled (private mode, locked-down origin, SSR).
+    // Falling back to the default keeps the UI usable.
+  }
+  return 'active';
+}
+
+export function storeSegment(value: SegmentId): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(SEGMENT_STORAGE_KEY, value);
+  } catch {
+    // Same reason as loadStoredSegment — silently ignore.
+  }
+}
+
 // SVG is intentionally treated as text/attachment by the API: rendering an
 // untrusted agent-produced SVG in the dashboard origin would allow script and
 // external-resource execution. Raster formats remain safe image previews.
@@ -837,6 +915,7 @@ export default function App() {
   const [controlBusy, setControlBusy] = useState(false);
   const [stopIgnored, setStopIgnored] = useState(false);
   const [search, setSearch] = useState('');
+  const [segment, setSegmentState] = useState<SegmentId>(() => loadStoredSegment());
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [creatingNew, setCreatingNew] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
@@ -901,7 +980,21 @@ export default function App() {
   // become terminal; doing so suggests that clicking it can resume a dead run.
   const pendingApprovalIds = useMemo(() => new Set(statusView.pendingApprovals.map((approval) => approval.id)), [statusView.pendingApprovals]);
   const pendingApprovals = snapshot.approvals.filter((approval) => pendingApprovalIds.has(approval.approval_id));
-  const filteredRuns = runs.filter((run) => `${run.id} ${run.task}`.toLowerCase().includes(search.toLowerCase()));
+  // Counts per sidebar segment drive the pill labels; "all" mirrors the
+  // total run count so the user always knows how many rows they are widening
+  // the view to. Counts ignore the search box — they describe the dataset,
+  // not the current view.
+  const segmentCounts = useMemo<Record<SegmentId, number>>(() => {
+    const counts: Record<SegmentId, number> = { active: 0, completed: 0, other: 0, all: runs.length };
+    for (const run of runs) {
+      counts[statusSegment(run.status)] += 1;
+    }
+    return counts;
+  }, [runs]);
+  const setSegment = (value: SegmentId) => {
+    storeSegment(value);
+    setSegmentState(value);
+  };
   const commandOptions = availableCommands(capabilities, snapshot, Boolean(runId));
   const visibleError = error || (feed.error && feed.error !== dismissedFeedError ? feed.error : '');
   const typedCommand = parseCommand(instruction);
@@ -1478,12 +1571,16 @@ export default function App() {
       <aside className="codex-sidebar">
         <div className="codex-brand"><span className="codex-mark"><Sparkles size={14} /></span><span>LongHorizon</span><div className="ui-language-switch" role="group" aria-label={text('界面语言', 'Interface language')}><button type="button" className={language === 'zh' ? 'active' : ''} aria-pressed={language === 'zh'} onClick={() => setLanguage('zh')} title="中文">中</button><button type="button" className={language === 'en' ? 'active' : ''} aria-pressed={language === 'en'} onClick={() => setLanguage('en')} title="English">EN</button></div></div>
         <button className="new-task-button" onClick={() => { setCreatingNew(true); setDetailsOpen(true); }} disabled={!canCreateRun}><Plus size={14} />{text('新任务', 'New task')}</button>
-        <label className="session-search"><span><Search size={13} /></span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={text('搜索会话', 'Search tasks')} /></label>
-        <div className="session-label">{text('会话', 'Tasks')} <span>{runs.length}</span></div>
-        <div className="session-list">
-          {filteredRuns.map((run) => <button key={run.id} className={`session-item ${run.id === runId ? 'selected' : ''}`} onClick={() => setRunId(run.id)}><span className={statusClass(run.status)} /><span className="session-copy"><strong>{run.task || 'Untitled task'}</strong><small>{run.id}</small>{run.status === 'waiting_approval' && run.pending_decision_owner && <DecisionBadge owner={run.pending_decision_owner} compact />}</span></button>)}
-          {!filteredRuns.length && <div className="sidebar-empty">{text('暂无会话', 'No tasks yet')}</div>}
-        </div>
+<TaskListSidebar
+          runs={runs}
+          runId={runId}
+          search={search}
+          onSearchChange={setSearch}
+          segment={segment}
+          onSegmentChange={setSegment}
+          segmentCounts={segmentCounts}
+          onSelectRun={setRunId}
+        />
         <div className="sidebar-footer"><span className={`connection-dot connection-${runId ? connection : 'idle'}`} />{!runId ? text('空闲', 'Idle') : connection === 'connected' ? text('已连接', 'Connected') : connection === 'loading' ? text('连接中', 'Connecting') : connection === 'reconnecting' ? text('重连中', 'Reconnecting') : connection === 'closed' ? text('已断开', 'Disconnected') : text('连接异常', 'Connection error')}<span>·</span> {text('本地工作区', 'Local workspace')}<button type="button" className="connection-settings" onClick={() => setAuthOpen(true)} title={text('连接设置', 'Connection settings')} aria-label={text('连接设置', 'Connection settings')}><KeyRound size={13} /></button></div>
       </aside>
 
@@ -1534,6 +1631,95 @@ export default function App() {
         onRefreshModels={refreshModelCatalogue}
       />}
       {authOpen && <AuthDialog onClose={() => setAuthOpen(false)} onSaved={() => { setAuthOpen(false); setAuthRevision((value) => value + 1); setError(''); setDismissedFeedError(''); }} />}
+    </div>
+  );
+}
+
+/** The left-sidebar task list and its filter UI, extracted so tests can render
+ * it in isolation via `renderToStaticMarkup`.
+ *
+ *   ┌────────────────────────────────┐
+ *   │ [Active N][Completed N][Other N][All N] │  ← filter pills + counts
+ *   │ 🔍 [search input]              │
+ *   │ TASKS N                         │
+ *   │ • …runs matching filter+search…
+ *   └────────────────────────────────┘
+ *
+ * The pills match the active segment (`statusSegment`) so the runtime
+ * classification matches what the user sees. The search input combines with
+ * the segment: narrowing to "Active" then typing still further narrows.
+ */
+export interface TaskListSidebarProps {
+  runs: RunSummary[];
+  runId: string | null;
+  search: string;
+  onSearchChange: (value: string) => void;
+  segment: SegmentId;
+  onSegmentChange: (value: SegmentId) => void;
+  segmentCounts: Record<SegmentId, number>;
+  onSelectRun: (id: string) => void;
+  totalLabel?: string;
+}
+
+export function TaskListSidebar({
+  runs,
+  runId,
+  search,
+  onSearchChange,
+  segment,
+  onSegmentChange,
+  segmentCounts,
+  onSelectRun,
+  totalLabel,
+}: TaskListSidebarProps) {
+  // Combine search (id/title substring) with the segment filter. The pill
+  // `statusSegment(run.status)` runs locally over what `fetchRuns()` already
+  // returned for the chosen segment (so an active run on page 2 cannot be
+  // missed by the in-memory view: the server already filtered it server-side).
+  const lowerSearch = search.trim().toLowerCase();
+  const matchesSearch = (run: RunSummary) =>
+    !lowerSearch || `${run.id} ${run.task || ''}`.toLowerCase().includes(lowerSearch);
+  const visible = runs.filter((run) => {
+    if (segment === 'all') return matchesSearch(run);
+    return statusSegment(run.status) === segment && matchesSearch(run);
+  });
+  const segments: SegmentId[] = ['active', 'completed', 'other', 'all'];
+  const segmentLabel = (id: SegmentId, language: UiLanguage): string => {
+    if (id === 'active') return uiText(language, '进行中', 'Active');
+    if (id === 'completed') return uiText(language, '已完成', 'Completed');
+    if (id === 'other') return uiText(language, '其他', 'Other');
+    return uiText(language, '全部', 'All');
+  };
+  const { language, text } = useUiLanguage();
+  return (
+    <div className="task-list-inner">
+      <div className="task-segments" role="tablist" aria-label={text('任务状态过滤', 'Task status filter')}>
+        {segments.map((id) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={segment === id}
+            className={`task-segment ${segment === id ? 'active' : ''}`}
+            data-segment={id}
+            onClick={() => onSegmentChange(id)}
+          >
+            <span className="task-segment-label">{segmentLabel(id, language)}</span>
+            <span className="task-segment-count">{segmentCounts[id] ?? 0}</span>
+          </button>
+        ))}
+      </div>
+      <label className="session-search"><span><Search size={13} /></span><input value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder={text('搜索会话', 'Search tasks')} /></label>
+      <div className="session-label">{totalLabel ?? text('会话', 'Tasks')} <span>{visible.length}</span></div>
+      <div className="session-list" data-task-list>
+        {visible.map((run) => (
+          <button key={run.id} type="button" className={`session-item ${run.id === runId ? 'selected' : ''}`} data-run-id={run.id} data-run-status={run.status} onClick={() => onSelectRun(run.id)}>
+            <span className={statusClass(run.status)} />
+            <span className="session-copy"><strong>{run.task || 'Untitled task'}</strong><small>{run.id}</small>{run.status === 'waiting_approval' && run.pending_decision_owner && <DecisionBadge owner={run.pending_decision_owner} compact />}</span>
+          </button>
+        ))}
+        {!visible.length && <div className="sidebar-empty">{text('暂无会话', 'No tasks yet')}</div>}
+      </div>
     </div>
   );
 }
