@@ -52,6 +52,7 @@ from ..caller_auth import (
     rounds_clamp_violation,
     run_control_allowed,
     tool_allowed,
+    validate_resolve_identity,
 )
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
 from ..overseer_state import resolve_overseer_root
@@ -3676,7 +3677,7 @@ def create_app(
         # Task 174: gate resolution follows the harness_resolve_gate allowlist
         # entry -- the single bearer is no longer sufficient (a leaked bearer
         # must not be able to resolve gates, migration doc 3.4).
-        _scoped_caller(request, RESOLVE_TOOL, run_id=run_id)
+        caller = _scoped_caller(request, RESOLVE_TOOL, run_id=run_id)
         state_for_run = _state_or_404(registry, run_id)
         if supervisor is not None and not supervisor.can_control(run_id):
             raise HTTPException(status_code=409, detail="run is not accepting approvals")
@@ -3689,12 +3690,47 @@ def create_app(
                 user_input.encode("ascii")
             except UnicodeEncodeError:
                 raise HTTPException(status_code=422, detail="user_input must be ASCII-only") from None
+        # DR-05a: every gate resolve carries approved_by (who) and channel
+        # (through what), both required.  ``identity_source`` is set here by
+        # the transport layer only -- a resolve via an A3d-signed caller
+        # (scoping ON, HMAC verified) is "caller-secret"; scoping-OFF installs
+        # have no verified identity and are "none" -- it is never taken from
+        # the caller payload.
+        identity_source = "caller-secret" if caller is not None else "none"
+        approved_by = body.get("approved_by")
+        channel = body.get("channel")
+        refusal = validate_resolve_identity(approved_by, channel, identity_source)
+        if refusal is not None:
+            # Every refusal is auditable: log the attempted identity source at
+            # WARNING so relayed and malformed resolves are distinguishable.
+            logger.warning(
+                "gate resolve refused (%s): identity_source=%s channel=%s approved_by=%s run_id=%s approval_id=%s",
+                refusal,
+                identity_source,
+                str(channel),
+                str(approved_by),
+                run_id,
+                approval_id,
+            )
+            return JSONResponse(
+                {"error": refusal},
+                status_code=403 if refusal == "relayed approval refused" else 422,
+            )
+        approved_by = str(approved_by).strip()
+        channel = str(channel).strip()
         try:
             ok = state_for_run.resolve_approval(
                 approval_id,
                 action=_body_text(body.get("action", body.get("decision", "continue")), field="action", required=True, max_chars=128),
                 reason=_body_text(body.get("reason", body.get("note", "")), field="reason", max_chars=10_000),
                 user_input=user_input,
+                approved_by=approved_by,
+                channel=channel,
+                # The unattributed marker can only ride a channel the caller
+                # cannot spoof: "service" approved_by values require an
+                # identity source set by this transport, not by the payload.
+                unattributed=(channel == "service"),
+                identity_source=identity_source,
                 extra_rounds=_optional_extra_rounds(body.get("extra_rounds")),
                 command_id=_bounded_command_id(request.headers.get("Idempotency-Key")),
                 expected_revision=expected_revision_int,

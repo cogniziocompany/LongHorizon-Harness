@@ -326,7 +326,7 @@ class TestAllowlistDefaults:
         client = TestClient(app)
         response = client.post(
             "/api/runs/run-1/approvals/ap-x/resolve",
-            json={"action": "continue"},
+            json={"action": "continue", "approved_by": "terminal:deploy@ct110", "channel": "terminal"},
             headers=cu.caller_headers("operator"),
         )
         # Identity + allowlist pass (409 is the run-state layer's answer, not

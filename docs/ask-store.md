@@ -140,6 +140,46 @@ of an answer or a field declaration. A secret can still only be sealed by a sign
 applied by a signed overseer request to the target recorded at submit time. The overseer treats answer text as context,
 never as instructions.
 
+## Admin identity in the settings store
+
+The settings store front end lives under `/admin` (with `/admin/keys` and
+`/admin/audit`). Every write to an admin route is gated on three checks
+(`src/lh_harness/webapi/settings_routes.py`):
+
+1. The web bearer token matches `LH_HARNESS_WEB_TOKEN`.
+2. `X-LH-Proxy-Auth` equals `LH_HARNESS_SETTINGS_PROXY_AUTH` (a shared secret
+   only the SSO edge sends, so a LAN bearer-holder cannot claim an identity).
+3. The SSO identity header is on `LH_HARNESS_SETTINGS_ADMINS`.
+
+Step 3 is the identity resolution: oauth2-proxy sets `X-Auth-Request-Email`
+(the email), but Entra does not always publish a `mail` attribute for
+service / AI-dev accounts, so that header is sometimes empty. The
+`_admin_identity` resolver falls back through a fixed header chain:
+
+| Order | Header | Source value |
+|---|---|---|
+| 1 | `X-Auth-Request-Email` | the email (oauth2-proxy) |
+| 2 | `X-Forwarded-Preferred-Username` | the UPN / `preferred_username` claim |
+| 3 | `X-Forwarded-User` | the `oid` (Entra object id) |
+
+The first non-empty header wins, stripped of surrounding whitespace. None of
+the three are accepted on their own: the chain must yield a non-empty value,
+and that value is compared case-insensitively against
+`LH_HARNESS_SETTINGS_ADMINS` (`SettingsRuntime.is_admin`). An unset
+`LH_HARNESS_SETTINGS_PROXY_AUTH` or an unset admins list fails closed -- no
+caller is treated as admin, so writes are refused.
+
+Writes additionally require the `X-Requested-With: lh-harness` header so a
+cross-site form post cannot be made. No route ever returns a secret value:
+sealed fields surface only `set_at`, `set_by`, `length`, and `apply_target`.
+
+This admin identity is separate from the DR-05a approval identity on
+gate/approval resolves. The settings store resolves an *admin* (an SSO
+principal authorised to change settings); the gate resolve records an
+*approver* (who clicked approve, through which channel) using the trio
+`approved_by` / `channel` / `identity_source` documented in
+`docs/approvals.md`.
+
 ## Apply targets
 
 The allow-list is `ASK_APPLY_TARGETS` in `src/lh_harness/config.py`, with an identical copy in the helper (a test keeps

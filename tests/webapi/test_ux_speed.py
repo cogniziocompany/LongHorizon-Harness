@@ -175,7 +175,7 @@ def test_resolve_approval_invalidates_snapshot_cache(tmp_path: Path) -> None:
     approval = state.create_approval(title="Confirm", message="Proceed?")
     client.post(
         f"/api/runs/run-1/approvals/{approval.approval_id}/resolve",
-        json={"action": "continue"},
+        json={"action": "continue", "approved_by": "terminal:deploy@ct110", "channel": "terminal"},
     )
 
     snapshot = client.get("/api/runs/run-1/snapshot").json()
