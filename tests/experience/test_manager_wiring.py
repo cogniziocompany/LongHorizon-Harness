@@ -211,6 +211,7 @@ async def test_capture_failure_is_a_non_fatal_event(tmp_path: Path, monkeypatch)
 @pytest.mark.asyncio
 async def test_env_var_off_overrides_config_on(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv(ENV_FLAG, "0")
+    _patched_auditor_launch(monkeypatch)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
@@ -234,6 +235,7 @@ async def test_env_var_off_overrides_config_on(tmp_path: Path, monkeypatch) -> N
 @pytest.mark.asyncio
 async def test_config_flag_enables_without_the_env_var(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv(ENV_FLAG, raising=False)
+    _patched_auditor_launch(monkeypatch)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
