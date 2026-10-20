@@ -229,6 +229,42 @@ CATALOG: tuple[SettingSpec, ...] = (
         False,
         restart=False,
     ),
+    # LHH-TEV1-DEFAULT-TRIO-ROUTER (Paxton 2026-10-20, Telegram): when a
+    # queue entry arrives with no trio, the launcher asks a typed decision
+    # model (tev1:4b on the 2060 lane) instead of falling through to the
+    # static default.  Off by default until Paxton flips it; all four knobs
+    # are restart-free so an admin change applies on the next launch pass.
+    SettingSpec(
+        "TRIO_ROUTER_ENABLED",
+        "Ask tev1 to pick a trio for queue entries that arrive without one (default off)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "TRIO_ROUTER_URL",
+        "Ollama /v1/systemone URL the tev1 model is served from "
+        "(default http://192.168.21.138:11436)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "TRIO_ROUTER_MODEL",
+        "Ollama model name the trio router calls (default tev1:4b)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "TRIO_ROUTER_MIN_CONFIDENCE",
+        "Minimum tev1 confidence for the picked trio to take effect (default 0.5)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "TRIO_ROUTER_SMALL_FLOOR",
+        "Minimum noul on the 'small' question required to route to a local 9B trio (default 0.6)",
+        False,
+        restart=False,
+    ),
 )
 CATALOG_BY_NAME = {spec.name: spec for spec in CATALOG}
 

@@ -1651,6 +1651,27 @@ class Launcher:
                 result[run_id] = {"status": status, "owner": self.supervisor.owner(run_id)}
         return result
 
+    def _route_default_trio(self, entry: QueueEntry) -> str | None:
+        """Ask the tev1 trio router for a default trio when ``entry.trio`` is empty.
+
+        Returns the chosen trio name (the launcher will then resolve the
+        entry against this pass's ``self._config``), or ``None`` when no
+        pick was made -- the caller falls back to the existing "unknown
+        trio" skip.  Side effect: writes the decision struct onto
+        ``entry.trio_router`` so Overseer1 can read why a fallback
+        happened.  The router is a no-op when ``entry.trio`` is already
+        non-empty (the launcher's own guard guarantees that here, but the
+        router repeats the check defensively).
+        """
+
+        from . import trio_router as _trio_router_module
+
+        return _trio_router_module.route_trio(
+            entry,
+            self._settings_store,
+            config_trios=self._config.get("trios", {}),
+        )
+
     def _launch(self, entry: QueueEntry) -> bool:
         """Attempt to launch ``entry``; report whether a run was created.
 
@@ -1662,8 +1683,34 @@ class Launcher:
         """
         trio = self._config.get("trios", {}).get(entry.trio)
         if trio is None:
-            self._skip(entry, f"unknown trio {entry.trio}")
-            return False
+            # LHH-TEV1-DEFAULT-TRIO-ROUTER (2026-10-20, Paxton): entries that
+            # arrive with no trio used to fall through here as "unknown trio
+            # <empty>" and stay pending forever.  When the admin has flipped
+            # ``TRIO_ROUTER_ENABLED``, ask the typed decision model to pick
+            # one instead.  Entries that already carry a non-empty trio
+            # never reach this branch, so it is a strict superset of the
+            # legacy behaviour.  The router writes its decision onto
+            # ``entry.trio_router`` for Overseer1's audit; ``_skip`` below
+            # still records a queue skip when no trio is selected so the entry
+            # stays pending.
+            chosen = self._route_default_trio(entry)
+            if chosen:
+                trio_spec = self._config.get("trios", {}).get(chosen)
+                if trio_spec is not None:
+                    trio = trio_spec
+                    entry.trio = chosen
+                    try:
+                        self.queue_store.update(entry)
+                    except Exception:
+                        logger.warning(
+                            "trio router persisted trio %s on entry %s but the store update failed; "
+                            "continuing with the in-memory trio",
+                            chosen,
+                            entry.queue_id,
+                        )
+            if trio is None:
+                self._skip(entry, f"unknown trio {entry.trio}")
+                return False
         agent = trio.get("agent", "codex")
         # LHH-QUEUE-HOTRELOAD (R8): the launch-time resolution and lock.
         # ``model`` resolves HERE -- the entry's per-task override (editable
