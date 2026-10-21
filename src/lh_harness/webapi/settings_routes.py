@@ -42,6 +42,7 @@ from ..settings_store import (
     trio_role_overrides,
     upsert_queue_trio,
 )
+from .. import effect_lease_wire
 # LHH-QUEUE-PROTECT-DOCS (F3): the kimi (synthetic) and glm (cloud) trios are
 # never modified at runtime.  Both REST ``PUT /api/queue/trios`` and the MCP
 # ``set_trio_model`` tool refuse writes to a row whose ``name`` is on the
@@ -226,6 +227,7 @@ def register_settings_routes(
 
     @app.put("/api/admin/settings/{name}")
     def admin_put_setting(name: str, request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        effect_lease_wire.check_effect(request, caller=None, tool="admin_put_setting")
         actor = require_admin(request, write=True)
         rt = runtime()
         assert rt.store is not None
@@ -248,6 +250,7 @@ def register_settings_routes(
 
     @app.delete("/api/admin/settings/{name}")
     def admin_delete_setting(name: str, request: Request) -> dict[str, Any]:
+        effect_lease_wire.check_effect(request, caller=None, tool="admin_delete_setting")
         actor = require_admin(request, write=True)
         rt = runtime()
         assert rt.store is not None
@@ -308,6 +311,7 @@ def register_settings_routes(
 
     @app.put("/api/queue/trios")
     def put_queue_trios(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        effect_lease_wire.check_effect(request, caller=None, tool="queue_trios_put")
         actor = require_admin(request, write=True)
         rt = runtime()
         assert rt.store is not None
@@ -424,6 +428,7 @@ def register_settings_routes(
 
     @app.put("/api/queue/capacity")
     def put_queue_capacity(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        effect_lease_wire.check_effect(request, caller=None, tool="queue_capacity_put")
         actor = require_admin(request, write=True)
         rt = runtime()
         assert rt.store is not None
@@ -526,6 +531,7 @@ def register_settings_routes(
         request: Request,
         body: dict[str, Any] = Body(default_factory=dict),
     ) -> dict[str, Any]:
+        effect_lease_wire.check_effect(request, caller=None, tool="queue_entry_model_put")
         actor = require_admin(request, write=True)
         rt = runtime()
         assert rt.store is not None

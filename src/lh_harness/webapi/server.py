@@ -55,6 +55,7 @@ from ..caller_auth import (
     tool_allowed,
 )
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
+from .. import effect_lease, effect_lease_wire
 from ..overseer_state import resolve_overseer_root
 from . import mcp_jsonrpc as mcp_protocol
 from ..build_info import build_info
@@ -110,6 +111,36 @@ _WEB_DEFAULT_AUDITOR_MODEL = (
 from .protocol import build_meta
 from .snapshot import _provenance, build_run_summary, build_snapshot
 from .experience_routes import register_experience_api
+
+
+# ----------------------------------------------------- effect-lease helpers --
+# A tiny proxy exposing ``.app`` so the wire installer (which expects a
+# ``Request``-shaped object) can attach a gate to ``app.state`` directly
+# during ``create_app``.  ``install_gate`` reads ``request.app.state`` only.
+class _RequestProxy:
+    __slots__ = ("app", "state")
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+        self.state = app.state
+
+
+def _lease_db_path(runs_root: Any) -> Path | None:
+    """Return the lease-DB path next to the settings store.
+
+    When the deployment does not have a settings store (no DB path env),
+    fall back to ``<runs_root>/.lh-harness/lease.db`` if a runs root is
+    available.  When neither is available, return None and the wire layer
+    stays inert (the flag is set but there is nowhere to persist).
+    """
+    from ..settings_store import DB_ENV as _DB_ENV
+
+    db_env = os.environ.get(_DB_ENV)
+    if db_env:
+        return Path(db_env + effect_lease.LEASE_DB_SUFFIX)
+    if runs_root:
+        return Path(runs_root) / ".lh-harness" / "lease.db"
+    return None
 
 # Vite builds directly into this directory, so a source checkout and an
 # installed wheel resolve the same path.  It is absent until the frontend is
@@ -1715,6 +1746,11 @@ def create_app(
                 status_code=403,
                 detail=f"caller '{caller}' is not allowed to use '{tool}'",
             )
+        # Effect-lease gate (default OFF). When the flag is on, mutating
+        # routes through this helper refuse stale / missing epochs from the
+        # non-holder with HTTP 409.  Reads and listener-only paths do not
+        # reach this line.
+        effect_lease_wire.check_effect(request, caller=caller, tool=tool)
         return caller
 
     def _run_control_caller(request: Request) -> str | None:
@@ -1732,6 +1768,7 @@ def create_app(
                 status_code=403,
                 detail=f"caller '{caller}' is not allowed to control runs",
             )
+        effect_lease_wire.check_effect(request, caller=caller, tool="rest_run_control")
         return caller
 
     # Bound before the try/except so the Launcher path below always has the
@@ -1816,6 +1853,25 @@ def create_app(
     app.state.auth_token = token
     app.state.allowed_origins = origins
     app.state.bind_host = bind_host
+    # Effect-lease gate (default OFF). The gate is installed but inert until
+    # LH_HARNESS_EFFECT_LEASE_ENABLED is true; until then mutating endpoints
+    # and MCP tools skip the lease check entirely (see effect_lease_wire).
+    if effect_lease.is_enabled():
+        lease_path = _lease_db_path(runs_root)
+        lease_store = effect_lease.LeaseStore(lease_path)
+        lease_gate = effect_lease_wire.install_gate(
+            _RequestProxy(app),
+            store=lease_store,
+        )
+        for _caller, _spec in (caller_specs or {}).items():
+            _family = _spec.get("family") if isinstance(_spec, dict) else None
+            _pair = _spec.get("pair") if isinstance(_spec, dict) else None
+            if isinstance(_family, str) and _family in effect_lease.FAMILIES:
+                try:
+                    lease_gate.declare_caller(_caller, family=_family, pair=_pair if isinstance(_pair, str) else None)
+                except ValueError:
+                    pass
+        app.state.lease_store = lease_store
     _maybe_start_fleet_reporter(registry, supervisor, queue_store)
     if bind_port is not None and _maybe_start_fleet_channel(token, bind_host, bind_port, caller_specs):
         app.router.add_event_handler("shutdown", stop_channel)
@@ -2021,6 +2077,7 @@ def create_app(
         Ordinary metadata polling stays cheap.  The workbench invokes this
         endpoint only when the user asks to re-detect local provider models.
         """
+        effect_lease_wire.check_effect(request, caller=None, tool="models_refresh")
 
         return _meta_response(request, force_models=True)
 
@@ -2125,7 +2182,7 @@ def create_app(
         return {"ok": True, "queue_id": entry.queue_id}
 
     @app.post("/api/queue/drain")
-    def set_queue_drain(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    def set_queue_drain(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
         """Set/clear the queue drain flag (task 242).
 
         ``{"enabled": true, "reason": "deploy 228"}`` stops NEW queue launches
@@ -2137,6 +2194,7 @@ def create_app(
         This inherits the single bearer-token boundary that guards every
         /api/ route (no separate role-token layer exists in this codebase).
         """
+        effect_lease_wire.check_effect(request, caller=None, tool="queue_drain")
 
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
@@ -2339,7 +2397,7 @@ def create_app(
         return snapshot
 
     @app.post("/api/maintenance/suspend", status_code=202)
-    def maintenance_suspend(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    def maintenance_suspend(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
         """Begin an asynchronous suspend; return 202 with the suspend id at once.
 
         Refused with 409 unless the queue drain is already enabled: suspend is
@@ -2356,6 +2414,7 @@ def create_app(
         409: windows never overlap, so manifests never merge and one suspend
         can only ever revive its own runs.
         """
+        effect_lease_wire.check_effect(request, caller=None, tool="maintenance_suspend")
 
         if queue_store is None:
             raise HTTPException(status_code=501, detail="maintenance requires a configured runs root")
@@ -2667,7 +2726,7 @@ def create_app(
                 record["errors"].append({"run_id": None, "error": f"could not clear maintenance launch pause: {exc}"})
 
     @app.post("/api/maintenance/resume")
-    def maintenance_resume(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    def maintenance_resume(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
         """Resume every run parked by one specific suspend id.
 
         The suspend id comes from the request body, or — when omitted — from
@@ -2685,6 +2744,7 @@ def create_app(
         retry for an older window never tears down a newer suspend's flag.
         The operator drain is a separate flag and untouched.
         """
+        effect_lease_wire.check_effect(request, caller=None, tool="maintenance_resume")
 
         if queue_store is None:
             raise HTTPException(status_code=501, detail="maintenance requires a configured runs root")
@@ -2963,6 +3023,10 @@ def create_app(
             caller_configs=caller_specs,
             overseer_root=str(overseer_root) if overseer_root is not None else None,
             ask_runtime=ask_runtime,
+            # Effect-lease gate (default OFF): when set on ``app.state`` and
+            # the flag is ON, every MCP mutating tool goes through the lease
+            # check using the same wire module the REST routes use.
+            lease_gate=getattr(request.app.state, "effect_gate", None),
         )
 
     @app.post("/api/mcp/fleet/{tool_name}")
@@ -3016,12 +3080,13 @@ def create_app(
         return JSONResponse(payload, status_code=status)
 
     @app.post("/api/queue/{queue_id}/priority")
-    def update_queue_priority(queue_id: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    def update_queue_priority(queue_id: str, request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
         priority = body.get("priority")
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise HTTPException(status_code=422, detail="priority must be an integer")
+        effect_lease_wire.check_effect(request, caller=None, tool="queue_priority")
         entry = queue_store.get(queue_id)
         if entry is None:
             raise HTTPException(status_code=404, detail="queue entry not found")
@@ -3634,6 +3699,7 @@ def create_app(
         ``_MAX_CHUNK_INFLATE_BYTES``).  The configured hard cap
         (``LH_HARNESS_MAX_TRANSCRIPT_BYTES``) is enforced before any write.
         """
+        effect_lease_wire.check_effect(request, caller=None, tool="artifact_chunk")
         state_for_run = _state_or_404(registry, run_id)
         envelope = await request.json()
         if round_index < 0 or round_index > 999_999:
@@ -3678,6 +3744,7 @@ def create_app(
         request: Request,
         body: dict[str, Any] = Body(default_factory=dict),
     ) -> dict[str, Any]:
+        effect_lease_wire.check_effect(request, caller=None, tool="send_instructions")
         state_for_run = _state_or_404(registry, run_id)
         if supervisor is not None and not supervisor.can_control(run_id):
             raise HTTPException(status_code=409, detail="run is not accepting instructions")
