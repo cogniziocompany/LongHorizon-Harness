@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import re
 import socket
@@ -18,10 +19,13 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from .supervisor.control_bus import _atomic_bytes_write
 from .types import DEFAULT_MAX_ROUNDS, MAX_ROUNDS
+
+logger = logging.getLogger(__name__)
 
 try:  # Imported lazily so PgQueueStore is optional for the file store.
     from .pg_queue import PgQueueStore  # noqa: F401
@@ -48,8 +52,21 @@ _NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
 # Trios every config carries (a missing one gets a safe fallback spec) and
 # trios that exist only when the config defines them (glm, zai, zaiq).
 _REQUIRED_TRIOS = frozenset({"kimi", "qwen"})
-_OPTIONAL_TRIOS = frozenset({"glm", "zai", "zaiq", "minimax"})
+_OPTIONAL_TRIOS = frozenset({"glm", "zai", "zaiq", "minimax", "mm31f"})
+# The hardcoded set: what every install knows without reading the store.
+# The effective valid set (see ``valid_trios``) is this union the enabled
+# ``queue_trio`` rows of the settings store.
 _VALID_TRIOS = _REQUIRED_TRIOS | _OPTIONAL_TRIOS
+
+# LHH-TRIOS-FROM-SETTINGS-DB: a trio defined only in the settings store
+# (``queue_trio``) is accepted at enqueue.  The read is cached for a short
+# window so a burst of enqueues does not hit the store once per entry, and a
+# store that cannot be read falls back to the hardcoded set instead of
+# refusing the enqueue.
+_TRIO_SET_CACHE_TTL_SECONDS = 30.0
+_trio_set_cache: frozenset[str] | None = None
+_trio_set_cache_at = 0.0
+_trio_set_cache_lock = Lock()
 
 # The requester identity block (task 300).  A JSON object on the entry body
 # (key "requester", stored on QueueEntry as a plain dict) that mechanically
@@ -407,7 +424,84 @@ def _validate_workspace(value: Any) -> str:
     return text
 
 
-def _validate_trio(value: Any) -> str:
+def _store_enabled_trio_names(store: Any) -> set[str]:
+    """The names of the enabled ``queue_trio`` rows, read through the store.
+
+    The store owns the table, so the row list comes from its own accessor
+    (``SettingsStore.queue_trios``) rather than a second connection to the
+    database.  A row without a usable name is skipped; the store already
+    reports ``enabled`` as a bool.
+    """
+
+    names: set[str] = set()
+    for row in store.queue_trios():
+        if not isinstance(row, dict):
+            continue
+        if not row.get("enabled"):
+            continue
+        name = row.get("name")
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip().lower())
+    return names
+
+
+def valid_trios(*, settings_runtime: Any = None, force: bool = False) -> frozenset[str]:
+    """The effective valid-trio set: hardcoded names plus the store's.
+
+    The hardcoded required/optional names are always valid.  Every *enabled*
+    ``queue_trio`` row in the settings store adds its name, so an admin who
+    defines a new trio in the store can enqueue against it without a code
+    change.  The store read is cached for
+    ``_TRIO_SET_CACHE_TTL_SECONDS``; ``force`` bypasses the cache.
+
+    ``settings_runtime`` is the same injectable seam
+    ``_enqueue_audit_store`` uses: an explicit runtime wins, otherwise the
+    process-wide ``settings_store.active_runtime()`` is read (the web process
+    wires it at boot).
+
+    A store that cannot be read (unconfigured, unreadable file, broken
+    database) never breaks an enqueue: the failure is logged and the
+    hardcoded set is used on its own.  A failed read is not cached, so the
+    next call tries the store again.
+    """
+
+    global _trio_set_cache, _trio_set_cache_at
+
+    now = time.monotonic()
+    with _trio_set_cache_lock:
+        if (
+            not force
+            and _trio_set_cache is not None
+            and now - _trio_set_cache_at < _TRIO_SET_CACHE_TTL_SECONDS
+        ):
+            return _trio_set_cache
+
+    names = set(_VALID_TRIOS)
+    try:
+        if settings_runtime is None:
+            from .settings_store import active_runtime  # lazy: the web process wires this at boot
+
+            settings_runtime = active_runtime()
+        store = getattr(settings_runtime, "store", None)
+        if store is not None:
+            names |= _store_enabled_trio_names(store)
+    except Exception as exc:  # a broken store must not refuse an enqueue
+        logger.warning(
+            "could not read queue trios from the settings store; "
+            "falling back to the built-in trio set: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return frozenset(_VALID_TRIOS)
+
+    resolved = frozenset(names)
+    with _trio_set_cache_lock:
+        _trio_set_cache = resolved
+        _trio_set_cache_at = time.monotonic()
+    return resolved
+
+
+def _validate_trio(value: Any, *, settings_runtime: Any = None) -> str:
     if value is None:
         # Optional (task 233): no default is invented here.  Persisting unset
         # is safe because the launcher defers such an entry: remaining
@@ -424,8 +518,9 @@ def _validate_trio(value: Any) -> str:
         # An explicitly empty trio is the same "not supplied" state as an
         # omitted key (MCP clients may fill a declared default of "").
         return ""
-    if text not in _VALID_TRIOS:
-        raise ValueError(f"trio must be one of: {', '.join(sorted(_VALID_TRIOS))}")
+    valid = valid_trios(settings_runtime=settings_runtime)
+    if text not in valid:
+        raise ValueError(f"trio must be one of: {', '.join(sorted(valid))}")
     return text
 
 
@@ -865,7 +960,7 @@ def _queue_requester_mode() -> str:
     return raw
 
 
-def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
+def _normalize_request(body: dict[str, Any], *, settings_runtime: Any = None) -> dict[str, Any]:
     """Convert a POST /api/queue body into validated launch parameters.
 
     Unknown body keys are rejected (task 233) with an error naming every
@@ -967,7 +1062,7 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "task": task_text,
         "workspace": _validate_workspace(body.get("workspace")),
         "max_rounds": _validate_max_rounds(body.get("max_rounds")),
-        "trio": _validate_trio(trio),
+        "trio": _validate_trio(trio, settings_runtime=settings_runtime),
         "model": _validate_model_override(body.get("model")),
         "roles": roles_config,
         "priority": _validate_priority(body.get("priority")),
@@ -1368,7 +1463,7 @@ class QueueStore:
         single-orchestrator guarantee against that window is the lease proposed
         as new work in the migration plan (section 4), not implemented here.
         """
-        params = _normalize_request(body)
+        params = _normalize_request(body, settings_runtime=settings_runtime)
         requester = params.get("requester")
         if requester is not None:
             requester = _stamp_requester(requester, observed_addr=observed_addr, verified_caller=verified_caller)
