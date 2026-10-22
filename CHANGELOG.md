@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Queue entries carry a go-to-market manager (`gtm_manager`).** A new
+  optional enqueue field names the overseer that owns the task: `overseer1` or
+  `overseer1-op` (GTM-MANAGER-G1-a, 2026-10-22). It is separate from the
+  creator fields (`requested_by`, `requester`): other agents create tasks, so
+  the creator is not the manager. Absent means the default manager
+  (`overseer1`), any other value is refused by the enqueue path's own
+  validation error (422 on REST, `code: 422` on MCP), and the value is stored
+  on the entry, returned by `GET /api/queue` / `GET /api/queue/{id}`, and
+  carried onto a requeued successor. Migration
+  `007_harness_queue_gtm_manager.sql` adds the Postgres column
+  (`VARCHAR(32) NOT NULL DEFAULT 'overseer1'`); an entry written before the
+  field existed reads back as the default manager.
+
 - **Postgres queue: retry and backoff columns.** Migration
   `005_harness_queue_retry_backoff.sql` adds `retry_of`, `attempt`,
   `failure_cause`, `not_before` and `wait_reason` to `harness.queue`, and

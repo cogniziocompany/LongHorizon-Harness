@@ -48,6 +48,9 @@ capacity allows.
 Either `task` (text) or `task_file` (absolute server path) must be supplied, not
 both. The response is `{"ok": true, "queue_id": "q-<16hex>"}`.
 
+The optional `gtm_manager` field names the manager that owns the task — see
+*The go-to-market manager*.
+
 ### `GET /api/queue`
 
 List entries. Optional `?status=pending|launched|done|failed`. The response
@@ -353,6 +356,7 @@ visible to any caller with the bearer token through `GET /api/queue`.
 | `not_before` | `float \| None` | `None` | epoch seconds; the launcher does not launch the entry before it (provider-quota backoff, see *Retries and provider-quota backoff*) | Launcher, via `requeue` |
 | `wait_reason` | `str \| None` | `None` | why the entry waits (`provider_quota` / `provider_rate_limit`); set only together with `not_before` | Launcher, via `requeue` |
 | `time_limit_minutes` | `int \| None` | `None` | wall-clock limit in minutes (1-1440) from `launched_at`; see *Per-task wall-clock limit* | Caller, at enqueue, or `POST /api/runs/{id}/time_limit` |
+| `gtm_manager` | `str` | `"overseer1"` | `overseer1` or `overseer1-op`; any other value is refused at enqueue (422); see *The go-to-market manager* | Caller, at enqueue |
 
 There is no dedicated `done_at`/`failed_at` field. The terminal time of an entry
 is the `updated_at` value at the moment `mark_done` or `mark_failed` runs (both
@@ -360,11 +364,11 @@ go through `update`, `queue.py:406`–`409`); the terminal cause is in `reason`.
 
 ### Caller-supplied vs. service-owned
 
-A caller supplies eleven input fields through the enqueue body: `name`, `task` (or
+A caller supplies twelve input fields through the enqueue body: `name`, `task` (or
 `task_file`), `workspace`, `trio` (or `roles`), `max_rounds`, `priority`,
-`base_check`, `requested_by`, `dedup_key`, `requester`, and
-`time_limit_minutes`. Of these, `max_rounds`, `priority`, `base_check`,
-`dedup_key`, and `time_limit_minutes` are optional; the rest are required
+`base_check`, `requested_by`, `dedup_key`, `requester`, `time_limit_minutes`, and
+`gtm_manager`. Of these, `max_rounds`, `priority`, `base_check`,
+`dedup_key`, `time_limit_minutes`, and `gtm_manager` are optional; the rest are required
 (`requested_by` may be omitted when a `requester` block is supplied and no
 verified caller is stamped; it is then derived as `name@host [session_ref]`).
 `task_file` and `roles` are alternative input keys for `task` and `trio`
@@ -424,6 +428,47 @@ tool) sends a block, then remove it.
 The Postgres backend validates and stamps the block but does not persist it
 yet, because `harness.queue` has no requester column; a re-read returns
 `requester: null`. The file store persists it fully.
+
+## The go-to-market manager (`gtm_manager`, GTM-MANAGER-G1-a)
+
+Every queue entry carries the manager that owns the task: the go-to-market
+manager, an overseer. It takes exactly two values — `overseer1` or
+`overseer1-op` — and it is **not** a creator field: other agents (codex,
+continuity1-op, Paxton's own sessions, CFO1, …) create tasks, so the creator is
+not the manager.
+
+```json
+{
+  "name": "ship the pricing page",
+  "task": "...",
+  "workspace": "./workspace",
+  "requested_by": "openwebui",
+  "gtm_manager": "overseer1-op"
+}
+```
+
+- **Absent** → the default manager `overseer1`. A task created by anyone other
+  than the two overseers belongs to `overseer1` until it is reassigned; it
+  never belongs to nobody.
+- **`overseer1` / `overseer1-op`** → kept as supplied.
+- **Anything else** → refused by the enqueue path's own validation error: 422
+  on REST, `{"ok": false, "code": 422}` on MCP. The message names the two
+  valid values. An unknown manager is never stored.
+
+The field is stored on the entry (`QueueEntry.gtm_manager`), returned by
+`GET /api/queue` and `GET /api/queue/{id}`, and carried onto a requeued
+successor — a retry of a task owned by `overseer1-op` does not fall back to
+the default manager. An entry written before the field existed (an old JSON
+file, or a Postgres row written before migration `007`) reads back as the
+default manager.
+
+The Postgres backend stores it in the `gtm_manager` column
+(`VARCHAR(32) NOT NULL DEFAULT 'overseer1'`, migration
+`007_harness_queue_gtm_manager.sql`); the file store persists it in the entry
+JSON.
+
+Reassignment (changing the manager of a live entry) and the run-side copy are
+separate work: this field is the queue-entry half only.
 
 ## Idempotent enqueue (`dedup_key`)
 

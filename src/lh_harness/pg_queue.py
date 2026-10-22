@@ -65,6 +65,10 @@ _COLUMN_TIME_LIMIT_MINUTES = "time_limit_minutes"
 # lands in the ``trio`` column instead).  See _MIGRATION_TASK_OVERRIDES_SQL.
 _COLUMN_MODEL = "model"
 _COLUMN_ROLES = "roles"
+# The go-to-market manager (GTM-MANAGER-G1-a, 2026-10-22): the overseer that
+# owns the task -- ``overseer1`` or ``overseer1-op``.  Migration 007 adds the
+# column; a row written before it (NULL) reads back as the default manager.
+_COLUMN_GTM_MANAGER = "gtm_manager"
 # ``requester`` (task 300) still has no column; see ``create``.
 _QUEUE_COLUMNS = (
     _COLUMN_QUEUE_ID,
@@ -95,6 +99,7 @@ _QUEUE_COLUMNS = (
     _COLUMN_TIME_LIMIT_MINUTES,
     _COLUMN_MODEL,
     _COLUMN_ROLES,
+    _COLUMN_GTM_MANAGER,
 )
 
 # LHH-QUEUE-HOTRELOAD R9: the two per-task override columns, applied in-code
@@ -120,6 +125,8 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
     """One row's values in ``_QUEUE_COLUMNS`` order (the single source for
     INSERT and UPDATE, so a new column cannot be written by one and not the
     other)."""
+    from .queue import DEFAULT_GTM_MANAGER, GTM_MANAGERS  # lazy: import cycle
+
     not_before = entry.not_before
     if isinstance(not_before, bool) or not isinstance(not_before, (int, float)):
         not_before = None
@@ -148,6 +155,17 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         model = model.strip()
     roles = getattr(entry, "roles", None)
     roles_json = json.dumps(roles) if isinstance(roles, dict) else None
+    # The go-to-market manager (GTM-MANAGER-G1-a).  Stored as validated at
+    # enqueue (persistence never re-validates, so a queued task survives a
+    # change of the known set); the shape guard only keeps a hand-built entry
+    # from writing something that is not one of the two managers.  A missing
+    # or unknown value falls back to the default manager, so the column is
+    # never NULL for a row the store wrote.
+    gtm_manager = getattr(entry, "gtm_manager", None)
+    if not isinstance(gtm_manager, str) or gtm_manager.strip() not in GTM_MANAGERS:
+        gtm_manager = DEFAULT_GTM_MANAGER
+    else:
+        gtm_manager = gtm_manager.strip()
     return [
         entry.queue_id,
         entry.name,
@@ -177,6 +195,7 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         time_limit,
         model,
         roles_json,
+        gtm_manager,
     ]
 
 
@@ -776,6 +795,10 @@ class PgQueueStore:
             updated_at=time.time(),
             dedup_key=None,  # retries must not collide with original dedup_key
             time_limit_minutes=entry.time_limit_minutes,
+            # The manager carries over: a retry of a task owned by
+            # ``overseer1-op`` must not silently fall back to the default
+            # manager (GTM-MANAGER-G1-a).
+            gtm_manager=entry.gtm_manager,
             not_before=float(not_before) if not_before is not None else None,
             wait_reason=(
                 str(wait_reason)[:_MAX_WAIT_REASON_CHARS]

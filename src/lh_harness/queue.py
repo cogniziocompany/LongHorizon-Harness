@@ -109,6 +109,7 @@ KNOWN_REQUEST_KEYS = frozenset(
         "dedup_key",
         "requester",
         "time_limit_minutes",
+        "gtm_manager",
     }
 )
 
@@ -116,6 +117,41 @@ KNOWN_REQUEST_KEYS = frozenset(
 # launcher stops the run.  Optional; ``None`` means no limit.
 TIME_LIMIT_MIN_MINUTES = 1
 TIME_LIMIT_MAX_MINUTES = 1440
+
+# The go-to-market manager (GTM-MANAGER-G1-a, 2026-10-22): the overseer that
+# owns the task.  Exactly two values -- the two overseers that are active at
+# the same time.  A task created by anyone else (codex, continuity1-op,
+# Paxton's own sessions, CFO1 ...) belongs to ``overseer1`` until it is
+# reassigned, so the default is that manager, never "nobody".
+GTM_MANAGERS = frozenset({"overseer1", "overseer1-op"})
+DEFAULT_GTM_MANAGER = "overseer1"
+
+
+def validate_gtm_manager(value: Any) -> str:
+    """The task's manager: ``overseer1`` or ``overseer1-op``.
+
+    ``None`` (the field was not supplied) means the default manager.  Any
+    other value raises ``ValueError`` so the enqueue path's existing 422
+    mapping refuses it -- an unknown manager is never stored, and the message
+    names the two valid ones.
+
+    Shared by the enqueue body of both stores (``_normalize_request``), so the
+    file store and the Postgres store accept and refuse exactly the same
+    values.
+    """
+
+    if value is None:
+        return DEFAULT_GTM_MANAGER
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "gtm_manager must be one of: " + ", ".join(sorted(GTM_MANAGERS))
+        )
+    text = value.strip()
+    if text not in GTM_MANAGERS:
+        raise ValueError(
+            "gtm_manager must be one of: " + ", ".join(sorted(GTM_MANAGERS))
+        )
+    return text
 
 
 def validate_time_limit_minutes(value: Any) -> int | None:
@@ -313,6 +349,12 @@ class QueueEntry:
     # backend, persists them fully).
     model: str | None = None
     roles: dict[str, dict[str, Any]] | None = None
+    # The go-to-market manager (GTM-MANAGER-G1-a): the overseer that owns the
+    # task.  ``overseer1`` or ``overseer1-op``; the default is ``overseer1``
+    # (a task created by anyone else belongs to it until it is reassigned).
+    # A legacy entry -- an old JSON file written before the field existed, or
+    # a Postgres row written before migration 007 -- loads as the default too.
+    gtm_manager: str = DEFAULT_GTM_MANAGER
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -354,9 +396,15 @@ class QueueEntry:
             "time_limit_minutes",
             "model",
             "roles",
+            "gtm_manager",
         ):
             if key in data:
                 kwargs[key] = data[key]
+        # A legacy entry carries no manager (old JSON without the key) or a
+        # NULL one (a Postgres row written before migration 007); both read
+        # back as the default manager, never as "nobody".
+        if kwargs.get("gtm_manager") is None:
+            kwargs["gtm_manager"] = DEFAULT_GTM_MANAGER
         return cls(**kwargs)
 
 
@@ -978,6 +1026,11 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "dedup_key": _validate_dedup_key(body.get("dedup_key")),
         "requester": requester_block,
         "time_limit_minutes": validate_time_limit_minutes(body.get("time_limit_minutes")),
+        # The go-to-market manager (GTM-MANAGER-G1-a): absent means the
+        # default manager, anything but the two known ones is refused by
+        # ``validate_gtm_manager`` (a plain ValueError -> the enqueue path's
+        # 422 mapping).
+        "gtm_manager": validate_gtm_manager(body.get("gtm_manager")),
     }
 
 
@@ -1666,6 +1719,10 @@ class QueueStore:
             time_limit_minutes=entry.time_limit_minutes,
             model=entry.model,
             roles=copy.deepcopy(entry.roles),
+            # The manager carries over: a retry of a task owned by
+            # ``overseer1-op`` must not silently fall back to the default
+            # manager (GTM-MANAGER-G1-a).
+            gtm_manager=entry.gtm_manager,
             not_before=float(not_before) if not_before is not None else None,
             wait_reason=str(wait_reason)[:64] if (not_before is not None and wait_reason) else None,
         )

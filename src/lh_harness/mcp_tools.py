@@ -527,6 +527,20 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                     "Optional wall-clock limit in minutes (1-1440) from launch; the launcher stops the run "
                     "when it is exceeded and does not requeue it (task fc-H2)."
                 ),
+                # The go-to-market manager (GTM-MANAGER-G1-a): the overseer that
+                # owns the task.  No "default" key on purpose -- an omitted
+                # field means the store's default manager ('overseer1'), so a
+                # client that fills in the schema must not send an empty
+                # string for it.  The store refuses any other value.
+                "gtm_manager": {
+                    "type": "string",
+                    "enum": ["overseer1", "overseer1-op"],
+                    "description": (
+                        "The go-to-market manager that owns this task: 'overseer1' or "
+                        "'overseer1-op'. Omit it to let the store apply the default "
+                        "manager ('overseer1')."
+                    ),
+                },
                 # With scoping ON the stamp wins (task 174); the field stays in
                 # the schema because the store's own contract (task 233)
                 # requires it -- the value a client passes is overridden, never
@@ -1383,6 +1397,18 @@ def _enqueue(
         # fc-H2: validated by the store (int 1..1440 or omitted).
         "time_limit_minutes": arguments.get("time_limit_minutes"),
     }
+    # GTM-MANAGER-G1-a: the go-to-market manager that owns the task.  An empty
+    # string is this layer's "not supplied" convention (the same one
+    # ``_bounded`` uses), so it is not forwarded and the store's default
+    # manager ('overseer1') applies; any other value is forwarded and
+    # validated by the store, which refuses an unknown manager with the
+    # enqueue path's 422.
+    raw_gtm_manager = arguments.get("gtm_manager")
+    if isinstance(raw_gtm_manager, str):
+        if raw_gtm_manager.strip():
+            body["gtm_manager"] = raw_gtm_manager.strip()
+    elif raw_gtm_manager is not None:
+        body["gtm_manager"] = raw_gtm_manager
     # LHH-QUEUE-HOTRELOAD (R6): model/roles are forwarded ONLY when actually
     # supplied.  An explicit null stays unforwarded (matching the pre-R6
     # body), so the legacy "roles" string keeps its exact alias semantics in
