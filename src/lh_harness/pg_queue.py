@@ -65,6 +65,14 @@ _COLUMN_TIME_LIMIT_MINUTES = "time_limit_minutes"
 # lands in the ``trio`` column instead).  See _MIGRATION_TASK_OVERRIDES_SQL.
 _COLUMN_MODEL = "model"
 _COLUMN_ROLES = "roles"
+# LHH-QUEUE-OUTCOMES: structured outcome / follow-up linkage columns,
+# mirroring the file store's persistence of QueueEntry.outcome /
+# outcome_reason / followup_queue_id / stopped_by / stop_reason.
+_COLUMN_OUTCOME = "outcome"
+_COLUMN_OUTCOME_REASON = "outcome_reason"
+_COLUMN_FOLLOWUP_QUEUE_ID = "followup_queue_id"
+_COLUMN_STOPPED_BY = "stopped_by"
+_COLUMN_STOP_REASON = "stop_reason"
 # ``requester`` (task 300) still has no column; see ``create``.
 _QUEUE_COLUMNS = (
     _COLUMN_QUEUE_ID,
@@ -95,6 +103,11 @@ _QUEUE_COLUMNS = (
     _COLUMN_TIME_LIMIT_MINUTES,
     _COLUMN_MODEL,
     _COLUMN_ROLES,
+    _COLUMN_OUTCOME,
+    _COLUMN_OUTCOME_REASON,
+    _COLUMN_FOLLOWUP_QUEUE_ID,
+    _COLUMN_STOPPED_BY,
+    _COLUMN_STOP_REASON,
 )
 
 # LHH-QUEUE-HOTRELOAD R9: the two per-task override columns, applied in-code
@@ -110,6 +123,21 @@ _MIGRATION_TASK_OVERRIDES_SQL = """\
 ALTER TABLE harness.queue
     ADD COLUMN IF NOT EXISTS model VARCHAR(256),
     ADD COLUMN IF NOT EXISTS roles JSONB;
+"""
+
+# LHH-QUEUE-OUTCOMES: structured outcome + follow-up linkage on the
+# Postgres queue backend.  Mirrors the file store's persistence of
+# QueueEntry.outcome / outcome_reason / followup_queue_id / stopped_by /
+# stop_reason.  ADD COLUMN IF NOT EXISTS so re-running the migration is
+# idempotent and old rows read NULL (the file store loads them as None).
+_MIGRATION_QUEUE_OUTCOMES_SQL = """\
+-- LHH-QUEUE-OUTCOMES: outcome + follow-up linkage on the queue table.
+ALTER TABLE harness.queue
+    ADD COLUMN IF NOT EXISTS outcome VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS outcome_reason VARCHAR(4000),
+    ADD COLUMN IF NOT EXISTS followup_queue_id VARCHAR(128),
+    ADD COLUMN IF NOT EXISTS stopped_by VARCHAR(256),
+    ADD COLUMN IF NOT EXISTS stop_reason VARCHAR(4000);
 """
 
 # Same bound the file store applies in ``QueueStore.requeue``.
@@ -148,6 +176,36 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         model = model.strip()
     roles = getattr(entry, "roles", None)
     roles_json = json.dumps(roles) if isinstance(roles, dict) else None
+    # LHH-QUEUE-OUTCOMES: outcome + follow-up linkage values. Outcome is
+    # one of the validated values; outcome_reason / stopped_by / stop_reason
+    # are bounded strings (max 4000 / 256 / 4000 chars); followup_queue_id
+    # is a free-form queue id (validated at write time). None / empty
+    # strings normalize to NULL.
+    outcome = getattr(entry, "outcome", None)
+    if not isinstance(outcome, str) or not outcome.strip():
+        outcome = None
+    else:
+        outcome = outcome.strip()[:64]
+    outcome_reason = getattr(entry, "outcome_reason", None)
+    if isinstance(outcome_reason, str):
+        outcome_reason = outcome_reason.strip()[:4000] or None
+    else:
+        outcome_reason = None
+    followup_qid = getattr(entry, "followup_queue_id", None)
+    if isinstance(followup_qid, str):
+        followup_qid = followup_qid.strip()[:128] or None
+    else:
+        followup_qid = None
+    stopped_by = getattr(entry, "stopped_by", None)
+    if isinstance(stopped_by, str):
+        stopped_by = stopped_by.strip()[:256] or None
+    else:
+        stopped_by = None
+    stop_reason = getattr(entry, "stop_reason", None)
+    if isinstance(stop_reason, str):
+        stop_reason = stop_reason.strip()[:4000] or None
+    else:
+        stop_reason = None
     return [
         entry.queue_id,
         entry.name,
@@ -177,6 +235,11 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         time_limit,
         model,
         roles_json,
+        outcome,
+        outcome_reason,
+        followup_qid,
+        stopped_by,
+        stop_reason,
     ]
 
 
@@ -305,6 +368,10 @@ class PgQueueStore:
                 # store connect can never leave a schema that accepts the old
                 # columns but not the new ones.
                 txn.execute(_MIGRATION_TASK_OVERRIDES_SQL)
+                # LHH-QUEUE-OUTCOMES: outcome + follow-up linkage columns,
+                # applied in the same committed unit as the file migrations
+                # and the per-task override migration.
+                txn.execute(_MIGRATION_QUEUE_OUTCOMES_SQL)
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"migration failed: {exc}") from exc
@@ -462,6 +529,17 @@ class PgQueueStore:
                             {"queue_id": row[0], "name": row[1], "status": row[2]}
                         )
                         raise DuplicateQueueEntryError(dup)
+        # LHH-QUEUE-OUTCOMES: a follow-up enqueue (``retry_of`` /
+        # ``followup_of``) must point at a real entry; the inverse
+        # ``followup_queue_id`` is stamped on the predecessor below.
+        retry_of = entry.retry_of
+        predecessor: QueueEntry | None = None
+        if retry_of:
+            predecessor = self.get(retry_of)
+            if predecessor is None:
+                raise ValueError(
+                    f"retry_of references a known entry id; {retry_of!r} was not found"
+                )
         try:
             with self._txn() as txn:
                 txn.execute(
@@ -471,6 +549,9 @@ class PgQueueStore:
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"could not create queue entry: {exc}") from exc
+        if predecessor is not None:
+            predecessor.followup_queue_id = entry.queue_id
+            self.update(predecessor)
         if audit_store is not None:
             _audit_enqueue_overrides(
                 audit_store,
@@ -629,8 +710,18 @@ class PgQueueStore:
         entry.launched_at = time.time()
         return self.update(entry)
 
-    def mark_done(self, queue_id: str, *, reason: str | None = None) -> QueueEntry | None:
-        from .queue import _MAX_QUEUE_REASON_CHARS  # lazy: see TYPE_CHECKING note
+    def mark_done(
+        self,
+        queue_id: str,
+        *,
+        reason: str | None = None,
+        outcome: str | None = None,
+        outcome_reason: str | None = None,
+    ) -> QueueEntry | None:
+        from .queue import (
+            _MAX_QUEUE_REASON_CHARS,
+            _validate_outcome,  # lazy: see TYPE_CHECKING note
+        )
 
         entry = self.get(queue_id)
         if entry is None:
@@ -638,16 +729,33 @@ class PgQueueStore:
         entry.status = "done"
         if reason is not None:
             entry.reason = reason[:_MAX_QUEUE_REASON_CHARS]
+        if outcome is not None:
+            entry.outcome = _validate_outcome(outcome)
+        elif entry.outcome is None:
+            entry.outcome = "done_at_gate"
+        if outcome_reason is not None:
+            entry.outcome_reason = str(outcome_reason)[:_MAX_QUEUE_REASON_CHARS]
         return self.update(entry)
 
-    def mark_failed(self, queue_id: str, reason: str) -> QueueEntry | None:
-        from .queue import _MAX_QUEUE_REASON_CHARS  # lazy: see TYPE_CHECKING note
+    def mark_failed(
+        self,
+        queue_id: str,
+        reason: str,
+        *,
+        outcome: str | None = None,
+    ) -> QueueEntry | None:
+        from .queue import (
+            _MAX_QUEUE_REASON_CHARS,
+            _validate_outcome,  # lazy: see TYPE_CHECKING note
+        )
 
         entry = self.get(queue_id)
         if entry is None:
             return None
         entry.status = "failed"
         entry.reason = reason[:_MAX_QUEUE_REASON_CHARS]
+        chosen = outcome if outcome is not None else "failed"
+        entry.outcome = _validate_outcome(chosen)
         return self.update(entry)
 
     def record_skip(self, queue_id: str, reason: str) -> QueueEntry | None:
@@ -660,6 +768,69 @@ class PgQueueStore:
             return None
         entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
         return self.update(entry)
+
+    def record_outcome(
+        self,
+        queue_id: str,
+        *,
+        outcome: str,
+        outcome_reason: str | None = None,
+        stopped_by: str | None = None,
+        stop_reason: str | None = None,
+    ) -> QueueEntry | None:
+        """Stamp the structured outcome on an entry, preserving its current status.
+
+        LHH-QUEUE-OUTCOMES: mirrors the file-store ``record_outcome`` so a
+        queue entry carries its ``outcome``, ``outcome_reason``,
+        ``stopped_by`` and ``stop_reason`` regardless of the configured
+        backend. The Postgres schema already carries the matching columns
+        via the LHH-QUEUE-OUTCOMES migration; missing columns surface as
+        a clear AttributeError here rather than a silent skip.
+        """
+        from .queue import (  # lazy: see TYPE_CHECKING note
+            _MAX_QUEUE_REASON_CHARS,
+            _bounded,
+            _validate_outcome,
+        )
+
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        entry.outcome = _validate_outcome(outcome)
+        if outcome_reason is not None:
+            entry.outcome_reason = str(outcome_reason)[:_MAX_QUEUE_REASON_CHARS]
+        if stopped_by is not None:
+            entry.stopped_by = _bounded(
+                stopped_by, field="stopped_by", max_chars=256, required=False
+            ) or None
+        if stop_reason is not None:
+            entry.stop_reason = _bounded(
+                stop_reason, field="stop_reason", max_chars=_MAX_QUEUE_REASON_CHARS, required=False
+            ) or None
+        return self.update(entry)
+
+    def list_needs_followup(self) -> list[QueueEntry]:
+        """Read-only: every entry that ended without a follow-up commit.
+
+        Mirrors the file-store method; the audit surface is identical.
+        """
+        return [
+            entry
+            for entry in self.list()
+            if entry.outcome in ("failed", "cancelled")
+            and not entry.followup_queue_id
+            and entry.status in ("done", "failed")
+        ]
+
+    def list_by_outcome(self, outcome: str) -> list[QueueEntry]:
+        """Read-only filter: every entry whose ``outcome`` field equals the given value.
+
+        Mirrors the file-store method.
+        """
+        from .queue import _validate_outcome  # lazy: see TYPE_CHECKING note
+
+        _validate_outcome(outcome)
+        return [entry for entry in self.list() if entry.outcome == outcome]
 
     def record_block(self, queue_id: str) -> QueueEntry | None:
         """Transition an entry from pending to blocked.

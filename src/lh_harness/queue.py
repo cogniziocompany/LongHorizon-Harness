@@ -40,6 +40,20 @@ _MAX_QUEUE_DEDUP_CHARS = 256
 # entry. It resumes through ``blocked`` -> ``pending`` (record_unblock) or
 # ``blocked`` -> ``launched`` (mark_launched).
 _VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked"})
+
+# LHH-QUEUE-OUTCOMES: structured outcome recorded alongside ``status``.
+# Separate from status so a ``done`` entry can declare HOW it ended:
+# ``done_at_gate`` (operator accepted the gate as the final deliverable),
+# ``blocked`` (parked on something outside the launcher), ``needs_followup``
+# (ended without a follow-up commit/queue-id -- an audit gap we now surface),
+# ``failed`` (the work failed) or ``cancelled`` (operator stopped the run).
+# Old entries without the field read as ``None`` -- backward compatible with
+# every JSON written before this slice. ``None`` is the only non-canonical
+# value (existing JSON carries nothing under ``outcome``); every entry the
+# store writes from now on sets one of the five explicit values.
+_VALID_OUTCOMES = frozenset(
+    {"done_at_gate", "blocked", "needs_followup", "failed", "cancelled"}
+)
 # Non-terminal entries are still waiting to be, or being, launched, or parked. A
 # dedup key is considered "in use" only while its entry is in one of these states;
 # once an entry reaches a terminal state (``done``/``failed``) the key is free for
@@ -109,6 +123,14 @@ KNOWN_REQUEST_KEYS = frozenset(
         "dedup_key",
         "requester",
         "time_limit_minutes",
+        # LHH-QUEUE-OUTCOMES: follow-up enqueue linkage.
+        # ``retry_of`` is the queue_id of the entry this new entry replaces
+        # (a queued retry/follow-up); ``followup_of`` is an alias accepted on
+        # the input surface to match free-text "this is the follow-up to
+        # entry X" expectations. The store stamps the inverse
+        # ``followup_queue_id`` on the predecessor.
+        "retry_of",
+        "followup_of",
     }
 )
 
@@ -313,6 +335,20 @@ class QueueEntry:
     # backend, persists them fully).
     model: str | None = None
     roles: dict[str, dict[str, Any]] | None = None
+    # LHH-QUEUE-OUTCOMES: the structured "how this entry ended" record.
+    # ``None`` on entries predating the field; the store writes one of
+    # ``_VALID_OUTCOMES`` on every transition into a terminal state.
+    outcome: str | None = None
+    outcome_reason: str | None = None
+    # The id of the follow-up entry this one was replaced by (the new entry
+    # holds the inverse ``retry_of`` link).  ``None`` until a follow-up is
+    # enqueued through the queue store's ``requeue``/``enqueue_followup`` path.
+    followup_queue_id: str | None = None
+    # The authenticated operator who last stopped this entry through the web
+    # stop route (caller stamp from the [callers] table); ``None`` when the
+    # entry was stopped without a recorded actor or before this slice.
+    stopped_by: str | None = None
+    stop_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -354,6 +390,11 @@ class QueueEntry:
             "time_limit_minutes",
             "model",
             "roles",
+            "outcome",
+            "outcome_reason",
+            "followup_queue_id",
+            "stopped_by",
+            "stop_reason",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -851,6 +892,49 @@ def _validate_continue_branch(value: Any) -> bool:
     return value
 
 
+def _validate_queue_id_or_none(value: Any, *, field: str) -> str | None:
+    """A queue_id-shaped string (``None`` allowed) for follow-up linkage fields.
+
+    Both ``retry_of`` (the predecessor of this new entry) and ``followup_of``
+    (alias for ``retry_of`` on the input surface) flow through here. A
+    malformed value raises the documented validator message so an enqueue that
+    claims a non-existent predecessor never silently lands as "no link".
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError(f"{field} must be a string or null")
+    text = value.strip()
+    if not text:
+        return None
+    if not _safe_queue_id(text):
+        raise ValueError(f"{field} must be a valid queue_id")
+    return text
+
+
+def _validate_outcome(value: Any, *, field: str = "outcome") -> str | None:
+    """A value in ``_VALID_OUTCOMES`` or ``None`` (legacy entries).
+
+    Used by the store's terminal-state writes; the field is never
+    caller-supplied on enqueue, only stamped by the store/webapi as a record
+    of how the entry ended.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError(f"{field} must be a string or null")
+    text = value.strip()
+    if not text:
+        return None
+    if text not in _VALID_OUTCOMES:
+        raise ValueError(
+            f"{field} must be one of: {', '.join(sorted(_VALID_OUTCOMES))}"
+        )
+    return text
+
+
 def _queue_requester_mode() -> str:
     """Return the rollout mode for the requester block, read at call time.
 
@@ -978,6 +1062,12 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         "dedup_key": _validate_dedup_key(body.get("dedup_key")),
         "requester": requester_block,
         "time_limit_minutes": validate_time_limit_minutes(body.get("time_limit_minutes")),
+        # LHH-QUEUE-OUTCOMES: ``retry_of`` and ``followup_of`` are accepted
+        # only as queue_id-shaped strings (or None). The store stamps the
+        # inverse link on the predecessor in ``create`` so the audit gap
+        # where a stop never had its follow-up recorded is closed.
+        "retry_of": _validate_queue_id_or_none(body.get("retry_of"), field="retry_of"),
+        "followup_of": _validate_queue_id_or_none(body.get("followup_of"), field="followup_of"),
     }
 
 
@@ -1404,6 +1494,26 @@ class QueueStore:
             dup = self._find_non_terminal_by_name(name)
             if dup is not None:
                 raise DuplicateQueueEntryError(dup)
+        # LHH-QUEUE-OUTCOMES: a follow-up enqueue (``retry_of`` / ``followup_of``
+        # both name the same predecessor) must (a) point at a real entry and
+        # (b) record the inverse ``followup_queue_id`` on the predecessor so the
+        # link survives a later read. The predecessor lookup happens before
+        # minting the new id so a non-existent reference is rejected up front.
+        # ``followup_of`` is the input alias; we collapse it into ``retry_of``
+        # BEFORE constructing the QueueEntry, which only carries the canonical
+        # field name.
+        if params.get("followup_of") and not params.get("retry_of"):
+            params["retry_of"] = params.pop("followup_of")
+        else:
+            params.pop("followup_of", None)
+        retry_of = params.get("retry_of")
+        predecessor: QueueEntry | None = None
+        if retry_of:
+            predecessor = self.get(retry_of)
+            if predecessor is None:
+                raise ValueError(
+                    f"retry_of references a known entry id; {retry_of!r} was not found"
+                )
         queue_id = f"q-{uuid.uuid4().hex[:16]}"
         now = _now()
         entry = QueueEntry(
@@ -1414,6 +1524,18 @@ class QueueStore:
             **{key: value for key, value in params.items() if key != "requester"},
         )
         self._write(entry)
+        if predecessor is not None:
+            # Stamp the inverse link on the predecessor. The predecessor must
+            # exist (we read it above) so this is a guaranteed write; the link
+            # is editable until the entry is reaped.
+            if predecessor.followup_queue_id not in (None, entry.queue_id):
+                # A second follow-up enqueue that targets the same predecessor
+                # leaves the first link in place (the operator can resolve
+                # either follow-up; the audit reads the most recent one). Both
+                # follow-ups keep their ``retry_of`` link.
+                pass
+            predecessor.followup_queue_id = entry.queue_id
+            self.update(predecessor)
         if audit_store is not None:
             _audit_enqueue_overrides(
                 audit_store,
@@ -1523,7 +1645,14 @@ class QueueStore:
         entry.launched_at = _now()
         return self.update(entry)
 
-    def mark_done(self, queue_id: str, *, reason: str | None = None) -> QueueEntry | None:
+    def mark_done(
+        self,
+        queue_id: str,
+        *,
+        reason: str | None = None,
+        outcome: str | None = None,
+        outcome_reason: str | None = None,
+    ) -> QueueEntry | None:
         entry = self.get(queue_id)
         if entry is None:
             return None
@@ -1532,9 +1661,25 @@ class QueueStore:
         entry.status = "done"
         if reason is not None:
             entry.reason = reason[:_MAX_QUEUE_REASON_CHARS]
+        # LHH-QUEUE-OUTCOMES: callers that already know WHY the entry is done
+        # (e.g. the manager's ``done_at_gate`` mapping) pass the outcome up
+        # front; otherwise we default to ``done_at_gate`` so the field is
+        # always populated on a terminal entry.
+        if outcome is not None:
+            entry.outcome = _validate_outcome(outcome)
+        elif entry.outcome is None:
+            entry.outcome = "done_at_gate"
+        if outcome_reason is not None:
+            entry.outcome_reason = str(outcome_reason)[:_MAX_QUEUE_REASON_CHARS]
         return self.update(entry)
 
-    def mark_failed(self, queue_id: str, reason: str) -> QueueEntry | None:
+    def mark_failed(
+        self,
+        queue_id: str,
+        reason: str,
+        *,
+        outcome: str | None = None,
+    ) -> QueueEntry | None:
         entry = self.get(queue_id)
         if entry is None:
             return None
@@ -1542,6 +1687,12 @@ class QueueStore:
             raise ValueError(f"invalid transition from {entry.status} to failed")
         entry.status = "failed"
         entry.reason = reason[:_MAX_QUEUE_REASON_CHARS]
+        # A failed entry records ``outcome=failed`` by default. ``needs_followup``
+        # is the only other valid mapping (the launcher calls it that when a
+        # stop without follow-up reaches the manager), and ``cancelled`` is
+        # reserved for the operator-driven stop/abort path.
+        chosen = outcome if outcome is not None else "failed"
+        entry.outcome = _validate_outcome(chosen)
         return self.update(entry)
 
     def record_skip(self, queue_id: str, reason: str) -> QueueEntry | None:
@@ -1553,6 +1704,80 @@ class QueueStore:
             return None
         entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
         return self.update(entry)
+
+    def record_outcome(
+        self,
+        queue_id: str,
+        *,
+        outcome: str,
+        outcome_reason: str | None = None,
+        stopped_by: str | None = None,
+        stop_reason: str | None = None,
+    ) -> QueueEntry | None:
+        """Stamp the structured outcome on an entry, preserving its current status.
+
+        LHH-QUEUE-OUTCOMES: the operator/stop path records ``outcome`` on the
+        entry WITHOUT triggering a status transition (``status`` stays
+        ``done``/``failed`` exactly as the supervisor decided; ``outcome`` is
+        the audit's view of HOW). The optional ``stopped_by`` / ``stop_reason``
+        stamp the actor and rationale recorded by ``POST /api/runs/{id}/stop``.
+
+        ``outcome`` is required and validated against ``_VALID_OUTCOMES``;
+        ``outcome_reason`` / ``stopped_by`` / ``stop_reason`` are bounded
+        strings, ``None`` when not supplied (a stop with no actor and no
+        reason is the audit gap we are closing).
+        """
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        entry.outcome = _validate_outcome(outcome)
+        if outcome_reason is not None:
+            entry.outcome_reason = str(outcome_reason)[:_MAX_QUEUE_REASON_CHARS]
+        if stopped_by is not None:
+            entry.stopped_by = _bounded(
+                stopped_by, field="stopped_by", max_chars=256, required=False
+            ) or None
+        if stop_reason is not None:
+            entry.stop_reason = _bounded(
+                stop_reason, field="stop_reason", max_chars=_MAX_QUEUE_REASON_CHARS, required=False
+            ) or None
+        return self.update(entry)
+
+    def list_needs_followup(self) -> list[QueueEntry]:
+        """Read-only: every entry that ended without a follow-up commit.
+
+        LHH-QUEUE-OUTCOMES audit gap #2: a stop that lands without either a
+        ``followup_queue_id`` set on it or a closed/blocked outcome marker
+        is the kind of audit-relevant record the ct110 review flagged. The
+        query is intentionally pure (no side effects, no mutation); it is
+        surfaced through the REST ``GET /api/queue/needs_followup`` route
+        and the MCP-visible ``needs_followup`` query so external operators
+        can spot the gap without scanning the queue by hand.
+
+        An entry is "needs follow-up" when ``outcome`` is ``failed`` or
+        ``cancelled`` AND ``followup_queue_id`` is empty AND the entry has
+        no record of a closed/blocked resolution. Done entries are
+        reported separately as ``done_at_gate``; only the unresolved
+        terminal ones show here.
+        """
+        return [
+            entry
+            for entry in self.list()
+            if entry.outcome in ("failed", "cancelled")
+            and not entry.followup_queue_id
+            and entry.status in ("done", "failed")
+        ]
+
+    def list_by_outcome(self, outcome: str) -> list[QueueEntry]:
+        """Read-only filter: every entry whose ``outcome`` field equals the given value.
+
+        Validated against ``_VALID_OUTCOMES`` so the caller's intent is
+        reflected in a 422-shaped ValueError. A pre-existing entry that
+        predates the field (carries ``outcome=None``) is NEVER returned --
+        this query is the explicit "what ended and how" audit surface.
+        """
+        _validate_outcome(outcome)
+        return [entry for entry in self.list() if entry.outcome == outcome]
 
     def record_block(self, queue_id: str) -> QueueEntry | None:
         """Transition an entry from pending to blocked.
