@@ -7,6 +7,11 @@ ledger), ``queue/OPEN-ASKS.md`` (the open-asks register), and
 ``docs/handoffs/HANDOFF-*.md`` (operator handoffs).  See
 ``README-OVERSEER-APPARATUS.md`` for the authoritative map.
 
+LHH-ARCHIVE-PRE-CUTOVER-QUEUE later moved the ``queue/done/`` and
+``queue/blocked/`` records to ``archive/pre-cutover-queue/done/`` and
+``archive/pre-cutover-queue/blocked/``; the record root is resolved there
+now, with the legacy ``queue/<status>/`` layout kept as a fallback.
+
 Before that migration a chat client that needed the overseer's working state had
 to read the fleet workstation filesystem directly (``C:/tmp``), which is what
 task 204's chat session did.  These tools expose the same state through the
@@ -31,6 +36,15 @@ from typing import Any
 # -> parents[0] = src/lh_harness, parents[1] = src, parents[2] = repo root.
 _DEFAULT_ROOT = Path(__file__).resolve().parents[2]
 _ENV_ROOT_NAME = "LH_HARNESS_APPARATUS_ROOT"
+
+# Where the pre-cutover queue records live.  LHH-ARCHIVE-PRE-CUTOVER-QUEUE
+# moved the repo-tracked records from ``queue/done/`` and ``queue/blocked/``
+# to ``archive/pre-cutover-queue/done/`` and ``archive/pre-cutover-queue/
+# blocked/``.  The legacy ``queue/<status>/`` layout is still honoured as a
+# fallback so an apparatus root that predates the move (an explicit
+# LH_HARNESS_APPARATUS_ROOT export, say) keeps resolving its records.
+_ARCHIVE_QUEUE_PARTS = ("archive", "pre-cutover-queue")
+_LEGACY_QUEUE_PARTS = ("queue",)
 
 # Output bounds.  The queue archive contains one note that is ~60 kB, so a
 # 64 kB cap preserves the large block reasons while keeping JSON responses
@@ -151,8 +165,30 @@ def _safe_stem(name: str) -> str | None:
     return name
 
 
+def _record_dirs(root: Path, status: str) -> list[Path]:
+    """Return the record directories for ``status`` under ``root``.
+
+    The archive location (``archive/pre-cutover-queue/<status>/``) is tried
+    first; the legacy ``queue/<status>/`` location is used only when the
+    archive directory is absent, so the two layouts never both contribute the
+    same record twice.
+    """
+    archive_dir = root.joinpath(*_ARCHIVE_QUEUE_PARTS, status)
+    if archive_dir.is_dir():
+        return [archive_dir]
+    legacy_dir = root.joinpath(*_LEGACY_QUEUE_PARTS, status)
+    if legacy_dir.is_dir():
+        return [legacy_dir]
+    return []
+
+
 def _load_json_records(root: Path, status: str | None = None) -> list[dict[str, Any]]:
-    """Load all JSON records from ``queue/<status>/*.json``.
+    """Load all JSON records from the queue archive's ``<status>/*.json``.
+
+    The records live under ``archive/pre-cutover-queue/<status>/`` since
+    LHH-ARCHIVE-PRE-CUTOVER-QUEUE moved them out of ``queue/<status>/``; the
+    legacy ``queue/<status>/`` layout is still read when the archive root is
+    present, so an apparatus root that predates the move keeps working.
 
     Each returned dict is the stored JSON plus two synthetic keys:
     ``status`` (``done`` or ``blocked``) and ``record_name`` (file stem).
@@ -167,23 +203,21 @@ def _load_json_records(root: Path, status: str | None = None) -> list[dict[str, 
 
     records: list[dict[str, Any]] = []
     for st in statuses:
-        dir_path = root / "queue" / st
-        if not dir_path.is_dir():
-            continue
-        for path in sorted(dir_path.glob("*.json")):
-            stem = path.stem
-            if not _safe_stem(stem):
-                continue
-            try:
-                with path.open("r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            data["status"] = st
-            data["record_name"] = stem
-            records.append(data)
+        for dir_path in _record_dirs(root, st):
+            for path in sorted(dir_path.glob("*.json")):
+                stem = path.stem
+                if not _safe_stem(stem):
+                    continue
+                try:
+                    with path.open("r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                except Exception:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                data["status"] = st
+                data["record_name"] = stem
+                records.append(data)
     return records
 
 
