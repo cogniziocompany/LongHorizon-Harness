@@ -330,6 +330,16 @@ class QueueEntry:
     # backend, persists them fully).
     model: str | None = None
     roles: dict[str, dict[str, Any]] | None = None
+    # LHH-TEV1-DEFAULT-TRIO-ROUTER (2026-10-20, Paxton): the audit struct the
+    # tev1 trio router wrote onto the entry when it filled a missing trio.
+    # ``None`` on every entry that already carried one (the router never
+    # touches an explicit trio) and on every entry the router did not run
+    # against (router disabled, settings store unreadable, etc.).  Recorded
+    # keys: ``model``, ``choice``, ``confidence``, ``probabilities``,
+    # ``small_noul``, ``reason``, ``ts``.  Persists on disk alongside the
+    # entry so Overseer1 can read the decision from the queue JSON without
+    # the run outcome.
+    trio_router: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -371,6 +381,7 @@ class QueueEntry:
             "time_limit_minutes",
             "model",
             "roles",
+            "trio_router",
         ):
             if key in data:
                 kwargs[key] = data[key]
