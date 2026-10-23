@@ -82,6 +82,14 @@ import {
   writeDrawerWidth,
 } from './drawerWidth';
 import { uiText, useUiLanguage, type UiLanguage } from './i18n';
+import {
+  TASK_PAGE_SIZE,
+  clampTaskPage,
+  taskPageCount,
+  taskPageOfIndex,
+  taskPageRange,
+  taskPageSlice,
+} from './taskListPaging';
 
 type DetailsTab = 'artifacts' | 'trajectory' | 'events';
 type MessageKind = 'user' | 'plan' | 'assistant' | 'verification' | 'final' | 'live';
@@ -1650,11 +1658,16 @@ export default function App() {
  *   │ 🔍 [search input]              │
  *   │ TASKS N                         │
  *   │ • …runs matching filter+search…
+ *   │ ‹ 1–50 / 1771 · Page 1 / 36 ›   │  ← pager (one page of rows)
  *   └────────────────────────────────┘
  *
  * The pills match the active segment (`statusSegment`) so the runtime
  * classification matches what the user sees. The search input combines with
  * the segment: narrowing to "Active" then typing still further narrows.
+ *
+ * The rows are paged: only the current page is rendered, so a node with
+ * thousands of runs still paints a small list. The pager arithmetic lives in
+ * `taskListPaging.ts` (pure, unit-tested).
  */
 export interface TaskListSidebarProps {
   runs: RunSummary[];
@@ -1698,6 +1711,45 @@ export function TaskListSidebar({
     return uiText(language, '全部', 'All');
   };
   const { language, text } = useUiLanguage();
+  // Paging: the sidebar renders one page of rows at a time. The node keeps
+  // thousands of runs, so rendering every match made the list slow to scroll
+  // and impossible to skim. The count above the list stays the count of every
+  // match, not of the page.
+  const [page, setPage] = useState(1);
+  const pageSize = TASK_PAGE_SIZE;
+  const pageCount = taskPageCount(visible.length, pageSize);
+  const currentPage = clampTaskPage(page, pageCount);
+  const pageRows = taskPageSlice(visible, currentPage, pageSize);
+  const range = taskPageRange(currentPage, visible.length, pageSize);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const jumpedToRun = useRef<string | null>(null);
+
+  // A new filter is a new list: start at the top again.
+  useEffect(() => { setPage(1); }, [search, segment]);
+
+  // The live poll can shrink the list under the operator (a run is archived,
+  // the segment filter gets narrower): keep the page inside the new range
+  // instead of showing an empty page.
+  useEffect(() => { setPage((current) => clampTaskPage(current, pageCount)); }, [pageCount]);
+
+  // A run picked elsewhere (deep link, the runs command, the queue drawer)
+  // may sit on another page: jump there once so the operator sees the run they
+  // picked. A poll that re-orders the list must not move the page under them.
+  useEffect(() => {
+    if (!runId || jumpedToRun.current === runId) return;
+    const index = visible.findIndex((run) => run.id === runId);
+    if (index < 0) return;
+    jumpedToRun.current = runId;
+    setPage(taskPageOfIndex(index, pageSize));
+  }, [runId, visible, pageSize]);
+
+  // Another page is another set of rows: start the list at the top.
+  useEffect(() => {
+    const node = listRef.current;
+    if (!node) return;
+    node.scrollTop = 0;
+  }, [currentPage]);
+
   return (
     <div className="task-list-inner">
       <div className="task-segments" role="tablist" aria-label={text('任务状态过滤', 'Task status filter')}>
@@ -1718,8 +1770,8 @@ export function TaskListSidebar({
       </div>
       <label className="session-search"><span><Search size={13} /></span><input value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder={text('搜索会话', 'Search tasks')} /></label>
       <div className="session-label">{totalLabel ?? text('会话', 'Tasks')} <span>{visible.length}</span></div>
-      <div className="session-list" data-task-list>
-        {visible.map((run) => (
+      <div className="session-list" data-task-list ref={listRef}>
+        {pageRows.map((run) => (
           <button key={run.id} type="button" className={`session-item ${run.id === runId ? 'selected' : ''}`} data-run-id={run.id} data-run-status={run.status} onClick={() => onSelectRun(run.id)}>
             <span className={statusClass(run.status)} />
             <span className="session-copy"><strong>{run.task || 'Untitled task'}</strong><small>{run.id}</small>{run.status === 'waiting_approval' && run.pending_decision_owner && <DecisionBadge owner={run.pending_decision_owner} compact />}</span>
@@ -1727,6 +1779,18 @@ export function TaskListSidebar({
         ))}
         {!visible.length && <div className="sidebar-empty">{text('暂无会话', 'No tasks yet')}</div>}
       </div>
+      {pageCount > 1 && (
+        <div className="task-pager" role="navigation" aria-label={text('任务分页', 'Task pages')} data-task-pager>
+          <button type="button" className="task-pager-button" data-page-action="first" disabled={currentPage <= 1} onClick={() => setPage(1)} title={text('第一页', 'First page')} aria-label={text('第一页', 'First page')}>«</button>
+          <button type="button" className="task-pager-button" data-page-action="prev" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)} title={text('上一页', 'Previous page')} aria-label={text('上一页', 'Previous page')}>‹</button>
+          <span className="task-pager-status" data-page-status>
+            <span data-page-range>{range.from}–{range.to} / {visible.length}</span>
+            <span data-page-indicator>{text(`第 ${currentPage} / ${pageCount} 页`, `Page ${currentPage} / ${pageCount}`)}</span>
+          </span>
+          <button type="button" className="task-pager-button" data-page-action="next" disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)} title={text('下一页', 'Next page')} aria-label={text('下一页', 'Next page')}>›</button>
+          <button type="button" className="task-pager-button" data-page-action="last" disabled={currentPage >= pageCount} onClick={() => setPage(pageCount)} title={text('最后一页', 'Last page')} aria-label={text('最后一页', 'Last page')}>»</button>
+        </div>
+      )}
     </div>
   );
 }
