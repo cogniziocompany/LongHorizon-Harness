@@ -57,3 +57,41 @@ export function taskPageRange(
   const from = (current - 1) * size + 1;
   return { from, to: Math.min(rows, from + size - 1) };
 }
+
+/**
+ * Decide which page the task list should show.
+ *
+ * The rules, in order:
+ *
+ * 1. The open run wins. When it is inside the filtered list and either the
+ *    selection or the filter changed, the list shows the page that holds it.
+ *    That covers a run picked from outside the sidebar (deep link, the runs
+ *    command, the queue drawer) and a filter change that brings the open run
+ *    back into view.
+ * 2. A filter change that leaves the open run outside the filtered list
+ *    starts at the top of the new list.
+ * 3. Otherwise the page stays where the operator left it. The poll re-orders
+ *    the list every three seconds and must never move the page under them.
+ *    The page is clamped, so a shrinking list cannot leave an empty page.
+ */
+export function resolveTaskPage(args: {
+  /** Index of the open run inside the filtered list, -1 when it is not in it. */
+  runIndex: number;
+  /** The page the operator is on. */
+  currentPage: number;
+  /** Pages the filtered list has. */
+  pageCount: number;
+  /** Rows per page. */
+  pageSize: number;
+  /** The filter (search or segment) changed. */
+  filterChanged: boolean;
+  /** The selected run changed. */
+  selectionChanged: boolean;
+}): number {
+  const { runIndex, currentPage, pageCount, pageSize, filterChanged, selectionChanged } = args;
+  if (runIndex >= 0 && (filterChanged || selectionChanged)) {
+    return clampTaskPage(taskPageOfIndex(runIndex, pageSize), pageCount);
+  }
+  if (filterChanged) return 1;
+  return clampTaskPage(currentPage, pageCount);
+}

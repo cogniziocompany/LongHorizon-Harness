@@ -15,10 +15,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { UiLanguageProvider } from '../src/i18n';
-import { TaskListSidebar, statusSegment, type SegmentId } from '../src/App';
+import { TaskListSidebar, TaskPager, statusSegment, type SegmentId } from '../src/App';
 import {
   TASK_PAGE_SIZE,
   clampTaskPage,
+  resolveTaskPage,
   taskPageCount,
   taskPageOfIndex,
   taskPageRange,
@@ -179,4 +180,39 @@ test('the search narrows the rows before the page is cut', () => {
   // 31 rows in total, which still fit on one page.
   assert.equal(rowCount(html), 31);
   assert.ok(!html.includes('data-task-pager'), 'the filtered rows fit on one page');
+});
+
+test('resolveTaskPage follows the open run and never moves the page under the poll', () => {
+  const base = { currentPage: 1, pageCount: 36, pageSize: 50 };
+  // The open run wins: it is inside the filtered list and the selection
+  // changed, so the list shows the page that holds it.
+  assert.equal(resolveTaskPage({ ...base, runIndex: 54, filterChanged: false, selectionChanged: true }), 2);
+  // A filter change that brings the open run back into view re-arms the jump:
+  // the operator must not be left with an invisible selection.
+  assert.equal(resolveTaskPage({ ...base, runIndex: 54, filterChanged: true, selectionChanged: false }), 2);
+  // A filter change without the open run in the list starts at the top.
+  assert.equal(resolveTaskPage({ ...base, currentPage: 7, runIndex: -1, filterChanged: true, selectionChanged: false }), 1);
+  // The poll changes neither the filter nor the selection: the page stays
+  // where the operator left it.
+  assert.equal(resolveTaskPage({ ...base, currentPage: 7, runIndex: 54, filterChanged: false, selectionChanged: false }), 7);
+  // A shrinking list clamps the page instead of leaving an empty page.
+  assert.equal(resolveTaskPage({ ...base, currentPage: 7, pageCount: 2, runIndex: -1, filterChanged: false, selectionChanged: false }), 2);
+  // The jump never lands outside the list.
+  assert.equal(resolveTaskPage({ ...base, runIndex: 1750, filterChanged: true, selectionChanged: false }), 36);
+});
+
+test('the pager disables the forward buttons on the last page', () => {
+  const html = renderToStaticMarkup(
+    <UiLanguageProvider initialLanguage="en">
+      <TaskPager page={36} pageCount={36} from={1751} to={1771} total={1771} onPage={() => undefined} />
+    </UiLanguageProvider>,
+  );
+  assert.match(html, /data-page-action="next" disabled/);
+  assert.match(html, /data-page-action="last" disabled/);
+  assert.doesNotMatch(html, /data-page-action="first" disabled/);
+  assert.doesNotMatch(html, /data-page-action="prev" disabled/);
+  assert.ok(html.includes('1751–1771 / 1771'), 'the pager reports the short last page');
+  assert.ok(html.includes('Page 36 / 36'));
+  // The current page is announced, not just printed.
+  assert.match(html, /data-page-indicator="true" aria-current="page"/);
 });

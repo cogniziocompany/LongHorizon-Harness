@@ -85,8 +85,8 @@ import { uiText, useUiLanguage, type UiLanguage } from './i18n';
 import {
   TASK_PAGE_SIZE,
   clampTaskPage,
+  resolveTaskPage,
   taskPageCount,
-  taskPageOfIndex,
   taskPageRange,
   taskPageSlice,
 } from './taskListPaging';
@@ -1681,6 +1681,41 @@ export interface TaskListSidebarProps {
   totalLabel?: string;
 }
 
+// The pager under the task list. Kept as its own component so the page
+// arithmetic and the button states can be rendered and asserted on their own.
+export function TaskPager({
+  page,
+  pageCount,
+  from,
+  to,
+  total,
+  onPage,
+}: {
+  page: number;
+  pageCount: number;
+  /** First row shown on the page (1-based). */
+  from: number;
+  /** Last row shown on the page (1-based, shorter on the last page). */
+  to: number;
+  /** Number of rows the filter matched. */
+  total: number;
+  onPage: (page: number) => void;
+}) {
+  const { text } = useUiLanguage();
+  return (
+    <div className="task-pager" role="navigation" aria-label={text('任务分页', 'Task pages')} data-task-pager>
+      <button type="button" className="task-pager-button" data-page-action="first" disabled={page <= 1} onClick={() => onPage(1)} title={text('第一页', 'First page')} aria-label={text('第一页', 'First page')}>«</button>
+      <button type="button" className="task-pager-button" data-page-action="prev" disabled={page <= 1} onClick={() => onPage(page - 1)} title={text('上一页', 'Previous page')} aria-label={text('上一页', 'Previous page')}>‹</button>
+      <span className="task-pager-status" data-page-status aria-live="polite">
+        <span data-page-range>{from}–{to} / {total}</span>
+        <span data-page-indicator aria-current="page">{text(`第 ${page} / ${pageCount} 页`, `Page ${page} / ${pageCount}`)}</span>
+      </span>
+      <button type="button" className="task-pager-button" data-page-action="next" disabled={page >= pageCount} onClick={() => onPage(page + 1)} title={text('下一页', 'Next page')} aria-label={text('下一页', 'Next page')}>›</button>
+      <button type="button" className="task-pager-button" data-page-action="last" disabled={page >= pageCount} onClick={() => onPage(pageCount)} title={text('最后一页', 'Last page')} aria-label={text('最后一页', 'Last page')}>»</button>
+    </div>
+  );
+}
+
 export function TaskListSidebar({
   runs,
   runId,
@@ -1696,13 +1731,19 @@ export function TaskListSidebar({
   // `statusSegment(run.status)` runs locally over what `fetchRuns()` already
   // returned for the chosen segment (so an active run on page 2 cannot be
   // missed by the in-memory view: the server already filtered it server-side).
-  const lowerSearch = search.trim().toLowerCase();
-  const matchesSearch = (run: RunSummary) =>
-    !lowerSearch || `${run.id} ${run.task || ''}`.toLowerCase().includes(lowerSearch);
-  const visible = runs.filter((run) => {
-    if (segment === 'all') return matchesSearch(run);
-    return statusSegment(run.status) === segment && matchesSearch(run);
-  });
+  //
+  // Memoised: the poll hands over a new `runs` array every three seconds and
+  // the page effect below depends on the filtered list, so recomputing it on
+  // every render would re-run the open-run lookup on every render too.
+  const visible = useMemo(() => {
+    const lowerSearch = search.trim().toLowerCase();
+    const matchesSearch = (run: RunSummary) =>
+      !lowerSearch || `${run.id} ${run.task || ''}`.toLowerCase().includes(lowerSearch);
+    return runs.filter((run) => {
+      if (segment === 'all') return matchesSearch(run);
+      return statusSegment(run.status) === segment && matchesSearch(run);
+    });
+  }, [runs, segment, search]);
   const segments: SegmentId[] = ['active', 'completed', 'other', 'all'];
   const segmentLabel = (id: SegmentId, language: UiLanguage): string => {
     if (id === 'active') return uiText(language, '进行中', 'Active');
@@ -1722,26 +1763,35 @@ export function TaskListSidebar({
   const pageRows = taskPageSlice(visible, currentPage, pageSize);
   const range = taskPageRange(currentPage, visible.length, pageSize);
   const listRef = useRef<HTMLDivElement | null>(null);
-  const jumpedToRun = useRef<string | null>(null);
+  const lastFilter = useRef({ search, segment });
+  const lastRunId = useRef<string | null>(null);
 
-  // A new filter is a new list: start at the top again.
-  useEffect(() => { setPage(1); }, [search, segment]);
-
-  // The live poll can shrink the list under the operator (a run is archived,
-  // the segment filter gets narrower): keep the page inside the new range
-  // instead of showing an empty page.
-  useEffect(() => { setPage((current) => clampTaskPage(current, pageCount)); }, [pageCount]);
-
-  // A run picked elsewhere (deep link, the runs command, the queue drawer)
-  // may sit on another page: jump there once so the operator sees the run they
-  // picked. A poll that re-orders the list must not move the page under them.
+  // One effect decides the page, so the rules cannot fight each other:
+  //   * the open run wins - when it is inside the filtered list and the
+  //     selection or the filter changed, the list shows the page that holds
+  //     it (a run picked from outside the sidebar, a deep link, or a filter
+  //     change that brings the open run back into view);
+  //   * a filter change without the open run in the list starts at the top;
+  //   * the poll keeps the page where the operator left it and only clamps the
+  //     page when the list shrinks under the operator (a run is archived, the
+  //     segment filter gets narrower) instead of showing an empty page.
+  // `lastRunId` starts empty, so the first render jumps to a run picked by a
+  // deep link.
   useEffect(() => {
-    if (!runId || jumpedToRun.current === runId) return;
-    const index = visible.findIndex((run) => run.id === runId);
-    if (index < 0) return;
-    jumpedToRun.current = runId;
-    setPage(taskPageOfIndex(index, pageSize));
-  }, [runId, visible, pageSize]);
+    const filterChanged = lastFilter.current.search !== search || lastFilter.current.segment !== segment;
+    const selectionChanged = lastRunId.current !== runId;
+    lastFilter.current = { search, segment };
+    lastRunId.current = runId;
+    const runIndex = runId ? visible.findIndex((run) => run.id === runId) : -1;
+    setPage((current) => resolveTaskPage({
+      runIndex,
+      currentPage: current,
+      pageCount,
+      pageSize,
+      filterChanged,
+      selectionChanged,
+    }));
+  }, [runId, search, segment, visible, pageSize, pageCount]);
 
   // Another page is another set of rows: start the list at the top.
   useEffect(() => {
@@ -1761,14 +1811,14 @@ export function TaskListSidebar({
             aria-selected={segment === id}
             className={`task-segment ${segment === id ? 'active' : ''}`}
             data-segment={id}
-            onClick={() => onSegmentChange(id)}
+            onClick={() => { onSegmentChange(id); setPage(1); }}
           >
             <span className="task-segment-label">{segmentLabel(id, language)}</span>
             <span className="task-segment-count">{segmentCounts[id] ?? 0}</span>
           </button>
         ))}
       </div>
-      <label className="session-search"><span><Search size={13} /></span><input value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder={text('搜索会话', 'Search tasks')} /></label>
+      <label className="session-search"><span><Search size={13} /></span><input value={search} onChange={(event) => { onSearchChange(event.target.value); setPage(1); }} placeholder={text('搜索会话', 'Search tasks')} /></label>
       <div className="session-label">{totalLabel ?? text('会话', 'Tasks')} <span>{visible.length}</span></div>
       <div className="session-list" data-task-list ref={listRef}>
         {pageRows.map((run) => (
@@ -1780,16 +1830,14 @@ export function TaskListSidebar({
         {!visible.length && <div className="sidebar-empty">{text('暂无会话', 'No tasks yet')}</div>}
       </div>
       {pageCount > 1 && (
-        <div className="task-pager" role="navigation" aria-label={text('任务分页', 'Task pages')} data-task-pager>
-          <button type="button" className="task-pager-button" data-page-action="first" disabled={currentPage <= 1} onClick={() => setPage(1)} title={text('第一页', 'First page')} aria-label={text('第一页', 'First page')}>«</button>
-          <button type="button" className="task-pager-button" data-page-action="prev" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)} title={text('上一页', 'Previous page')} aria-label={text('上一页', 'Previous page')}>‹</button>
-          <span className="task-pager-status" data-page-status>
-            <span data-page-range>{range.from}–{range.to} / {visible.length}</span>
-            <span data-page-indicator>{text(`第 ${currentPage} / ${pageCount} 页`, `Page ${currentPage} / ${pageCount}`)}</span>
-          </span>
-          <button type="button" className="task-pager-button" data-page-action="next" disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)} title={text('下一页', 'Next page')} aria-label={text('下一页', 'Next page')}>›</button>
-          <button type="button" className="task-pager-button" data-page-action="last" disabled={currentPage >= pageCount} onClick={() => setPage(pageCount)} title={text('最后一页', 'Last page')} aria-label={text('最后一页', 'Last page')}>»</button>
-        </div>
+        <TaskPager
+          page={currentPage}
+          pageCount={pageCount}
+          from={range.from}
+          to={range.to}
+          total={visible.length}
+          onPage={setPage}
+        />
       )}
     </div>
   );
