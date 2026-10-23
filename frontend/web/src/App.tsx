@@ -1771,6 +1771,9 @@ export function TaskListSidebar({
   //     selection or the filter changed, the list shows the page that holds
   //     it (a run picked from outside the sidebar, a deep link, or a filter
   //     change that brings the open run back into view);
+  //   * a search is a lookup - while the operator types, the list shows the
+  //     hits from the top instead of jumping to the open run on every
+  //     keystroke;
   //   * a filter change without the open run in the list starts at the top;
   //   * the poll keeps the page where the operator left it and only clamps the
   //     page when the list shrinks under the operator (a run is archived, the
@@ -1778,8 +1781,12 @@ export function TaskListSidebar({
   // `lastRunId` starts empty, so the first render jumps to a run picked by a
   // deep link.
   useEffect(() => {
-    const filterChanged = lastFilter.current.search !== search || lastFilter.current.segment !== segment;
+    const searchChanged = lastFilter.current.search !== search;
+    const filterChanged = searchChanged || lastFilter.current.segment !== segment;
     const selectionChanged = lastRunId.current !== runId;
+    // Typing a search is a lookup; clearing it is a change of view again, so
+    // the open run wins then.
+    const lookup = searchChanged && search.trim() !== '';
     lastFilter.current = { search, segment };
     lastRunId.current = runId;
     const runIndex = runId ? visible.findIndex((run) => run.id === runId) : -1;
@@ -1790,6 +1797,7 @@ export function TaskListSidebar({
       pageSize,
       filterChanged,
       selectionChanged,
+      lookup,
     }));
   }, [runId, search, segment, visible, pageSize, pageCount]);
 
@@ -1800,6 +1808,10 @@ export function TaskListSidebar({
     node.scrollTop = 0;
   }, [currentPage]);
 
+  // The segment pills and the search box reset the page the moment they are
+  // used, so the list never paints a page that does not exist in the new
+  // filter. The effect above then moves to the open run when the new filter
+  // holds it.
   return (
     <div className="task-list-inner">
       <div className="task-segments" role="tablist" aria-label={text('任务状态过滤', 'Task status filter')}>

@@ -199,6 +199,11 @@ test('resolveTaskPage follows the open run and never moves the page under the po
   assert.equal(resolveTaskPage({ ...base, currentPage: 7, pageCount: 2, runIndex: -1, filterChanged: false, selectionChanged: false }), 2);
   // The jump never lands outside the list.
   assert.equal(resolveTaskPage({ ...base, runIndex: 1750, filterChanged: true, selectionChanged: false }), 36);
+  // A search is a lookup: while the operator types, the list shows the hits
+  // from the top instead of jumping to the open run on every keystroke.
+  assert.equal(resolveTaskPage({ ...base, runIndex: 54, filterChanged: true, selectionChanged: false, lookup: true }), 1);
+  // Clearing the search is a change of view again, so the open run wins.
+  assert.equal(resolveTaskPage({ ...base, runIndex: 54, filterChanged: true, selectionChanged: false, lookup: false }), 2);
 });
 
 test('the pager disables the forward buttons on the last page', () => {

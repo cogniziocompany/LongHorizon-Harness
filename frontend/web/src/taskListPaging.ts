@@ -64,13 +64,15 @@ export function taskPageRange(
  * The rules, in order:
  *
  * 1. The open run wins. When it is inside the filtered list and either the
- *    selection or the filter changed, the list shows the page that holds it.
- *    That covers a run picked from outside the sidebar (deep link, the runs
- *    command, the queue drawer) and a filter change that brings the open run
- *    back into view.
- * 2. A filter change that leaves the open run outside the filtered list
+ *    selection changed or the filter changed, the list shows the page that
+ *    holds it. That covers a run picked from outside the sidebar (deep link,
+ *    the runs command, the queue drawer) and a filter change that brings the
+ *    open run back into view.
+ * 2. A search is a lookup: while the operator types, the list shows the hits
+ *    from the top instead of jumping to the open run on every keystroke.
+ * 3. A filter change that leaves the open run outside the filtered list
  *    starts at the top of the new list.
- * 3. Otherwise the page stays where the operator left it. The poll re-orders
+ * 4. Otherwise the page stays where the operator left it. The poll re-orders
  *    the list every three seconds and must never move the page under them.
  *    The page is clamped, so a shrinking list cannot leave an empty page.
  */
@@ -87,9 +89,22 @@ export function resolveTaskPage(args: {
   filterChanged: boolean;
   /** The selected run changed. */
   selectionChanged: boolean;
+  /**
+   * The filter change is a search the operator is typing: the list shows the
+   * hits from the top instead of the page of the open run.
+   */
+  lookup?: boolean;
 }): number {
-  const { runIndex, currentPage, pageCount, pageSize, filterChanged, selectionChanged } = args;
-  if (runIndex >= 0 && (filterChanged || selectionChanged)) {
+  const {
+    runIndex,
+    currentPage,
+    pageCount,
+    pageSize,
+    filterChanged,
+    selectionChanged,
+    lookup = false,
+  } = args;
+  if (runIndex >= 0 && (selectionChanged || (filterChanged && !lookup))) {
     return clampTaskPage(taskPageOfIndex(runIndex, pageSize), pageCount);
   }
   if (filterChanged) return 1;
