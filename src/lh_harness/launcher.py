@@ -25,6 +25,8 @@ from typing import Any, Callable
 from .safe_subprocess import child_env, git_argv
 from .config import PROJECT_CONFIG_PATH, load_run_defaults
 from .contention import ContentionGroup, detect_contention, groups_to_json
+from .fleet.reporter import FleetReporter, get_reporter as _get_reporter_default
+from .fleet.trios import build_trios_payload
 from .queue import (
     DEFAULT_QUOTA_BACKOFF_MINUTES,
     QueueEntry,
@@ -55,6 +57,13 @@ except ImportError:  # pragma: no cover
 
 
 _MAX_REASON_LEN = 4_000
+
+# Slice B: heartbeat debounce window for the launcher's ``/harness/trios``
+# push.  Fleet-admin only needs to know that a node is alive; pushing more
+# often than once every 10 minutes burns bandwidth for no real signal.  Set
+# inside the same window the reporter uses for its own ``_WARN_ONCE`` so a
+# noisy node that already dampens its warnings does not get more trios spam.
+_TRIOS_HEARTBEAT_SECONDS = 600.0
 
 logger = logging.getLogger(__name__)
 
@@ -571,6 +580,25 @@ def _now() -> float:
     return time.time()
 
 
+def _resolve_trios_node_name() -> str:
+    """Best-effort node name for the ``/harness/trios`` envelope.
+
+    Honours ``LH_HARNESS_FLEET_NODE`` (the same env var the reporter
+    reads) and falls back to ``socket.gethostname()``.  Never raises so
+    the launcher's hot path stays clean.
+    """
+
+    raw = os.environ.get("LH_HARNESS_FLEET_NODE", "").strip()
+    if raw:
+        return raw
+    try:
+        import socket
+
+        return socket.gethostname() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def _normalize_workspace(value: str) -> str:
     """Return a stable absolute form for workspace-path comparison."""
 
@@ -769,6 +797,28 @@ class Launcher:
         self._stall_threshold = _stall_threshold_from_env()
         self._stall_cycles = 0
         self._stall_fired = False
+        # Slice B launcher-side trio push (FLEET-TRIOS-B): track the last
+        # ``configSha256`` we shipped to fleet-admin and the monotonic time
+        # we shipped it so the next pass can decide between "sha moved,
+        # push now" and "heartbeat window elapsed, push now" without
+        # shipping anything for the steady-state case.  ``None`` until the
+        # first push has actually been attempted.
+        self._trios_last_pushed_sha: str | None = None
+        self._trios_last_pushed_at: float | None = None
+        # Injectable resolver so tests can hand in a fake reporter without
+        # standing up a real fleet-admin daemon; production uses the
+        # singleton ``get_reporter`` factory.
+        self._trios_reporter_factory = (
+            _get_reporter_default if _get_reporter_default is not None else (lambda: None)
+        )
+        # Injectable monotonic clock for the heartbeat window (the same
+        # ``time.monotonic`` the reporter uses for its own timing).  Tests
+        # pass a hand-rolled callable so they can step the clock without
+        # sleeping.
+        self._trios_clock = time.monotonic
+        # Injectable node name (defaults to ``socket.gethostname``); tests
+        # can pin it for predictable payload assertions.
+        self._trios_node_name = _resolve_trios_node_name()
 
     @staticmethod
     def _load_project_queue_config() -> dict[str, Any]:
@@ -872,6 +922,112 @@ class Launcher:
             capacity[f"{trio_name.strip()}_max"] = self._effective_cap(base, peak)
         merged["capacity"] = capacity
         self._config = merged
+
+    # ------------------------------------------------------------------
+    # Slice B: launcher-side trio push (FLEET-TRIOS-B).
+    #
+    # The dispatcher side (slice A, ``fleet/reporter.py`` and
+    # ``fleet/trios.py``) already knows how to build and ship a
+    # ``/harness/trios`` envelope; this method is the *trigger*.  Three
+    # triggers wire to one ship:
+    #
+    # 1. **Start** — the very first time ``_push_trios_if_due`` runs the
+    #    ``_trios_last_pushed_sha`` is ``None`` and we push regardless of
+    #    clock or config: fleet-admin learns the node exists.
+    # 2. **sha change** — if the new payload's ``configSha256`` differs
+    #    from the one we last shipped, an admin edit (trio model, capacity,
+    #    enable/disable) has landed and fleet-admin needs the new view
+    #    now, not at the next heartbeat.
+    # 3. **Heartbeat** — even on a perfectly steady config, push at most
+    #    once every ``_TRIOS_HEARTBEAT_SECONDS`` (10 minutes by default)
+    #    so a long-lived launcher still shows as alive.
+    #
+    # All three triggers run inside the same try/except: a misconfigured
+    # reporter or a malformed config must never abort a run pass.  Live
+    # counts come from ``_remaining_capacity``'s "launched entries" view,
+    # the same ``active`` mapping the eligibility gate already counts.
+    # ------------------------------------------------------------------
+    def _push_trios_if_due(self, active: dict[str, dict[str, Any]]) -> None:
+        if build_trios_payload is None or _get_reporter_default is None:
+            return
+        try:
+            reporter = self._trios_reporter_factory()
+        except Exception:  # noqa: BLE001 - a broken factory must never abort the pass
+            logger.warning("fleet trios: reporter factory raised; skipping push")
+            return
+        if reporter is None or not getattr(reporter, "enabled", False):
+            return
+        live_counts = self._count_launched_per_trio(self, active)
+        try:
+            payload = build_trios_payload(
+                self._config, self._trios_node_name, live_counts
+            )
+        except Exception:  # noqa: BLE001 - a builder failure must never abort the pass
+            logger.warning("fleet trios: build_trios_payload raised; skipping push")
+            return
+        sha = payload.get("configSha256")
+        now = self._trios_clock()
+        last_sha = self._trios_last_pushed_sha
+        last_at = self._trios_last_pushed_at
+        should_push = False
+        if last_sha is None:
+            # Trigger 1: never pushed — push now (this is also the "start"
+            # push that fires on the very first pass).
+            should_push = True
+        elif last_sha != sha:
+            # Trigger 2: configuration moved — push now regardless of clock.
+            should_push = True
+        elif last_at is None or (now - last_at) >= _TRIOS_HEARTBEAT_SECONDS:
+            # Trigger 3: heartbeat — push to prove the launcher is alive.
+            should_push = True
+        if not should_push:
+            return
+        try:
+            reporter.send_trios(payload)
+        except Exception:  # noqa: BLE001 - reporter.send_trios is fail-open but we double-wrap
+            logger.warning("fleet trios: send_trios raised; launcher continuing")
+            return
+        # Only record a successful push attempt.  The reporter itself may
+        # queue the payload and fail later, but that is the reporter's
+        # problem; the launcher's debounce window is keyed off what we
+        # SENT, not what the network eventually delivered.
+        self._trios_last_pushed_sha = sha
+        self._trios_last_pushed_at = now
+
+    @staticmethod
+    def _count_launched_per_trio(
+        launcher: "Launcher",
+        active: dict[str, dict[str, Any]],
+    ) -> dict[str, int]:
+        """Walk ``launcher.queue_store.list()`` the same way ``_remaining_capacity`` does.
+
+        Returns a ``{trio_name: count}`` mapping; trios with no launched
+        entries are simply absent (``build_trios_payload`` clamps unknown
+        names to 0).  The walk is fail-open: a broken store or a missing
+        ``list`` method returns an empty dict so the trio push never aborts
+        the launch pass.
+        """
+
+        counts: dict[str, int] = {}
+        try:
+            entries = launcher.queue_store.list()
+        except Exception:  # noqa: BLE001 - a broken store must never abort the push
+            return counts
+        for entry in entries:
+            try:
+                status = getattr(entry, "status", None)
+                run_id = getattr(entry, "run_id", None)
+                trio = getattr(entry, "trio", None)
+            except Exception:
+                continue
+            if status != "launched":
+                continue
+            if not run_id or run_id not in active:
+                continue
+            if not isinstance(trio, str) or not trio:
+                continue
+            counts[trio] = counts.get(trio, 0) + 1
+        return counts
 
     @staticmethod
     def _project_role_mcp_profile(role: str) -> str | None:
@@ -1010,6 +1166,12 @@ class Launcher:
         except Exception as exc:
             self._emit_service_event("queue.error", {"error": f"contention check failed: {exc}"[:200]})
         capacities = self._remaining_capacity(active)
+        # Slice B trio push: ship the launcher's current trio view to
+        # fleet-admin whenever the configuration moved or the heartbeat
+        # window elapsed (and unconditionally on the first pass so a
+        # fresh node announces itself).  The call is fail-open and uses
+        # the same launched-run view ``_remaining_capacity`` just walked.
+        self._push_trios_if_due(active)
         launched = False
         # Stall detector (task 230): an entry is ELIGIBLE this cycle when it is
         # pending and the eligibility gate (capacity, workspace occupancy,
