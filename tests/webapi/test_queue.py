@@ -262,6 +262,7 @@ def test_default_queue_config_shape() -> None:
     assert set(config) == {
         "trios",
         "capacity",
+        "node_max_runs",
         "observe",
         "occupancy_ignore_dirty",
         "default_time_limit_minutes",

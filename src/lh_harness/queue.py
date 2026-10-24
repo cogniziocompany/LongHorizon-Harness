@@ -1240,9 +1240,20 @@ def queue_config_from_config(config: dict[str, Any]) -> dict[str, Any]:
         default_time_limit = validate_time_limit_minutes(default_time_limit)
     except ValueError:
         default_time_limit = None
+    # NODE-level active-run ceiling, read from ``[queue] node_max_runs`` (NOT
+    # from ``[queue.capacity]``: those are per-trio caps).  Mirrors
+    # ``config._flatten_queue_table`` so both loaders agree; a value that is
+    # not a positive integer falls back to the default rather than raising,
+    # because this loader is also the API's read-only shape helper.
+    from .config import DEFAULT_NODE_MAX_RUNS
+
+    node_max_runs = queue.get("node_max_runs") if isinstance(queue, dict) else None
+    if isinstance(node_max_runs, bool) or not isinstance(node_max_runs, int) or node_max_runs < 1:
+        node_max_runs = DEFAULT_NODE_MAX_RUNS
     return {
         "trios": normalized_trios,
         "capacity": normalized_capacity,
+        "node_max_runs": node_max_runs,
         "observe": observe,
         "occupancy_ignore_dirty": occupancy_ignore_dirty,
         "default_time_limit_minutes": default_time_limit,
