@@ -28,6 +28,15 @@ _CLEAN_AUDIT = (
     "Contract audit: aligned\n"
     "Summary:\nthe change is verified"
 )
+# A clean audit ends the run at that round, so a two-round fixture needs a
+# round whose audit does not verify the deliverable (round 1) followed by the
+# one that does (round 2).
+_UNCLEAN_AUDIT = (
+    "Status: incomplete\n"
+    "Integrity: clean\n"
+    "Contract audit: needs_revision\n"
+    "Summary:\nthe change is still incomplete"
+)
 
 
 class SequencedAgent:
@@ -62,7 +71,11 @@ async def _two_round_run(
             harness_dir=str(tmp_path / "harness"),
             log_dir=str(tmp_path / "logs"),
         ),
-        agent=SequencedAgent(replies or [_PLAN, _EXECUTED, _CLEAN_AUDIT, _DONE]),
+        # Round 1 audits unclean (so the run continues), round 2 audits clean
+        # (which is where the run now stops).
+        agent=SequencedAgent(
+            replies or [_PLAN, _EXECUTED, _UNCLEAN_AUDIT, _PLAN, _EXECUTED, _CLEAN_AUDIT]
+        ),
     )
 
 
@@ -145,11 +158,11 @@ async def test_flag_on_captures_one_redacted_record_per_round(
     # input ⇒ satisfaction 0. R = 0.45 * 1 + 0.30 * 0 + 0.25 * 0.
     assert terminal["value"] == pytest.approx(0.45)
     assert terminal["reward_terms"] == {"goal": 1.0, "process": 0.0, "satisfaction": 0.0}
-    # The terminal "done" round carries no independent auditor reflection, so
-    # its weight is low; the executed round's clean audit weights high.
-    assert terminal["alpha"] == pytest.approx(0.3)
-    assert records[0]["alpha"] == pytest.approx(0.7)
-    assert records[0]["value"] == pytest.approx(0.7 * 0.45 + 0.3 * 0.9 * 0.45)
+    # Round 2 is the clean audit that ends the run, so it reflects the verified
+    # verdict; round 1's needs-revision audit is a mid-confidence reflection.
+    assert terminal["alpha"] == pytest.approx(0.7)
+    assert records[0]["alpha"] == pytest.approx(0.5)
+    assert records[0]["value"] == pytest.approx(0.5 * 0.45 + 0.5 * 0.9 * 0.45)
     assert all("content_hash" in item for item in records)
     captured = next(event for event in _events(tmp_path) if event["event"] == "experience_captured")
     assert captured["records_written"] == 2
@@ -194,7 +207,7 @@ async def test_env_var_off_overrides_config_on(tmp_path: Path, monkeypatch) -> N
             log_dir=str(tmp_path / "logs"),
             experience=True,
         ),
-        agent=SequencedAgent([_PLAN, _EXECUTED, _CLEAN_AUDIT, _DONE]),
+        agent=SequencedAgent([_PLAN, _EXECUTED, _UNCLEAN_AUDIT, _PLAN, _EXECUTED, _CLEAN_AUDIT]),
     )
 
     assert report["status"] == "complete"
@@ -217,7 +230,7 @@ async def test_config_flag_enables_without_the_env_var(tmp_path: Path, monkeypat
             log_dir=str(tmp_path / "logs"),
             experience=True,
         ),
-        agent=SequencedAgent([_PLAN, _EXECUTED, _CLEAN_AUDIT, _DONE]),
+        agent=SequencedAgent([_PLAN, _EXECUTED, _UNCLEAN_AUDIT, _PLAN, _EXECUTED, _CLEAN_AUDIT]),
     )
 
     assert len(_read_experience(tmp_path)) == 2

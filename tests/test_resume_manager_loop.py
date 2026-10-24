@@ -30,7 +30,14 @@ def _clean_audit(summary: str) -> str:
     )
 
 
-_CLEAN_AUDIT = _clean_audit("the change is verified")
+# Not clean, so it never stops the run early; used to keep the loop spending
+# rounds until its budget is exhausted.
+_UNCLEAN_AUDIT = (
+    "Status: incomplete\n"
+    "Integrity: clean\n"
+    "Contract audit: needs_revision\n\n"
+    "Summary:\nthe change is still incomplete"
+)
 
 
 def _ledger_round(index: int, **overrides: Any) -> dict[str, Any]:
@@ -227,13 +234,15 @@ async def test_a_resume_with_no_ledger_starts_from_round_one(tmp_path: Path) -> 
 async def test_a_resumed_loop_still_stops_at_its_budget(tmp_path: Path) -> None:
     _seed_ledger(tmp_path, [1, 2, 3])
 
+    # Not-clean audits, so the budget — not an early completion — ends the run.
     report, _agent = await _run(
         tmp_path,
         resume=True,
-        replies=[_PLAN, _EXECUTED, _CLEAN_AUDIT, _PLAN, _EXECUTED, _CLEAN_AUDIT, _PLAN],
+        replies=[_PLAN, _EXECUTED, _UNCLEAN_AUDIT, _PLAN, _EXECUTED, _UNCLEAN_AUDIT, _PLAN],
     )
 
     # 3 restored + 2 additional rounds, then the budget is exhausted.
     assert [item["round_index"] for item in report["rounds"]] == [1, 2, 3, 4, 5]
     assert report["max_rounds"] == 5
     assert report["completion_satisfied"] is False
+    assert report["abort_reason"] == "max_rounds_exhausted"
