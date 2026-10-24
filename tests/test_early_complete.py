@@ -197,6 +197,53 @@ async def test_a_not_clean_audit_still_runs_another_round(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_an_all_unclean_run_spends_its_budget_exactly_as_before(
+    tmp_path: Path,
+) -> None:
+    # Isolates the unchanged path: when no audit is ever clean, the run must run
+    # every round it is allowed and end as it always did — ``max_rounds_exhausted``.
+    # This test is expected to pass identically against the pre-change manager,
+    # which is what makes it a regression guard rather than a restatement of the
+    # new stop; the clean-audit tests above are the ones that require the change.
+    report, agent = await _run(
+        tmp_path,
+        replies=[
+            _PLAN,
+            _EXECUTED,
+            _INCOMPLETE_AUDIT,
+            _PLAN,
+            _EXECUTED,
+            _INCOMPLETE_AUDIT,
+        ],
+        max_rounds=2,
+    )
+
+    assert report["rounds_run"] == 2
+    assert [item["round_index"] for item in report["rounds"]] == [1, 2]
+    assert report["completion_satisfied"] is False
+    assert report["status"] != "complete"
+    assert report["abort_reason"] == "max_rounds_exhausted"
+
+    # No round was treated as a verification: the stop never fired.
+    assert _events_named(tmp_path, "completion_accepted_at_clean_audit") == []
+
+    # Each round is the ordinary progress record with the auditor's own text and
+    # no synthetic repair feedback — the non-clean path is untouched.
+    for item in report["rounds"]:
+        assert item["next_step"] == "cli"
+        assert item["auditor_report"].strip() == _INCOMPLETE_AUDIT
+        assert item["harness_feedback"] == ""
+        assert not item["auditor_status"].get("invalid_completion")
+
+    # The finding reached the next manager turn instead of ending the run.
+    manager_prompts = [
+        prompt for prompt in agent.prompts if "You are the LongHorizon-Harness manager agent" in prompt
+    ]
+    assert len(manager_prompts) == 2
+    assert "the change is not yet verified end to end" in manager_prompts[1]
+
+
+@pytest.mark.asyncio
 async def test_a_complete_but_suspect_audit_does_not_stop_the_run(tmp_path: Path) -> None:
     # "Clean AND complete": a complete verdict with suspect integrity is not
     # enough to end the run, so round 2 still happens.
