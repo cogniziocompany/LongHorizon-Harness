@@ -5,6 +5,11 @@ The launcher is an asyncio task started with the Web API. It polls the
 per trio, skips workspaces that already have an active run, and launches the
 highest-priority eligible entry through the same ``supervisor.create_run`` path
 used by ``POST /api/runs``.
+
+Capacity is enforced at TWO levels: the per-trio caps in ``[queue.capacity]``
+(one lane each, whose sum can exceed the node's own maximum) and the node-wide
+ceiling in ``[queue] node_max_runs`` — the value this node advertises to the
+fleet registry as ``maxConcurrentRuns``.  The tighter of the two wins.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .safe_subprocess import child_env, git_argv
-from .config import PROJECT_CONFIG_PATH, load_run_defaults
+from .config import DEFAULT_NODE_MAX_RUNS, PROJECT_CONFIG_PATH, load_run_defaults
 from .contention import ContentionGroup, detect_contention, groups_to_json
 from .queue import (
     DEFAULT_QUOTA_BACKOFF_MINUTES,
@@ -813,10 +818,11 @@ class Launcher:
         A row with ``enabled = false`` REMOVES that trio from scheduling: once
         the database holds a row for a name it is authoritative. Only trios and
         per-trio ``<name>_max`` capacity keys are overlaid; everything else
-        (observe, poll_seconds, key-health, occupancy flags, time limits)
-        stays config-file-owned. A run keeps the trio resolved at its launch;
-        this merge never reaches into a running run. A store read failure is
-        logged and the pass keeps the bootstrap config.
+        (observe, poll_seconds, key-health, occupancy flags, time limits, and
+        the node-wide ``node_max_runs`` ceiling) stays config-file-owned. A run
+        keeps the trio resolved at its launch; this merge never reaches into a
+        running run. A store read failure is logged and the pass keeps the
+        bootstrap config.
         """
 
         if self._settings_store is None:
@@ -1010,6 +1016,11 @@ class Launcher:
         except Exception as exc:
             self._emit_service_event("queue.error", {"error": f"contention check failed: {exc}"[:200]})
         capacities = self._remaining_capacity(active)
+        # NODE-level ceiling: the per-trio caps above each bound one lane, and
+        # their SUM can exceed the maximum this node advertises to the fleet
+        # (ct110, 2026-10-22: 11 active against maxConcurrentRuns 5).  Both
+        # checks run on the same ``active`` set; the tighter one refuses.
+        node_active = len(active)
         launched = False
         # Stall detector (task 230): an entry is ELIGIBLE this cycle when it is
         # pending and the eligibility gate (capacity, workspace occupancy,
@@ -1026,8 +1037,10 @@ class Launcher:
                 # Once one entry has LAUNCHED this pass, any later pending
                 # entry in the same trio must be skipped with an up-to-date
                 # capacity reason.
-                skip_reason = self._waiting_skip_reason(entry) or self._capacity_reason(
-                    entry, capacities
+                skip_reason = (
+                    self._waiting_skip_reason(entry)
+                    or self._capacity_reason(entry, capacities)
+                    or self._node_capacity_reason(node_active)
                 )
                 if skip_reason is None:
                     skip_reason = "launch batch already consumed capacity"
@@ -1036,7 +1049,7 @@ class Launcher:
                     continue
                 self._skip(entry, skip_reason)
                 continue
-            skip_reason = self._check_eligibility(entry, active, capacities)
+            skip_reason = self._check_eligibility(entry, active, capacities, node_active)
             if skip_reason is None:
                 eligible_seen = True
                 if self._observe:
@@ -1052,10 +1065,12 @@ class Launcher:
                     self._shadow_launch_decision(entry)
                     launched = True
                     capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
+                    node_active += 1
                     continue
                 if self._launch(entry):
                     launched = True
                     capacities[entry.trio] = capacities.get(entry.trio, 0) - 1
+                    node_active += 1
             elif self._observe:
                 self._shadow_skip(entry, skip_reason)
             else:
@@ -1331,6 +1346,39 @@ class Launcher:
             return f"{entry.trio} at capacity"
         return None
 
+    def _node_max_runs(self) -> int:
+        """The node-wide active-run ceiling from ``[queue] node_max_runs``.
+
+        The ONE configuration value that decides how many runs this node may
+        have active at once — the number the fleet registry advertises as
+        ``maxConcurrentRuns``.  It is separate from the per-trio caps in
+        ``[queue.capacity]``: those bound a single lane each, their sum can be
+        larger than this, and the pass enforces both (the tighter wins).
+        """
+
+        raw = self._config.get("node_max_runs") if isinstance(self._config, dict) else None
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+            return DEFAULT_NODE_MAX_RUNS
+        return raw
+
+    def _node_capacity_reason(self, node_active: int) -> str | None:
+        """Refuse the pass once THIS node has its advertised maximum active.
+
+        ``node_active`` is seeded in ``_run_pass`` from the very same
+        ``_active_runs()`` set the per-trio counts come from, and grows by one
+        for every launch this pass makes (exactly as ``capacities`` shrinks),
+        so the node total and the per-trio counts can never disagree about
+        what "active" means.  The reason has the same shape as the existing
+        per-trio refusal (``f"{entry.trio} at capacity"``) so it flows through
+        the identical skip/pending path: the entry stays pending and is
+        retried later.
+        """
+
+        node_max = self._node_max_runs()
+        if node_active >= node_max:
+            return f"node at capacity: {node_active} active runs, node max {node_max}"
+        return None
+
     def _drain_skip_reason(self) -> str | None:
         """Drain skip reason while the operator flag is set, else None.
 
@@ -1427,6 +1475,7 @@ class Launcher:
         entry: QueueEntry,
         active: dict[str, dict[str, Any]],
         capacities: dict[str, int],
+        node_active: int | None = None,
     ) -> str | None:
         drain_reason = self._drain_skip_reason()
         if drain_reason is not None:
@@ -1447,6 +1496,15 @@ class Launcher:
                 return "key health insufficient"
         if capacities.get(entry.trio, 0) <= 0:
             return f"{entry.trio} at capacity"
+        # The node-wide ceiling sits right beside the per-trio one and is
+        # checked AFTER it, so a trio that is itself full keeps reporting its
+        # own reason ("<trio> at capacity") and the node reason appears only
+        # once the trio has room.  ``node_active`` is None for callers that
+        # have no pass-level count (the check is then skipped).
+        if node_active is not None:
+            node_reason = self._node_capacity_reason(node_active)
+            if node_reason is not None:
+                return node_reason
         entry_workspace = _normalize_workspace(entry.workspace)
         # Use the shared supervisor reservation primitive so queue launches
         # race-safely with POST /api/runs. A reservation takes priority over the

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The launcher enforces a node-level active-run ceiling.** `[queue] node_max_runs`
+  is the maximum number of runs the launcher will let be active on THIS node at
+  once — the value the fleet registry advertises as `maxConcurrentRuns`. Until
+  now the launcher enforced only the per-trio caps in `[queue.capacity]`, and
+  because those sum past the node maximum a node could run well over its own
+  advertised limit (ct110 on 2026-10-22: 11 active runs against an advertised
+  maximum of 5, with per-trio caps summing to 13).  `_run_pass` now counts the
+  active runs from the same `_active_runs()` set it already counts per-trio
+  occupancy from, and once the node maximum is reached it skips the entry
+  through the existing pending path with
+  `node at capacity: <n> active runs, node max <m>`.  The per-trio caps keep
+  working unchanged and the tighter of the two wins.  The key is a NEW,
+  documented config key (the harness had no node-level value before; the
+  advertised number lived only in the Hydra node registry): it defaults to
+  `5`, matching what ct110 advertises today, and a node that advertises
+  something else (ct111: `2`) sets it explicitly.  No existing per-trio cap,
+  node maximum value or default was changed.
+
 - **Queue entries carry a go-to-market manager (`gtm_manager`).** A new
   optional enqueue field names the overseer that owns the task: `overseer1` or
   `overseer1-op` (GTM-MANAGER-G1-a, 2026-10-22). It is separate from the

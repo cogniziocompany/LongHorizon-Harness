@@ -252,6 +252,19 @@ _QUEUE_CAPACITY_KEYS = {
     "max_retries",
     "quota_backoff_minutes",
 }
+# ``[queue] node_max_runs`` — the node-wide active-run ceiling the fleet
+# registry advertises (``maxConcurrentRuns``).  It is deliberately NOT in
+# ``[queue.capacity]``: every ``<trio>_max`` key there is a PER-TRIO cap, and
+# summing those is what let ct110 reach 11 active runs against an advertised
+# maximum of 5 (2026-10-22).  One value, one place.
+#
+# The harness itself had no such value (the advertised number lives in the
+# Hydra node registry, a different repo), so this key is new.  The default
+# mirrors the value ct110 advertises today (``maxConcurrentRuns: 5``,
+# docs/LEDGER.md:5237); a node that advertises something else (ct111: 2,
+# docs/nodes/ct111-cfo1.md:54) sets it explicitly.
+DEFAULT_NODE_MAX_RUNS = 5
+
 _STRING_KEYS = {
     "model",
     "runs_root",
@@ -447,6 +460,12 @@ tool_output_truncation_chars = 500
 #                       # the provider error wins when it is later.
 
 # [queue]
+# node_max_runs = 5     # NODE-level active-run ceiling for this node: the
+#                       # launcher refuses to launch once this many runs are
+#                       # ACTIVE here, whatever the per-trio caps below say.
+#                       # Must match the maximum the fleet registry advertises
+#                       # for this node (``maxConcurrentRuns``). The per-trio
+#                       # caps still apply; the tighter of the two wins.
 # observe = false       # shadow (observe) mode: the launcher computes the full
 #                       # launch decision but starts NOTHING -- it appends
 #                       # queue.shadow_launch / queue.shadow_skip records to
@@ -769,6 +788,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "database_url",
         "default_time_limit_minutes",
         "protected_trios",
+        "node_max_runs",
     }
     if unknown_queue_keys:
         raise ProjectConfigError(f"unknown [queue] key(s): {_names(unknown_queue_keys)}")
@@ -896,6 +916,15 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         raise ProjectConfigError(
             "[queue].default_time_limit_minutes must be an integer between 1 and 1440"
         )
+    # NODE-level active-run ceiling (the value the fleet registry advertises as
+    # ``maxConcurrentRuns``).  Distinct from every per-trio ``<trio>_max``: the
+    # per-trio caps bound one lane each and their sum can exceed this.  Unset
+    # keeps the deployment on the default; a configured value must be a
+    # positive integer (0 would freeze the node's queue entirely, so a
+    # deliberate pause belongs in the drain flag, not here).
+    node_max_runs = queue.get("node_max_runs", DEFAULT_NODE_MAX_RUNS)
+    if isinstance(node_max_runs, bool) or not isinstance(node_max_runs, int) or node_max_runs < 1:
+        raise ProjectConfigError("[queue].node_max_runs must be a positive integer")
     # Paxton's standing rule (2026-10-12): the kimi (synthetic) and glm
     # (cloud) trios and the auditor model are never modified at runtime.
     # A protected trio refuses writes from PUT /api/queue/trios and the
@@ -915,6 +944,7 @@ def _flatten_queue_table(queue: dict[str, Any]) -> dict[str, Any]:
         "trios": normalized_trios,
         "capacity": normalized_capacity,
         "backend": normalized_backend,
+        "node_max_runs": node_max_runs,
         "observe": observe,
         "occupancy_ignore_dirty": occupancy_ignore_dirty,
         "database_url": database_url.strip(),
