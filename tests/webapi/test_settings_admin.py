@@ -199,7 +199,13 @@ def _fake_model_catalog(*, force: bool = False, **_kwargs: Any) -> dict[str, Any
 
 
 def _seeded_client(tmp_path: Path):
-    client, rt = _client(tmp_path)
+    # The default ``[queue].protected_trios`` is ``("kimi", "glm", "qwen")``;
+    # the loader seeds that tuple when no project config sets the key, so a
+    # plain ``_client`` would 409 every ``PUT /api/agent__trios`` we exercise
+    # here on the seeded ``glm`` row.  Writing an empty protected list keeps
+    # the rule off for this fixture without touching the global config or
+    # other tests' behaviour.
+    client, rt = _client_with_protected(tmp_path, protected_trios=())
     seeded = rt.store.seed_queue_defaults(
         {"glm": {"agent": "claude_code", "model": "opus", "mcp_profile": "default"}},
         {"glm_max": 2},

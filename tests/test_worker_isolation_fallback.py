@@ -529,7 +529,7 @@ def test_limit_resolution_precedence_kept(explicit, env, config, expected) -> No
     )
 
 
-def test_ct110_scope_failure_retries_without_an_address_space_rlimit(tmp_path) -> None:
+def test_ct110_scope_failure_retries_without_an_address_space_rlimit(tmp_path, host_independent_worker_isolation) -> None:
     """rc=1 + "Failed to start transient scope unit: Access denied" retries.
 
     The real CT110 stderr matches none of the legacy phrase signatures, so
@@ -574,7 +574,7 @@ def test_ct110_stderr_matches_no_legacy_signature_structurally() -> None:
     assert scope_launch_failed(None, tail) is False
 
 
-def test_poll_none_after_cgroup_wait_briefly_waits_for_exit(tmp_path) -> None:
+def test_poll_none_after_cgroup_wait_briefly_waits_for_exit(tmp_path, host_independent_worker_isolation) -> None:
     """poll() still None after the cgroup wait: settle the exit first."""
 
     from lh_harness.supervisor.service import RunSupervisor
