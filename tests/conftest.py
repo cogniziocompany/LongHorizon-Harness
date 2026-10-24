@@ -35,15 +35,16 @@ elif [
 ]:
     pass  # src tree itself, nothing to do
 else:
-    for _p in [
-        p
-        for p in sys.path
-        if p
-        and "site-packages" in p
-        and (Path(p) / "lh_harness").exists()
-        and Path(p).resolve() != Path(_SRC).resolve().parent
-    ]:
-        sys.path.remove(_p)
+    # ``_SRC`` is now at the front of sys.path; ``import lh_harness`` will
+    # resolve to this checkout ahead of any later site-packages copy. A
+    # stale ``lh_harness`` directory in site-packages would still win for
+    # ``PYTHONSTARTUP`` / interactive REPL pre-imports, and keeping
+    # site-packages here also means third-party packages (fastapi, etc.)
+    # stay importable. The pre-existing recopy was overly aggressive and
+    # silently broke the test run on hosts where site-packages owns a
+    # stale lh_harness; we now leave sys.path alone. Imports of lh_harness
+    # already come from this checkout via the sys.path.insert(0, _SRC).
+    pass
 
 # TASK 211: a test run launched from inside a harness run inherits the
 # service's own fleet-reporter environment (LH_HARNESS_FLEET_URL/KEY/...).
@@ -133,3 +134,104 @@ def host_independent_worker_isolation(monkeypatch):
 
     monkeypatch.setattr(worker_isolation, "probe_systemd_run", lambda: None)
     monkeypatch.setattr(worker_isolation, "cgroup_subtree_writable", lambda *a, **k: False)
+
+
+@_pytest_task300.fixture(autouse=True)
+def _auditor_isolation_git_workspace(tmp_path, request):
+    """HARNESS-AUDITOR-ISOLATION (round 2 redesign): tests that drive the
+    manager loop now need a git-initialised workspace because the auditor
+    isolation step is fail-closed (a non-git workspace aborts the round
+    before the auditor launches).
+
+    The pre-existing suite wires ``workspace_path=str(tmp_path /
+    "workspace")`` everywhere; some tests create that directory inline
+    (after the fixture runs), others expect it not to exist yet (resume
+    tests).  Rather than touch every call site, this autouse fixture
+    takes two complementary actions:
+
+    1. If a directory named ``workspace`` already exists under
+       ``tmp_path`` at the time the test starts, the fixture
+       initialises it as a git repo immediately.  This covers the
+       common case (``workspace.mkdir()`` inside the test body, plus
+       ``SequencedAgent`` mocks).
+
+    2. For tests that wire ``workspace_path`` without creating the
+       directory (manager_hardening / resume_manager_loop), the
+       fixture wraps :func:`pathlib.Path.mkdir` so the directory
+       becomes a git repo the moment it is created.
+
+    Tests that exercise an absent workspace (resume rejection cases)
+    do not create a ``workspace`` directory and are therefore
+    unaffected.
+
+    The git init itself bypasses the standard :mod:`subprocess` wrapper
+    because the supervisor test fixture monkeypatches
+    ``subprocess.Popen``; using a captured reference to the original
+    ``subprocess.Popen`` (taken before any test patching can reach it)
+    sidesteps the patch.
+    """
+    import os as _os
+
+    # Capture the real Popen before any test patches the module attribute.
+    from subprocess import Popen as _RealPopen  # noqa: N813
+
+    # Step 1: pre-existing workspace directories under tmp_path get a
+    # git repo right away (covers tests that mkdir before the manager
+    # runs).
+    for candidate in tmp_path.iterdir():
+        if candidate.name == "workspace" and candidate.is_dir() and not (candidate / ".git").exists():
+            _init_git_repo(candidate, _RealPopen)
+
+    real_mkdir = Path.mkdir
+
+    def _git_init_mkdir(self, *args, **kwargs):
+        result = real_mkdir(self, *args, **kwargs)
+        try:
+            tmp = tmp_path
+            self_resolved = self.resolve()
+            tmp_resolved = tmp.resolve()
+        except OSError:
+            return result
+        if self_resolved == tmp_resolved or tmp_resolved in self_resolved.parents:
+            if self.name == "workspace" and not (self / ".git").exists():
+                _init_git_repo(self, _RealPopen)
+        return result
+
+    # Step 2: patch mkdir for the duration of this test (covers tests
+    # that mkdir inside the test body).
+    Path.mkdir = _git_init_mkdir
+    try:
+        yield
+    finally:
+        Path.mkdir = real_mkdir
+
+
+def _init_git_repo(workspace, popen_cls):
+    """Initialise ``workspace`` as a git repo using ``popen_cls`` directly.
+
+    Using a direct ``popen_cls`` reference (captured before any test
+    monkeypatch) sidesteps the resume-suite ``monkeypatch.setattr(
+    "lh_harness.supervisor.service.subprocess.Popen", ...)`` patch
+    that would otherwise turn our git init into a no-op.
+    """
+    import os as _os
+
+    def _run(*args):
+        devnull_fd = _os.open(_os.devnull, _os.O_RDONLY)
+        try:
+            proc = popen_cls(
+                args,
+                stdout=devnull_fd,
+                stderr=devnull_fd,
+                stdin=devnull_fd,
+            )
+            proc.wait()
+        finally:
+            _os.close(devnull_fd)
+
+    _run("git", "-C", str(workspace), "init", "-q", "--initial-branch=main")
+    _run("git", "-C", str(workspace), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(workspace), "config", "user.name", "Test")
+    (workspace / "README.md").write_text("init\n", encoding="utf-8")
+    _run("git", "-C", str(workspace), "add", "README.md")
+    _run("git", "-C", str(workspace), "commit", "-q", "-m", "init")
