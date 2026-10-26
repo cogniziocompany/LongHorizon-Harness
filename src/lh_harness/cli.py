@@ -959,6 +959,34 @@ def main(argv: list[str] | None = None) -> int:
         help="Actually move/delete. The default is dry-run; run once, read the report, then re-run with --apply.",
     )
 
+    # TEV1-LANE-OPTIMIZER (Paxton 2026-10-26): tev1-suggested lane/workspace
+    # rearrangement per overseer tick.  STRICTLY read-only — the command
+    # never moves, cancels or enqueues anything; Overseer1 reviews the
+    # suggestions and applies them out of band.
+    lane_opt_parser = add_command(
+        "lane-optimizer",
+        "Suggest lane/workspace rebalancing from queue state + provider usage (read-only, suggest-only)",
+    )
+    lane_opt_parser.add_argument(
+        "--runs-root",
+        default=run_default("runs_root", _DEFAULT_RUNS_ROOT),
+        help="Base directory holding harness run folders and the queue (default: the same path the web server uses).",
+    )
+    lane_opt_parser.add_argument(
+        "--usage-json",
+        default=None,
+        help=(
+            "Path to a JSON array of provider usage rows (provider/trio, plan, window, used_pct, "
+            "reset_at, observed_at, observed_by) exported from the fleet usage plane. Without it "
+            "the run degrades honestly: usage_available=false and no lane is a move target."
+        ),
+    )
+    lane_opt_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the machine-readable suggestion JSON (the only output mode; kept for scripts).",
+    )
+
     try:
         args = parser.parse_args(raw_argv)
     except SystemExit:
@@ -1009,6 +1037,8 @@ def main(argv: list[str] | None = None) -> int:
         return _check_update_command()
     if args.command == "retention":
         return _retention_command(args)
+    if args.command == "lane-optimizer":
+        return _lane_optimizer_command(args)
 
     parser.print_help()
     return 2
@@ -2602,6 +2632,60 @@ def _build_env(spec: str, *, tmp_dir: str | None = None):
 
         return LocalEnvironment(tmp_dir=tmp_dir)
     raise ValueError(f"Unknown env: {spec}")
+
+
+def _lane_optimizer_command(args: argparse.Namespace) -> int:
+    """`lh-harness lane-optimizer`.  Read-only, suggest-only — always exits 0 with JSON.
+
+    Prints ``{"snapshot": ..., "suggestion": ...}`` per overseer tick.  The
+    provider usage plane is not reachable from this host, so rows come from
+    ``--usage-json`` (an Overseer1-exported meter snapshot); without it the
+    output carries ``usage_available=false`` and the rules refuse to guess
+    move targets.  Nothing here ever mutates the queue, the settings DB, or
+    a workspace.
+    """
+
+    from . import lane_optimizer
+    from .settings_store import active_runtime
+
+    usage_rows = None
+    if getattr(args, "usage_json", None):
+        usage_path = Path(str(args.usage_json)).expanduser()
+        try:
+            payload = json.loads(usage_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"cannot read --usage-json {usage_path}: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(payload, list):
+            print(f"--usage-json {usage_path}: expected a JSON array of usage rows", file=sys.stderr)
+            return 1
+        usage_rows = payload
+
+    store = None
+    try:
+        store = getattr(active_runtime(), "store", None)
+    except Exception:
+        store = None
+
+    settings_db: object = store
+    if store is None:
+        # Degrade honestly to a direct read-only open (mode=ro) on the default
+        # settings DB path (queue tables are unencrypted).  Deliberately NOT
+        # open_from_environment()/SettingsStore: that constructor chmods and
+        # migrates the DB, and this command is strictly read-only — it never
+        # touches key material and never writes.
+        from .settings_store import DEFAULT_DB_PATH
+
+        settings_db = DEFAULT_DB_PATH
+
+    snapshot = lane_optimizer.build_snapshot(
+        Path(str(args.runs_root)).expanduser().resolve(),
+        settings_db,
+        usage_rows,
+    )
+    suggestion = lane_optimizer.suggest(snapshot, store=store)
+    print(json.dumps({"snapshot": snapshot, "suggestion": suggestion}, indent=2, sort_keys=True))
+    return 0
 
 
 def _retention_command(args: argparse.Namespace) -> int:

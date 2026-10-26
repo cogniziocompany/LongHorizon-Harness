@@ -2903,6 +2903,31 @@ def create_app(
             "computed_at": time.time(),
         }
 
+    @app.get("/api/lane-optimizer")
+    def lane_optimizer_latest() -> dict[str, Any]:
+        """TEV1-LANE-OPTIMIZER: the current tick's lane suggestion, computed on request.
+
+        Read-only and suggest-only — the same bearer-middleware boundary as
+        every other ``/api/*`` read, no new persistence: the suggestion is
+        derived fresh from queue state plus the settings store, with the
+        provider-usage plane reported as unavailable (this host cannot reach
+        it; callers with meter rows use the CLI's ``--usage-json`` path).
+        """
+
+        if runs_root is None:
+            raise HTTPException(status_code=501, detail="lane optimizer requires a configured runs root")
+        from .. import lane_optimizer as _lane_optimizer
+        from ..settings_store import active_runtime as _settings_active_runtime
+
+        store = None
+        try:
+            rt = settings_runtime if settings_runtime is not None else _settings_active_runtime()
+            store = getattr(rt, "store", None)
+        except Exception:
+            store = None
+        snapshot = _lane_optimizer.build_snapshot(runs_root, store, None)
+        return _lane_optimizer.suggest(snapshot, store=store)
+
     @app.delete("/api/queue/{queue_id}")
     def delete_queue_entry(queue_id: str, request: Request) -> dict[str, Any]:
         if queue_store is None:
