@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import tempfile
@@ -157,11 +158,17 @@ def main() -> None:
                 raise AssertionError("projection endpoint remained reachable during outage")
             except urllib.error.URLError:
                 pass
+            livekit_compose = os.environ.get("INTERACTIVE_OFFICE_TEST_LIVEKIT_COMPOSE")
+            if livekit_compose:
+                subprocess.run([os.environ.get("INTERACTIVE_OFFICE_TEST_DOCKER", "docker"), "compose", "-f", livekit_compose, "stop"], check=True)
+                with socket.socket() as sock:
+                    sock.settimeout(2)
+                    assert sock.connect_ex(("127.0.0.1", 17880)) != 0, "LiveKit remained reachable during outage"
             agents["executor"].release.set()
             assert service.wait_for_idle(RUN_ID)["status"] == "completed"
             projection.start()
             assert evidence(projection.base)["status"] == "completed"
-            print(json.dumps({"ok": True, "mode": "hermetic-real-http", "duplicate_hold_and_resume": True, "durable_hold_reconnect": True, "projection_outage_authorized_completion": True, "livekit_device_proof": "not_claimed"}, indent=2))
+            print(json.dumps({"ok": True, "mode": "hermetic-real-http", "duplicate_hold_and_resume": True, "durable_hold_reconnect": True, "projection_outage_authorized_completion": True, "livekit_outage_authorized_completion": bool(livekit_compose), "livekit_device_proof": "not_claimed"}, indent=2))
         finally:
             if projection.thread is not None and projection.thread.is_alive():
                 projection.stop()
