@@ -133,7 +133,12 @@ def leak_app(tmp_path_factory: pytest.TempPathFactory):
     )
 
     state = DashboardState(
-        root / "leak000000run" / "lh_harness" / "role_orchestration",
+        # The state's log_dir is the CANONICAL LOG DIR (``lh_harness``), not
+        # the role ledger inside it: ``StateRegistry.state_for`` compares the
+        # cached state's log_dir against the walked ``safe_run_logs`` result
+        # (``webapi/server.py:818``), so pointing it at
+        # ``lh_harness/role_orchestration`` makes every per-run read 404.
+        root / "leak000000run" / "lh_harness",
         runs_root=root,
     )
     supervisor = RunSupervisor(root)
