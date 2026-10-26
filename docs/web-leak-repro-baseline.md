@@ -162,6 +162,13 @@ hang window (and beyond).
 `supervisor/service.py:1687`) still walks every run directory on every
 request; it only avoids the deeper per-run reads.
 
+**The full projection does not answer at all at 520 run dirs.** Against the
+same running fixture, a client `GET /api/runs` with a **180 s** timeout
+**never returned** (curl exit code 124), while the server's RSS climbed from
+71.2 MB to 85.3 MB during the attempt and `/api/meta` was still answering.
+That is the CT110 "hangs > 40–140 s (curl 000)" symptom, reproduced
+locally.
+
 ### Mechanism 4 — a read endpoint writes to disk
 
 `src/lh_harness/supervisor/service.py:1846` — `list_run_items()` calls
