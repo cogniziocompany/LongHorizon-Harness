@@ -504,10 +504,17 @@ def test_preflight_does_not_block_a_workspace_with_no_test_suite(
     """(A) "No tests to run" is not "a broken test environment".
 
     A workspace with no manifest and no test directory has no test suite at
-    all.  Treating its empty collection as a failure would block every run
-    whose workspace simply has nothing to test -- including the many
-    harness self-tests that use a bare temp directory as their workspace.
-    The zero-collected rule applies to a repo that *declares* tests.
+    all.  Treating its empty collection as a *broken environment* would
+    block every run whose workspace simply has nothing to test -- including
+    the many harness self-tests that use a bare temp directory as their
+    workspace.
+
+    -- amendment-3: the absence of a suite is only legitimate when it is
+    *established*, and a bare directory establishes nothing.  The explicit
+    applicability signal (``no_tests_applicable``) is what says "this run
+    genuinely has no tests"; the preflight honours it and stays out of the
+    way.  Without that signal the same directory is a readiness gap, which
+    is covered by its own test below.
     """
 
     from lh_harness.workspace_preflight import run_preflight
@@ -519,9 +526,11 @@ def test_preflight_does_not_block_a_workspace_with_no_test_suite(
         workspace,
         allow_env_prep=False,
         allow_install=False,
+        no_tests_applicable=True,
     )
 
     assert record.ok is True, record.prerequisite
+    assert record.readiness_gap is None
     assert record.env_manifest["has_tests"] is False
     assert record.collection["collected"] == 0
     assert record.collection["ok"] is True
@@ -1274,3 +1283,395 @@ async def test_the_run_gate_fires_on_a_provenance_violation(
         if line.strip()
     ]
     assert not [item for item in events if item["event"] == "round_start"]
+
+
+# ---------------------------------------------------------------------------
+# LHH-WORKSPACE-TEST-PREFLIGHT -- amendment-3
+#
+# "No manifest" and "the repo declares no tests" are different facts.  A
+# missing manifest (a wrong working directory, a partial checkout), an
+# unreadable manifest, and a declared suite this preflight cannot drive must
+# each produce a *typed readiness gap* -- never a silent green, and never the
+# hard owned prerequisite that is reserved for a dependency the preflight
+# genuinely cannot satisfy.
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_reports_a_missing_manifest_as_a_readiness_gap(
+    tmp_path: Path,
+) -> None:
+    """Amendment-3: a missing manifest is not "the repo declares no tests".
+
+    The old behaviour read an empty collection as "the repo declares no
+    tests" and reported a healthy gate.  That is exactly the false pass the
+    amendment forbids: a wrong working directory or a partial checkout both
+    produced a green.
+    """
+
+    from lh_harness.workspace_preflight import (
+        READINESS_GAP_MANIFEST_MISSING,
+        run_preflight,
+    )
+
+    workspace = tmp_path / "no-manifest"
+    workspace.mkdir()
+
+    record = run_preflight(
+        workspace,
+        allow_env_prep=False,
+        allow_install=False,
+    )
+
+    assert record.ok is False, "a missing manifest must not report success"
+    assert record.readiness_gap is not None
+    assert record.readiness_gap["code"] == READINESS_GAP_MANIFEST_MISSING
+    assert record.readiness_gap["kind"] == "readiness_gap"
+    # The gap is not laundered into the owned prerequisite: that one is
+    # reserved for a dependency the preflight cannot satisfy.
+    assert record.prerequisite is None
+    # The message must not claim the repo declared that it has no tests.
+    assert "declares no tests" not in record.readiness_gap["message"]
+    # And the manifest facts must be visible in the receipt.
+    assert record.env_manifest["manifest_found"] is False
+    assert record.env_manifest["declared_no_tests"] is False
+
+
+def test_preflight_reports_a_wrong_working_directory_as_a_readiness_gap(
+    tmp_path: Path,
+) -> None:
+    """Amendment-3: being pointed at the wrong directory is a gap, not a green.
+
+    The preflight is given a directory that is not the repo -- no manifest,
+    no checkout.  It must say so truthfully and name the wrong-cwd shape,
+    rather than reporting "the repo declares no tests".
+    """
+
+    from lh_harness.workspace_preflight import (
+        READINESS_GAP_MANIFEST_MISSING,
+        run_preflight,
+    )
+
+    # A directory that holds the repo *somewhere else* -- the preflight is
+    # pointed at the parent, not at the checkout.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_python_manifest(repo, test_extra=["pytest"])
+    _write_a_real_test(repo)
+    _git_init_workspace(repo)
+
+    wrong_cwd = tmp_path / "elsewhere"
+    wrong_cwd.mkdir()
+
+    record = run_preflight(
+        wrong_cwd,
+        allow_env_prep=False,
+        allow_install=False,
+    )
+
+    assert record.ok is False
+    assert record.readiness_gap is not None
+    assert record.readiness_gap["code"] == READINESS_GAP_MANIFEST_MISSING
+    assert record.readiness_gap["detail"]["looks_like_checkout"] is False
+    # The message points at the wrong-cwd shape explicitly.
+    assert "wrong working directory" in record.readiness_gap["message"]
+    assert record.prerequisite is None
+
+
+def test_preflight_reports_a_declared_node_suite_as_an_unsupported_suite(
+    tmp_path: Path,
+) -> None:
+    """Amendment-3: a Node-declared suite is a readiness gap, not a pytest run.
+
+    The repo declares a JavaScript test suite.  The preflight must not force
+    a Python runner onto it -- it must report that the declared suite is one
+    it cannot drive, and it must not claim the repo declared no tests.
+    """
+
+    from lh_harness.workspace_preflight import (
+        READINESS_GAP_UNSUPPORTED_SUITE,
+        run_preflight,
+    )
+
+    workspace = tmp_path / "js-repo"
+    workspace.mkdir()
+    (workspace / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "js-only",
+                "version": "1.0.0",
+                "scripts": {"test": "jest", "build": "tsc"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "package-lock.json").write_text(
+        json.dumps({"name": "js-only", "lockfileVersion": 3}),
+        encoding="utf-8",
+    )
+
+    record = run_preflight(
+        workspace,
+        allow_env_prep=False,
+        allow_install=False,
+    )
+
+    assert record.ok is False
+    assert record.readiness_gap is not None
+    assert record.readiness_gap["code"] == READINESS_GAP_UNSUPPORTED_SUITE
+    # The gap names the suite and its runner rather than guessing.
+    assert record.readiness_gap["detail"]["suite_kind"] == "node"
+    assert record.readiness_gap["detail"]["declared_runner"] == "npm test"
+    assert "npm test" in record.readiness_gap["message"]
+    # A declared Node suite is not the hard owned prerequisite either.
+    assert record.prerequisite is None
+    # The manifest facts are truthful: the suite was found and named.
+    assert record.env_manifest["manifest_found"] is True
+    assert record.env_manifest["suite_kind"] == "node"
+    assert record.env_manifest["node_test_scripts"] == ["test"]
+
+
+def test_preflight_reports_a_declared_go_suite_as_an_unsupported_suite(
+    tmp_path: Path,
+) -> None:
+    """Amendment-3: a Go-declared suite is likewise a readiness gap."""
+
+    from lh_harness.workspace_preflight import (
+        READINESS_GAP_UNSUPPORTED_SUITE,
+        run_preflight,
+    )
+
+    workspace = tmp_path / "go-repo"
+    workspace.mkdir()
+    (workspace / "go.mod").write_text(
+        "module example.com/jsontest\n\ngo 1.22\n",
+        encoding="utf-8",
+    )
+
+    record = run_preflight(
+        workspace,
+        allow_env_prep=False,
+        allow_install=False,
+    )
+
+    assert record.ok is False
+    assert record.readiness_gap is not None
+    assert record.readiness_gap["code"] == READINESS_GAP_UNSUPPORTED_SUITE
+    assert record.readiness_gap["detail"]["suite_kind"] == "go"
+    assert record.readiness_gap["detail"]["declared_runner"] == "go test"
+    assert record.prerequisite is None
+
+
+def test_preflight_honours_an_explicit_no_tests_applicability(
+    tmp_path: Path,
+) -> None:
+    """Amendment-3: an explicit applicability suppresses the readiness gap.
+
+    The task/profile has established that this run has no test suite.  The
+    preflight must honour that and stay out of the way -- it must not report
+    a gap for a task it was told has no tests.
+    """
+
+    from lh_harness.workspace_preflight import run_preflight
+
+    workspace = tmp_path / "explicit-no-suite"
+    workspace.mkdir()
+
+    record = run_preflight(
+        workspace,
+        allow_env_prep=False,
+        allow_install=False,
+        no_tests_applicable=True,
+    )
+
+    assert record.ok is True, record.readiness_gap
+    assert record.readiness_gap is None
+    assert record.prerequisite is None
+    assert record.collection["collected"] == 0
+    assert record.collection["ok"] is True
+    assert "no tests" in record.collection["detail"]
+
+
+def test_preflight_honours_a_repos_own_no_tests_declaration(
+    tmp_path: Path,
+) -> None:
+    """Amendment-3: the repo's own declaration is honoured too.
+
+    A repo that declares it ships no tests is a truthful declaration, so the
+    preflight reports it as such rather than as a gap.
+    """
+
+    from lh_harness.workspace_preflight import run_preflight
+
+    workspace = tmp_path / "declares-no-tests"
+    workspace.mkdir()
+    (workspace / "pyproject.toml").write_text(
+        "[build-system]\n"
+        'requires = ["hatchling"]\n'
+        'build-backend = "hatchling.build"\n'
+        "\n"
+        "[project]\n"
+        'name = "fixture-repo"\n'
+        'version = "0.1.0"\n'
+        'requires-python = ">=3.10"\n'
+        "\n"
+        "[tool.pytest.ini_options]\n"
+        "testpaths = []\n",
+        encoding="utf-8",
+    )
+
+    record = run_preflight(
+        workspace,
+        allow_env_prep=False,
+        allow_install=False,
+    )
+
+    assert record.ok is True, record.readiness_gap
+    assert record.readiness_gap is None
+    assert record.env_manifest["declared_no_tests"] is True
+    assert record.collection["collected"] == 0
+    assert "no tests" in record.collection["detail"]
+
+
+def test_the_readiness_gap_is_carried_in_the_receipts(
+    tmp_path: Path,
+) -> None:
+    """(D) + amendment-3: the gap rides in both receipts, beside the prerequisite."""
+
+    from lh_harness.workspace_preflight import (
+        receipt_from_record,
+        run_preflight,
+    )
+
+    workspace = tmp_path / "gap-receipt"
+    workspace.mkdir()
+
+    record = run_preflight(
+        workspace,
+        allow_env_prep=False,
+        allow_install=False,
+    )
+    payload = receipt_from_record(record)
+
+    assert payload["readiness_gap"] is not None
+    assert payload["readiness_gap"]["code"] == "manifest_missing"
+    assert payload["readiness_gap"]["kind"] == "readiness_gap"
+    # The hard prerequisite stays absent: the two are different outcomes.
+    assert payload["prerequisite"] is None
+    # The contract's own receipt fields are still present alongside it.
+    for field in (
+        "candidate_sha",
+        "env_manifest",
+        "interpreter",
+        "collected",
+        "tool_availability",
+    ):
+        assert field in payload
+
+
+def test_the_snapshot_projects_the_readiness_gap(
+    tmp_path: Path,
+) -> None:
+    """(D) + amendment-3: the overseer's snapshot carries the gap too."""
+
+    from lh_harness.webapi.snapshot import _safe_preflight
+
+    projected = _safe_preflight(
+        {
+            "candidate_sha": "a" * 40,
+            "env_manifest": {
+                "ecosystem": "",
+                "manifest_found": False,
+                "suite_kind": "unknown",
+                "declared_no_tests": False,
+            },
+            "interpreter": {},
+            "collection": {"collected": 0},
+            "tool_availability": {},
+            "readiness_gap": {
+                "code": "manifest_missing",
+                "message": "the workspace has no known manifest",
+                "kind": "readiness_gap",
+            },
+            "ok": False,
+        }
+    )
+
+    assert projected["readiness_gap"]["code"] == "manifest_missing"
+    assert projected["readiness_gap"]["kind"] == "readiness_gap"
+    assert projected["ok"] is False
+    # The manifest's health is visible in the snapshot as well.
+    assert projected["env_manifest"]["manifest_found"] is False
+    assert projected["env_manifest"]["suite_kind"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_the_gate_reports_a_readiness_gap_as_its_own_outcome(
+    tmp_path: Path,
+) -> None:
+    """Amendment-3: the manager distinguishes the gap from the prerequisite.
+
+    The gate must not report a readiness gap as an owned dependency problem
+    (that would name "infra onboarding" for something infra onboarding does
+    not own), and it must not report it as a healthy start either.
+    """
+
+    from lh_harness.manager import run
+
+    workspace = tmp_path / "gap-workspace"
+    workspace.mkdir()
+
+    config = HarnessConfig(
+        workspace_path=str(workspace),
+        harness_dir=str(tmp_path / "harness"),
+        log_dir=str(tmp_path / "logs"),
+        runs_root=str(tmp_path / "runs"),
+    )
+
+    class DoneAgent:
+        async def run_episode(self, prompt, _env, _budget, live_trajectory_path=None):
+            return EpisodeResult(status="done", actions_log=_DONE)
+
+    report = await run(
+        agent=DoneAgent(),
+        task="work in the workspace",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=config,
+        resume=False,
+    )
+
+    assert report["rounds_run"] == 0, "the gate must fire before round 1"
+    assert report["completion_satisfied"] is False
+    assert report["abort_reason"] == "preflight_readiness_gap"
+    # The gap is not an owned dependency problem.
+    assert "infra onboarding" not in report["failure_reason"]
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "role_orchestration" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert not [item for item in events if item["event"] == "round_start"]
+
+    # The gap rides in the run-dir receipt and on the ledger, beside the
+    # prerequisite it is *not*.
+    preflight_events = [
+        item for item in events if item["event"] == "workspace_preflight"
+    ]
+    assert preflight_events, "the preflight receipt must be on the ledger"
+    assert preflight_events[-1]["readiness_gap"]["code"] == "manifest_missing"
+    assert preflight_events[-1]["readiness_gap"]["kind"] == "readiness_gap"
+    assert preflight_events[-1]["prerequisite"] is None
+
+    # The run-dir file carries the same fields.
+    receipt = json.loads(
+        (tmp_path / "logs" / "role_orchestration" / "workspace_preflight.json")
+        .read_text(encoding="utf-8")
+    )
+    assert receipt["readiness_gap"]["code"] == "manifest_missing"
+    assert receipt["prerequisite"] is None
+
+    # And the snapshot-facing field of the start event carries them too.
+    start = next(item for item in events if item["event"] == "role_harness_start")
+    assert start["workspace_preflight"]["readiness_gap"]["code"] == "manifest_missing"
