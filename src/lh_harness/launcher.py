@@ -1708,27 +1708,30 @@ class Launcher:
 
         settings = self._admission_settings()
         node_max = int(settings.get("node_max", DEFAULT_NODE_MAX_ADMISSION))
-        running = 0
-        starting = 0
-        for info in active.values():
-            lifecycle = canonical_lifecycle_status(
-                (info.get("status") or {}).get("status")
-            )
-            if lifecycle in ("creating", "starting"):
-                starting += 1
-            else:
-                running += 1
-        # Launched entries whose run the supervisor no longer sees hold a
-        # slot until the reconcile pass terminal-marks them.
-        for entry in self.queue_store.list():
-            if entry.status != "launched" or not entry.run_id:
-                continue
-            if entry.run_id not in active:
-                starting += 1
         # Read the memory picture BEFORE the node check so /api/meta always
         # reports a fresh mem_available_mb, whichever gate ends up refusing.
         memory_reason = self._memory_headroom_reason(settings)
         with self._admission_lock:
+            # The COUNT is computed under the same lock as the DECISION, so
+            # two callers can never both read a count that leaves room for
+            # one run and both admit into it.
+            running = 0
+            starting = 0
+            for info in active.values():
+                lifecycle = canonical_lifecycle_status(
+                    (info.get("status") or {}).get("status")
+                )
+                if lifecycle in ("creating", "starting"):
+                    starting += 1
+                else:
+                    running += 1
+            # Launched entries whose run the supervisor no longer sees hold a
+            # slot until the reconcile pass terminal-marks them.
+            for entry in self.queue_store.list():
+                if entry.status != "launched" or not entry.run_id:
+                    continue
+                if entry.run_id not in active:
+                    starting += 1
             self._admission = {
                 "node_max": node_max,
                 "running": running,
