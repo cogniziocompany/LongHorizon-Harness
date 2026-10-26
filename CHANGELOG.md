@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Node-wide atomic run admission and a memory headroom gate in the launcher**
+  (LHH-CT110-MEMORY-ADMISSION, after the 2026-10-25 CT110 OOM: lane caps
+  summing to 20 against a node maximum of 5 let 11-15 runs run at once, the
+  OOM killer took `lh-harness.service`, and 13 launched runs ended
+  "worker disappeared without a final report").  Before any launch, the
+  launcher now makes ONE admission decision per launch cycle under a lock:
+  it counts running + starting runs across ALL lanes from the authoritative
+  run store and refuses once the count reaches `LH_HARNESS_NODE_MAX_RUNS`
+  (new setting, default 5, stored in the settings DB like the lane caps),
+  regardless of lane caps; then it applies a memory headroom gate that
+  refuses when `MemAvailable` minus the startup allowance
+  `LH_HARNESS_RUN_STARTUP_MB` (default 600) is below the floor
+  `LH_HARNESS_MEM_FLOOR_MB` (default 1024), recording `memory_headroom` as
+  the entry's latest skip reason.  The count is released by the next pass
+  re-reading the store; at service start the launcher reconciles from live
+  processes and run dirs and marks orphaned launched entries failed with the
+  existing crash-naming reason, never requeueing them beyond `retry_of`.
+  A node already over the cap at start kills nothing and admits nothing
+  until the count drops below it.  `/api/meta` gains
+  `admission: {node_max, running, starting, mem_available_mb,
+  blocked_reason}`, and a startup check warns (and the node gate clamps)
+  when the lane caps sum past the node maximum -- with a regression test
+  pinning that incident shape.  See docs/operations/admission.md for how the
+  three limits compose and how to raise caps safely.
 - **The launcher enforces a node-level active-run ceiling.** `[queue] node_max_runs`
   is the maximum number of runs the launcher will let be active on THIS node at
   once — the value the fleet registry advertises as `maxConcurrentRuns`. Until

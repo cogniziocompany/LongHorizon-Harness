@@ -2016,6 +2016,16 @@ def create_app(
                         launcher._disk_warn_emitted = False
         except Exception:
             pass
+        # LHH-CT110-MEMORY-ADMISSION (D): the node-wide admission snapshot,
+        # read from the launcher's own state (never a re-created one), same
+        # fail-open style as the stall flag: a launcher that cannot report
+        # degrades to the defaults rather than aborting the handshake.
+        admission: dict[str, Any] | None = None
+        if launcher is not None:
+            try:
+                admission = launcher.admission_snapshot()
+            except Exception:
+                admission = None
         return build_meta(
             endpoint=endpoint,
             fleet_configured=bool(reporter is not None and reporter.configured),
@@ -2068,6 +2078,7 @@ def create_app(
             mcp_gateway_configured=gateway_configured(),
             model_discovery=catalogue["model_discovery"],
             disk=disk,
+            admission=admission,
         )
 
     @app.post("/api/models/refresh")

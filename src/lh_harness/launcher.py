@@ -10,6 +10,16 @@ Capacity is enforced at TWO levels: the per-trio caps in ``[queue.capacity]``
 (one lane each, whose sum can exceed the node's own maximum) and the node-wide
 ceiling in ``[queue] node_max_runs`` — the value this node advertises to the
 fleet registry as ``maxConcurrentRuns``.  The tighter of the two wins.
+
+LHH-CT110-MEMORY-ADMISSION adds the node-wide ADMISSION layer on top of both:
+before any launch, ``_admit`` (under the admission lock, one decision per
+launch cycle) counts running+starting runs across ALL lanes from the
+authoritative run store and refuses once the count reaches
+``LH_HARNESS_NODE_MAX_RUNS`` (settings store, default 5) -- regardless of lane
+caps -- and the memory gate refuses when ``MemAvailable`` minus the startup
+allowance ``LH_HARNESS_RUN_STARTUP_MB`` (default 600) is below the floor
+``LH_HARNESS_MEM_FLOOR_MB`` (default 1024), recording ``memory_headroom`` as
+the entry's latest skip reason.  See docs/operations/admission.md.
 """
 
 from __future__ import annotations
@@ -25,7 +35,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .safe_subprocess import child_env, git_argv
 from .config import DEFAULT_NODE_MAX_RUNS, PROJECT_CONFIG_PATH, load_run_defaults
@@ -576,6 +586,139 @@ def _now() -> float:
     return time.time()
 
 
+# ---------------------------------------------------------------------------
+# LHH-CT110-MEMORY-ADMISSION: node-wide admission limits.
+#
+# The 2026-10-25 CT110 OOM incident: queue_capacity rows summed to 20
+# (glm 5, minimax 4, qwen 4, zai 2, mm31f 2, dsf 2, kimi 1) while the fleet
+# node record advertises maxConcurrentRuns 5.  The launcher admitted per
+# lane only, so 11-15 runs ran at once (~300 MB each plus an 861 MB web
+# process inside a 6144 MB container); lh-harness.service was OOM-killed at
+# 22:27:29Z and 13 launched runs ended "worker disappeared without a final
+# report".  The three settings below close that hole; they live in the
+# settings store (settings_store.CATALOG) so an operator can change them
+# without a restart, like the lane caps and the disk thresholds.
+# ---------------------------------------------------------------------------
+
+SETTING_NODE_MAX_RUNS = "LH_HARNESS_NODE_MAX_RUNS"
+SETTING_RUN_STARTUP_MB = "LH_HARNESS_RUN_STARTUP_MB"
+SETTING_MEM_FLOOR_MB = "LH_HARNESS_MEM_FLOOR_MB"
+
+DEFAULT_NODE_MAX_ADMISSION = 5
+DEFAULT_RUN_STARTUP_MB = 600
+DEFAULT_MEM_FLOOR_MB = 1024
+
+# Skip reason recorded on an entry the memory gate refused (deliverable B):
+# MemAvailable minus the startup allowance is below the floor.
+MEMORY_HEADROOM_SKIP_REASON = "memory_headroom"
+
+# The exact crash-naming reason the supervisor already writes for an
+# orphaned run (supervisor/service.py reconciliation); the launcher's
+# startup reconciliation reuses the same sentence so an operator greps one
+# string for the whole incident class.
+WORKER_DISAPPEARED_REASON = "worker disappeared without a final report"
+
+
+def _coerce_positive_int(raw: Any, default: int, *, minimum: int = 1) -> int:
+    """Settings-store value -> positive int, falling back to ``default``.
+
+    Mirrors disk_retention.config._coerce_int: a missing, blank, or
+    unparseable value keeps the default rather than raising, because the
+    admission gates must never take the launcher down over one bad row.
+    """
+
+    if isinstance(raw, bool) or raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    if value < minimum:
+        return default
+    return value
+
+
+def _admission_settings_from_values(values: Mapping[str, Any] | None) -> dict[str, int]:
+    """Resolve the three admission limits from a settings-store value map.
+
+    The keys are the settings-store names; the defaults are the documented
+    ones (5 / 600 / 1024).  Tests pass a fake map; the launcher passes the
+    live store's ``values()``.
+    """
+
+    values = values or {}
+    return {
+        "node_max": _coerce_positive_int(
+            values.get(SETTING_NODE_MAX_RUNS), DEFAULT_NODE_MAX_ADMISSION
+        ),
+        "startup_mb": _coerce_positive_int(
+            values.get(SETTING_RUN_STARTUP_MB), DEFAULT_RUN_STARTUP_MB, minimum=0
+        ),
+        "mem_floor_mb": _coerce_positive_int(
+            values.get(SETTING_MEM_FLOOR_MB), DEFAULT_MEM_FLOOR_MB, minimum=0
+        ),
+    }
+
+
+def read_mem_available_mb(
+    proc_meminfo: str | Path = "/proc/meminfo",
+    cgroup_memory_max: str | Path = "/sys/fs/cgroup/memory.max",
+    *,
+    follow_self_cgroup: bool = True,
+) -> float | None:
+    """MemAvailable in MB, bounded by the cgroup limit when present.
+
+    Reads ``MemAvailable`` from procfs.  When this process runs inside a
+    cgroup v2 with a finite ``memory.max`` (CT110's LXC), the host-wide
+    MemAvailable can overstate what the container may actually touch, so
+    the smaller of the two is the honest headroom.  When the given knob does
+    not exist, ``follow_self_cgroup`` (default on) resolves this process's
+    own cgroup via /proc/self/cgroup and reads ITS ``memory.max``; tests pass
+    explicit fake paths with the flag off.  ``"max"`` on the knob (v1's
+    ``-1`` equivalent) means no limit and is ignored.  Any read failure
+    returns None; the caller decides whether that blocks (fail closed) or
+    passes (fail open), never this helper.
+    """
+
+    available: float | None = None
+    try:
+        text = Path(proc_meminfo).read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    available = int(parts[1]) / 1024.0
+                break
+    except (OSError, ValueError):
+        available = None
+    limit_mb: float | None = None
+    knob = Path(cgroup_memory_max)
+    if follow_self_cgroup and not knob.exists():
+        # The default knob is the unified root; inside a delegated container
+        # this process lives deeper in the tree, so follow /proc/self/cgroup
+        # (worker_isolation.own_cgroup_path) to OUR OWN limit before giving
+        # up on the cgroup side of the bound.
+        try:
+            from .worker_isolation import CGROUP_ROOT, own_cgroup_path
+
+            path = own_cgroup_path()
+            if path:
+                knob = CGROUP_ROOT / path.strip("/") / "memory.max"
+        except Exception:  # noqa: BLE001 - no cgroup info: MemAvailable alone stands
+            knob = Path(cgroup_memory_max)
+    try:
+        raw = knob.read_text(encoding="utf-8").strip()
+        if raw and raw not in ("max", "-1"):
+            limit_mb = int(raw) / (1024.0 * 1024.0)
+    except (OSError, ValueError):
+        limit_mb = None
+    if available is None:
+        return limit_mb
+    if limit_mb is not None:
+        return min(available, limit_mb)
+    return available
+
+
 def _normalize_workspace(value: str) -> str:
     """Return a stable absolute form for workspace-path comparison."""
 
@@ -774,6 +917,27 @@ class Launcher:
         self._stall_threshold = _stall_threshold_from_env()
         self._stall_cycles = 0
         self._stall_fired = False
+        # LHH-CT110-MEMORY-ADMISSION (A): node-wide atomic admission.  One
+        # decision per launch cycle under this lock: the pass reads the
+        # running+starting count across ALL lanes from the authoritative run
+        # store and refuses when it has reached node_max, so two lanes can
+        # never both admit into the last slot.  ``_launch_lock`` above is
+        # held for the whole pass, so the decision made inside a pass is
+        # already serialized; this second lock exists for the /api/meta
+        # reader and for callers that ever admit outside ``_tick_sync``.
+        self._admission_lock = threading.Lock()
+        self._admission: dict[str, Any] = {
+            "node_max": DEFAULT_NODE_MAX_ADMISSION,
+            "running": 0,
+            "starting": 0,
+            "mem_available_mb": None,
+            "blocked_reason": None,
+        }
+        self._admission_values: dict[str, int] | None = None
+        self._caps_clamp_warned = False
+        # Test seam (deliverable F): a fake meminfo source.  Production
+        # leaves this None and reads /proc/meminfo (+ the cgroup limit).
+        self._meminfo_probe: Callable[[], float | None] | None = None
 
     @staticmethod
     def _load_project_queue_config() -> dict[str, Any]:
@@ -914,6 +1078,12 @@ class Launcher:
         if self._task is not None:
             return
         self._stopping = False
+        # LHH-CT110-MEMORY-ADMISSION (C): reconcile the admission count from
+        # live processes and run dirs before the first pass, and let the
+        # orphan sweep mark crash victims failed.  Runs in a thread: the
+        # supervisor calls hit the filesystem and must not block the event
+        # loop the caller is starting.
+        await asyncio.to_thread(self._reconcile_startup_state)
         self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
@@ -1021,6 +1191,15 @@ class Launcher:
         # (ct110, 2026-10-22: 11 active against maxConcurrentRuns 5).  Both
         # checks run on the same ``active`` set; the tighter one refuses.
         node_active = len(active)
+        # LHH-CT110-MEMORY-ADMISSION (A): the ONE admission decision of this
+        # launch cycle, made under the admission lock before any launch is
+        # attempted.  ``admission_reason`` is the node/memory gate's refusal
+        # for the whole pass; per-trio capacity and workspace rules still
+        # refuse per entry as before.  When the node is ALREADY over node_max
+        # at start (deliverable D: e.g. after a cap change), nothing is
+        # killed and nothing is admitted until the count drops below it.
+        admission_reason, admission_settings = self._admit(active)
+        self._warn_on_caps_over_node_max(admission_settings)
         launched = False
         # Stall detector (task 230): an entry is ELIGIBLE this cycle when it is
         # pending and the eligibility gate (capacity, workspace occupancy,
@@ -1032,6 +1211,16 @@ class Launcher:
         eligible_seen = False
         for entry in entries:
             if entry.status != "pending":
+                continue
+            if admission_reason is not None:
+                # The node-wide gate (node_max or memory headroom) refused
+                # the WHOLE cycle: the entry stays pending with the gate's
+                # reason and is retried on the next pass.  Shadow mode
+                # records the same decision.
+                if self._observe:
+                    self._shadow_skip(entry, admission_reason)
+                else:
+                    self._skip(entry, admission_reason)
                 continue
             if launched:
                 # Once one entry has LAUNCHED this pass, any later pending
@@ -1171,6 +1360,37 @@ class Launcher:
             if run_id in self._maintenance_run_ids():
                 continue
             run_status = status.get("status") or "unknown"
+            # LHH-CT110-MEMORY-ADMISSION (C): a run the supervisor can no
+            # longer see at all -- the OOM-kill shape, where the whole service
+            # died and the run dir's worker never wrote a report -- is named
+            # with the existing crash reason the supervisor's own
+            # reconciliation uses, so one grep finds the whole incident
+            # class.  The existing retry_of logic below alone decides
+            # whether this failure gets a successor; the launcher never
+            # requeues an orphan on its own.
+            if run_status in ("unknown", "idle") and not self._run_dir_exists(run_id):
+                report = self._read_run_report(run_id)
+                if not report:
+                    cause = f"run {run_status}: {WORKER_DISAPPEARED_REASON}"
+                    updated = self.queue_store.mark_failed(
+                        entry.queue_id, reason=cause[:_MAX_REASON_LEN]
+                    )
+                    self._emit_run_event(
+                        run_id,
+                        "queue.failed",
+                        {
+                            "queue_id": entry.queue_id,
+                            "run_id": run_id,
+                            "trio": entry.trio,
+                            "workspace": entry.workspace,
+                            "run_status": run_status,
+                            "orphan": True,
+                        },
+                    )
+                    if updated is not None:
+                        updated.last_checked_at = _now()
+                        self.queue_store.update(updated)
+                    continue
             # The supervisor exposes owner/status but not the manager report.
             # Read the durable audit result directly from the run directory.
             report = self._read_run_report(run_id)
@@ -1284,6 +1504,19 @@ class Launcher:
         report_path = Path(runs_root) / run_id / "lh_harness" / "report.json"
         return _read_report_json(report_path)
 
+    def _run_dir_exists(self, run_id: str) -> bool:
+        """True when the run directory still exists under the runs root.
+
+        Used by the orphan check in ``_update_launched_entries``: a launched
+        entry whose supervisor reports nothing AND whose run dir is gone is
+        an orphan of a crash, not a run the supervisor still owns.
+        """
+
+        runs_root = getattr(self.supervisor, "runs_root", None)
+        if runs_root is None:
+            return False
+        return (Path(runs_root) / run_id).is_dir()
+
     def _maintenance_run_ids(self) -> set[str]:
         """Run ids parked by POST /api/maintenance/suspend for this root."""
 
@@ -1378,6 +1611,211 @@ class Launcher:
         if node_active >= node_max:
             return f"node at capacity: {node_active} active runs, node max {node_max}"
         return None
+
+    # ------------------------------------------------------------------
+    # LHH-CT110-MEMORY-ADMISSION: node-wide atomic admission (A/B/D/E).
+    #
+    # ``_admission_settings`` resolves the three limits from the settings
+    # DB on every pass (hot-reload, like the lane caps); ``_admit`` is the
+    # ONE decision point per launch: under the admission lock it counts
+    # running+starting runs across ALL lanes from the authoritative run
+    # store, applies the memory headroom gate, and returns None (admit) or
+    # a skip reason (refuse).  A single method is the atomicity contract:
+    # every launch path goes through it, so two lanes can never both admit
+    # into the last slot.
+    # ------------------------------------------------------------------
+
+    def _admission_settings(self) -> dict[str, int]:
+        """The three admission limits, resolved fresh from the settings DB.
+
+        Precedence mirrors the rest of the harness: a settings-store value
+        wins over the config/env default.  An unreadable or absent store
+        keeps the documented defaults (5 / 600 / 1024); the resolver never
+        raises, because the gate must not take the launcher down.
+        """
+
+        values: Mapping[str, Any] = {}
+        store = self._settings_store
+        if store is not None:
+            try:
+                values = store.values()
+            except Exception:  # noqa: BLE001 - a broken store keeps defaults
+                logger.warning("admission settings read failed; keeping defaults")
+                values = {}
+        resolved = _admission_settings_from_values(values)
+        # Keep the /api/meta snapshot in step even when no launch was
+        # attempted this pass (idle queue).
+        self._admission_values = resolved
+        return resolved
+
+    def _mem_available_mb(self) -> float | None:
+        """MemAvailable in MB via the probe seam, else the real procfs read.
+
+        Tests inject a fake (deliverable F); production calls
+        ``read_mem_available_mb`` (/proc/meminfo bounded by the cgroup
+        ``memory.max`` when present).
+        """
+
+        if self._meminfo_probe is not None:
+            try:
+                return self._meminfo_probe()
+            except Exception:  # noqa: BLE001 - a broken probe must not crash the pass
+                return None
+        return read_mem_available_mb()
+
+    def _memory_headroom_reason(self, settings: dict[str, int]) -> str | None:
+        """Deliverable B: refuse when MemAvailable - startup allowance < floor.
+
+        Returns the skip reason (``memory_headroom: ...``) when the gate
+        refuses, None when there is headroom.  A MISSING reading (no
+        /proc/meminfo, e.g. a stripped container) fails OPEN: the node cap
+        of deliverable A still bounds admission, and a container without
+        meminfo must not have its queue frozen forever.
+        """
+
+        available = self._mem_available_mb()
+        self._admission["mem_available_mb"] = (
+            round(available, 1) if available is not None else None
+        )
+        if available is None:
+            return None
+        startup = int(settings.get("startup_mb", DEFAULT_RUN_STARTUP_MB))
+        floor = int(settings.get("mem_floor_mb", DEFAULT_MEM_FLOOR_MB))
+        headroom = available - startup
+        if headroom < floor:
+            return (
+                f"{MEMORY_HEADROOM_SKIP_REASON}: MemAvailable {available:.0f} MB "
+                f"minus startup allowance {startup} MB is below the "
+                f"{floor} MB floor"
+            )
+        return None
+
+
+    def _admit(
+        self, active: dict[str, dict[str, Any]]
+    ) -> tuple[str | None, dict[str, int]]:
+        """The ONE admission decision for a launch cycle (deliverable A).
+
+        Under the admission lock: count running + starting runs across ALL
+        lanes from the authoritative run store (the supervisor's live set,
+        plus launched entries whose run has gone missing from it), refuse
+        when the count has reached node_max regardless of lane caps, then
+        apply the memory headroom gate.  ``_launch_lock`` serializes whole
+        passes, so in practice the decision runs once per pass; the
+        admission lock additionally guards the snapshot against the
+        /api/meta reader thread.  Returns ``(skip_reason_or_None,
+        settings)``.
+        """
+
+        settings = self._admission_settings()
+        node_max = int(settings.get("node_max", DEFAULT_NODE_MAX_ADMISSION))
+        running = 0
+        starting = 0
+        for info in active.values():
+            lifecycle = canonical_lifecycle_status(
+                (info.get("status") or {}).get("status")
+            )
+            if lifecycle in ("creating", "starting"):
+                starting += 1
+            else:
+                running += 1
+        # Launched entries whose run the supervisor no longer sees hold a
+        # slot until the reconcile pass terminal-marks them.
+        for entry in self.queue_store.list():
+            if entry.status != "launched" or not entry.run_id:
+                continue
+            if entry.run_id not in active:
+                starting += 1
+        # Read the memory picture BEFORE the node check so /api/meta always
+        # reports a fresh mem_available_mb, whichever gate ends up refusing.
+        memory_reason = self._memory_headroom_reason(settings)
+        with self._admission_lock:
+            self._admission = {
+                "node_max": node_max,
+                "running": running,
+                "starting": starting,
+                "mem_available_mb": self._admission.get("mem_available_mb"),
+                "blocked_reason": None,
+            }
+            if running + starting >= node_max:
+                reason = (
+                    f"node at capacity: {running + starting} running+starting runs, "
+                    f"node max {node_max}"
+                )
+                self._admission["blocked_reason"] = "node_max"
+                return reason, settings
+            if memory_reason is not None:
+                self._admission["blocked_reason"] = MEMORY_HEADROOM_SKIP_REASON
+                return memory_reason, settings
+        return None, settings
+
+    def admission_snapshot(self) -> dict[str, Any]:
+        """The ``admission`` object /api/meta exposes (deliverable D).
+
+        Exactly five keys: node_max, running, starting, mem_available_mb,
+        blocked_reason.  Refreshed by every pass's admission decision; a
+        launcher that has not run a pass yet reports the defaults.
+        """
+
+        with self._admission_lock:
+            return dict(self._admission)
+
+    def _warn_on_caps_over_node_max(self, settings: dict[str, int]) -> None:
+        """Deliverable E: warn + clamp when sum(lane caps) > node_max.
+
+        The warning is logged once per launcher process (not once per pass,
+        which would spam the log); the clamp is structural, not a warning:
+        the node gate of deliverable A already caps admission at node_max
+        no matter how large the lane caps sum, and the regression test pins
+        that.  This check exists so a mis-set capacity table is VISIBLE:
+        the ct110 incident was exactly caps summing to 20 against a node
+        maximum of 5 with nothing surfacing the mismatch.
+        """
+
+        if self._caps_clamp_warned:
+            return
+        capacity = self._config.get("capacity", {}) if isinstance(self._config, dict) else {}
+        caps_sum = 0
+        for key, value in capacity.items():
+            if isinstance(key, str) and key.endswith("_max"):
+                try:
+                    caps_sum += max(0, int(value))
+                except (TypeError, ValueError):
+                    continue
+        node_max = int(settings.get("node_max", DEFAULT_NODE_MAX_ADMISSION))
+        if caps_sum > node_max:
+            logger.warning(
+                "admission clamp: per-lane caps sum to %d but the node maximum "
+                "is %d; effective admission is clamped to %d (the node gate "
+                "refuses launches once running+starting reaches node_max, "
+                "whatever the lane caps allow)",
+                caps_sum, node_max, node_max,
+            )
+            self._caps_clamp_warned = True
+
+    def _reconcile_startup_state(self) -> None:
+        """Deliverable C: reconcile admission and orphans at service start.
+
+        Runs once from ``start()`` before the first pass: the count is
+        rebuilt from live processes and run dirs (``_active_runs``), and
+        every launched entry whose run went terminal without a queue update
+        is marked failed through the same ``_update_launched_entries`` path
+        the pass uses -- including the supervisor's crash-naming reason
+        (``worker disappeared without a final report``).  Nothing is
+        requeued here; the existing retry_of logic alone decides that.
+        """
+
+        try:
+            active = self._active_runs()
+            self._update_launched_entries(active)
+            settings = self._admission_settings()
+            self._warn_on_caps_over_node_max(settings)
+            # Refresh the /api/meta snapshot from the reconciled state (the
+            # pass would do this on its first tick; start-up answers /api/meta
+            # even before that).
+            self._admit(active)
+        except Exception as exc:  # noqa: BLE001 - start must never fail on reconcile
+            logger.warning("startup admission reconcile failed: %s", exc)
 
     def _drain_skip_reason(self) -> str | None:
         """Drain skip reason while the operator flag is set, else None.
