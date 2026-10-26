@@ -41,9 +41,11 @@ Each row builds a fresh fixture with N run dirs and issues **one**
 **Reading of these numbers.** `GET /api/runs` is superlinear in the number of
 run directories: 8× the run dirs (25 → 200) costs ~19× the wall clock
 (3.4 s → 62.8 s), and it reaches the 40–140 s hang window CT110 reported.
-`GET /api/queue` stays flat at ~20 ms across the whole range, which is
-precisely the reported CT110 symptom — the queue endpoint answers while the
-dashboard hangs, because the queue path never touches the run directories.
+`GET /api/queue` stays flat at ~20 ms across the whole range **when the
+server is otherwise idle**, because the queue path never touches the run
+directories. (Under *concurrent* load it degrades anyway — see Measurement 3
+— because it queues behind the saturated worker pool. That is the CT110
+symptom: the queue endpoint answers while the dashboard hangs.)
 
 ## Measurement 2 — where the time goes (cProfile of one `GET /api/runs`, 60 runs)
 
