@@ -1,13 +1,13 @@
 # Node-wide run admission
 
 How the launcher decides whether THIS node may start one more run. Written
-after the CT110 OOM incident of 2026-10-25: the queue's per-lane caps
-(`queue_capacity` in the settings DB) summed to 20 while the fleet node
-record advertises `maxConcurrentRuns 5`. The launcher admitted per lane
-only, so 11-15 runs ran at once in a 6144 MB container, the OOM killer
-took `lh-harness.service` at 22:27:29Z, and 13 launched runs ended
-`worker disappeared without a final report`. Admission is now decided at
-the NODE level, per launch cycle, under a lock, before any launch.
+after the OOM incident in which the queue's per-lane caps (`queue_capacity`
+in the settings DB) summed to far more than the fleet node record's
+`maxConcurrentRuns`. The launcher admitted per lane only, so many more
+runs ran at once than the node could hold; the OOM killer took
+`lh-harness.service`, and every launched run ended `worker disappeared
+without a final report`. Admission is now decided at the NODE level, per
+launch cycle, under a lock, before any launch.
 
 ## The three limits and how they compose
 
@@ -107,6 +107,32 @@ reconciliation uses (`worker disappeared without a final report`); the
 launcher never requeues such an orphan itself -- the existing `retry_of`
 retry logic alone decides that, exactly as for any other failure.
 
+## Where the decision is enforced (two layers, one cap)
+
+The node cap is enforced twice, and both layers read the SAME three
+settings, so they can never disagree about the limit:
+
+1. **The launcher**, once per launch cycle, in `Launcher._admit`: it
+   counts running + starting runs across all lanes from the supervisor's
+   live run set plus the launched queue entries whose run the store no
+   longer sees, and refuses the whole cycle when the count has reached
+   the cap. One decision per cycle, under the launcher's admission lock,
+   so two lanes can never both admit into the last slot.
+
+2. **The supervisor**, at the shared launch boundary, in
+   `RunSupervisor.create_run`: every launch path -- the launcher's
+   `_launch` AND the API's `POST /api/runs` -- funnels through
+   `NodeAdmission.reserve_startup`, which takes a PENDING STARTUP
+   reservation under its own lock before any worker process is spawned.
+   The reservation is released when the worker is published into the live
+   supervision window, when the start fails, and when the worker exits
+   or crashes, so a slot is never leaked.
+
+The second layer is the backstop for the first: a launch that did not
+come through the queue launcher (a direct API call) still has to pass
+the same cap, and a run in its startup window -- before the launcher can
+see it -- still holds its slot.
+
 ## Raising caps safely
 
 1. Check the current state first: `GET /api/meta` (`admission.running` +
@@ -114,8 +140,10 @@ retry logic alone decides that, exactly as for any other failure.
    `admission.mem_available_mb`).
 2. Budget the memory, not just the runs. One run is roughly 300 MB RSS at
    steady state but STARTS hungrier; keep the floor high enough that the
-   web process and the runs never meet. On a 6144 MB node: web ~0.9 GB,
-   floor 1.0 GB, startup 0.6 GB leaves room for about 3-4 concurrent runs.
+   web process and the runs never meet. Work it out from the node's own
+   RAM: subtract the web process's share, then subtract the floor and the
+   startup allowance, and divide what is left by the per-run cost to get a
+   safe concurrent-run count.
 3. Raise `LH_HARNESS_NODE_MAX_RUNS` first (it takes effect on the next
    launch pass), then raise the lane caps. Never the reverse: lane caps
    above the node maximum are clamped by the node gate anyway, and a
@@ -133,10 +161,23 @@ retry logic alone decides that, exactly as for any other failure.
   `_admission_settings`, `_memory_headroom_reason`,
   `_reconcile_startup_state`, `_warn_on_caps_over_node_max`, and the
   module-level `read_mem_available_mb` probe.
+- `src/lh_harness/supervisor/admission.py` -- the shared boundary:
+  `NodeAdmission.reserve_startup` (the reservation and the two gates),
+  `release_startup` / `publish` / `observe` / `forget` (the slot's life
+  cycle), `reconcile` (the count rebuilt from live runs), and the
+  `/api/meta` snapshot.
+- `src/lh_harness/supervisor/service.py` -- the reservation taken in
+  `create_run`, published when the worker comes up, and released when it
+  exits or crashes.
 - `src/lh_harness/settings_store.py` -- the three setting names in the
   catalog.
 - `src/lh_harness/webapi/protocol.py` and `src/lh_harness/webapi/server.py`
   -- the `/api/meta` `admission` object.
-- `tests/webapi/test_launcher_node_admission.py` -- the regression tests,
-  including the exact incident shape (lane caps summing to 20 against
-  node_max 5 can never admit more than 5).
+- `tests/webapi/test_launcher_node_admission.py` -- the launcher-side
+  regression tests, including the exact incident shape (lane caps summing
+  past the node maximum can never admit more than node_max).
+- `tests/supervisor/test_supervisor_admission.py` -- the shared-boundary
+  tests: the reservation is atomic under the lock (two racing launches
+  cannot both take the last slot), the memory gate refuses, the slot is
+  released on a failed start and on worker exit, and the count is
+  reconciled from the live run dirs at construction.

@@ -7,12 +7,12 @@ launcher.  PR #169 counted only the runs the launcher had already
 published to ``_active_runs`` (its own supervision window), so a POST
 /api/runs launch and a queue launch could still admit into the same last
 slot, and a run in its startup window that the launcher had not yet
-observed was invisible to the check.  The 2026-10-25 CT110 OOM was exactly
-that shape: queue_capacity rows summed to 20 (glm 5, minimax 4, qwen 4,
-zai 2, mm31f 2, dsf 2, kimi 1) against a fleet node record of
-maxConcurrentRuns 5, the launcher admitted per lane only, 11-15 runs ran
-at once, and the OOM killer took lh-harness.service at 22:27:29Z (13
-launched runs ended "worker disappeared without a final report").
+observed was invisible to the check.  The OOM incident that motivated this
+was exactly that shape: the per-lane queue_capacity rows summed to far
+more than the fleet node record's maxConcurrentRuns, the launcher
+admitted per lane only, so many more runs ran at once than the node could
+hold, the OOM killer took the service, and every launched run ended
+"worker disappeared without a final report".
 
 The reservation protocol implemented here:
 
@@ -366,6 +366,7 @@ class NodeAdmission:
 
         with self._lock:
             self._reservations.pop(run_id, None)
+            self._recount_locked()
 
     def publish(self, run_id: str, status: str) -> None:
         """Promote a reserved run into the published live set.
@@ -378,12 +379,14 @@ class NodeAdmission:
         with self._lock:
             self._reservations.pop(run_id, None)
             self._live[run_id] = str(status)
+            self._recount_locked()
 
     def observe(self, run_id: str, status: str) -> None:
         """Record a lifecycle transition for an already published run."""
 
         with self._lock:
             self._live[run_id] = str(status)
+            self._recount_locked()
 
     def forget(self, run_id: str) -> None:
         """Drop a run from the published set (worker exited or crashed).
@@ -395,6 +398,21 @@ class NodeAdmission:
         with self._lock:
             self._reservations.pop(run_id, None)
             self._live.pop(run_id, None)
+            self._recount_locked()
+
+    def _recount_locked(self) -> None:
+        """Refresh the snapshot's COUNTS after the live set changed.
+
+        The counts in the /api/meta snapshot must never be stale: a run
+        that was published, observed, or forgotten changes them at once.
+        The node_max, the memory reading, and the blocked reason are left
+        alone here -- they belong to the last admission DECISION, which
+        only ``reserve_startup`` (and ``refresh_snapshot``) makes.
+        """
+
+        running, starting = self._counts_locked()
+        self._snapshot["running"] = running
+        self._snapshot["starting"] = starting
 
     def _drop_stale_locked(self, now: float) -> None:
         """Age out reservations whose launch never published.
@@ -437,18 +455,28 @@ class NodeAdmission:
             self._live = {
                 run_id: str(status) for run_id, status in live_runs.items()
             }
+            self._recount_locked()
 
     def reconcile_from_supervisor(self, supervisor: Any) -> None:
-        """``reconcile`` using a supervisor's ``list_run_items`` view.
+        """``reconcile`` using the supervisor's durable run-dir view.
 
         A separate entry point so the supervisor can reconcile at start
         with its OWN authoritative enumeration (live run dirs and their
         durable status records) without the caller hand-mapping statuses.
+
+        The enumeration is ``list_run_summaries`` -- the durable
+        ``status.json`` projection of every run dir -- and NOT
+        ``list_run_items``.  ``list_run_items`` walks the full run
+        boundary and RECONCILES each run's lifecycle, which has side
+        effects (it parks terminal workspaces, runs git, may signal a
+        worker).  Reconciling the admission count must be a pure READ:
+        it runs at supervisor construction, and a side effect there would
+        change the behaviour of every restart on the node.
         """
 
         live: dict[str, str] = {}
         try:
-            for item in supervisor.list_run_items():
+            for item in supervisor.list_run_summaries():
                 run_id = str(item.get("id") or "")
                 if run_id:
                     live[run_id] = str(item.get("status") or "unknown")

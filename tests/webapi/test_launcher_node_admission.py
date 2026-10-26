@@ -1,13 +1,14 @@
 """LHH-CT110-MEMORY-ADMISSION: node-wide atomic admission in the launcher.
 
-The 2026-10-25 CT110 incident: queue_capacity rows summed to 20 while the
-fleet node record advertises maxConcurrentRuns 5; the launcher admitted per
-lane only, 11-15 runs ran at once, and the OOM killer took
-lh-harness.service (13 launched runs ended "worker disappeared without a
-final report").  These tests pin the three admission limits (A), the memory
-headroom gate (B), release/reconciliation (C), the bound of existing
-in-flight with no kill (D), and the sum(caps) > node_max clamp (E) -- all
-through a fake run store and a fake meminfo probe (F).
+The incident that motivated this: the per-lane queue_capacity rows summed
+to far more than the fleet node record's maxConcurrentRuns, and the
+launcher admitted per lane only, so many more runs ran at once than the
+node could hold; the OOM killer took the service and every launched run
+ended "worker disappeared without a final report".  These tests pin the
+three admission limits (A), the memory headroom gate (B),
+release/reconciliation (C), the bound of existing in-flight with no kill
+(D), and the sum(caps) > node_max clamp (E) -- all through a fake run
+store and a fake meminfo probe (F).
 """
 
 from __future__ import annotations
@@ -475,13 +476,13 @@ def test_admission_snapshot_blocked_reason_memory(tmp_path: Path) -> None:
 def test_regression_sum_of_lane_caps_over_node_max_never_admits_more(tmp_path: Path) -> None:
     """THE regression test for the incident shape.
 
-    Lane caps sum to 20 (glm 5, minimax 4, qwen 4, zai 2, mm31f 2, zaiq 2,
-    kimi 1) against node_max 5 -- the CT110 queue_capacity table (the store
-    has no 'dsf' trio; zaiq carries the sixth lane).  With an empty node and
-    20 pending entries spread over every lane, no sequence of passes may
-    ever leave more than node_max runs running+starting, even though every
-    single lane cap still has room.  That invariant is what the per-lane
-    checks of 2026-10-25 could not express and the OOM proved.
+    Lane caps sum to 20 across seven lanes against node_max 5 -- the shape
+    of a queue_capacity table whose lanes were configured far above what
+    the node could hold.  With an empty node and 20 pending entries spread
+    over every lane, no sequence of passes may ever leave more than
+    node_max runs running+starting, even though every single lane cap still
+    has room.  That invariant is what per-lane checks alone could not
+    express.
     """
 
     caps = {

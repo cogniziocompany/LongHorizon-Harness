@@ -1540,6 +1540,38 @@ class RunSupervisor:
             )
 
     def _refresh(self, run_id: str) -> dict[str, Any]:
+        """Resolve a run's lifecycle and keep the admission count in step.
+
+        LHH-CT110-MEMORY-ADMISSION (C): releasing the node slot on worker
+        exit or crash.  ``_refresh`` is the single place where a run's
+        lifecycle is resolved (the worker exited, crashed, or was
+        cancelled), so the admission set is synced here: a run that is
+        still alive keeps its slot, and a run that reached a terminal
+        lifecycle releases it immediately.  The sync is best-effort: an
+        admission bookkeeping failure must never break status reporting.
+        """
+
+        status = self._refresh_status(run_id)
+        try:
+            self._sync_admission(run_id, status)
+        except Exception:  # noqa: BLE001 - bookkeeping must not break status
+            pass
+        return status
+
+    def _sync_admission(self, run_id: str, status: dict[str, Any]) -> None:
+        """Mirror one run's lifecycle into the node admission set.
+
+        A terminal lifecycle (the worker exited, crashed, or was
+        cancelled) releases the node slot; an active one keeps it.
+        """
+
+        lifecycle = canonical_lifecycle_status(status.get("status"), default="idle")
+        if lifecycle in TERMINAL_STATUSES:
+            self.admission.forget(run_id)
+        else:
+            self.admission.observe(run_id, lifecycle)
+
+    def _refresh_status(self, run_id: str) -> dict[str, Any]:
         bus = self._bus(run_id)
         with self._lifecycle_lock:
             status = bus.read_status()
@@ -2230,6 +2262,14 @@ class RunSupervisor:
                 queue_id=queue_id,
                 trio=trio,
             )
+        except Exception:
+            # LHH-CT110-MEMORY-ADMISSION (C): the start failed, so the node
+            # slot must be freed immediately -- a failed launch must never
+            # hold a node slot against the next one.  The release is
+            # idempotent: on the success path the reservation was already
+            # promoted by ``publish`` when the worker came up.
+            self.admission.release_startup(run_id)
+            raise
 
     def _create_run_once_reserved(
         self,
@@ -2526,6 +2566,11 @@ class RunSupervisor:
             raise
         self._processes[run_id] = process
         self._commands[run_id] = command
+        # LHH-CT110-MEMORY-ADMISSION (C): the worker is up, so the PENDING
+        # STARTUP reservation becomes a published live run.  The reservation
+        # is dropped here (idempotently) and the run now holds its node slot
+        # through the published set instead -- the slot is never lost.
+        self.admission.publish(run_id, "starting")
         return {"id": run_id, "task": task, "status": "starting", "log_dir": str(self._run_logs_dir(run_id)), "owner": owner}
 
     def attach_run(
@@ -2607,6 +2652,9 @@ class RunSupervisor:
         # a failed attach must not leave the API pointing at a half-registered run.
         if self.attached_only:
             self.attached_run_id = run_id
+        # LHH-CT110-MEMORY-ADMISSION (C): an attached worker is a real run
+        # on this node, so it holds a node slot like any other.
+        self.admission.observe(run_id, "running")
         current = bus.read_status()
         if canonical_lifecycle_status(current.get("status"), default="") not in TERMINAL_STATUSES:
             bus.write_status({

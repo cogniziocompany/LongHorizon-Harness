@@ -589,15 +589,14 @@ def _now() -> float:
 # ---------------------------------------------------------------------------
 # LHH-CT110-MEMORY-ADMISSION: node-wide admission limits.
 #
-# The 2026-10-25 CT110 OOM incident: queue_capacity rows summed to 20
-# (glm 5, minimax 4, qwen 4, zai 2, mm31f 2, dsf 2, kimi 1) while the fleet
-# node record advertises maxConcurrentRuns 5.  The launcher admitted per
-# lane only, so 11-15 runs ran at once (~300 MB each plus an 861 MB web
-# process inside a 6144 MB container); lh-harness.service was OOM-killed at
-# 22:27:29Z and 13 launched runs ended "worker disappeared without a final
-# report".  The three settings below close that hole; they live in the
-# settings store (settings_store.CATALOG) so an operator can change them
-# without a restart, like the lane caps and the disk thresholds.
+# The incident that motivated this: the per-lane queue_capacity caps
+# summed to far more than the fleet node record's maxConcurrentRuns, and
+# the launcher admitted per lane only, so far more runs ran at once than
+# the node could hold.  The service was OOM-killed and every launched run
+# ended "worker disappeared without a final report".  The three settings
+# below close that hole; they live in the settings store
+# (settings_store.CATALOG) so an operator can change them without a
+# restart, like the lane caps and the disk thresholds.
 # ---------------------------------------------------------------------------
 
 SETTING_NODE_MAX_RUNS = "LH_HARNESS_NODE_MAX_RUNS"
@@ -1768,8 +1767,8 @@ class Launcher:
         the node gate of deliverable A already caps admission at node_max
         no matter how large the lane caps sum, and the regression test pins
         that.  This check exists so a mis-set capacity table is VISIBLE:
-        the ct110 incident was exactly caps summing to 20 against a node
-        maximum of 5 with nothing surfacing the mismatch.
+        the incident that motivated this was exactly lane caps summing past
+        the node maximum with nothing surfacing the mismatch.
         """
 
         if self._caps_clamp_warned:
