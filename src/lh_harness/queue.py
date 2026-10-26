@@ -136,6 +136,11 @@ KNOWN_REQUEST_KEYS = frozenset(
         "requester",
         "time_limit_minutes",
         "gtm_manager",
+        # LHH-QUEUE-MIGRATION-TOMBSTONE (B): the DESTINATION entry's link
+        # back to the source it was migrated from.  Accepted only together
+        # with the matching dedup_key (see ``validate_migrated_from``), so
+        # it cannot be used to forge an origin.
+        "migrated_from",
     }
 )
 
@@ -200,6 +205,66 @@ def validate_time_limit_minutes(value: Any) -> int | None:
             f"{TIME_LIMIT_MAX_MINUTES}"
         )
     return value
+
+
+def validate_migrated_from(
+    value: Any,
+    *,
+    dedup_key: str | None,
+) -> dict[str, Any] | None:
+    """Validate the ``migrated_from`` link on a DESTINATION entry.
+
+    LHH-QUEUE-MIGRATION-TOMBSTONE (B).  The destination entry names the
+    source it arrived from: ``{node, queue_id, at}``.
+
+    The link is SELF-VERIFYING against the entry's own ``dedup_key``, which
+    is ``<source queue_id>:<dest node>``: the ``queue_id`` the link names
+    must be exactly the key's source half.  A body cannot therefore claim an
+    origin that does not match its own idempotency key -- the link and the
+    key tell the same story or the enqueue is refused.  (The link's ``node``
+    is the SOURCE node, which the key does not carry; the key's second half
+    is the DESTINATION node, which the destination already knows.)
+
+    That is what keeps a plain (non-migrated) enqueue honest: it simply omits
+    ``migrated_from``, and the field stays ``None``.
+
+    ``None`` (the field was not supplied) means "this entry did not arrive
+    through a migration".
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("migrated_from must be an object")
+    unknown = sorted(set(value) - {"node", "queue_id", "at"})
+    if unknown:
+        raise ValueError(
+            "migrated_from has unknown field(s): " + ", ".join(unknown)
+        )
+    node = value.get("node")
+    source_id = value.get("queue_id")
+    if not isinstance(node, str) or not node.strip():
+        raise ValueError("migrated_from.node is required")
+    if not isinstance(source_id, str) or not source_id.strip():
+        raise ValueError("migrated_from.queue_id is required")
+    source_id = source_id.strip()
+    node = node.strip()
+    if not dedup_key:
+        raise ValueError("migrated_from requires a dedup_key")
+    # The key is "<source queue_id>:<dest node>"; the link's queue_id must be
+    # the source half of it.
+    source_half, sep, _dest_half = dedup_key.partition(":")
+    if not sep or source_half != source_id:
+        raise ValueError(
+            f"migrated_from does not match the dedup_key "
+            f"(expected the source id {source_id!r} in {dedup_key!r})"
+        )
+    at = value.get("at")
+    if at is None:
+        at = time.time()
+    if isinstance(at, bool) or not isinstance(at, (int, float)):
+        raise ValueError("migrated_from.at must be a number")
+    return {"node": node, "queue_id": source_id, "at": float(at)}
 
 
 class UnknownQueueFieldError(ValueError):
@@ -417,6 +482,14 @@ class QueueEntry:
     # indistinguishable from an untouched one -- which is correct: it has no
     # migration to reconcile.
     migration_epoch: int | None = None
+    # The SOURCE tombstone's destination API root (LHH-QUEUE-MIGRATION-TOMBSTONE,
+    # slice C).  The recovery sweep has to be able to REACH the destination to
+    # ask whether it already holds the work; the node NAME alone is not an
+    # address.  It is stored beside the link rather than inside it, so the
+    # link keeps exactly the shape the task specifies -- {node, queue_id, at}.
+    #
+    # ``None`` on every entry that was never migrated.
+    migrated_dest_base_url: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -462,6 +535,7 @@ class QueueEntry:
             "migrated_to",
             "migrated_from",
             "migration_epoch",
+            "migrated_dest_base_url",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -1153,6 +1227,12 @@ def _normalize_request(body: dict[str, Any], *, settings_runtime: Any = None) ->
     else:
         requested_by = _validate_requested_by(requested_by_value)
 
+    dedup_key = _validate_dedup_key(body.get("dedup_key"))
+    # LHH-QUEUE-MIGRATION-TOMBSTONE (B): the DESTINATION entry's link back to
+    # its source.  Validated against the dedup_key, so the link and the key
+    # always tell the same story.  ``None`` for every ordinary enqueue.
+    migrated_from = validate_migrated_from(body.get("migrated_from"), dedup_key=dedup_key)
+
     return {
         "name": _validate_name(body.get("name")),
         "task": task_text,
@@ -1166,7 +1246,7 @@ def _normalize_request(body: dict[str, Any], *, settings_runtime: Any = None) ->
         "continue_branch": continue_branch,
         "base_check": _validate_base_check(body.get("base_check")),
         "requested_by": requested_by,
-        "dedup_key": _validate_dedup_key(body.get("dedup_key")),
+        "dedup_key": dedup_key,
         "requester": requester_block,
         "time_limit_minutes": validate_time_limit_minutes(body.get("time_limit_minutes")),
         # The go-to-market manager (GTM-MANAGER-G1-a): absent means the
@@ -1174,6 +1254,10 @@ def _normalize_request(body: dict[str, Any], *, settings_runtime: Any = None) ->
         # ``validate_gtm_manager`` (a plain ValueError -> the enqueue path's
         # 422 mapping).
         "gtm_manager": validate_gtm_manager(body.get("gtm_manager")),
+        # LHH-QUEUE-MIGRATION-TOMBSTONE (B): the destination-side link.  Set
+        # only on an entry that arrived through a migration; ``None``
+        # everywhere else.
+        "migrated_from": migrated_from,
     }
 
 
@@ -1760,6 +1844,7 @@ class QueueStore:
         epoch: int | None = None,
         pending: bool = True,
         at: float | None = None,
+        dest_base_url: str | None = None,
     ) -> QueueEntry | None:
         """Turn a PENDING entry into a durable migration TOMBSTONE.
 
@@ -1816,6 +1901,62 @@ class QueueStore:
         entry.status = "migrated"
         entry.migrated_to = link
         entry.migration_epoch = int(epoch) if epoch is not None else (entry.migration_epoch or 0) + 1
+        if dest_base_url:
+            entry.migrated_dest_base_url = dest_base_url
+        return self.update(entry)
+
+    def finalize_migration(
+        self,
+        queue_id: str,
+        *,
+        node: str,
+        dest_queue_id: str | None = None,
+        epoch: int | None = None,
+        dest_base_url: str | None = None,
+    ) -> QueueEntry | None:
+        """Finalize an existing migration tombstone.
+
+        LHH-QUEUE-MIGRATION-TOMBSTONE (slice B/C).  The tombstone was written
+        by ``mark_migrated`` BEFORE the destination entry existed, so its link
+        carried ``pending = true`` and no destination queue id.  Once the
+        destination entry is known -- created by the migration call, or found
+        by the recovery sweep -- this method records it and clears the pending
+        flag.
+
+        This is NOT a status transition: the entry is already ``migrated`` and
+        stays ``migrated``.  The status table has no ``migrated`` -> anything
+        edge, and none is added: a tombstone is final.  Only the LINK is
+        updated, in one write.
+
+        Calling it on an entry that is not a tombstone raises ``ValueError``;
+        calling it on a tombstone whose link names a different node raises too,
+        so a link can never be repointed at a second destination.
+        """
+
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if entry.status != "migrated":
+            raise ValueError(f"cannot finalize a migration on a {entry.status} entry")
+        link = dict(entry.migrated_to or {})
+        dest_node = str(node).strip()
+        if not dest_node:
+            raise ValueError("migrated_to node is required")
+        existing_node = str(link.get("node") or "").strip()
+        if existing_node and existing_node != dest_node:
+            raise ValueError(
+                f"entry is already migrated to {existing_node}, not {dest_node}"
+            )
+        link["node"] = dest_node
+        if dest_queue_id:
+            link["queue_id"] = str(dest_queue_id)
+        link["at"] = float(link.get("at") or _now())
+        link.pop("pending", None)
+        entry.migrated_to = link
+        if epoch is not None:
+            entry.migration_epoch = int(epoch)
+        if dest_base_url:
+            entry.migrated_dest_base_url = dest_base_url
         return self.update(entry)
 
     def record_skip(self, queue_id: str, reason: str) -> QueueEntry | None:

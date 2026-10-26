@@ -50,3 +50,10 @@ ALTER TABLE harness.queue
 
 ALTER TABLE harness.queue
     ADD COLUMN IF NOT EXISTS migration_epoch INTEGER;
+
+-- The destination API root of a SOURCE tombstone.  The recovery sweep has to
+-- be able to REACH the destination to ask whether it already holds the work;
+-- the node name alone is not an address.  NULL on every entry that was never
+-- migrated.
+ALTER TABLE harness.queue
+    ADD COLUMN IF NOT EXISTS migrated_dest_base_url TEXT;

@@ -78,6 +78,11 @@ _COLUMN_GTM_MANAGER = "gtm_manager"
 _COLUMN_MIGRATED_TO = "migrated_to"
 _COLUMN_MIGRATED_FROM = "migrated_from"
 _COLUMN_MIGRATION_EPOCH = "migration_epoch"
+# The destination API root of a SOURCE tombstone (LHH-QUEUE-MIGRATION-TOMBSTONE,
+# slice C).  The recovery sweep needs to REACH the destination to ask whether
+# it already holds the work; the node name alone is not an address.  NULL on
+# every entry that was never migrated.
+_COLUMN_MIGRATED_DEST_BASE_URL = "migrated_dest_base_url"
 # ``requester`` (task 300) still has no column; see ``create``.
 _QUEUE_COLUMNS = (
     _COLUMN_QUEUE_ID,
@@ -112,6 +117,7 @@ _QUEUE_COLUMNS = (
     _COLUMN_MIGRATED_TO,
     _COLUMN_MIGRATED_FROM,
     _COLUMN_MIGRATION_EPOCH,
+    _COLUMN_MIGRATED_DEST_BASE_URL,
 )
 
 # LHH-QUEUE-HOTRELOAD R9: the two per-task override columns, applied in-code
@@ -193,6 +199,11 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
     migration_epoch = getattr(entry, "migration_epoch", None)
     if isinstance(migration_epoch, bool) or not isinstance(migration_epoch, int):
         migration_epoch = None
+    # The destination API root of a source tombstone (slice C); NULL on every
+    # entry that was never migrated.
+    migrated_dest_base_url = getattr(entry, "migrated_dest_base_url", None)
+    if not isinstance(migrated_dest_base_url, str) or not migrated_dest_base_url.strip():
+        migrated_dest_base_url = None
     return [
         entry.queue_id,
         entry.name,
@@ -226,6 +237,7 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         migrated_to_json,
         migrated_from_json,
         migration_epoch,
+        migrated_dest_base_url,
     ]
 
 

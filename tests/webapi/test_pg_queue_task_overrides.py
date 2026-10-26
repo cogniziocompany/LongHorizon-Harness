@@ -92,10 +92,15 @@ def test_column_list_covers_both_overrides_append_only() -> None:
     # The migration tombstone columns (migration 008,
     # LHH-QUEUE-MIGRATION-TOMBSTONE) are appended after that, so the list
     # stays append-only: every earlier column keeps its index.
-    assert columns[-7] == "time_limit_minutes"
-    assert columns[-6:-4] == OVERRIDE_COLUMNS
-    assert columns[-4] == "gtm_manager"
-    assert columns[-3:] == ("migrated_to", "migrated_from", "migration_epoch")
+    assert columns[-8] == "time_limit_minutes"
+    assert columns[-7:-5] == OVERRIDE_COLUMNS
+    assert columns[-5] == "gtm_manager"
+    assert columns[-4:] == (
+        "migrated_to",
+        "migrated_from",
+        "migration_epoch",
+        "migrated_dest_base_url",
+    )
     assert _OVERRIDE_COLUMNS_SQL_MARKERS()
 
 

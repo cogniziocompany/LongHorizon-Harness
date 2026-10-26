@@ -27,6 +27,7 @@ transition.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -35,6 +36,8 @@ from typing import Any, Iterable
 
 from .safe_subprocess import git_argv
 from .queue import QueueStore
+
+logger = logging.getLogger(__name__)
 
 
 # ``launched`` is the only non-terminal state where the run_id pointer is
@@ -132,6 +135,10 @@ class ReconcileReport:
     stashes: list[StashReport] = field(default_factory=list)
     applied: list[ZombieReconciliation] = field(default_factory=list)
     live_entries: list[str] = field(default_factory=list)
+    # LHH-QUEUE-MIGRATION-TOMBSTONE (C): one line per repaired partial pair
+    # (a source tombstone whose destination create never landed).  Empty
+    # unless a non-dry-run sweep repaired something.
+    migration_repairs: list[str] = field(default_factory=list)
 
     @property
     def zombie_count(self) -> int:
@@ -140,6 +147,10 @@ class ReconcileReport:
     @property
     def stash_count(self) -> int:
         return len(self.stashes)
+
+    @property
+    def migration_repair_count(self) -> int:
+        return len(self.migration_repairs)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -151,6 +162,7 @@ class ReconcileReport:
             "stashes": [s.as_dict() for s in self.stashes],
             "applied": [a.as_dict() for a in self.applied],
             "live_entries": list(self.live_entries),
+            "migration_repairs": list(self.migration_repairs),
         }
 
 
@@ -419,6 +431,33 @@ def _apply_reconciliation(
             applied.append(zombie)
 
 
+def _repair_pending_migrations(store: QueueStore) -> list[str]:
+    """Repair the partial pairs a migration left behind.
+
+    LHH-QUEUE-MIGRATION-TOMBSTONE (C).  A source tombstone whose
+    ``migrated_to.pending`` is still true means the destination create never
+    landed -- the work is on neither side.  The repair asks the destination
+    whether it already holds the entry (by dedup_key): present -> finalize the
+    link; absent -> re-create it from the source's stored task text.
+
+    This is deliberately SEPARATE from the zombie sweep above: a tombstone is
+    never a zombie (it has no run on this node), and the repair writes only
+    the tombstone's LINK -- never its status, never a run.  A failure to
+    repair is not a sweep failure: the tombstone stays pending and the next
+    attempt tries again.
+    """
+
+    try:
+        from .queue_migrate import repair_pending_migrations
+    except ImportError:  # pragma: no cover - defensive
+        return []
+    try:
+        return repair_pending_migrations(store)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("queue migrate repair failed during the reconcile sweep")
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
@@ -431,6 +470,13 @@ def reconcile_sweep(runs_root: str | Path, *, dry_run: bool = True) -> Reconcile
     directory that contains ``queue/<queue_id>.json`` and one
     ``runs/<run_id>/`` subdir per run. The sweep never starts a worker, never
     restarts the service, never touches git, and never deletes files.
+
+    LHH-QUEUE-MIGRATION-TOMBSTONE (C): with ``dry_run=False`` the sweep also
+    REPAIRS the partial pairs -- the source tombstones whose destination
+    create never landed.  The destination is asked whether it already holds
+    the work (by dedup_key): present -> the link is finalized; absent -> the
+    entry is re-created from the source's stored task text.  A dry run never
+    writes, so the repair is skipped then.
     """
 
     root = Path(runs_root).expanduser().resolve()
@@ -442,6 +488,8 @@ def reconcile_sweep(runs_root: str | Path, *, dry_run: bool = True) -> Reconcile
     report.live_entries = _list_live_entries(store.list())
     if not dry_run and report.zombies:
         _apply_reconciliation(store, report.zombies, applied=report.applied)
+    if not dry_run:
+        report.migration_repairs = _repair_pending_migrations(store)
     return report
 
 
@@ -475,6 +523,10 @@ def format_report_text(report: ReconcileReport) -> str:
         lines.append(
             "  live entries (untouched): " + ", ".join(report.live_entries)
         )
+    if report.migration_repairs:
+        lines.append("  migration repairs:")
+        for line in report.migration_repairs:
+            lines.append(f"    - {line}")
     return "\n".join(lines) + "\n"
 
 

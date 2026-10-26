@@ -601,12 +601,17 @@ def test_migration_008_adds_the_tombstone_columns_idempotently() -> None:
 
 
 def test_pg_column_list_carries_the_tombstone_columns() -> None:
-    """The Postgres column list carries the three new columns, appended."""
+    """The Postgres column list carries the new columns, appended."""
 
     from lh_harness import pg_queue
 
     columns = pg_queue._QUEUE_COLUMNS
-    assert columns[-3:] == ("migrated_to", "migrated_from", "migration_epoch")
+    assert columns[-4:] == (
+        "migrated_to",
+        "migrated_from",
+        "migration_epoch",
+        "migrated_dest_base_url",
+    )
     # Append-only: the earlier columns keep their positions.
     assert "gtm_manager" in columns
 

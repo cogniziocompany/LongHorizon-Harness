@@ -12,6 +12,7 @@ import ipaddress
 import json
 import mimetypes
 import os
+import socket
 import re
 import threading
 from collections import OrderedDict
@@ -533,6 +534,20 @@ def _configured_token(explicit: str | None) -> str | None:
     value = explicit if explicit is not None else os.environ.get("LH_HARNESS_WEB_TOKEN")
     value = str(value or "").strip()
     return value or None
+
+
+def _migration_source_node() -> str:
+    """This node's fleet name -- the source id a migration records.
+
+    LHH-QUEUE-MIGRATION-TOMBSTONE: the destination entry's ``migrated_from``
+    names the SOURCE node, and the source tombstone's ``migrated_to`` names
+    the destination node.  The name is the fleet enrollment name
+    (``LH_HARNESS_FLEET_NODE``), the same identifier the rest of the fleet
+    apparatus uses for this host; the hostname is the fallback when the node
+    is not enrolled.
+    """
+
+    return (os.environ.get("LH_HARNESS_FLEET_NODE") or socket.gethostname()).strip()
 
 
 def _bearer_matches(value: str | None, token: str | None) -> bool:
@@ -1838,6 +1853,24 @@ def create_app(
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> Any:
+        # LHH-QUEUE-MIGRATION-TOMBSTONE (C): on web start, repair every
+        # PARTIAL PAIR -- a source tombstone whose destination create never
+        # landed.  The destination is asked whether it already holds the work
+        # (by dedup_key): present -> the link is finalized; absent -> the
+        # entry is re-created from the source's stored task text.  One log
+        # line per repair.
+        #
+        # This runs BEFORE the launcher starts, so a repaired entry exists
+        # before anything can launch work on this node.  A failure here never
+        # blocks the web process: the tombstone stays pending and the next
+        # sweep (or the next retry of the migration call) tries again.
+        if queue_store is not None:
+            try:
+                from ..queue_migrate import repair_pending_migrations
+
+                repair_pending_migrations(queue_store, source_node=_migration_source_node())
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("queue migrate repair on web start failed")
         if launcher is not None:
             await launcher.start()
         yield
@@ -3099,6 +3132,59 @@ def create_app(
         if updated is None:
             raise HTTPException(status_code=404, detail="queue entry not found")
         return {"ok": True, "queue_id": queue_id, "priority": updated.priority}
+
+    @app.post("/api/queue/{queue_id}/migrate")
+    def migrate_queue_entry(
+        queue_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        """Migrate one PENDING queue entry to another node.
+
+        LHH-QUEUE-MIGRATION-TOMBSTONE (B).  Body:
+        ``{dest_node, dest_base_url, idempotency_key}``.
+
+        The order is the guarantee: the SOURCE entry is tombstoned FIRST, in
+        one transaction (status ``migrated`` -- terminal, so this node can
+        never launch it again), and only THEN is the destination entry
+        created.  That closes the duplicate-writer window the Codex review
+        named: there is never an instant at which both nodes hold a
+        launchable copy of the same work.
+
+        If the destination create fails, the source stays tombstoned with
+        ``migrated_to.pending = true`` and the call answers 502; re-running
+        the same call completes the migration idempotently (the destination's
+        ``dedup_key`` -- ``<source queue_id>:<dest node>`` -- returns the
+        existing entry instead of a second one).
+
+        Only PENDING entries are accepted.  A launched entry owns a live run
+        on this node and is refused with 409: running runs are untouched.
+        """
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        from ..queue_migrate import MigrationError, migrate_pending_entry
+
+        dest_node = body.get("dest_node")
+        dest_base_url = body.get("dest_base_url")
+        idempotency_key = body.get("idempotency_key")
+        if not isinstance(dest_node, str) or not dest_node.strip():
+            raise HTTPException(status_code=422, detail="dest_node is required")
+        if not isinstance(dest_base_url, str) or not dest_base_url.strip():
+            raise HTTPException(status_code=422, detail="dest_base_url is required")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise HTTPException(status_code=422, detail="idempotency_key is required")
+        try:
+            result = migrate_pending_entry(
+                queue_store,
+                queue_id,
+                dest_node=dest_node.strip(),
+                dest_base_url=dest_base_url.strip(),
+                idempotency_key=idempotency_key.strip(),
+                source_node=_migration_source_node(),
+            )
+        except MigrationError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        return result.to_dict()
 
     @app.get("/api/queue/config")
     def queue_config_endpoint() -> dict[str, Any]:
