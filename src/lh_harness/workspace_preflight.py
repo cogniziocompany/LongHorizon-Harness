@@ -34,6 +34,15 @@ baseline and the candidate.  The shared harness virtualenv is never used and
 never written to -- a harness venv shared by every run on the host is exactly
 the wrong place for a per-run test environment.
 
+Isolation needs one more thing: *sanitization*.  The harness shell exports
+``PYTHONPATH=/home/harness/venv/lib/python3.12/site-packages``, so a child
+launched with the workspace interpreter still resolves packages from the
+shared harness venv.  Every step here therefore runs with ``PYTHONPATH``,
+``VIRTUAL_ENV``, and ``PYTHONHOME`` cleared, and the receipt carries the
+environment's *provenance* -- ``sys.executable``, the whole ``sys.path``, and
+the resolved paths of the repo package and of ``pytest`` -- so a leak is
+visible instead of silently producing a green count.
+
 Every observation is recorded as a receipt so a later reader (or an auditor)
 can see exactly what the run saw before it started: see
 :class:`PreflightRecord`.
@@ -84,6 +93,37 @@ _PROBE_TIMEOUT = 30.0
 # The smoke collection timeout is larger: a cold collection of a large suite
 # legitimately takes a while, but it must still terminate.
 _COLLECT_TIMEOUT = 180.0
+
+# The environment variables that make a child's import resolution depend on
+# something other than the interpreter it was launched with.
+#
+# ``PYTHONPATH`` is the dangerous one: the harness shell exports
+# ``PYTHONPATH=/home/harness/venv/lib/python3.12/site-packages``, so a child
+# launched with the *workspace* interpreter still resolves packages from the
+# *shared harness* venv.  The preflight then reports a healthy environment
+# that a real test run cannot reproduce -- the fake-green hazard.
+#
+# ``VIRTUAL_ENV`` names an environment the child is not running in, and
+# ``PYTHONHOME`` moves the interpreter's prefix away from the one it was
+# built for.  All three are cleared before every install and every
+# collection, for the baseline and the candidate alike.
+SANITIZED_ENV_NAMES: tuple[str, ...] = ("PYTHONPATH", "VIRTUAL_ENV", "PYTHONHOME")
+
+
+def sanitized_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return a child environment with the import-leaking names removed.
+
+    The result is the harness's own scrubbed child environment (no
+    control-plane secrets, no interactive prompts) with
+    :data:`SANITIZED_ENV_NAMES` removed.  Every preflight subprocess runs
+    under this environment, so the interpreter that the preflight inspects
+    is the interpreter a real test run would use.
+    """
+
+    env = child_env(base)
+    for name in SANITIZED_ENV_NAMES:
+        env.pop(name, None)
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -374,9 +414,27 @@ def _run_probe(
     timeout: float = _PROBE_TIMEOUT,
     cwd: str | Path | None = None,
     env: Mapping[str, str] | None = None,
+    sanitize: bool = True,
 ) -> tuple[int, str, str]:
-    """Run one bounded probe; never raises."""
+    """Run one bounded probe; never raises.
 
+    By default the probe runs under the **sanitized** environment: the
+    import-leaking names are removed, so no probe can accidentally resolve a
+    package from outside the interpreter it names.  ``env`` is merged **on
+    top of** that sanitized environment rather than replacing it.
+
+    ``sanitize=False`` is used by exactly one caller -- the provenance
+    probe.  That probe has to *measure* the environment the preflight
+    itself inherited, because the whole point of the provenance receipt is
+    to show whether the run's own environment leaked a shared venv into the
+    interpreter's import path.  Measuring a sanitized environment would
+    always come back clean and hide the very thing the receipt exists to
+    reveal.
+    """
+
+    merged = sanitized_env() if sanitize else child_env()
+    if env is not None:
+        merged.update(dict(env))
     try:
         completed = subprocess.run(
             argv,
@@ -385,7 +443,7 @@ def _run_probe(
             timeout=timeout,
             check=False,
             cwd=str(cwd) if cwd is not None else None,
-            env=dict(env) if env is not None else None,
+            env=merged,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return 127, "", f"{type(exc).__name__}: {exc}"
@@ -516,6 +574,154 @@ def _probe_venv_membership(interpreter: Path) -> bool:
         ]
     )
     return code == 0 and stdout.strip() == "1"
+
+
+# The probe that reports where the interpreter, its import path, the repo
+# package, and the test runner actually come from.  It is printed as JSON on
+# one line so the caller can parse it without guessing at the layout.
+_PROVENANCE_SCRIPT = r"""
+import json, os, sys
+out = {
+    "sys_executable": sys.executable,
+    "sys_prefix": sys.prefix,
+    "sys_base_prefix": sys.base_prefix,
+    "sys_path": list(sys.path),
+    "pythonpath": os.environ.get("PYTHONPATH"),
+    "virtual_env": os.environ.get("VIRTUAL_ENV"),
+    "pythonhome": os.environ.get("PYTHONHOME"),
+    "repo_package_path": None,
+    "pytest_path": None,
+}
+try:
+    import lh_harness
+    out["repo_package_path"] = getattr(lh_harness, "__file__", None)
+except Exception:
+    out["repo_package_path"] = None
+try:
+    import pytest
+    out["pytest_path"] = getattr(pytest, "__file__", None)
+except Exception:
+    out["pytest_path"] = None
+print(json.dumps(out))
+"""
+
+
+def collect_provenance(interpreter: str | Path) -> dict[str, Any]:
+    """Record *where* the interpreter's packages actually come from.
+
+    The preflight's job is not just to say "pytest imports" but to say
+    *which* pytest: a run that believes it has a workspace-isolated
+    environment, while its imports are silently resolved from the shared
+    harness venv, is the exact failure this receipt exists to make visible.
+
+    The fields are:
+
+    ``sys_executable``
+        The interpreter that actually ran.
+    ``sys_path``
+        The whole import path, in order.
+    ``repo_package_path``
+        The resolved file path of the repo's own package.
+    ``pytest_path``
+        The resolved file path of the test runner.
+
+    Every one of them is checked against the shared harness venv by
+    :func:`provenance_violations`.
+
+    The probe deliberately runs with the **inherited** environment
+    (``sanitize=False``).  Sanitizing it would hide the very leak the
+    receipt exists to reveal: the harness shell exports
+    ``PYTHONPATH=/home/harness/venv/lib/python3.12/site-packages``, and a
+    sanitized probe would report a clean import path every time.  The
+    preflight *measures* the inherited environment and then acts on it --
+    the install and the collection both run sanitized, so the environment
+    it builds is the sanitized one.
+    """
+
+    code, stdout, _stderr = _run_probe(
+        [str(interpreter), "-c", _PROVENANCE_SCRIPT], timeout=60.0, sanitize=False
+    )
+    if code != 0:
+        return {
+            "sys_executable": str(interpreter),
+            "sys_path": [],
+            "repo_package_path": None,
+            "pytest_path": None,
+            "pythonpath": None,
+            "virtual_env": None,
+            "pythonhome": None,
+            "error": "provenance probe failed",
+        }
+    try:
+        parsed = json.loads(stdout)
+    except Exception:
+        return {
+            "sys_executable": str(interpreter),
+            "sys_path": [],
+            "repo_package_path": None,
+            "pytest_path": None,
+            "pythonpath": None,
+            "virtual_env": None,
+            "pythonhome": None,
+            "error": "provenance probe returned unreadable output",
+        }
+    if not isinstance(parsed, dict):
+        parsed = {}
+    return {
+        "sys_executable": parsed.get("sys_executable"),
+        "sys_prefix": parsed.get("sys_prefix"),
+        "sys_base_prefix": parsed.get("sys_base_prefix"),
+        "sys_path": [str(item) for item in (parsed.get("sys_path") or [])],
+        "repo_package_path": parsed.get("repo_package_path"),
+        "pytest_path": parsed.get("pytest_path"),
+        "pythonpath": parsed.get("pythonpath"),
+        "virtual_env": parsed.get("virtual_env"),
+        "pythonhome": parsed.get("pythonhome"),
+    }
+
+
+def provenance_violations(provenance: Mapping[str, Any]) -> list[str]:
+    """Return the provenance fields that land under the shared harness venv.
+
+    A violation is any resolved path -- the interpreter, an entry of
+    ``sys.path``, the repo package, or pytest -- that lives under the
+    shared harness virtualenv.  The preflight refuses such an environment:
+    the shared venv belongs to every run on the host, so a task environment
+    that resolves packages from it is neither isolated nor reproducible.
+    """
+
+    violations: list[str] = []
+
+    def _check(label: str, value: object) -> None:
+        if isinstance(value, str) and value and _under_shared_harness_venv(value):
+            violations.append(f"{label}={value}")
+
+    _check("sys_executable", provenance.get("sys_executable"))
+    _check("repo_package_path", provenance.get("repo_package_path"))
+    _check("pytest_path", provenance.get("pytest_path"))
+    sys_path = provenance.get("sys_path")
+    if isinstance(sys_path, list):
+        for entry in sys_path:
+            if isinstance(entry, str) and _under_shared_harness_venv(entry):
+                violations.append(f"sys_path={entry}")
+    return violations
+
+
+def _under_shared_harness_venv(path: str) -> bool:
+    """True when ``path`` lives under the shared harness virtualenv.
+
+    The check is a *path-string* comparison: nothing is executed from, or
+    written to, the shared venv.  The comparison is deliberately generous
+    about the surrounding path shape so that a venv nested under the
+    harness home (``/home/harness/venv``, ``/home/harness/work/venv``, ...)
+    is caught too.
+    """
+
+    text = str(path).replace("\\", "/")
+    if "/home/harness/venv" in text:
+        return True
+    parts = {part.lower() for part in text.split("/") if part}
+    return "venv" in parts and "harness" in parts
 
 
 def installed_packages(interpreter: str | Path) -> list[str]:
@@ -684,7 +890,7 @@ def git_baseline(workspace_path: str | Path) -> dict[str, Any]:
     def _git(args: list[str]) -> str | None:
         code, stdout, _stderr = _run_probe(
             git_argv("-C", str(root), *args),
-            env=child_env(),
+            env=sanitized_env(),
         )
         if code != 0:
             return None
@@ -816,6 +1022,11 @@ def prepare_workspace_env(
 
     manifest = read_manifest(root)
     if manifest.declared_test_requirements:
+        # The install runs under the sanitized environment: an inherited
+        # ``PYTHONPATH`` pointing at the shared harness venv would make pip
+        # resolve the declared dependencies *from that venv* instead of
+        # installing them into the new one -- the workspace would look
+        # provisioned while carrying none of its own packages.
         code, stdout, stderr = _run_probe(
             [
                 str(created_interpreter),
@@ -896,6 +1107,7 @@ class PreflightRecord:
     git_baseline: dict[str, Any] = field(default_factory=dict)
     tool_availability: dict[str, Any] = field(default_factory=dict)
     env_preparation: dict[str, Any] = field(default_factory=dict)
+    provenance: dict[str, Any] = field(default_factory=dict)
     prerequisite: dict[str, Any] | None = None
     ok: bool = True
 
@@ -911,6 +1123,7 @@ class PreflightRecord:
             "git_baseline": dict(self.git_baseline),
             "tool_availability": dict(self.tool_availability),
             "env_preparation": dict(self.env_preparation),
+            "provenance": dict(self.provenance),
             "prerequisite": dict(self.prerequisite) if self.prerequisite else None,
             "ok": self.ok,
         }
@@ -924,6 +1137,15 @@ RECEIPT_FIELDS: tuple[str, ...] = (
     "interpreter",
     "collected",
     "tool_availability",
+)
+
+# The provenance fields the receipt must carry, asserted by the test suite so
+# a rename cannot silently drop one of the two carriers.
+PROVENANCE_FIELDS: tuple[str, ...] = (
+    "sys_executable",
+    "sys_path",
+    "repo_package_path",
+    "pytest_path",
 )
 
 
@@ -1005,13 +1227,37 @@ def run_preflight(
 
     interpreter_path = str(resolved_pinned["executable"])
 
-    # 5. The dependency-import check for the declared test extras.
+    # 5. The provenance of that interpreter: where its packages come from.
+    #    The check runs before the import check because a resolution that
+    #    lands under the shared harness venv is a provenance violation even
+    #    when every import happens to succeed.
+    provenance = collect_provenance(interpreter_path)
+    record.provenance = provenance
+    violations = provenance_violations(provenance)
+    if violations:
+        record.prerequisite = PreflightPrerequisite(
+            code="environment_provenance_violation",
+            message=(
+                "the test environment resolves packages from the shared "
+                "harness virtualenv, so it is not workspace-isolated: "
+                + "; ".join(violations[:8])
+            ),
+            detail={
+                "violations": violations[:32],
+                "provenance": provenance,
+                "interpreter": record.interpreter,
+            },
+        ).as_dict()
+        record.ok = False
+        return record
+
+    # 6. The dependency-import check for the declared test extras.
     imports = import_check(interpreter_path, declared)
     record.dependency_imports = imports
     missing = [name for name, ok in imports.items() if not ok]
 
     if missing and allow_env_prep:
-        # 6. Workspace-isolated env prep: build ``.venv-task`` from the
+        # 7. Workspace-isolated env prep: build ``.venv-task`` from the
         #    manifest and reuse it for both the baseline and the candidate.
         preparation = prepare_workspace_env(
             root, interpreter=interpreter_path, allow_install=allow_install
@@ -1022,6 +1268,30 @@ def run_preflight(
             resolved_pinned = resolve_interpreter(root, preferred=prepared)
             record.interpreter = resolved_pinned
             interpreter_path = str(resolved_pinned.get("executable") or prepared)
+            # The prepared environment gets its own provenance check: a
+            # freshly created venv is exactly where a leaked ``PYTHONPATH``
+            # would show up, and the candidate must be as isolated as the
+            # baseline.
+            provenance = collect_provenance(interpreter_path)
+            record.provenance = provenance
+            violations = provenance_violations(provenance)
+            if violations:
+                record.prerequisite = PreflightPrerequisite(
+                    code="environment_provenance_violation",
+                    message=(
+                        "the prepared test environment resolves packages from "
+                        "the shared harness virtualenv, so it is not "
+                        "workspace-isolated: " + "; ".join(violations[:8])
+                    ),
+                    detail={
+                        "violations": violations[:32],
+                        "provenance": provenance,
+                        "interpreter": record.interpreter,
+                        "env_preparation": record.env_preparation,
+                    },
+                ).as_dict()
+                record.ok = False
+                return record
             imports = import_check(interpreter_path, declared)
             record.dependency_imports = imports
             missing = [name for name, ok in imports.items() if not ok]
@@ -1045,8 +1315,10 @@ def run_preflight(
 
     record.installed_packages = installed_packages(interpreter_path)
 
-    # 7. The collection smoke.  Zero collected is a failure unless the repo
-    #    explicitly declares that it has no tests.
+    # 8. The collection smoke.  Zero collected is a failure unless the repo
+    #    explicitly declares that it has no tests.  The collection runs under
+    #    the sanitized environment, so the tests it finds are the tests a
+    #    real run would find.
     collection = collect_tests(interpreter_path, root)
     record.collection = collection.as_dict()
     if collection.collected <= 0 and manifest.has_tests and not manifest.declared_no_tests:

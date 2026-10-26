@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 from typing import Any
 
@@ -409,6 +410,29 @@ def _bare_interpreter(tmp_path: Path) -> str:
     )
     shim.chmod(0o755)
     return str(shim)
+
+
+def _fake_shared_site_packages(tmp_path: Path) -> Path:
+    """A *fake* shared site-packages directory shaped like the real one.
+
+    The shape is what matters: a directory called ``venv`` under a directory
+    called ``harness``, holding a ``lib/python3.12/site-packages``.  It is
+    created under ``tmp_path`` so the scenario never reads, writes, or
+    executes anything from the real shared harness virtualenv -- only the
+    path *shape* is faked, which is what the provenance check keys on.
+
+    The directory carries a real ``httpx2`` package so the refusal is
+    observable: without sanitization the fake would satisfy the import.
+    """
+
+    fake = tmp_path / "fake-home" / "harness" / "venv" / "lib" / "python3.12" / "site-packages"
+    fake.mkdir(parents=True)
+    package = fake / "httpx2"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "MARKER = 'fake-shared-site-packages'\n", encoding="utf-8"
+    )
+    return fake
 
 
 def _git_init_workspace(workspace: Path) -> None:
@@ -974,3 +998,279 @@ async def test_the_snapshot_projects_the_preflight_fields(
     assert snap_preflight["env_manifest"]["ecosystem"] == "python"
     assert snap_preflight["interpreter"]["executable"]
     assert "graphify" in snap_preflight["tool_availability"]
+
+
+# ---------------------------------------------------------------------------
+# LHH-WORKSPACE-TEST-PREFLIGHT -- operator amendment (2026-10-26)
+#
+# The amendment adds the environment *sanitization* and *provenance* cases
+# that the #172 evidence exposed: the harness shell exports
+# ``PYTHONPATH=/home/harness/venv/lib/python3.12/site-packages``, so a child
+# launched with the *workspace* interpreter still resolves packages from the
+# *shared harness* venv.  A preflight that does not sanitize reports a
+# healthy environment a real test run cannot reproduce.
+#
+# The fixture below fakes the shared site-packages **path shape** under
+# ``tmp_path``.  Nothing is ever read from, written to, or executed from the
+# real shared harness virtualenv.
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_sanitizes_the_environment_before_it_probes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(amendment) The preflight's children never inherit PYTHONPATH.
+
+    The probe must see a sanitized environment: an inherited ``PYTHONPATH``
+    would make the preflight's own import check resolve packages from
+    somewhere other than the interpreter it names.
+    """
+
+    from lh_harness.workspace_preflight import SANITIZED_ENV_NAMES, sanitized_env
+
+    monkeypatch.setenv("PYTHONPATH", "/somewhere/shared/site-packages")
+    monkeypatch.setenv("VIRTUAL_ENV", "/somewhere/venv")
+    monkeypatch.setenv("PYTHONHOME", "/somewhere")
+
+    env = sanitized_env()
+
+    for name in SANITIZED_ENV_NAMES:
+        assert name not in env, f"{name} must not reach a preflight child"
+
+
+def test_preflight_detects_and_refuses_a_leaked_shared_venv_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(amendment)(C) A leaked shared-venv resolution fails fast, owner named.
+
+    The workspace's interpreter is a real one, but ``PYTHONPATH`` points at
+    a *fake* shared site-packages shaped like the real one.  The preflight
+    must notice that the interpreter's import path reaches into a shared
+    harness venv and refuse the environment -- with a typed prerequisite that
+    names its owner -- rather than reporting a healthy collection.
+    """
+
+    from lh_harness.workspace_preflight import (
+        PREREQUISITE_OWNER,
+        collect_provenance,
+        provenance_violations,
+        run_preflight,
+    )
+
+    fake_site_packages = _fake_shared_site_packages(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(fake_site_packages))
+
+    workspace = _healthy_workspace(tmp_path)
+
+    # The provenance probe sees the leak ...
+    provenance = collect_provenance(sys.executable)
+    assert any("sys_path" in item for item in provenance_violations(provenance)), (
+        "the leaked PYTHONPATH must show up in the import path"
+    )
+
+    # ... and the preflight refuses it with a typed, owned prerequisite.
+    record = run_preflight(
+        workspace,
+        allow_env_prep=False,
+        allow_install=False,
+    )
+
+    assert record.ok is False, "a leaked shared venv must fail the gate"
+    prerequisite = record.prerequisite
+    assert prerequisite is not None
+    assert prerequisite["code"] == "environment_provenance_violation"
+    assert prerequisite["owner"] == PREREQUISITE_OWNER
+    assert "infra onboarding" in prerequisite["owner"]
+    assert "shared harness" in prerequisite["message"]
+
+
+def test_preflight_resolves_the_module_from_the_workspace_venv_after_sanitization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(amendment) After sanitization the module resolves from the workspace.
+
+    This is the other half of the #172 case: once ``PYTHONPATH`` is gone,
+    the declared extra resolves out of the workspace-local environment --
+    the very isolation the preflight claims.
+
+    The two views are both checked, because they answer different
+    questions: the *inherited* view is what the provenance probe measures
+    (and it still shows the leak), and the *sanitized* view is what the
+    preflight's install and collection actually run under.
+    """
+
+    from lh_harness.workspace_preflight import (
+        _run_probe,
+        collect_provenance,
+        provenance_violations,
+        sanitized_env,
+    )
+
+    fake_site_packages = _fake_shared_site_packages(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(fake_site_packages))
+
+    # A workspace-local environment that genuinely carries its own pytest:
+    # a bare ``pyvenv.cfg`` does not, so the fixture points the venv's
+    # site-packages at the interpreter's own ones.  That makes "resolved
+    # from the workspace venv" a claim the test can actually check.
+    workspace = tmp_path / "venv-repo"
+    workspace.mkdir()
+    venv_dir = workspace / ".venv-task"
+    bin_dir = venv_dir / "bin"
+    lib_dir = venv_dir / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    bin_dir.mkdir(parents=True)
+    lib_dir.mkdir(parents=True)
+    interpreter = bin_dir / "python"
+    interpreter.symlink_to(Path(sys.executable))
+    (venv_dir / "pyvenv.cfg").write_text(
+        f"home = /usr\ninclude-system-site-packages = false\nversion = {sys.version_info.major}.{sys.version_info.minor}\n",
+        encoding="utf-8",
+    )
+    real_site_packages = Path(sysconfig.get_paths()["purelib"])
+    if not real_site_packages.is_dir():  # pragma: no cover - unusual host layout
+        pytest.skip("this interpreter has no site-packages layout to borrow")
+    (lib_dir / "site-packages").symlink_to(real_site_packages)
+
+    # The sanitized environment carries no PYTHONPATH ...
+    env = sanitized_env()
+    assert "PYTHONPATH" not in env
+
+    # ... so a child launched under it resolves pytest from the workspace
+    # environment, never from the fake shared site-packages.
+    code, stdout, stderr = _run_probe(
+        [
+            str(interpreter),
+            "-c",
+            "import pytest; print(pytest.__file__)",
+        ],
+    )
+    assert code == 0, stderr
+    assert str(fake_site_packages) not in stdout, (
+        "the fake shared site-packages must not satisfy the import under the "
+        "sanitized environment"
+    )
+    assert "pytest" in stdout
+    assert str(venv_dir) in stdout, (
+        "pytest must resolve out of the workspace-local environment"
+    )
+
+    # The provenance probe measures the *inherited* environment on purpose:
+    # that is the leak the receipt has to expose.
+    provenance = collect_provenance(interpreter)
+    assert any("sys_path" in item for item in provenance_violations(provenance))
+    assert provenance["sys_executable"]
+    assert provenance["pytest_path"], "the test runner must be resolved"
+
+
+def test_preflight_receipt_carries_the_provenance_fields(
+    tmp_path: Path,
+) -> None:
+    """(D)(amendment) The receipt carries the provenance fields."""
+
+    from lh_harness.workspace_preflight import (
+        PROVENANCE_FIELDS,
+        receipt_from_record,
+        run_preflight,
+    )
+
+    workspace = _healthy_workspace(tmp_path)
+
+    receipt = receipt_from_record(run_preflight(workspace))
+
+    provenance = receipt["provenance"]
+    for field in PROVENANCE_FIELDS:
+        assert field in provenance, f"the provenance must carry {field!r}"
+    assert provenance["sys_executable"]
+    assert provenance["sys_path"], "the whole import path must be recorded"
+    assert provenance["pytest_path"], "the test runner must be resolved"
+
+
+def test_the_snapshot_projects_the_provenance_fields(
+    tmp_path: Path,
+) -> None:
+    """(D)(amendment) The snapshot carries the provenance fields too."""
+
+    from lh_harness.webapi.snapshot import _safe_preflight
+
+    projected = _safe_preflight(
+        {
+            "candidate_sha": "a" * 40,
+            "env_manifest": {"ecosystem": "python"},
+            "interpreter": {"executable": "/w/.venv-task/bin/python"},
+            "collection": {"collected": 3},
+            "tool_availability": {},
+            "provenance": {
+                "sys_executable": "/w/.venv-task/bin/python",
+                "sys_path": ["/w/.venv-task/lib/python3.12/site-packages"],
+                "repo_package_path": "/w/src/lh_harness/__init__.py",
+                "pytest_path": "/w/.venv-task/lib/python3.12/site-packages/pytest/__init__.py",
+                "pythonpath": None,
+                "virtual_env": None,
+                "pythonhome": None,
+            },
+        }
+    )
+
+    provenance = projected["provenance"]
+    assert provenance["sys_executable"] == "/w/.venv-task/bin/python"
+    assert provenance["sys_path"] == [
+        "/w/.venv-task/lib/python3.12/site-packages"
+    ]
+    assert provenance["repo_package_path"] == "/w/src/lh_harness/__init__.py"
+    assert provenance["pytest_path"].endswith("pytest/__init__.py")
+
+
+@pytest.mark.asyncio
+async def test_the_run_gate_fires_on_a_provenance_violation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(C)(amendment) A provenance violation blocks the run before round 1.
+
+    The run must stop at the gate with the owner named, and no round may be
+    dispatched -- the same shape as the missing-dependency gate, so the run
+    never consumes a round on an environment it cannot trust.
+    """
+
+    from lh_harness import workspace_preflight
+
+    fake_site_packages = _fake_shared_site_packages(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(fake_site_packages))
+
+    workspace = _healthy_workspace(tmp_path)
+
+    original_preflight = workspace_preflight.run_preflight
+
+    def _pinned(workspace_path, **kwargs):
+        kwargs["allow_env_prep"] = False
+        kwargs["allow_install"] = False
+        return original_preflight(workspace_path, **kwargs)
+
+    monkeypatch.setattr("lh_harness.manager.run_preflight", _pinned)
+
+    config = HarnessConfig(
+        max_total_episodes=1,
+        workspace_path=str(workspace),
+        harness_dir=str(tmp_path / "harness"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    report = await run(
+        task="observe the workspace",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=config,
+        agent=DoneAgent(),
+        resume=False,
+    )
+
+    assert report["rounds_run"] == 0, "the gate must fire before round 1"
+    assert report["completion_satisfied"] is False
+    assert report["abort_reason"] == "preflight_prerequisite_missing"
+    assert "infra onboarding" in report["failure_reason"]
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "role_orchestration" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert not [item for item in events if item["event"] == "round_start"]

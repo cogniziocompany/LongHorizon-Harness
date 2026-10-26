@@ -248,12 +248,35 @@ def _safe_preflight(value: object) -> dict[str, Any]:
                 "alternate_route": _text(entry.get("alternate_route"), 2048),
             }
 
+    # The provenance fields answer "where did these packages actually come
+    # from?".  They are the evidence that the environment was workspace
+    # isolated rather than resolving out of the shared harness venv.
+    provenance_raw = value.get("provenance")
+    provenance: dict[str, Any] = {}
+    if isinstance(provenance_raw, dict):
+        provenance["sys_executable"] = _text(provenance_raw.get("sys_executable"), 4096)
+        provenance["repo_package_path"] = _text(
+            provenance_raw.get("repo_package_path"), 4096
+        )
+        provenance["pytest_path"] = _text(provenance_raw.get("pytest_path"), 4096)
+        sys_path = provenance_raw.get("sys_path")
+        if isinstance(sys_path, list):
+            provenance["sys_path"] = [
+                _text(item, 4096) for item in sys_path[:64] if isinstance(item, str)
+            ]
+        else:
+            provenance["sys_path"] = []
+        provenance["pythonpath"] = _text(provenance_raw.get("pythonpath"), 4096)
+        provenance["virtual_env"] = _text(provenance_raw.get("virtual_env"), 4096)
+        provenance["pythonhome"] = _text(provenance_raw.get("pythonhome"), 4096)
+
     result: dict[str, Any] = {
         "candidate_sha": candidate_sha,
         "env_manifest": manifest,
         "interpreter": interpreter,
         "collected": collected,
         "tool_availability": tools,
+        "provenance": provenance,
     }
     prerequisite = value.get("prerequisite")
     if isinstance(prerequisite, dict):

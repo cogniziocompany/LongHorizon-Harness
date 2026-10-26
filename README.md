@@ -206,9 +206,13 @@ A **collected count of zero is a failure**, not a green light — a skipped or e
 
 If the declared test extras are missing, the preflight creates a `.venv-task` environment **inside the workspace** from the repo's own manifest (`pip install -e '.[test]'`) and uses that same interpreter for the baseline and the candidate. The shared harness virtualenv is never used and never written to: it is shared by every run on the host, so a per-run install into it would corrupt other runs and hide a broken workspace behind another run's packages.
 
+The preflight also **sanitizes the environment** it hands to every step. `PYTHONPATH`, `VIRTUAL_ENV`, and `PYTHONHOME` are cleared before any install and before any collection, for the baseline and the candidate alike. This matters because the harness shell exports `PYTHONPATH=/home/harness/venv/lib/python3.12/site-packages`: without sanitization a child launched with the *workspace* interpreter still resolves packages from the *shared harness* venv, so the preflight would report a healthy environment that a real test run cannot reproduce.
+
+To make that leak visible rather than silent, the receipt carries the **provenance** of the environment: `sys.executable`, the full `sys.path`, and the resolved file paths of the repo's own package and of `pytest`. If any of them lands under the shared harness virtualenv, the preflight refuses the environment with the same typed prerequisite — naming **infra onboarding** — and the run stops at the gate before any round is consumed.
+
 When a dependency cannot be satisfied from the repo's own manifest, the preflight fails fast with a typed prerequisite naming its owner (**infra onboarding**) and the run stops at that gate — before any round is consumed — instead of spending a round discovering the missing package.
 
-The preflight leaves a receipt in the run directory (`role_orchestration/workspace_preflight.json`) and the same fields in the run snapshot, so you can see exactly what the run saw before it started: the candidate SHA, the env manifest, the interpreter, the collected count, and the tool availability.
+The preflight leaves a receipt in the run directory (`role_orchestration/workspace_preflight.json`) and the same fields in the run snapshot, so you can see exactly what the run saw before it started: the candidate SHA, the env manifest, the interpreter, the collected count, the tool availability, and the provenance fields.
 
 #### 1. Install LongHorizon-Harness
 
