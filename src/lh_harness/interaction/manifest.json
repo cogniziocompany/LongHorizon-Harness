@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "fixture": "interactive-office-local",
+  "bmad_required": false,
+  "stages": [
+    {"id": "manager.plan", "role": "manager", "position": 0},
+    {"id": "executor.build", "role": "executor", "position": 1},
+    {"id": "auditor.verify", "role": "auditor", "position": 2},
+    {"id": "final_response", "role": "final_response", "position": 3}
+  ]
+}
