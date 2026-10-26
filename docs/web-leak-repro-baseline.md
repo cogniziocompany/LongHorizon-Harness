@@ -147,9 +147,20 @@ That is a **full run-dir scan per run** → O(runs²) per request.
 | 20 | yes | 0 | 0 | 8 749 ms |
 | 40 | yes | 0 | 0 | 12 946 ms |
 | 20 | **no** | **35** | **35** | **61 543 ms** |
+| 40 | **no** | **73** | **73** | **274 551 ms (4 min 35 s)** |
 
-35 scans for 20 runs is the quadratic signature (one scan per run, plus the
-listing's own), and it costs **7×** the time of the non-scanning path.
+73 scans for 40 runs is the quadratic signature (roughly one full scan per
+run, plus the listing's own), and it is **quadratic in the measured time**:
+doubling the run dirs (20 → 40) costs **4.5×** the wall clock
+(61.5 s → 274.6 s), not 2×. At CT110's ~800 run dirs this is the 40–140 s
+hang window (and beyond).
+
+**The "cheap" projection is not cheap either.** Against the reproduction's
+520-run fixture, `GET /api/runs?fields=summary` took **14 822 ms** and
+`GET /api/runs` did not answer inside a 40 s client timeout. The cheap path
+(`run_items_cheap` → `supervisor.list_run_summaries`,
+`supervisor/service.py:1687`) still walks every run directory on every
+request; it only avoids the deeper per-run reads.
 
 ### Mechanism 4 — a read endpoint writes to disk
 
@@ -214,6 +225,36 @@ per-request re-scan/re-validation above. The lead is therefore recorded as
 adding as defence in depth, but it is not what produced the CT110 wedge.
 
 ---
+
+## Measurement 3 — the queue symptom explained (the CT110 "queue hangs" report)
+
+CT110 reported `/api/queue` hanging > 40–140 s (curl 000) while the
+unauthenticated probe answered in 5–10 ms. The mechanism is **worker-pool
+saturation**, not a slow queue path:
+
+* `src/lh_harness/queue.py:1603-1617` — `QueueStore.list()` iterates only
+  `self._root` (the `queue/` sub-directory) and reads only `*.json` files.
+  It never touches a run directory. The queue read is therefore O(queue
+  entries), independent of the ~800 run dirs.
+* `src/lh_harness/webapi/server.py:2836-2838` — the `/api/queue` handler
+  calls only `queue_store.list()` / `queue_store.counts()`.
+
+Measured against the reproduction's child server **while the run-list path
+was saturated** (520 fixture run dirs, the script's poll mix running):
+
+| endpoint | idle | under load |
+| --- | ---: | ---: |
+| `GET /api/meta` | ~20 ms | 49–112 ms |
+| `GET /api/queue` | 18–33 ms | **2 613–2 906 ms** |
+
+`/api/queue` is unchanged in cost, but it is **queued behind the saturated
+worker pool**, so it slows by ~100×. The same effect at CT110's scale (62–66
+threads, 800 run dirs) is what produced the 40–140 s hangs and the `curl
+000`. The fix is therefore to make the run-list path cheap, not to make the
+queue path faster.
+
+Child process state during the saturated phase: `Threads: 9`,
+`VmRSS: 71 156 kB` (69.5 MiB).
 
 ## Reproduction commands
 
