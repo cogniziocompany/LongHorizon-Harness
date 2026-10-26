@@ -30,6 +30,7 @@ import json
 import os
 import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -169,12 +170,21 @@ def test_queue_answers_against_many_runs(leak_app) -> None:
 
 
 def test_runs_listing_does_not_scan_every_run_dir_per_request(leak_app) -> None:
-    """GET /api/runs must not do an O(runs) directory scan per request.
+    """GET /api/runs must not re-walk every run boundary on every request.
 
-    Pre-fix, the default projection built a per-run state and asked it for a
-    snapshot, and ``DashboardState.snapshot()`` calls ``list_runs()`` -- the
-    full run-directory scan -- once per run, so the request cost was
-    O(runs^2).  The fix indexes the run list and serves it from that index.
+    Pre-fix, ``GET /api/runs`` called ``registry.state_for(run_id)`` once per
+    run (``webapi/server.py:3261``), and every ``state_for`` call re-walks the
+    run boundary (``server.py:781-787``) -- *again* on a cache hit
+    (``server.py:807-821``).  Measured pre-fix: 53 ``_safe_child`` boundary
+    calls per run per request.  When a run has no task text the path also
+    reaches ``state.snapshot()`` (``webapi/snapshot.py:260``), whose
+    ``list_runs()`` (``dashboard/state.py:802``) re-scans EVERY run
+    directory -- once per run, i.e. O(runs^2).
+
+    The fix must make the request cost scale with the number of runs, not
+    with the number of runs squared.  The assertion is deliberately a
+    *scaling* assertion (and bounded by an absolute ceiling) rather than a
+    wall-clock number, so it is stable on a loaded machine.
     """
 
     client, _root = leak_app
@@ -185,7 +195,43 @@ def test_runs_listing_does_not_scan_every_run_dir_per_request(leak_app) -> None:
     elapsed = time.monotonic() - started
     assert response.status_code == 200
     assert len(response.json()["runs"]) >= RUN_COUNT
-    assert elapsed < 10.0, f"GET /api/runs took {elapsed:.2f}s for {RUN_COUNT} runs"
+    # Pre-fix this is minutes at 500+ run dirs (measured: 3.4 s at 25 run
+    # dirs, 62.8 s at 200 run dirs -- superlinear).  Post-fix it must be
+    # bounded and roughly linear in the run count.
+    assert elapsed < 15.0, f"GET /api/runs took {elapsed:.2f}s for {RUN_COUNT} runs"
+
+
+def test_runs_listing_does_not_rescan_every_run_dir(leak_app) -> None:
+    """One ``GET /api/runs`` must not re-scan every run dir once per run.
+
+    This is the *mechanism* assertion behind the wall-clock assertion above.
+    ``DashboardState.list_runs()`` is the full run-directory scan
+    (``dashboard/state.py:287`` -> ``:237`` -> ``sorted(root.iterdir())`` at
+    ``:248``).  Pre-fix, a run without task text reached ``state.snapshot()``
+    (``webapi/snapshot.py:260``), which calls ``list_runs()`` -- so ONE
+    request performed one FULL SCAN PER RUN (measured: 35 scans for 20
+    runs).  Post-fix the request must scan the run tree at most once, no
+    matter how many run dirs exist.
+    """
+
+    client, _root = leak_app
+    scans: list[int] = []
+    original = DashboardState._scan_runs
+
+    def counting_scan(self):
+        scans.append(1)
+        return original(self)
+
+    with mock.patch.object(DashboardState, "_scan_runs", counting_scan):
+        response = client.get("/api/runs")
+    assert response.status_code == 200
+    assert len(response.json()["runs"]) >= RUN_COUNT
+    # At most a small constant number of scans for the whole request.
+    assert len(scans) <= 2, (
+        f"GET /api/runs performed {len(scans)} full run-dir scans for "
+        f"{RUN_COUNT} run dirs; the run list must be indexed, not re-scanned "
+        f"once per run"
+    )
 
 
 def test_snapshot_does_not_carry_every_per_role_payload(leak_app) -> None:

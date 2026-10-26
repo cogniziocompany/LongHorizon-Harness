@@ -373,7 +373,7 @@ def _wait_for_port(port: int, proc: subprocess.Popen[bytes], timeout: float = 60
 # ---------------------------------------------------------------------------
 # request helpers
 # ---------------------------------------------------------------------------
-def _get(port: int, path: str, timeout: float = 120.0) -> tuple[int, int, float]:
+def _get(port: int, path: str, timeout: float = 30.0) -> tuple[int, int, float]:
     """Return ``(status, body_bytes, elapsed_seconds)`` for one GET.
 
     A timeout is NOT an error here: the wedge this script reproduces is
@@ -396,7 +396,7 @@ def _get(port: int, path: str, timeout: float = 120.0) -> tuple[int, int, float]
     return status, len(body), time.monotonic() - started
 
 
-def _delete(port: int, path: str, timeout: float = 120.0) -> int:
+def _delete(port: int, path: str, timeout: float = 30.0) -> int:
     url = f"http://127.0.0.1:{port}{path}"
     request = urllib.request.Request(url, method="DELETE")
     try:
@@ -452,7 +452,7 @@ def drive_traffic(
     batches: int,
     polls_per_batch: int,
     queue_ids: list[str],
-    timeout: float = 120.0,
+    timeout: float = 30.0,
     include_full_runs: bool = True,
 ) -> list[dict[str, Any]]:
     """Drive the poll mix the dashboard/fleet use; return per-batch rows."""
@@ -597,11 +597,18 @@ def drive_concurrent(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runs", type=int, default=600, help="Fixture run dirs to create.")
-    parser.add_argument("--queue", type=int, default=150, help="Fixture queue entries to create.")
-    parser.add_argument("--batches", type=int, default=8, help="Measurement batches.")
+    parser.add_argument("--runs", type=int, default=520, help="Fixture run dirs to create.")
+    parser.add_argument("--queue", type=int, default=120, help="Fixture queue entries to create.")
+    parser.add_argument("--batches", type=int, default=4, help="Measurement batches.")
     parser.add_argument(
-        "--polls-per-batch", type=int, default=25, help="Poll rounds per batch."
+        "--polls-per-batch",
+        type=int,
+        default=4,
+        help=(
+            "Poll rounds per batch.  Kept small by default: at 500+ run dirs "
+            "a single full run-list request takes minutes pre-fix, so a big "
+            "poll count would not finish inside the reproduction's budget."
+        ),
     )
     parser.add_argument(
         "--concurrent-workers",
@@ -618,13 +625,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--request-timeout",
         type=float,
-        default=120.0,
-        help="Per-request timeout in seconds.",
+        default=30.0,
+        help=(
+            "Per-request timeout in seconds.  Kept short on purpose: the "
+            "pre-fix wedge makes a single full run-list request take minutes "
+            "at 500+ run dirs, and a timeout IS the measurement."
+        ),
     )
     parser.add_argument(
         "--wedge-timeout",
         type=float,
-        default=300.0,
+        default=180.0,
         help="Timeout for the dedicated wedge measurement of the full run list.",
     )
     parser.add_argument(
