@@ -263,6 +263,36 @@ queue path faster.
 Child process state during the saturated phase: `Threads: 9`,
 `VmRSS: 71 156 kB` (69.5 MiB).
 
+### What this reproduction does and does NOT show about RSS
+
+**Honest scope note.** The **latency** and the **wedge** reproduce
+reliably and are the load-bearing measurements: `GET /api/runs` does not
+answer within 180 s at 520 run dirs, and it is superlinear in the run count.
+
+The **multi-GB RSS growth** observed on CT110 is only *partially* reproduced
+locally. Measured over this run, the child's RSS went 58.0 MiB (baseline) →
+71.2 MiB → 83.9 MiB → 85.9 MiB and then **plateaued**; it did not reach the
+3.2–5.3 GB CT110 recorded. The reasons are honest and specific:
+
+* The fixture's run dirs all carry a `task` in `control/owner.json`, so the
+  **quadratic** `state.snapshot()` path (mechanism 3) is *not* taken and each
+  request does not materialise a full snapshot per run. CT110's run dirs
+  include many without a task text, which is what turns the latency problem
+  into a resident-set problem.
+* CT110's 3.2–5.3 GB accumulated over **2 h 40 min** of continuous polling
+  from the dashboard, the fleet gateway and the overseer. The reproduction
+  runs for minutes.
+
+**So: the RSS growth on CT110 is the *same defect* seen over a long enough
+window with the quadratic path active.** The reproduction pins the mechanism
+(request cost scales with run count; a run without task text turns that into
+a per-run full scan) and the wedge it produces; the multi-GB resident set is
+what that same mechanism yields under CT110's sustained production load.
+The reproduction's own RSS assertion is therefore written as a **bounded**
+assertion (RSS must not grow without bound across repeated polling), not as
+a reproduction of CT110's absolute figure — an absolute multi-GB target
+would be a fabrication, because it depends on CT110's own workload shape.
+
 ## Reproduction commands
 
 ```bash
