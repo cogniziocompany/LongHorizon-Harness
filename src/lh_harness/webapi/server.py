@@ -58,7 +58,7 @@ from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token,
 from .. import effect_lease, effect_lease_wire
 from ..overseer_state import resolve_overseer_root
 from . import mcp_jsonrpc as mcp_protocol
-from ..build_info import build_info
+from ..build_info import build_info, package_build_info
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import (
@@ -549,8 +549,20 @@ def _bearer_matches(value: str | None, token: str | None) -> bool:
 # share the authentication logic rather than duplicating it.
 _BEARER_GUARDED_PREFIXES = ("/api/", "/mcp", "/mcp/")
 
+# The liveness probe is deliberately OUTSIDE the bearer boundary.  The node
+# deploy (scripts/deploy-node.sh) reads it back right after it restarts the
+# service, and it must do so WITHOUT reading the service's credentials: the
+# secrets file is never opened by the deploy.  The endpoint therefore answers
+# with nothing but a status string -- no run ids, no paths, no settings, no
+# build identity -- so an unauthenticated caller learns only that the process
+# is serving.  Everything the deploy actually needs to verify (the deployed
+# commit) is read from /api/meta, which stays behind the bearer.
+_PUBLIC_API_PATHS = frozenset({"/api/health"})
+
 
 def _path_requires_bearer(path: str) -> bool:
+    if path in _PUBLIC_API_PATHS:
+        return False
     return any(path == prefix or path.startswith(prefix) for prefix in _BEARER_GUARDED_PREFIXES)
 
 
@@ -1847,7 +1859,10 @@ def create_app(
     app = FastAPI(title="LongHorizon-Harness Web API", version="1", lifespan=_lifespan)
     # Read the build identity once, at startup: /api/meta must describe the
     # code this process loaded, not a wheel installed underneath it later.
-    build_info()
+    # The PACKAGE value is cached (package_build_info); the deploy receipt
+    # that scripts/deploy-node.sh writes is re-read per request, so a receipt
+    # left by a deploy is visible to the next process without a restart.
+    package_build_info()
     app.state.registry = registry
     app.state.queue_store = queue_store
     app.state.auth_token = token
@@ -1936,6 +1951,19 @@ def create_app(
         if channel is None:
             return {"connected": False, "since": None, "last_error": None}
         return channel.status()
+
+    @app.get("/api/health")
+    def health() -> dict[str, Any]:
+        """Liveness probe: the process is serving.
+
+        Deliberately outside the bearer boundary (see ``_PUBLIC_API_PATHS``) so
+        the node deploy can read it back after a restart without handling a
+        credential.  It therefore reports NOTHING but liveness: no run ids, no
+        paths, no settings and no build identity.  The deploy reads the
+        deployed commit from /api/meta, which stays behind the bearer.
+        """
+
+        return {"status": "ok", "service": "lh-harness"}
 
     @app.get("/api/meta")
     def meta(request: Request) -> dict[str, Any]:

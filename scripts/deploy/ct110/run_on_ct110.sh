@@ -19,6 +19,7 @@
 #   run_on_ct110.sh deploy          stage wheel+script, run deploy inside CT110
 #   run_on_ct110.sh rollback        stage script, run rollback inside CT110
 #   run_on_ct110.sh units           stage script+units, install units inside CT110 (TASK 236)
+#   run_on_ct110.sh script <file> [args...]   stage a script, run it inside CT110
 #   run_on_ct110.sh exec <cmd...>   run an arbitrary command inside CT110
 #
 # Required environment: PVE_HOST, PVE_USER, SSH_KEY_FILE, CT_ID.
@@ -26,6 +27,13 @@
 # wheel was built from; the inner script verifies the installed build commit).
 # The wheel is picked up from ./stage/.
 # units additionally: the two unit files from packaging/ staged under ./stage/units/.
+#
+# script mode (added for LHH-DEPLOY-CT110-PIPELINE) stages ONE script from
+# ./stage/ and runs it inside the container with the given arguments.  It
+# reuses the byte-verified transfer path above unchanged: the payload moves as
+# BYTES, is sha256-verified at both hops, and is refused on mismatch.  This
+# is how scripts/deploy-node.sh reaches the node for a ref-based deploy; the
+# node-side script installs from a git ref, so there is no wheel to stage.
 set -euo pipefail
 
 MODE="${1:?usage: run_on_ct110.sh deploy|rollback|exec ...}"
@@ -87,8 +95,30 @@ if [[ "$MODE" == "exec" ]]; then
   exit $?
 fi
 
-[[ "$MODE" == "deploy" || "$MODE" == "rollback" || "$MODE" == "units" ]] || {
-  echo "usage: run_on_ct110.sh deploy|rollback|units|exec ..." >&2; exit 1; }
+[[ "$MODE" == "deploy" || "$MODE" == "rollback" || "$MODE" == "units" || "$MODE" == "script" ]] || {
+  echo "usage: run_on_ct110.sh deploy|rollback|units|script <file> [args...]|exec ..." >&2; exit 1; }
+
+# --- script mode: stage ONE script from ./stage/ and run it ---------------
+# Added for LHH-DEPLOY-CT110-PIPELINE: scripts/deploy-node.sh installs from
+# a git REF, so there is no wheel to stage -- but the script itself still has
+# to reach the node as BYTES with both hops sha256-verified, exactly like
+# every other payload this script moves.
+SCRIPT_REMOTE_NAME=""
+SCRIPT_ARGS=()
+# Environment variables passed INTO the container for script mode.  Names
+# only here; the values are read from the caller's environment at run time
+# and are never printed.  LH_HARNESS_WEB_TOKEN is the one the node deploy
+# needs: it authenticates the /api/meta read-back without the deploy ever
+# opening the node's secrets file.
+SCRIPT_ENV_NAMES=("LH_HARNESS_WEB_TOKEN" "LH_DEPLOY_REF" "LH_DRAIN_WAIT")
+if [[ "$MODE" == "script" ]]; then
+  shift
+  [[ $# -ge 1 ]] || { echo "script mode needs a script path" >&2; exit 1; }
+  script_path="$1"; shift
+  [[ -f "$script_path" ]] || { echo "script mode: no such file: $script_path" >&2; exit 1; }
+  SCRIPT_REMOTE_NAME="$(basename "$script_path")"
+  SCRIPT_ARGS=("$@")
+fi
 
 # --- stage payload ----------------------------------------------------------
 payload=("$INNER_LOCAL")
@@ -115,6 +145,9 @@ if [[ "$MODE" == "units" ]]; then
   [[ -f "$SCRIPT_DIR/ct110_units.sh" ]] || {
     echo "expected ct110_units.sh next to run_on_ct110.sh" >&2; exit 1; }
   payload+=("$SCRIPT_DIR/ct110_units.sh" "${units[@]}")
+fi
+if [[ "$MODE" == "script" ]]; then
+  payload+=("$script_path")
 fi
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -148,4 +181,35 @@ done
 "${SSH[@]}" "rm -rf '$remote_tmp'"
 
 # --- execute ----------------------------------------------------------------
+if [[ "$MODE" == "script" ]]; then
+  # Run the staged script inside the container with the caller's arguments.
+  # Each argument is re-escaped individually so the remote shell sees exactly
+  # what the caller passed ($* alone would silently drop quoting).
+  #
+  # SCRIPT_ENV names environment variables that must reach the script
+  # INSIDE the container (a `pct exec` does not inherit the runner's
+  # environment).  The values are passed through `env NAME=value`, the same
+  # way run_inner passes LH_EXPECTED_VERSION/LH_EXPECTED_COMMIT.  Only the
+  # names are configured here; the values come from the caller's environment
+  # and are never printed.
+  full="pct exec $CT_ID -- env"
+  for name in ${SCRIPT_ENV_NAMES[@]+"${SCRIPT_ENV_NAMES[@]}"}; do
+    full="$full $(printf '%q=%q' "$name" "${!name-}")"
+  done
+  full="$full bash '$REMOTE_DIR/$SCRIPT_REMOTE_NAME'"
+  for arg in ${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"}; do
+    full="$full $(printf '%q' "$arg")"
+  done
+  set +e
+  remote_exec "$full"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 2 ]]; then
+    # Same overloaded rc as the inner script: the remote stderr block above
+    # says whether this was an operator abort or a parse failure.
+    echo "::error::remote rc=2 (OVERLOADED per the 2026-09-18 lesson): read the stderr block above before interpreting it." >&2
+  fi
+  exit "$rc"
+fi
+
 run_inner "$MODE"
