@@ -212,7 +212,16 @@ To make that leak visible rather than silent, the receipt carries the **provenan
 
 When a dependency cannot be satisfied from the repo's own manifest, the preflight fails fast with a typed prerequisite naming its owner (**infra onboarding**) and the run stops at that gate — before any round is consumed — instead of spending a round discovering the missing package.
 
-The preflight leaves a receipt in the run directory (`role_orchestration/workspace_preflight.json`) and the same fields in the run snapshot, so you can see exactly what the run saw before it started: the candidate SHA, the env manifest, the interpreter, the collected count, the tool availability, and the provenance fields.
+The preflight distinguishes two kinds of "not green", because they call for different responses:
+
+| Outcome | Meaning | What happens |
+|---|---|---|
+| **Typed prerequisite** | A dependency the preflight cannot satisfy from the repo's own manifest (or an environment that resolves packages from the shared harness venv). | The run stops at the gate and names the owner (**infra onboarding**). |
+| **Typed readiness gap** | The preflight could not *determine* the workspace's declared test suite: the manifest is missing or unreadable, or the repo declares a suite the preflight cannot drive (a Node or Go suite). | The run stops at the gate with `abort_reason: preflight_readiness_gap` and no owner is named — this is not a dependency problem. |
+
+A **missing manifest is not "the repo declares no tests"**. A wrong working directory, a partial checkout, and a repo whose manifest this preflight does not recognise all produce a readiness gap rather than a green. The only two ways an absent test suite is legitimate are an explicit declaration in the repo's own manifest (for example `testpaths = []`) and an explicit task- or profile-level applicability signal; neither is inferred. The preflight never forces a Python runner onto a non-Python repository: a declared Node suite is reported as a gap naming its runner (`npm test`), not collected with pytest.
+
+The preflight leaves a receipt in the run directory (`role_orchestration/workspace_preflight.json`) and the same fields in the run snapshot, so you can see exactly what the run saw before it started: the candidate SHA, the env manifest, the interpreter, the collected count, the tool availability, and the provenance fields. A readiness gap rides in both carriers under its own `kind`, beside — and distinct from — the prerequisite.
 
 #### 1. Install LongHorizon-Harness
 
