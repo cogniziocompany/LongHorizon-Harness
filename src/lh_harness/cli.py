@@ -959,6 +959,50 @@ def main(argv: list[str] | None = None) -> int:
         help="Actually move/delete. The default is dry-run; run once, read the report, then re-run with --apply.",
     )
 
+    # LHH-QUEUE-MIGRATION-TOMBSTONE (E): the operator entry point for moving
+    # a PENDING queue entry to another node.  It uses the endpoint
+    # (POST /api/queue/{queue_id}/migrate) -- the CLI never writes the queue
+    # itself, so the tombstone is always created by the same server-side
+    # transaction that a direct API caller gets.
+    queue_parser = add_command("queue", "Queue operations")
+    queue_actions = queue_parser.add_subparsers(dest="queue_command")
+    queue_migrate = queue_actions.add_parser(
+        "migrate",
+        help="Move a pending queue entry to another node",
+        epilog=_EPILOG,
+        formatter_class=_HelpFormatter,
+    )
+    queue_migrate.add_argument("queue_id", help="The queue id of the PENDING entry to move.")
+    queue_migrate.add_argument(
+        "--to",
+        dest="dest_node",
+        required=True,
+        help="The destination node's fleet name.",
+    )
+    queue_migrate.add_argument(
+        "--dest-url",
+        dest="dest_base_url",
+        default=os.environ.get("LH_HARNESS_QUEUE_DEST_URL"),
+        help="The destination node's API base URL (also LH_HARNESS_QUEUE_DEST_URL).",
+    )
+    queue_migrate.add_argument(
+        "--idempotency-key",
+        dest="idempotency_key",
+        default=None,
+        help="Idempotency key for the migration (default: derived from the queue id and the destination).",
+    )
+    queue_migrate.add_argument(
+        "--api-url",
+        dest="api_url",
+        default=os.environ.get("LH_HARNESS_QUEUE_API_URL", "http://127.0.0.1:8799"),
+        help="The local web API base URL that serves the queue (also LH_HARNESS_QUEUE_API_URL).",
+    )
+    queue_migrate.add_argument(
+        "--auth-token",
+        default=os.environ.get("LH_HARNESS_WEB_TOKEN"),
+        help="Bearer token for the web API (also LH_HARNESS_WEB_TOKEN).",
+    )
+
     try:
         args = parser.parse_args(raw_argv)
     except SystemExit:
@@ -1009,6 +1053,11 @@ def main(argv: list[str] | None = None) -> int:
         return _check_update_command()
     if args.command == "retention":
         return _retention_command(args)
+    if args.command == "queue":
+        if not args.queue_command:
+            queue_parser.print_help()
+            return 2
+        return _queue_command(args)
 
     parser.print_help()
     return 2
@@ -2675,6 +2724,92 @@ def _retention_command(args: argparse.Namespace) -> int:
     _write_report(report_path, payload)
     print(json.dumps(payload, indent=2, sort_keys=True))
     print(f"\nreport written to {report_path}", file=sys.stderr)
+    return 0
+
+
+def _queue_command(args: argparse.Namespace) -> int:
+    """`lh-harness queue migrate <queue_id> --to <node>`.
+
+    LHH-QUEUE-MIGRATION-TOMBSTONE (E).  The operator entry point for moving a
+    PENDING queue entry to another node.  It goes through the endpoint
+    (``POST /api/queue/{queue_id}/migrate``) rather than writing the queue
+    itself, so the tombstone is created by exactly the same server-side
+    transaction a direct API caller gets -- one transaction that tombstones
+    the source BEFORE the destination entry is created, so there is never an
+    instant at which both nodes hold a launchable copy.
+
+    The command is idempotent: the idempotency key defaults to a value
+    derived from the queue id and the destination, so re-running the same
+    command converges on the same destination entry instead of creating a
+    second one.
+    """
+
+    if args.queue_command != "migrate":
+        print(f"unknown queue command: {args.queue_command}", file=sys.stderr)
+        return 2
+
+    import json
+    import urllib.error
+    import urllib.request
+    from urllib.parse import quote
+
+    queue_id = str(args.queue_id).strip()
+    dest_node = str(args.dest_node).strip()
+    dest_base_url = str(args.dest_base_url or "").strip()
+    if not queue_id:
+        print("queue_id is required", file=sys.stderr)
+        return 2
+    if not dest_node:
+        print("--to <node> is required", file=sys.stderr)
+        return 2
+    if not dest_base_url:
+        print(
+            "--dest-url is required (the destination node's API base URL)",
+            file=sys.stderr,
+        )
+        return 2
+    idempotency_key = str(args.idempotency_key or "").strip() or (
+        f"queue-migrate:{queue_id}:{dest_node}"
+    )
+
+    api_url = str(args.api_url or "").strip().rstrip("/")
+    if not api_url:
+        print("--api-url is required", file=sys.stderr)
+        return 2
+    body = {
+        "dest_node": dest_node,
+        "dest_base_url": dest_base_url,
+        "idempotency_key": idempotency_key,
+    }
+    request = urllib.request.Request(
+        f"{api_url}/api/queue/{quote(queue_id, safe='')}/migrate",
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Idempotency-Key": idempotency_key,
+        },
+    )
+    token = str(args.auth_token or "").strip()
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310 - operator-supplied local API URL
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        try:
+            detail = json.loads(raw.decode("utf-8")).get("detail", raw.decode("utf-8"))
+        except Exception:
+            detail = raw.decode("utf-8", errors="replace")
+        print(f"migrate failed (HTTP {exc.code}): {detail}", file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"cannot reach the queue API at {api_url}: {exc}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
 

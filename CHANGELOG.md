@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses anything else), the #160 reconciliation sweep never re-creates or
   writes one (it reconciles `launched` entries against the run they launched;
   a tombstone was never launched), and a tombstone is retained on the same
-  terms as a finished entry — the record stays on disk and is still listed.
+  terms as a finished entry -- the record stays on disk and is still listed.
   It frees its `dedup_key` like `done`/`failed` do, and it is never reported
   as pending: `GET /api/queue` reports it in its own `migrated` group,
   `?status=migrated` filters on it, and `GET /api/queue/stats` counts it
@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `migration_epoch` on the source.  `QueueStore.mark_migrated` writes the
   status change and the link in ONE atomic write, so a reader never observes
   a tombstone without its destination link, and it refuses anything that is
-  not `pending` — a launched entry has a live run behind it and is never
+  not `pending` -- a launched entry has a live run behind it and is never
   migrated.  Migration `008_harness_queue_migration_tombstone.sql` adds the
   Postgres columns (`migrated_to JSONB`, `migrated_from JSONB`,
   `migration_epoch INTEGER`) and adds the `migrated` value to the
@@ -40,6 +40,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Scope: the state model only.  The migrate endpoint, the recovery path and
   the operator CLI are separate work built on top of it.
+
+- **`POST /api/queue/{queue_id}/migrate` moves a pending entry to another node.**
+  LHH-QUEUE-MIGRATION-TOMBSTONE (slice B).  Body:
+  `{dest_node, dest_base_url, idempotency_key}`.
+
+  The order is the guarantee.  ONE source-side transaction tombstones the
+  source entry first -- status `migrated`, terminal, so this node can never
+  launch it again -- and ONLY THEN is the destination entry created, through
+  the destination's own `POST /api/queue`.  At no instant do both nodes hold
+  a launchable copy of the same work.  This closes the duplicate-writer
+  window that an "enqueue on B, then cancel on A" sequence leaves open: the
+  source goes durable-first, rather than the two sides agreeing later.  It
+  also satisfies the review requirement that the destination claim be gated
+  on a confirmed source cancel -- the source is not merely cancelled, it is
+  durably unable to launch.
+
+  The destination body carries the exact field mapping: the same task text,
+  name, trio, priority and `max_rounds`, the workspace BASENAME (the
+  destination has its own root), `dedup_key = <source queue_id>:<dest
+  node>`, `requested_by` carrying the source id, and the `migrated_from`
+  link back to the source.  The `dedup_key` makes the create idempotent --
+  the destination's own semantics return the existing entry rather than
+  minting a second one -- so a retry of the same call converges on ONE
+  destination entry.  The `migrated_from` link is self-verifying: the source
+  id it names must be the source half of the entry's own `dedup_key`, so a
+  body cannot claim an origin that contradicts its idempotency key.
+
+  On a destination failure the source STAYS tombstoned with
+  `migrated_to.pending = true` and the call answers 502.  The source is
+  deliberately not resurrected -- that would reopen the window.  Re-running
+  the same call completes the migration idempotently.
+
+  Only PENDING entries are accepted: a `launched` entry owns a live run and
+  is refused with 409.  Running runs are untouched.
+
+- **A partial migration pair is repaired automatically.**
+  LHH-QUEUE-MIGRATION-TOMBSTONE (slice C).  A source tombstone whose
+  `migrated_to.pending` is still true is a partial pair: the create never
+  landed, so the work is on neither side.  The repair runs on web start
+  (before the launcher starts) and in the #160 reconciliation sweep.  The
+  destination is asked whether it already holds the work, identified by the
+  `dedup_key`: present -> the link is finalized; absent -> the entry is
+  re-created from the source's stored task text.  One log line per repair.
+  An unreachable destination leaves the tombstone pending, which is the safe
+  outcome -- the source stays tombstoned, so there is still exactly one
+  possible writer.
+
+- **`lh-harness queue migrate <queue_id> --to <node>`.**
+  LHH-QUEUE-MIGRATION-TOMBSTONE (slice E).  The operator entry point for
+  moving a pending entry to another node.  It goes through the endpoint, so
+  the tombstone is created by exactly the same server-side transaction a
+  direct API caller gets.  `--dest-url` names the destination's API base URL,
+  `--idempotency-key` defaults to a value derived from the queue id and the
+  destination (so re-running the same command converges on the same entry),
+  and `--api-url` / `--auth-token` address the local web API.
 
 - **The launcher enforces a node-level active-run ceiling.** `[queue] node_max_runs`
   is the maximum number of runs the launcher will let be active on THIS node at
