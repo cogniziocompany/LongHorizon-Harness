@@ -47,6 +47,11 @@ from .lifecycle import (
     is_terminal_status,
     resume_epoch,
 )
+from .admission import (
+    AdmissionRefused,
+    NodeAdmission,
+    admission_settings_from_values,
+)
 from ..agent_registry import normalise_reasoning_effort, supports_reasoning_effort
 from .. import worker_isolation
 from ..workspace_park import park_workspace
@@ -112,6 +117,27 @@ def _config_worker_memory_max() -> str | None:
 
 _ROLE_KEYS = ("manager", "executor", "auditor")
 _AGENT_CHOICES = frozenset({"codex", "claude_code", "deepseek_harness", "opencode"})
+
+
+def _admission_settings_reader() -> dict[str, str] | None:
+    """The settings store's value map for the admission limits, or None.
+
+    Fail-open reader for ``NodeAdmission``: the active settings store is
+    the runtime authority (LHH-QUEUE-HOTRELOAD's convention -- DB over
+    env, applied at service start); an unconfigured or unreadable store
+    returns None and the admission module keeps its documented defaults.
+    Never raises: the launch path must not fail over a settings read.
+    """
+
+    try:
+        from ..settings_store import active_runtime
+
+        store = getattr(active_runtime(), "store", None)
+        if store is None:
+            return None
+        return store.values()
+    except Exception:  # noqa: BLE001 - unreadable store keeps the defaults
+        return None
 
 
 def _default_model_for_agent(agent: str) -> str:
@@ -833,6 +859,21 @@ class RunSupervisor:
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._commands: dict[str, list[str]] = {}
         self._lifecycle_lock = threading.RLock()
+        # LHH-CT110-MEMORY-ADMISSION (operator amendment): the node-wide
+        # admission boundary lives HERE, at the shared supervisor boundary,
+        # so every launch path -- the queue launcher's _launch and the API's
+        # POST /api/runs, both of which call create_run -- acquires a
+        # PENDING STARTUP reservation under one lock before any worker is
+        # spawned.  The settings reader resolves the three limits from the
+        # active settings store on every decision (hot-reload, like the
+        # lane caps); an unreadable store keeps the documented defaults
+        # inside the admission module.
+        self.admission = NodeAdmission(settings_reader=_admission_settings_reader)
+        # Deliverable C/D: rebuild the published live set from run dirs
+        # (live processes and their durable status records) at start.  A
+        # node already over the cap stays over: nothing is killed and
+        # nothing is admitted until the count drops below node_max.
+        self.admission.reconcile_from_supervisor(self)
 
     @contextmanager
     def _supervisor_locked(self):
@@ -2152,11 +2193,25 @@ class RunSupervisor:
         )
         run_id = run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
         run_dir = self._run_dir(run_id)
-        with self.reserve_workspace(workspace) as workspace_path:
-            return self._create_run_once_reserved(
-                task=task,
-                agent=agent,
-                model=model,
+        # LHH-CT110-MEMORY-ADMISSION (A, operator amendment): the ONE
+        # node-wide admission decision, taken at the shared supervisor
+        # boundary every launch path funnels through -- the queue
+        # launcher's _launch and the API's POST /api/runs both reach this
+        # line.  reserve_startup takes a PENDING STARTUP reservation under
+        # the admission lock (so two paths racing for the last slot cannot
+        # both win) and raises AdmissionRefused when reservations +
+        # running + starting across ALL lanes has reached
+        # LH_HARNESS_NODE_MAX_RUNS, or when the memory headroom gate
+        # refuses.  The reservation is released on every failed-start path
+        # below (and idempotently at publish), so a crash or a failed
+        # start frees its slot immediately.
+        self.admission.reserve_startup(run_id)
+        try:
+            with self.reserve_workspace(workspace) as workspace_path:
+                return self._create_run_once_reserved(
+                    task=task,
+                    agent=agent,
+                    model=model,
                 role_configs=role_configs,
                 resolved_role_configs=resolved_role_configs,
                 workspace_path=workspace_path,
