@@ -378,17 +378,38 @@ async def _run_impl(
     )
     if preflight_record is not None and not preflight_record.ok:
         prerequisite = preflight_record.prerequisite or {}
-        reason = str(prerequisite.get("message") or "workspace preflight failed")
-        owner = str(prerequisite.get("owner") or PREREQUISITE_OWNER)
-        gate.abort_reason = "preflight_prerequisite_missing"
-        gate.completion_satisfied = False
-        gate.failure_reason = f"{reason} (owner: {owner})"
-        emit(
-            "preflight_blocked",
-            code=prerequisite.get("code"),
-            owner=owner,
-            reason=reason,
-        )
+        # -- amendment-3: a readiness gap is not an owned dependency
+        # problem.  It says the preflight could not *determine* the
+        # workspace's declared test suite (a missing or unreadable
+        # manifest, an unsupported suite), which is a different fact from
+        # "a dependency is missing and infra onboarding owns it".  The two
+        # are reported with different abort reasons so an overseer reading
+        # the run snapshot can tell them apart -- and so a readiness gap is
+        # never laundered into an owned prerequisite.
+        gap = preflight_record.readiness_gap or {}
+        if gap and not prerequisite:
+            reason = str(gap.get("message") or "workspace preflight could not determine the test suite")
+            gate.abort_reason = "preflight_readiness_gap"
+            gate.completion_satisfied = False
+            gate.failure_reason = reason
+            emit(
+                "preflight_readiness_gap",
+                code=gap.get("code"),
+                kind=gap.get("kind"),
+                reason=reason,
+            )
+        else:
+            reason = str(prerequisite.get("message") or "workspace preflight failed")
+            owner = str(prerequisite.get("owner") or PREREQUISITE_OWNER)
+            gate.abort_reason = "preflight_prerequisite_missing"
+            gate.completion_satisfied = False
+            gate.failure_reason = f"{reason} (owner: {owner})"
+            emit(
+                "preflight_blocked",
+                code=prerequisite.get("code"),
+                owner=owner,
+                reason=reason,
+            )
         return await _finalize_preflight_blocked_run(
             task=task,
             rounds=rounds,

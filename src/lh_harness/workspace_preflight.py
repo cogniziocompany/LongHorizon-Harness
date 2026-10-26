@@ -283,6 +283,25 @@ class ManifestInfo:
     # True when the repo has a test suite the preflight can look for: a
     # declared test extra, a declared test script, or a test directory.
     has_tests: bool = False
+    # -- amendment-3: the manifest's own health ------------------------------
+    #
+    # "No manifest" and "the repo declares no tests" are *different* facts and
+    # must never be conflated.  A workspace whose manifest is missing,
+    # unreadable, or simply not one this module knows how to read is a
+    # workspace whose declared test suite is **unknown** -- not empty.  The
+    # preflight reports that as a readiness gap rather than as a healthy
+    # "no tests" green.
+    #
+    # ``manifest_found``   -- at least one known manifest file exists.
+    # ``manifest_error``   -- a manifest exists but could not be read.
+    # ``suite_kind``       -- which test runner the declared suite implies:
+    #                         "python", "node", "go", or "unknown".  A repo may
+    #                         be polyglot; the *test* ecosystem is what
+    #                         matters here, and it is not assumed to be
+    #                         Python.
+    manifest_found: bool = False
+    manifest_error: str | None = None
+    suite_kind: str = "unknown"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -294,6 +313,9 @@ class ManifestInfo:
             "node_test_scripts": list(self.node_test_scripts),
             "requires_python": self.requires_python,
             "has_tests": self.has_tests,
+            "manifest_found": self.manifest_found,
+            "manifest_error": self.manifest_error,
+            "suite_kind": self.suite_kind,
         }
 
 
@@ -327,60 +349,76 @@ def read_manifest(workspace_path: str | Path) -> ManifestInfo:
 
     pyproject = root / "pyproject.toml"
     if pyproject.is_file():
-        text = _read_text(pyproject) or ""
-        info.ecosystem = "python"
-        info.manifest_path = str(pyproject)
-        info.declared_test_requirements = _pyproject_test_extras(text)
-        info.declared_no_tests = _pyproject_declares_no_tests(text)
-        match = re.search(r'(?m)^\s*requires-python\s*=\s*"([^"]+)"', text)
-        if match:
-            info.requires_python = match.group(1)
-        for name in PYTHON_MANIFESTS[1:]:
-            if (root / name).is_file():
-                info.lock_paths.append(str(root / name))
-        # A requirements*.txt may carry the test extras when pyproject does
-        # not declare them.
-        if not info.declared_test_requirements:
-            for name in PYTHON_MANIFESTS[3:]:
-                candidate = root / name
-                if not candidate.is_file():
-                    continue
-                body = _read_text(candidate)
-                if body:
-                    names = _requirements_txt_names(body)
-                    if names:
-                        info.declared_test_requirements = names
-                        break
+        info.manifest_found = True
+        text = _read_text(pyproject)
+        if text is None:
+            # The manifest exists but cannot be read (permissions, a binary
+            # file, an I/O error).  That is *not* "the repo declares no
+            # tests" -- it is an unreadable declaration.
+            info.manifest_error = f"could not read {pyproject}"
+        else:
+            info.ecosystem = "python"
+            info.manifest_path = str(pyproject)
+            info.declared_test_requirements = _pyproject_test_extras(text)
+            info.declared_no_tests = _pyproject_declares_no_tests(text)
+            match = re.search(r'(?m)^\s*requires-python\s*=\s*"([^"]+)"', text)
+            if match:
+                info.requires_python = match.group(1)
+            for name in PYTHON_MANIFESTS[1:]:
+                if (root / name).is_file():
+                    info.lock_paths.append(str(root / name))
+            # A requirements*.txt may carry the test extras when pyproject
+            # does not declare them.
+            if not info.declared_test_requirements:
+                for name in PYTHON_MANIFESTS[3:]:
+                    candidate = root / name
+                    if not candidate.is_file():
+                        continue
+                    body = _read_text(candidate)
+                    if body:
+                        names = _requirements_txt_names(body)
+                        if names:
+                            info.declared_test_requirements = names
+                            break
     else:
         requirements = [
             root / name for name in PYTHON_MANIFESTS[3:] if (root / name).is_file()
         ]
         if requirements:
+            info.manifest_found = True
             info.ecosystem = "python"
             info.manifest_path = str(requirements[0])
-            body = _read_text(requirements[0]) or ""
-            info.declared_test_requirements = _requirements_txt_names(body)
+            body = _read_text(requirements[0])
+            if body is None:
+                info.manifest_error = f"could not read {requirements[0]}"
+            else:
+                info.declared_test_requirements = _requirements_txt_names(body)
             info.lock_paths = [str(item) for item in requirements[1:]]
 
     package_json = root / "package.json"
     if package_json.is_file():
-        text = _read_text(package_json) or ""
-        # A Python manifest wins the ecosystem label: this repo may ship a
-        # frontend, but the test extras the contract names are the Python
-        # ones.
-        if not info.ecosystem:
-            info.ecosystem = "node"
-            info.manifest_path = str(package_json)
-        elif str(package_json) not in info.lock_paths:
-            info.lock_paths.append(str(package_json))
-        info.node_test_scripts = _package_json_test_scripts(text)
-        for name in NODE_MANIFESTS[1:]:
-            candidate = root / name
-            if candidate.is_file() and str(candidate) not in info.lock_paths:
-                info.lock_paths.append(str(candidate))
+        info.manifest_found = True
+        text = _read_text(package_json)
+        if text is None:
+            info.manifest_error = info.manifest_error or f"could not read {package_json}"
+        else:
+            # A Python manifest wins the ecosystem label: this repo may ship a
+            # frontend, but the test extras the contract names are the Python
+            # ones.
+            if not info.ecosystem:
+                info.ecosystem = "node"
+                info.manifest_path = str(package_json)
+            elif str(package_json) not in info.lock_paths:
+                info.lock_paths.append(str(package_json))
+            info.node_test_scripts = _package_json_test_scripts(text)
+            for name in NODE_MANIFESTS[1:]:
+                candidate = root / name
+                if candidate.is_file() and str(candidate) not in info.lock_paths:
+                    info.lock_paths.append(str(candidate))
 
     go_mod = root / "go.mod"
     if go_mod.is_file():
+        info.manifest_found = True
         if not info.ecosystem:
             info.ecosystem = "go"
             info.manifest_path = str(go_mod)
@@ -391,6 +429,11 @@ def read_manifest(workspace_path: str | Path) -> ManifestInfo:
     # when it ships a test directory.  A repo with no manifest and no test
     # directory simply has no test suite, and the preflight must not treat
     # "no tests to run" as a broken test environment.
+    #
+    # -- amendment-3: a test *directory* alone does not establish a declared
+    # suite.  A directory called ``tests`` proves the repo has tests; it does
+    # not prove which runner collects them, and it says nothing about whether
+    # the manifest that would declare them was read at all.
     info.has_tests = bool(
         info.declared_test_requirements
         or info.node_test_scripts
@@ -399,6 +442,18 @@ def read_manifest(workspace_path: str | Path) -> ManifestInfo:
         or (root / "spec").is_dir()
         or (root / "__tests__").is_dir()
     )
+
+    # The declared suite's runner.  This is derived from what the manifest
+    # *declares*, never assumed to be Python: a polyglot repo that declares a
+    # Node test script has a Node suite even when it also ships a pyproject.
+    if info.declared_test_requirements or info.ecosystem == "python":
+        info.suite_kind = "python"
+    elif info.node_test_scripts or info.ecosystem == "node":
+        info.suite_kind = "node"
+    elif info.ecosystem == "go":
+        info.suite_kind = "go"
+    else:
+        info.suite_kind = "unknown"
 
     return info
 
@@ -1085,6 +1140,66 @@ class PreflightPrerequisite:
 
 
 # ---------------------------------------------------------------------------
+# The typed readiness gap
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PreflightReadinessGap:
+    """A gap in what the preflight could determine about the workspace.
+
+    A *prerequisite* (above) is a hard stop: a dependency the preflight
+    cannot satisfy from the repo's own manifest, owned by a named team.  A
+    *readiness gap* is different in kind: the preflight could not determine
+    the workspace's declared test suite at all, so it cannot say the
+    environment is healthy.
+
+    The three canonical gaps are:
+
+    ``manifest_missing``
+        No known manifest file exists in the workspace.  This is **not** the
+        repo declaring it has no tests -- it is the preflight being unable
+        to read the declaration.  A wrong working directory and a partial
+        checkout both land here, and both would otherwise produce a green
+        "the repo declares no tests".
+
+    ``manifest_unreadable``
+        A manifest exists but could not be read.
+
+    ``unsupported_suite``
+        The repo declares a test suite whose runner this preflight does not
+        know how to drive (a Node or Go suite, or an unknown one).  The
+        preflight reports the gap truthfully instead of forcing a Python
+        runner onto a non-Python repo.
+
+    A readiness gap never reports a healthy collection.  It is recorded, it
+    is projected into both receipts, and it is distinguishable from a
+    prerequisite by its ``kind`` field -- so an overseer can tell "the
+    environment is broken" from "we could not tell".
+    """
+
+    code: str
+    message: str
+    kind: str = "readiness_gap"
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "kind": self.kind,
+            "detail": dict(self.detail),
+        }
+
+
+# The readiness-gap codes.  They are named constants so a test can assert on
+# the exact outcome instead of on a message string.
+READINESS_GAP_MANIFEST_MISSING = "manifest_missing"
+READINESS_GAP_MANIFEST_UNREADABLE = "manifest_unreadable"
+READINESS_GAP_UNSUPPORTED_SUITE = "unsupported_suite"
+
+
+# ---------------------------------------------------------------------------
 # The record
 # ---------------------------------------------------------------------------
 
@@ -1109,6 +1224,9 @@ class PreflightRecord:
     env_preparation: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
     prerequisite: dict[str, Any] | None = None
+    # -- amendment-3: a typed readiness gap, distinct from the prerequisite.
+    # At most one gap is recorded (the first one the preflight hits).
+    readiness_gap: dict[str, Any] | None = None
     ok: bool = True
 
     def as_dict(self) -> dict[str, Any]:
@@ -1125,6 +1243,7 @@ class PreflightRecord:
             "env_preparation": dict(self.env_preparation),
             "provenance": dict(self.provenance),
             "prerequisite": dict(self.prerequisite) if self.prerequisite else None,
+            "readiness_gap": dict(self.readiness_gap) if self.readiness_gap else None,
             "ok": self.ok,
         }
 
@@ -1154,6 +1273,131 @@ PROVENANCE_FIELDS: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 
+def _readiness_gap_for(
+    manifest: ManifestInfo,
+    root: Path,
+    *,
+    no_tests_applicable: bool = False,
+) -> PreflightReadinessGap | None:
+    """Return the readiness gap for this workspace, or ``None``.
+
+    This is the amendment-3 guard.  It answers one question: *could the
+    preflight determine the workspace's declared test suite?*  When the
+    answer is no, the preflight must say so with a typed gap instead of
+    reporting a healthy environment.
+
+    The four situations that produce a gap:
+
+    * **the manifest is missing** -- no known manifest file exists.  A
+      wrong working directory, a partial checkout, and a repo whose
+      manifest this module does not know all land here.  None of them
+      means "the repo has no tests".
+    * **the manifest is unreadable** -- it exists but could not be read.
+    * **the declared suite is unsupported** -- the repo declares a Node or
+      Go suite and this preflight cannot drive it.  The gap names the
+      suite; it never forces a Python runner onto a non-Python repo.
+    * **the suite is unknown** -- a manifest was found but it declares
+      nothing that identifies a test runner at all.
+
+    ``no_tests_applicable`` (the explicit task/profile signal) and the
+    repo's own ``declared_no_tests`` declaration both suppress the gap:
+    those are the two ways an absent suite is *truthfully* established.
+
+    A wrong working directory is worth calling out on its own: a
+    directory that is not a git checkout and holds no manifest is exactly
+    what "the preflight was pointed at the wrong path" looks like, so the
+    gap message says so.
+    """
+
+    if no_tests_applicable:
+        # The task/profile established that there is no test suite.  That is
+        # an explicit applicability, so the absence is not a gap.
+        return None
+
+    if manifest.manifest_error:
+        return PreflightReadinessGap(
+            code=READINESS_GAP_MANIFEST_UNREADABLE,
+            message=(
+                "the workspace's manifest could not be read, so its declared "
+                f"test suite could not be determined: {manifest.manifest_error}"
+            ),
+            detail={
+                "manifest_path": manifest.manifest_path,
+                "manifest_error": manifest.manifest_error,
+                "workspace_path": str(root),
+            },
+        )
+
+    if not manifest.manifest_found:
+        looks_like_checkout = (root / ".git").exists()
+        if looks_like_checkout:
+            message = (
+                "the workspace has no known manifest (pyproject.toml, "
+                "requirements*.txt, package.json, go.mod), so its declared "
+                "test suite could not be determined; a missing manifest is "
+                "not a declaration that the repo has no tests"
+            )
+        else:
+            message = (
+                "the workspace path is not a checkout and holds no known "
+                "manifest (pyproject.toml, requirements*.txt, package.json, "
+                "go.mod), so the declared test suite could not be determined; "
+                "this is what a wrong working directory looks like, and it "
+                "is not a declaration that the repo has no tests"
+            )
+        return PreflightReadinessGap(
+            code=READINESS_GAP_MANIFEST_MISSING,
+            message=message,
+            detail={
+                "workspace_path": str(root),
+                "looks_like_checkout": looks_like_checkout,
+                "known_manifests": list(PYTHON_MANIFESTS)
+                + list(NODE_MANIFESTS)
+                + list(GO_MANIFESTS),
+            },
+        )
+
+    if manifest.declared_no_tests:
+        # The repo itself declares that it ships no tests.  That is a
+        # truthful declaration, so there is no gap.
+        return None
+
+    if manifest.suite_kind in ("node", "go"):
+        runner = "npm test" if manifest.suite_kind == "node" else "go test"
+        return PreflightReadinessGap(
+            code=READINESS_GAP_UNSUPPORTED_SUITE,
+            message=(
+                f"the workspace declares a {manifest.suite_kind} test suite "
+                f"(manifest: {manifest.manifest_path}), which this preflight "
+                f"cannot drive; the declared runner is {runner!r}. The "
+                "environment was not verified and no collection was attempted"
+            ),
+            detail={
+                "suite_kind": manifest.suite_kind,
+                "manifest_path": manifest.manifest_path,
+                "node_test_scripts": list(manifest.node_test_scripts),
+                "declared_runner": runner,
+            },
+        )
+
+    if manifest.suite_kind == "unknown":
+        return PreflightReadinessGap(
+            code=READINESS_GAP_UNSUPPORTED_SUITE,
+            message=(
+                "the workspace's manifest does not declare a test suite this "
+                "preflight can recognise, so the declared test suite could "
+                "not be determined; an unknown suite is not a declaration "
+                "that the repo has no tests"
+            ),
+            detail={
+                "suite_kind": manifest.suite_kind,
+                "manifest_path": manifest.manifest_path,
+            },
+        )
+
+    return None
+
+
 def run_preflight(
     workspace_path: str | Path,
     *,
@@ -1162,6 +1406,7 @@ def run_preflight(
     allow_install: bool = True,
     require_tool: str | None = None,
     interpreter: str | Path | None = None,
+    no_tests_applicable: bool = False,
 ) -> PreflightRecord:
     """Run the whole preflight for one workspace.
 
@@ -1174,6 +1419,12 @@ def run_preflight(
     for the test suite, whose scenarios must not depend on what the host
     happens to have installed).  When omitted, the interpreter is resolved
     from the workspace.
+
+    ``no_tests_applicable`` is the **explicit** applicability signal: it says
+    the task or the profile has already established that this run has no test
+    suite to collect.  It is the only way, besides a declaration in the
+    repo's own manifest, for an empty collection to be legitimate.  A
+    missing manifest is never such a signal.
     """
 
     root = Path(workspace_path)
@@ -1185,6 +1436,29 @@ def run_preflight(
     # 1. The manifest and lock files.
     manifest = read_manifest(root)
     record.env_manifest = manifest.as_dict()
+
+    # 1b. -- amendment-3: can the preflight determine the declared suite at
+    #     all?  A missing, unreadable, or unknown manifest is a *readiness
+    #     gap*, never "the repo declares no tests".  This is checked before
+    #     the interpreter is resolved so a wrong working directory is
+    #     reported as what it is instead of being papered over by a healthy
+    #     interpreter and an empty collection.
+    gap = _readiness_gap_for(manifest, root, no_tests_applicable=no_tests_applicable)
+    if gap is not None:
+        record.readiness_gap = gap.as_dict()
+        # The git baseline is still recorded: the gap is *about* the
+        # workspace, and the baseline tells the operator whether the
+        # workspace was even a checkout.
+        record.git_baseline = git_baseline(root)
+        if record.candidate_sha is None:
+            record.candidate_sha = record.git_baseline.get("head_sha")
+        record.tool_availability = profile_tool_availability()
+        # A readiness gap is not a hard prerequisite: the run is not stopped
+        # by an owned dependency problem.  But the preflight did not verify
+        # anything, so it does not report success either -- ``ok`` stays
+        # False and the gap says why.
+        record.ok = False
+        return record
 
     # 2. The interpreter the repo declares, and the package set it has.
     if interpreter is not None:
@@ -1333,15 +1607,43 @@ def run_preflight(
         ).as_dict()
         record.ok = False
         return record
-    if collection.collected <= 0 and not manifest.has_tests:
-        # The repo declares no test suite at all: there is nothing to
-        # collect, so there is nothing to be broken.  This is recorded
-        # truthfully rather than silently reported as a healthy collection.
+    if collection.collected <= 0 and manifest.declared_no_tests:
+        # The repo itself declares that it ships no tests.  That is an
+        # explicit declaration, so an empty collection is legitimate here.
         record.collection["ok"] = True
         record.collection["detail"] = "the repo declares no tests"
-    elif collection.collected <= 0 and manifest.declared_no_tests:
+    elif collection.collected <= 0 and no_tests_applicable:
+        # The task/profile explicitly established that this run has no test
+        # suite.  Same treatment as an explicit repo declaration: the empty
+        # collection is legitimate, and it is recorded as such rather than
+        # silently reported as a healthy collection.
         record.collection["ok"] = True
-        record.collection["detail"] = "the repo declares no tests"
+        record.collection["detail"] = "the task declares no tests"
+    elif collection.collected <= 0:
+        # -- amendment-3: neither an explicit declaration nor an explicit
+        # applicability, yet nothing was collected.  This is *not* "the repo
+        # declares no tests": the preflight did not establish that, so it
+        # must not report a healthy environment.  It is a readiness gap.
+        #
+        # Note that this branch is reached only when a manifest *was* found
+        # and *was* read (the missing/unreadable manifest cases returned
+        # earlier), so the gap here is about the declared suite specifically.
+        record.readiness_gap = PreflightReadinessGap(
+            code=READINESS_GAP_UNSUPPORTED_SUITE,
+            message=(
+                "the workspace's manifest declares no test suite that could "
+                "be collected, so the test environment could not be verified; "
+                "an empty collection with no explicit no-tests declaration is "
+                "a readiness gap, not a healthy environment"
+            ),
+            detail={
+                "collection": collection.as_dict(),
+                "manifest_path": manifest.manifest_path,
+                "suite_kind": manifest.suite_kind,
+            },
+        ).as_dict()
+        record.ok = False
+        return record
 
     # 8. A required profile tool that is not available.
     if require_tool:
@@ -1374,6 +1676,10 @@ def receipt_from_record(record: PreflightRecord) -> dict[str, Any]:
     payload = record.as_dict()
     payload["collected"] = int(record.collection.get("collected", 0) or 0)
     payload["candidate_sha"] = record.candidate_sha
+    # -- amendment-3: the readiness gap is projected with the same fields as
+    # the prerequisite so a reader can tell the two apart by their ``kind``.
+    gap = record.readiness_gap
+    payload["readiness_gap"] = dict(gap) if gap else None
     return payload
 
 

@@ -217,6 +217,12 @@ def _safe_preflight(value: object) -> dict[str, Any]:
                 _text(item, 4096) for item in lock_paths[:32] if isinstance(item, str)
             ]
         manifest["declared_no_tests"] = bool(manifest_raw.get("declared_no_tests"))
+        # -- amendment-3: the manifest's own health.  "No manifest" and
+        # "the repo declares no tests" are different facts, and the overseer
+        # needs to tell them apart in the snapshot.
+        manifest["manifest_found"] = bool(manifest_raw.get("manifest_found"))
+        manifest["manifest_error"] = _text(manifest_raw.get("manifest_error"), 2048)
+        manifest["suite_kind"] = _text(manifest_raw.get("suite_kind"), 32)
 
     interpreter_raw = value.get("interpreter")
     interpreter: dict[str, Any] = {}
@@ -284,6 +290,17 @@ def _safe_preflight(value: object) -> dict[str, Any]:
             "code": _text(prerequisite.get("code"), 64),
             "message": _text(prerequisite.get("message"), 2048),
             "owner": _text(prerequisite.get("owner"), 128),
+        }
+    # -- amendment-3: the readiness gap is projected next to the
+    # prerequisite and carries its own ``kind``, so a reader can tell "the
+    # environment is broken and owned" from "we could not determine the
+    # declared suite".
+    gap = value.get("readiness_gap")
+    if isinstance(gap, dict):
+        result["readiness_gap"] = {
+            "code": _text(gap.get("code"), 64),
+            "message": _text(gap.get("message"), 2048),
+            "kind": _text(gap.get("kind"), 64),
         }
     result["ok"] = bool(value.get("ok", True))
     return result
