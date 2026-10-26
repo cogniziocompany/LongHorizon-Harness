@@ -198,6 +198,18 @@ Steps 1–2 are once per machine; step 3 is once per project. Then run tasks fro
 
 Run `lh-harness doctor` at any point to check all of the above; see [Verify the environment](#verify-the-environment).
 
+#### Test environment preflight
+
+Before a run dispatches its first round, the harness runs a **workspace preflight** on the run's workspace. It reads the repo's manifest and lock files (`pyproject.toml`, `poetry.lock`, `uv.lock`, `requirements*.txt`, `package.json` with its lock, `go.mod`), resolves the interpreter the repo declares, records that interpreter's version and installed package set, checks that the declared test extras are actually importable, and runs a test-collection smoke (`pytest --collect-only -q`). It also records the git baseline (HEAD, dirty files, stashes) and whether the profile tools the task needs are genuinely available.
+
+A **collected count of zero is a failure**, not a green light — a skipped or empty collection never counts as a healthy environment. The only exception is a repo that explicitly declares it has no tests.
+
+If the declared test extras are missing, the preflight creates a `.venv-task` environment **inside the workspace** from the repo's own manifest (`pip install -e '.[test]'`) and uses that same interpreter for the baseline and the candidate. The shared harness virtualenv is never used and never written to: it is shared by every run on the host, so a per-run install into it would corrupt other runs and hide a broken workspace behind another run's packages.
+
+When a dependency cannot be satisfied from the repo's own manifest, the preflight fails fast with a typed prerequisite naming its owner (**infra onboarding**) and the run stops at that gate — before any round is consumed — instead of spending a round discovering the missing package.
+
+The preflight leaves a receipt in the run directory (`role_orchestration/workspace_preflight.json`) and the same fields in the run snapshot, so you can see exactly what the run saw before it started: the candidate SHA, the env manifest, the interpreter, the collected count, and the tool availability.
+
 #### 1. Install LongHorizon-Harness
 
 ```bash

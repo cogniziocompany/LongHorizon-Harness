@@ -176,6 +176,96 @@ def _safe_mcp_profile_resolution(value: object) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _safe_preflight(value: object) -> dict[str, Any]:
+    """Sanitize the workspace-preflight receipt carried by the start event.
+
+    The preflight receipt is written by the manager and reaches the snapshot
+    through the ``role_harness_start`` event.  It carries the five fields the
+    overseer needs -- candidate SHA, env manifest, interpreter, collected
+    count, and tool availability -- and every one of them is bounded before
+    it is projected: the record is produced from a workspace the agent may
+    influence, so an unbounded string here would let a run inflate its own
+    summary response.
+    """
+
+    if not isinstance(value, dict):
+        return {}
+
+    def _text(raw: object, limit: int) -> str:
+        if not isinstance(raw, str):
+            return ""
+        text = raw.strip()
+        if "\x00" in text:
+            return ""
+        return text[:limit]
+
+    candidate_sha = _text(value.get("candidate_sha"), 64)
+
+    manifest_raw = value.get("env_manifest")
+    manifest: dict[str, Any] = {}
+    if isinstance(manifest_raw, dict):
+        manifest["ecosystem"] = _text(manifest_raw.get("ecosystem"), 32)
+        manifest["manifest_path"] = _text(manifest_raw.get("manifest_path"), 4096)
+        requirements = manifest_raw.get("declared_test_requirements")
+        if isinstance(requirements, list):
+            manifest["declared_test_requirements"] = [
+                _text(item, 128) for item in requirements[:64] if isinstance(item, str)
+            ]
+        lock_paths = manifest_raw.get("lock_paths")
+        if isinstance(lock_paths, list):
+            manifest["lock_paths"] = [
+                _text(item, 4096) for item in lock_paths[:32] if isinstance(item, str)
+            ]
+        manifest["declared_no_tests"] = bool(manifest_raw.get("declared_no_tests"))
+
+    interpreter_raw = value.get("interpreter")
+    interpreter: dict[str, Any] = {}
+    if isinstance(interpreter_raw, dict):
+        interpreter["executable"] = _text(interpreter_raw.get("executable"), 4096)
+        interpreter["version"] = _text(interpreter_raw.get("version"), 128)
+        interpreter["source"] = _text(interpreter_raw.get("source"), 64)
+        interpreter["shared_harness_venv"] = bool(
+            interpreter_raw.get("shared_harness_venv")
+        )
+
+    collection_raw = value.get("collection")
+    collected = 0
+    if isinstance(collection_raw, dict):
+        raw_count = collection_raw.get("collected")
+        if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count >= 0:
+            collected = raw_count
+
+    tools_raw = value.get("tool_availability")
+    tools: dict[str, Any] = {}
+    if isinstance(tools_raw, dict):
+        for name, entry in list(tools_raw.items())[:16]:
+            if not isinstance(name, str) or not isinstance(entry, dict):
+                continue
+            tools[_text(name, 64)] = {
+                "available": bool(entry.get("available")),
+                "usable": bool(entry.get("usable")),
+                "path": _text(entry.get("path"), 4096),
+                "alternate_route": _text(entry.get("alternate_route"), 2048),
+            }
+
+    result: dict[str, Any] = {
+        "candidate_sha": candidate_sha,
+        "env_manifest": manifest,
+        "interpreter": interpreter,
+        "collected": collected,
+        "tool_availability": tools,
+    }
+    prerequisite = value.get("prerequisite")
+    if isinstance(prerequisite, dict):
+        result["prerequisite"] = {
+            "code": _text(prerequisite.get("code"), 64),
+            "message": _text(prerequisite.get("message"), 2048),
+            "owner": _text(prerequisite.get("owner"), 128),
+        }
+    result["ok"] = bool(value.get("ok", True))
+    return result
+
+
 def _separate_claims(round_item: dict[str, Any]) -> dict[str, Any]:
     """Return a round projection that separates executor claims from auditor findings.
 
@@ -359,6 +449,17 @@ def build_snapshot(state: DashboardState, *, run_id: str | None = None) -> dict[
             start_payload = {**start_payload, "workspace": start_payload.get("workspace_path")}
         break
     provenance = _provenance(owner, report, start_payload)
+    # The workspace preflight receipt rides on the start event; the run
+    # snapshot projects it so the overseer sees the same fields the run-dir
+    # receipt file carries.
+    # The ledger record is flat, but a legacy/legacy-shaped event may nest the
+    # payload; accept both so the preflight is found either way.
+    _preflight_raw = start_payload.get("workspace_preflight")
+    if _preflight_raw is None:
+        nested = start_payload.get("payload")
+        if isinstance(nested, dict):
+            _preflight_raw = nested.get("workspace_preflight")
+    preflight = _safe_preflight(_preflight_raw)
     # The worker/adapter writes the authoritative resolved profile record after
     # it resolves against the gateway key and project config.  Merge it into
     # snapshot provenance when the file exists.
@@ -423,6 +524,7 @@ def build_snapshot(state: DashboardState, *, run_id: str | None = None) -> dict[
             "failure_reason": failure_reason,
             "final_response": final_response,
             **provenance,
+            **({"workspace_preflight": preflight} if preflight else {}),
         },
         "mission": {
             "task": task,
