@@ -53,8 +53,12 @@ The optional `gtm_manager` field names the manager that owns the task — see
 
 ### `GET /api/queue`
 
-List entries. Optional `?status=pending|launched|done|failed`. The response
-contains `entries`, `groups`, and `counts`.
+List entries. Optional `?status=pending|launched|done|failed|blocked|migrated`.
+The response contains `entries`, `groups`, and `counts`.
+
+A `migrated` entry is a **migration tombstone** — see
+*The migration tombstone* below. It is reported in its own `migrated` group
+and is never reported as `pending`.
 
 ### `DELETE /api/queue/{queue_id}`
 
@@ -341,7 +345,7 @@ visible to any caller with the bearer token through `GET /api/queue`.
 | `priority` | `int` | `0` when omitted | integer (bool rejected) (`_validate_priority`) | Caller, at enqueue (mutable via `POST /api/queue/{id}/priority` while pending) |
 | `requested_by` | `str` | — (required) | non-empty after strip; ≤256 chars (`_validate_requested_by`) | Caller, at enqueue |
 | `base_check` | `str` | `""` | string, stripped (`_validate_base_check`) | Caller, at enqueue |
-| `status` | `str` | `"pending"` | one of `pending`, `launched`, `done`, `failed` (`_VALID_STATUS` `queue.py:28`) | Store, on every transition |
+| `status` | `str` | `"pending"` | one of `pending`, `launched`, `done`, `failed`, `blocked`, `migrated` (`_VALID_STATUS` `queue.py:46`) | Store, on every transition |
 | `run_id` | `str \| None` | `None` | set when the entry is launched | Store, via `mark_launched` (`queue.py:430`–`439`) |
 | `reason` | `str \| None` | `None` | truncated to 4,000 chars (`_MAX_QUEUE_REASON_CHARS` `queue.py:26`) | Store, via `mark_done` (optional) / `mark_failed` (required) |
 | `skip_reasons` | `list[str]` | `[]` | appended while `pending` (launcher capacity skips) and while `failed` (so the reason accrues after a retryable failure); each item truncated to 4,000 chars | Store, via `record_skip` (`queue.py:497`–`505`) |
@@ -357,10 +361,16 @@ visible to any caller with the bearer token through `GET /api/queue`.
 | `wait_reason` | `str \| None` | `None` | why the entry waits (`provider_quota` / `provider_rate_limit`); set only together with `not_before` | Launcher, via `requeue` |
 | `time_limit_minutes` | `int \| None` | `None` | wall-clock limit in minutes (1-1440) from `launched_at`; see *Per-task wall-clock limit* | Caller, at enqueue, or `POST /api/runs/{id}/time_limit` |
 | `gtm_manager` | `str` | `"overseer1"` | `overseer1` or `overseer1-op`; any other value is refused at enqueue (422); see *The go-to-market manager* | Caller, at enqueue |
+| `migrated_to` | `dict \| None` | `None` | the migration link on a **source** entry: `{"node": ..., "queue_id": ..., "at": ...}` naming the destination; see *The migration tombstone* | Store, via `mark_migrated` |
+| `migrated_from` | `dict \| None` | `None` | the migration link on a **destination** entry: `{"node": ..., "queue_id": ..., "at": ...}` naming the source; see *The migration tombstone* | Store |
+| `migration_epoch` | `int \| None` | `None` | the monotonic migration counter stamped on the source tombstone; `None` on an entry that was never migrated | Store, via `mark_migrated` |
 
 There is no dedicated `done_at`/`failed_at` field. The terminal time of an entry
 is the `updated_at` value at the moment `mark_done` or `mark_failed` runs (both
 go through `update`, `queue.py:406`–`409`); the terminal cause is in `reason`.
+A `migrated` tombstone follows the same rule: its terminal time is the
+`updated_at` value at the moment `mark_migrated` runs, and the destination it
+went to is in `migrated_to`.
 
 ### Caller-supplied vs. service-owned
 
@@ -470,6 +480,83 @@ JSON.
 Reassignment (changing the manager of a live entry) and the run-side copy are
 separate work: this field is the queue-entry half only.
 
+## The migration tombstone (`migrated`, LHH-QUEUE-MIGRATION-TOMBSTONE)
+
+A queue entry whose work moved to another node becomes a durable **tombstone**:
+its status is `migrated` and it records where the work went. The source keeps
+the record; the destination holds the live copy.
+
+This section documents the **state model** (the sixth status, the link fields
+and their guarantees). The migrate endpoint, the recovery path and the operator
+CLI are separate work built on top of it.
+
+### The sixth status
+
+`migrated` joins `pending`, `launched`, `done`, `failed` and `blocked` in
+`_VALID_STATUS` (`queue.py:46`). It is a **terminal** state, exactly like
+`done` and `failed`:
+
+- it has **no outgoing edge** in the transition table, so a tombstone can
+  never be launched again, never unblocked back to `pending`, and never move
+  anywhere else. The only way in is `pending` → `migrated`;
+- the launcher therefore **never launches** it — the claim loop only ever
+  considers a `pending` entry, and `mark_launched` refuses any entry that is
+  not pending;
+- the #160 reconciliation sweep **never re-creates or writes** it. The sweep
+  reconciles a `launched` entry against the status of the run it launched; a
+  tombstone was never launched, so the sweep skips it both by its state filter
+  and by an explicit guard (`_RECONCILE_FORBIDDEN_STATES`,
+  `queue_reconcile.py`);
+- it is **retained** like `done`/`failed`: the entry file stays on disk and
+  the store still lists it. Queue entries are never pruned by the retention
+  sweep (the `queue/` directory is excluded from it), so a tombstone is
+  retained on exactly the same terms as a finished entry;
+- it **frees its `dedup_key`**, like `done`/`failed` do, because the entry no
+  longer holds work on this node.
+
+`migrated` is never reported as pending. `GET /api/queue` reports it in its
+own `migrated` group, `GET /api/queue?status=migrated` filters on it, and
+`GET /api/queue/stats` counts it separately — the per-trio pending/launched
+breakdown never includes it.
+
+### The link fields
+
+| Field | On | Shape |
+| --- | --- | --- |
+| `migrated_to` | the **source** entry | `{"node": <dest node>, "queue_id": <dest queue id>, "at": <epoch seconds>}` |
+| `migrated_from` | the **destination** entry | `{"node": <source node>, "queue_id": <source queue id>, "at": <epoch seconds>}` |
+| `migration_epoch` | the **source** entry | the monotonic migration counter |
+
+Both links are plain JSON objects, so they round-trip through the file store
+with no schema change. An entry that was never part of a migration carries
+neither link and no epoch; an entry written before the fields existed (an old
+JSON file, or a Postgres row written before migration `008`) reads back the
+same way.
+
+`QueueStore.mark_migrated(queue_id, node=..., dest_queue_id=..., epoch=...,
+pending=...)` performs the source-side tombstone write. It refuses anything
+that is not `pending` — a `launched` entry has a live run behind it and is
+never migrated, and a `done`/`failed`/already-`migrated` entry is refused
+rather than silently re-stamped. The status change and the link are written in
+**one atomic file write**, so a reader never observes a tombstone without its
+destination link.
+
+The `pending` flag on the link marks "the destination entry may not exist yet":
+the destination entry is created *after* the tombstone write, so a crash in
+between leaves a tombstone whose link says the destination is not confirmed
+yet. That state is what the recovery path looks for.
+
+### The Postgres backend
+
+The Postgres backend stores the links in three new columns — `migrated_to`
+(JSONB), `migrated_from` (JSONB) and `migration_epoch` (INTEGER) — added by
+migration `008_harness_queue_migration_tombstone.sql`. The `status` column is
+the enum `harness.queue_status`, so the same migration adds the `migrated`
+value to it; without that a migrated row would be refused by Postgres before
+the store ever saw it. The file is safe to re-run: the column additions are
+`ADD COLUMN IF NOT EXISTS` and the enum addition is guarded by a `pg_enum`
+check.
+
 ## Idempotent enqueue (`dedup_key`)
 
 `dedup_key` is the single-orchestrator floor: two orchestrators (or a retrying
@@ -565,7 +652,10 @@ Every migration file is safe on both ends of that order:
   database with `ERROR: default for column "status" cannot be cast
   automatically to type queue_status`). `002`'s foreign key is added inside a
   `DO` block that checks `pg_constraint`, because `ADD CONSTRAINT` has no
-  `IF NOT EXISTS`.
+  `IF NOT EXISTS`. `008` adds the `migrated` value to the `queue_status` enum
+  the same way — inside a `DO` block that checks `pg_enum`, because Postgres
+  has no `ALTER TYPE ... ADD VALUE IF NOT EXISTS` (and the addition is legal
+  inside the migration transaction on Postgres 12+).
 - **Already-migrated schema** — re-running either file is a no-op: `CREATE
   TYPE` is guarded by a `pg_type` check inside a `DO` block (Postgres has no
   `CREATE TYPE IF NOT EXISTS`), the tables and indexes use `IF NOT EXISTS`, and

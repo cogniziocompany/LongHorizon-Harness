@@ -43,12 +43,21 @@ _MAX_QUEUE_DEDUP_CHARS = 256
 # key stays "in use" and a fresh enqueue with the same key does not fork a second
 # entry. It resumes through ``blocked`` -> ``pending`` (record_unblock) or
 # ``blocked`` -> ``launched`` (mark_launched).
-_VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked"})
+_VALID_STATUS = frozenset({"pending", "launched", "done", "failed", "blocked", "migrated"})
 # Non-terminal entries are still waiting to be, or being, launched, or parked. A
 # dedup key is considered "in use" only while its entry is in one of these states;
 # once an entry reaches a terminal state (``done``/``failed``) the key is free for
 # a fresh (retry) entry.
 _NON_TERMINAL_STATUS = frozenset({"pending", "launched", "blocked"})
+# LHH-QUEUE-MIGRATION-TOMBSTONE (A): the terminal states.  ``migrated`` joins
+# ``done``/``failed`` here: a migrated entry is a durable TOMBSTONE -- the work
+# moved to another node, so this node keeps the record (never launchable again,
+# never re-created by reconciliation) but holds no live work behind it.
+#
+# A tombstone frees its dedup key exactly like ``done``/``failed`` do, because
+# the entry that held the key no longer represents work on this node: the
+# destination entry carries the key that continues to represent the work.
+_TERMINAL_STATUS = frozenset({"done", "failed", "migrated"})
 # Trios every config carries (a missing one gets a safe fallback spec) and
 # trios that exist only when the config defines them (glm, zai, zaiq).
 _REQUIRED_TRIOS = frozenset({"kimi", "qwen"})
@@ -237,11 +246,18 @@ def normalize_task_name(name: Any) -> str:
 # not a first-class QueueStore method: they are applied by the launcher by
 # mutating the entry's status and calling ``update``. The terminal edges (done,
 # failed) have no outgoing edge -- a terminal entry cannot leave its state.
+#
+# LHH-QUEUE-MIGRATION-TOMBSTONE (A): ``pending`` -> ``migrated`` is the ONE
+# transition into a tombstone, and ``migrated`` has NO outgoing edge -- exactly
+# like ``done`` and ``failed``.  A tombstone is final: it can never be launched
+# again, never unblocked back to pending, and never move to any other state.
+# The transition is performed by ``QueueStore.mark_migrated`` (slice B).
 _QUEUE_TRANSITIONS: dict[tuple[str, str], str] = {
     ("pending", "launched"): "mark_launched",
     ("pending", "done"): "mark_done",
     ("pending", "failed"): "mark_failed",
     ("pending", "blocked"): "update (record_block)",
+    ("pending", "migrated"): "mark_migrated",
     ("launched", "done"): "mark_done",
     ("launched", "failed"): "mark_failed",
     ("blocked", "pending"): "update (record_unblock)",
@@ -372,6 +388,35 @@ class QueueEntry:
     # A legacy entry -- an old JSON file written before the field existed, or
     # a Postgres row written before migration 007 -- loads as the default too.
     gtm_manager: str = DEFAULT_GTM_MANAGER
+    # LHH-QUEUE-MIGRATION-TOMBSTONE (A): the migration link fields.
+    #
+    # ``migrated_to`` is set on the SOURCE entry: a dict
+    # ``{"node": <dest node>, "queue_id": <dest queue id>, "at": <epoch>}``
+    # naming where this entry's work went.  It is ``None`` on every entry that
+    # was never migrated.
+    #
+    # ``migrated_from`` is set on the DESTINATION entry: a dict
+    # ``{"node": <source node>, "queue_id": <source queue id>, "at": <epoch>}``
+    # naming where this entry came from.  It is ``None`` on every entry that
+    # did not arrive through a migration.
+    #
+    # Both are plain dicts so the shape stays JSON-round-trippable in the file
+    # store with no schema change, and so a legacy entry (an old JSON file, or
+    # a Postgres row written before the columns existed) loads as ``None``.
+    # The link is written in ONE transaction by the source side before the
+    # destination entry is created (slice B), so a source tombstone always
+    # knows which destination entry it stands for.
+    migrated_to: dict[str, Any] | None = None
+    migrated_from: dict[str, Any] | None = None
+    # The migration epoch: a monotonically increasing counter stamped on the
+    # SOURCE tombstone when it is marked migrated.  It orders migration
+    # attempts on one entry and lets a later repair tell a stale link from a
+    # current one (slice B/C use it; slice (A) only stores it).
+    #
+    # ``None`` on every entry that was never migrated, so a legacy entry is
+    # indistinguishable from an untouched one -- which is correct: it has no
+    # migration to reconcile.
+    migration_epoch: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -414,6 +459,9 @@ class QueueEntry:
             "model",
             "roles",
             "gtm_manager",
+            "migrated_to",
+            "migrated_from",
+            "migration_epoch",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -1701,6 +1749,73 @@ class QueueStore:
             raise ValueError(f"invalid transition from {entry.status} to failed")
         entry.status = "failed"
         entry.reason = reason[:_MAX_QUEUE_REASON_CHARS]
+        return self.update(entry)
+
+    def mark_migrated(
+        self,
+        queue_id: str,
+        *,
+        node: str,
+        dest_queue_id: str | None = None,
+        epoch: int | None = None,
+        pending: bool = True,
+        at: float | None = None,
+    ) -> QueueEntry | None:
+        """Turn a PENDING entry into a durable migration TOMBSTONE.
+
+        LHH-QUEUE-MIGRATION-TOMBSTONE (A).  This is the source-side half of a
+        migration: the work has been (or is being) handed to another node, so
+        this node keeps the record but must never launch it again.
+
+        Properties this method guarantees, and that the rest of the code
+        relies on:
+
+        - Only a ``pending`` entry may be tombstoned.  A ``launched`` entry has
+          a live run behind it and is never migrated (the hard rule: running
+          runs are untouched); a ``done``/``failed`` entry is already terminal;
+          an already-``migrated`` entry is already a tombstone.  Any of those
+          raises ``ValueError`` -- the caller gets a refusal, not a silent
+          no-op.
+        - The resulting entry is terminal.  ``migrated`` has no outgoing edge
+          in ``_QUEUE_TRANSITIONS``, so it can never be launched, unblocked or
+          moved to any other state afterwards.
+        - The tombstone is RETAINED like ``done``/``failed``: the entry file
+          stays on disk, and the normal done/failed retention rules apply to
+          it unchanged.  Nothing here deletes or hides the record.
+        - The link to the destination is written IN THE SAME WRITE as the
+          status change (one atomic file write), so a reader never observes a
+          tombstone without its destination link.
+
+        ``pending=True`` marks the link as "the destination entry may not exist
+        yet" -- the destination create happens AFTER this write (slice B), so
+        a crash in between leaves a tombstone that the recovery path
+        (slice C) resolves.  ``pending=False`` finalizes the link.
+
+        The method is deliberately idempotent at the STATUS level: migrating an
+        already-migrated entry raises rather than re-stamping, so the caller
+        (slice B) can detect "this source was already tombstoned" and resume
+        the outstanding migration instead of starting a second one.
+        """
+
+        entry = self.get(queue_id)
+        if entry is None:
+            return None
+        if not self._is_valid_transition(entry.status, "migrated"):
+            raise ValueError(f"invalid transition from {entry.status} to migrated")
+        dest_node = str(node).strip()
+        if not dest_node:
+            raise ValueError("migrated_to node is required")
+        stamp = float(at) if at is not None else _now()
+        link: dict[str, Any] = {
+            "node": dest_node,
+            "queue_id": str(dest_queue_id) if dest_queue_id else None,
+            "at": stamp,
+        }
+        if pending:
+            link["pending"] = True
+        entry.status = "migrated"
+        entry.migrated_to = link
+        entry.migration_epoch = int(epoch) if epoch is not None else (entry.migration_epoch or 0) + 1
         return self.update(entry)
 
     def record_skip(self, queue_id: str, reason: str) -> QueueEntry | None:

@@ -308,7 +308,10 @@ def test_migration_007_adds_the_gtm_manager_column_idempotently() -> None:
 
 def test_pg_column_list_and_values_carry_the_gtm_manager() -> None:
     columns = pg_queue._QUEUE_COLUMNS
-    assert columns[-1] == "gtm_manager"
+    # The gtm_manager column (migration 007) is present; later migrations
+    # (008, the migration tombstone) append after it, so the list stays
+    # append-only and gtm_manager keeps its own column.
+    assert "gtm_manager" in columns
     entry = QueueEntry(
         queue_id="q-1", name="n", task="t", workspace="w", max_rounds=3, trio="kimi",
         priority=1, requested_by="ci", gtm_manager="overseer1-op",

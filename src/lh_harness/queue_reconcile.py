@@ -42,6 +42,20 @@ from .queue import QueueStore
 # ``run_id`` may be None. ``pending`` is pre-launch.
 _RECONCILE_ENTRY_STATES = frozenset({"launched"})
 
+# LHH-QUEUE-MIGRATION-TOMBSTONE (A): the states this sweep must NEVER touch.
+#
+# A ``migrated`` entry is a durable tombstone: its work moved to another node,
+# so this node holds a record, not work.  The sweep reconciles an entry
+# against the status of the RUN it launched -- a tombstone has no run here (it
+# was never launched), and re-creating or re-queueing one would resurrect work
+# on the source node while the destination node also holds it (the
+# duplicate-writer window the migration tombstone exists to close).
+#
+# The guard is explicit rather than incidental: ``migrated`` is not a member
+# of ``_RECONCILE_ENTRY_STATES`` (so it is not swept), and this set is checked
+# explicitly wherever the sweep could otherwise act on an entry.
+_RECONCILE_FORBIDDEN_STATES = frozenset({"migrated"})
+
 # A run is terminal when its lifecycle status is one of these. The launcher
 # itself uses the same set in ``run_outcome._TERMINAL``; the values come from
 # the supervisor (control/status.json ``status`` field).
@@ -313,9 +327,17 @@ def _stash_report_for_run(
 
 
 def _iter_launched_entries(entries: Iterable[Any]) -> Iterable[Any]:
-    """Yield only entries the sweep should consider for reconcile."""
+    """Yield only entries the sweep should consider for reconcile.
+
+    LHH-QUEUE-MIGRATION-TOMBSTONE (A): a ``migrated`` tombstone is skipped
+    twice over -- it is not in ``_RECONCILE_ENTRY_STATES``, and it is in
+    ``_RECONCILE_FORBIDDEN_STATES``, which is checked explicitly so the
+    invariant survives a future change to the first set.
+    """
 
     for entry in entries:
+        if entry.status in _RECONCILE_FORBIDDEN_STATES:
+            continue
         if entry.status in _RECONCILE_ENTRY_STATES:
             yield entry
 
@@ -379,6 +401,11 @@ def _apply_reconciliation(
     for zombie in zombies:
         entry = store.get(zombie.queue_id)
         if entry is None:
+            continue
+        if entry.status in _RECONCILE_FORBIDDEN_STATES:
+            # LHH-QUEUE-MIGRATION-TOMBSTONE (A): a tombstone is terminal and
+            # must never be written by the sweep.  Its work lives on another
+            # node now; touching it here would resurrect the source copy.
             continue
         if entry.status != "launched":
             # Another writer (the supervisor, the manager) already moved it.

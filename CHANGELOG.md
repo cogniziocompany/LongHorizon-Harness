@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Queue entries carry a migration tombstone state (`migrated`).**
+  LHH-QUEUE-MIGRATION-TOMBSTONE (slice A): a queue entry whose work moved to
+  another node becomes a durable tombstone.  `migrated` is the sixth queue
+  status, joining `pending`, `launched`, `done`, `failed` and `blocked`, and
+  it is TERMINAL exactly like `done`/`failed`: it has no outgoing edge in the
+  transition table, so it can never be launched again, never unblocked back to
+  `pending`, and never move anywhere else.  The launcher therefore never
+  launches one (the claim loop only considers `pending`, and `mark_launched`
+  refuses anything else), the #160 reconciliation sweep never re-creates or
+  writes one (it reconciles `launched` entries against the run they launched;
+  a tombstone was never launched), and a tombstone is retained on the same
+  terms as a finished entry — the record stays on disk and is still listed.
+  It frees its `dedup_key` like `done`/`failed` do, and it is never reported
+  as pending: `GET /api/queue` reports it in its own `migrated` group,
+  `?status=migrated` filters on it, and `GET /api/queue/stats` counts it
+  separately from the per-trio pending/launched breakdown.
+
+  Two link fields carry the ownership: `migrated_to` on the SOURCE entry
+  (`{"node", "queue_id", "at"}`, naming the destination) and `migrated_from`
+  on the DESTINATION entry (naming the source), plus a monotonic
+  `migration_epoch` on the source.  `QueueStore.mark_migrated` writes the
+  status change and the link in ONE atomic write, so a reader never observes
+  a tombstone without its destination link, and it refuses anything that is
+  not `pending` — a launched entry has a live run behind it and is never
+  migrated.  Migration `008_harness_queue_migration_tombstone.sql` adds the
+  Postgres columns (`migrated_to JSONB`, `migrated_from JSONB`,
+  `migration_epoch INTEGER`) and adds the `migrated` value to the
+  `harness.queue_status` enum, which the `status` column is declared as.
+
+  Scope: the state model only.  The migrate endpoint, the recovery path and
+  the operator CLI are separate work built on top of it.
+
 - **The launcher enforces a node-level active-run ceiling.** `[queue] node_max_runs`
   is the maximum number of runs the launcher will let be active on THIS node at
   once — the value the fleet registry advertises as `maxConcurrentRuns`. Until

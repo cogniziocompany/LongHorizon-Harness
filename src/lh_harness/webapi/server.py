@@ -2838,7 +2838,10 @@ def create_app(
         entries = queue_store.list()
         # The status set is canonical in queue.py; a "blocked" entry (the PC
         # queue's fifth state) is surfaced as its own group, not a failure.
-        valid_statuses = {"pending", "launched", "done", "failed", "blocked"}
+        # "migrated" (LHH-QUEUE-MIGRATION-TOMBSTONE) is the sixth state: a
+        # durable tombstone whose work moved to another node.  It is surfaced
+        # as its own group and is never reported as pending.
+        valid_statuses = {"pending", "launched", "done", "failed", "blocked", "migrated"}
         wanted: set[str] | None = None
         if status is not None:
             wanted = {s.strip() for s in status.split(",") if s.strip()}
@@ -2853,7 +2856,7 @@ def create_app(
 
         filtered = [item for item in entries if wanted is None or item.status in wanted]
         if not new_api:
-            legacy_groups: dict[str, list[dict[str, Any]]] = {s: [] for s in ("pending", "launched", "done", "failed", "blocked")}
+            legacy_groups: dict[str, list[dict[str, Any]]] = {s: [] for s in ("pending", "launched", "done", "failed", "blocked", "migrated")}
             for item in entries:
                 legacy_groups[item.status].append(item.to_dict())
             return {
@@ -2893,12 +2896,12 @@ def create_app(
             "view": "summary" if summary else "full",
         }
         if groups in ("1", "full"):
-            full_groups: dict[str, list[dict[str, Any]]] = {s: [] for s in ("pending", "launched", "done", "failed", "blocked")}
+            full_groups: dict[str, list[dict[str, Any]]] = {s: [] for s in ("pending", "launched", "done", "failed", "blocked", "migrated")}
             for item in entries:
                 full_groups[item.status].append(_queue_entry_summary(item) if summary else item.to_dict())
             result["groups"] = full_groups
         elif groups == "ids":
-            id_groups: dict[str, list[str]] = {s: [] for s in ("pending", "launched", "done", "failed", "blocked")}
+            id_groups: dict[str, list[str]] = {s: [] for s in ("pending", "launched", "done", "failed", "blocked", "migrated")}
             for item in entries:
                 id_groups[item.status].append(item.queue_id)
             result["groups"] = id_groups
@@ -2927,7 +2930,7 @@ def create_app(
         if queue_store is None:
             raise HTTPException(status_code=501, detail="queue requires a configured runs root")
         entries = queue_store.list()
-        counts: dict[str, int] = {s: 0 for s in ("pending", "launched", "done", "failed", "blocked")}
+        counts: dict[str, int] = {s: 0 for s in ("pending", "launched", "done", "failed", "blocked", "migrated")}
         by_trio: dict[str, dict[str, int]] = {}
         for entry in entries:
             counts[entry.status] = counts.get(entry.status, 0) + 1
