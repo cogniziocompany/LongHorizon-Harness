@@ -1329,15 +1329,17 @@ def _readiness_gap_for(
         )
 
     if not manifest.manifest_found:
-        looks_like_checkout = (root / ".git").exists()
-        if looks_like_checkout:
-            message = (
-                "the workspace has no known manifest (pyproject.toml, "
-                "requirements*.txt, package.json, go.mod), so its declared "
-                "test suite could not be determined; a missing manifest is "
-                "not a declaration that the repo has no tests"
-            )
-        else:
+        # A workspace that is not a git checkout at all is a *legitimate*
+        # non-repo workspace -- the launcher's own guard calls it
+        # ``not-a-repo`` and hands it over as found (a docs-only tree, a
+        # scratch directory).  Such a workspace has no declared test suite,
+        # and the caller establishes that explicitly.
+        #
+        # A workspace that *is* a checkout but carries no manifest is a
+        # different fact: a partial checkout, or the preflight pointed at
+        # the wrong directory.  That is a readiness gap.
+        is_checkout = (root / ".git").exists()
+        if not is_checkout:
             message = (
                 "the workspace path is not a checkout and holds no known "
                 "manifest (pyproject.toml, requirements*.txt, package.json, "
@@ -1345,12 +1347,20 @@ def _readiness_gap_for(
                 "this is what a wrong working directory looks like, and it "
                 "is not a declaration that the repo has no tests"
             )
+        else:
+            message = (
+                "the workspace is a checkout but carries no known manifest "
+                "(pyproject.toml, requirements*.txt, package.json, go.mod), "
+                "so its declared test suite could not be determined; a "
+                "missing manifest is not a declaration that the repo has no "
+                "tests (a partial checkout looks exactly like this)"
+            )
         return PreflightReadinessGap(
             code=READINESS_GAP_MANIFEST_MISSING,
             message=message,
             detail={
                 "workspace_path": str(root),
-                "looks_like_checkout": looks_like_checkout,
+                "looks_like_checkout": is_checkout,
                 "known_manifests": list(PYTHON_MANIFESTS)
                 + list(NODE_MANIFESTS)
                 + list(GO_MANIFESTS),

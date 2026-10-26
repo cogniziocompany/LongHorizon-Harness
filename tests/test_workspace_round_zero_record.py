@@ -1315,6 +1315,8 @@ def test_preflight_reports_a_missing_manifest_as_a_readiness_gap(
 
     workspace = tmp_path / "no-manifest"
     workspace.mkdir()
+    (workspace / "README.md").write_text("no manifest here\n", encoding="utf-8")
+    _git_init_workspace(workspace)
 
     record = run_preflight(
         workspace,
@@ -1341,9 +1343,10 @@ def test_preflight_reports_a_wrong_working_directory_as_a_readiness_gap(
 ) -> None:
     """Amendment-3: being pointed at the wrong directory is a gap, not a green.
 
-    The preflight is given a directory that is not the repo -- no manifest,
-    no checkout.  It must say so truthfully and name the wrong-cwd shape,
-    rather than reporting "the repo declares no tests".
+    The preflight is given a directory that holds the repo *somewhere else*
+    -- it is pointed at the parent, not at the checkout.  It must say so
+    truthfully and name the wrong-cwd shape, rather than reporting "the repo
+    declares no tests".
     """
 
     from lh_harness.workspace_preflight import (
@@ -1375,6 +1378,72 @@ def test_preflight_reports_a_wrong_working_directory_as_a_readiness_gap(
     # The message points at the wrong-cwd shape explicitly.
     assert "wrong working directory" in record.readiness_gap["message"]
     assert record.prerequisite is None
+
+
+def test_preflight_reports_a_partial_checkout_as_a_readiness_gap(
+    tmp_path: Path,
+) -> None:
+    """Amendment-3: a checkout without its manifest is a gap too.
+
+    This is the shape a partial checkout has: the ``.git`` directory is
+    there, so the workspace *is* the repo, but the manifest was never
+    checked out.  The preflight must not conclude that the repo has no
+    tests.
+    """
+
+    from lh_harness.workspace_preflight import (
+        READINESS_GAP_MANIFEST_MISSING,
+        run_preflight,
+    )
+
+    workspace = tmp_path / "partial"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("partial checkout\n", encoding="utf-8")
+    _git_init_workspace(workspace)
+
+    record = run_preflight(
+        workspace,
+        allow_env_prep=False,
+        allow_install=False,
+    )
+
+    assert record.ok is False
+    assert record.readiness_gap is not None
+    assert record.readiness_gap["code"] == READINESS_GAP_MANIFEST_MISSING
+    assert record.readiness_gap["detail"]["looks_like_checkout"] is True
+    assert "partial checkout" in record.readiness_gap["message"]
+    assert record.prerequisite is None
+
+
+def test_a_non_checkout_workspace_is_the_legitimate_no_test_case(
+    tmp_path: Path,
+) -> None:
+    """A directory that is not a checkout has no declared suite to verify.
+
+    The launcher's own guard calls this mode ``not-a-repo`` and hands the
+    workspace over as found (a docs-only tree, a scratch directory).  The
+    manager turns that into the explicit applicability the preflight
+    honours, so such a workspace is not blocked -- and, importantly, is not
+    reported as a *verified* environment either: the receipt says the repo
+    declares no tests.
+    """
+
+    from lh_harness.workspace_preflight import run_preflight
+
+    workspace = tmp_path / "not-a-repo"
+    workspace.mkdir()
+
+    record = run_preflight(
+        workspace,
+        allow_env_prep=False,
+        allow_install=False,
+        no_tests_applicable=True,
+    )
+
+    assert record.ok is True, record.readiness_gap
+    assert record.readiness_gap is None
+    assert record.collection["collected"] == 0
+    assert "no tests" in record.collection["detail"]
 
 
 def test_preflight_reports_a_declared_node_suite_as_an_unsupported_suite(
@@ -1544,6 +1613,8 @@ def test_the_readiness_gap_is_carried_in_the_receipts(
 
     workspace = tmp_path / "gap-receipt"
     workspace.mkdir()
+    (workspace / "README.md").write_text("receipt fixture\n", encoding="utf-8")
+    _git_init_workspace(workspace)
 
     record = run_preflight(
         workspace,
@@ -1617,8 +1688,14 @@ async def test_the_gate_reports_a_readiness_gap_as_its_own_outcome(
 
     from lh_harness.manager import run
 
+    # A *checkout* with no manifest: the partial-checkout / wrong-cwd shape.
+    # (A bare directory with no ``.git`` is the launcher's legitimate
+    # ``not-a-repo`` workspace, which the preflight honours as an explicit
+    # no-test applicability -- that case has its own test.)
     workspace = tmp_path / "gap-workspace"
     workspace.mkdir()
+    (workspace / "README.md").write_text("gap workspace\n", encoding="utf-8")
+    _git_init_workspace(workspace)
 
     config = HarnessConfig(
         workspace_path=str(workspace),
