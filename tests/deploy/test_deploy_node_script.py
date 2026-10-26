@@ -57,6 +57,52 @@ def _make_venv(path: Path) -> None:
     pip.chmod(0o755)
 
 
+# Building a venv with ensurepip costs ~2 minutes, and the suite needs one
+# per test (each test installs into it).  The venv is therefore built ONCE
+# per session into a template and COPIED per test: a copy takes milliseconds.
+# The copy is what the node under test installs into, so it is still a real
+# venv with a real pip.
+_VENV_TEMPLATE: Path | None = None
+
+
+@pytest.fixture(scope="session")
+def venv_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    global _VENV_TEMPLATE
+    if _VENV_TEMPLATE is not None:
+        return _VENV_TEMPLATE
+    template = tmp_path_factory.mktemp("venv-template") / "venv"
+    _make_venv(template)
+    _VENV_TEMPLATE = template
+    return template
+
+
+def _clone_venv(template: Path, target: Path) -> None:
+    """Copy the prepared venv to the node's path.
+
+    A venv is not relocatable by plain copy (the scripts in bin/ have the
+    build path baked in), so the copy is followed by a rewrite of that path.
+    The rewrite is what keeps the copy a working venv.
+    """
+    shutil.copytree(template, target, symlinks=True)
+    bin_dir = target / "bin"
+    for script in list(bin_dir.iterdir()):
+        if not script.is_file():
+            continue
+        try:
+            text = script.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if str(template) not in text:
+            continue
+        script.write_text(text.replace(str(template), str(target)), encoding="utf-8")
+    pyvenv = target / "pyvenv.cfg"
+    if pyvenv.is_file():
+        pyvenv.write_text(
+            pyvenv.read_text(encoding="utf-8").replace(str(template), str(target)),
+            encoding="utf-8",
+        )
+
+
 def _git(repo: Path, *args: str) -> str:
     env = {
         **os.environ,
@@ -73,7 +119,7 @@ def _git(repo: Path, *args: str) -> str:
 class Node:
     """A fake harness node: venv, runs root, local git repo, shims."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, venv_template: Path) -> None:
         self.root = root
         self.venv = root / "venv"
         self.home = root / "home"
@@ -124,7 +170,7 @@ class Node:
             "HOME": str(self.home),
         }
         self.env.pop("PYTHONPATH", None)
-        _make_venv(self.venv)
+        _clone_venv(venv_template, self.venv)
 
     # --- the fake upstream repository -------------------------------------
 
@@ -133,15 +179,63 @@ class Node:
         package = self.repo / "src" / "lh_harness"
         package.mkdir(parents=True, exist_ok=True)
         (package / "__init__.py").write_text(f'__version__ = "0.1.7"\n# {marker}\n', encoding="utf-8")
+        # The fixture mirrors the REAL src/lh_harness/build_info.py: the
+        # package's own commit comes from a stamped _build_info.json, and
+        # build_info() PREFERS the deploy receipt over it (that is what makes
+        # /api/meta report the deployed commit).  The deploy script must
+        # therefore read package_build_info() -- the package-only view -- when
+        # it verifies what it just installed, or the second deploy on a node
+        # would verify against the PREVIOUS deploy's receipt.
         (package / "build_info.py").write_text(
             "import json, os\n"
             "from pathlib import Path\n"
+            "from . import __version__\n"
             "def _read_commit():\n"
             "    p = Path(__file__).with_name('_build_info.json')\n"
             "    try:\n"
             "        return json.loads(p.read_text())['commit']\n"
             "    except Exception:\n"
-            "        return None\n",
+            "        return None\n"
+            "def _read_deployed_commit():\n"
+            "    # Mirrors the REAL build_info._deployed_receipt_paths(): the\n"
+            "    # override, then $LH_HARNESS_HOME/.lh-harness/deployed.json,\n"
+            "    # then ~/.lh-harness/deployed.json.  The deploy script sets\n"
+            "    # LH_HARNESS_HOME to the node's home, so on a real node this\n"
+            "    # DOES find the receipt -- which is exactly why the deploy\n"
+            "    # script must read package_build_info() (the package-only\n"
+            "    # view) when it verifies what it just installed.\n"
+            "    override = os.environ.get('LH_HARNESS_DEPLOYED_JSON', '').strip()\n"
+            "    roots = []\n"
+            "    if override:\n"
+            "        roots.append(Path(override))\n"
+            "    else:\n"
+            "        home = os.environ.get('LH_HARNESS_HOME', '').strip()\n"
+            "        if home:\n"
+            "            roots.append(Path(home) / '.lh-harness' / 'deployed.json')\n"
+            "        roots.append(Path.home() / '.lh-harness' / 'deployed.json')\n"
+            "    for p in roots:\n"
+            "        try:\n"
+            "            d = json.loads(p.read_text())\n"
+            "        except Exception:\n"
+            "            continue\n"
+            "        if isinstance(d, dict):\n"
+            "            c = (d.get('commit') or '').strip()\n"
+            "            if c:\n"
+            "                return c\n"
+            "    return None\n"
+            "def package_build_info():\n"
+            "    # The PACKAGE-only view: the real module exposes this so the\n"
+            "    # deploy script can read the package's own commit without the\n"
+            "    # deploy receipt overriding it.\n"
+            "    return {'version': __version__, 'commit': _read_commit()}\n"
+            "def build_info():\n"
+            "    info = dict(package_build_info())\n"
+            "    deployed = _read_deployed_commit()\n"
+            "    if deployed:\n"
+            "        info['commit'] = deployed\n"
+            "    return info\n"
+            "if __name__ == '__main__':\n"
+            "    print(build_info()['commit'] or '')\n",
             encoding="utf-8",
         )
         (self.repo / "pyproject.toml").write_text(
@@ -228,8 +322,8 @@ class Node:
 
 
 @pytest.fixture()
-def node(tmp_path: Path) -> Node:
-    node = Node(tmp_path)
+def node(tmp_path: Path, venv_template: Path) -> Node:
+    node = Node(tmp_path, venv_template)
     node.install_previous()
     # The API reports the commit of whatever the node runs.  A live node
     # reports the commit its package was built from; the shim starts with the
@@ -351,6 +445,35 @@ def test_the_receipt_records_the_previous_deploy(node: Node) -> None:
         "at": "2026-10-01T00:00:00Z",
         "by": "someone-else",
     }
+
+
+def test_a_second_deploy_verifies_against_the_package_not_the_old_receipt(
+    node: Node,
+) -> None:
+    """The install verify must read the PACKAGE's commit, not the receipt's.
+
+    build_info() prefers the deploy receipt (that is what makes /api/meta
+    report the deployed commit), so if the deploy script verified what it had
+    just installed through build_info(), the SECOND deploy on a node would
+    read the PREVIOUS deploy's receipt and fail its own verify against a
+    commit it never installed.  The script therefore reads
+    package_build_info() -- the package-only view.
+    """
+    # A previous deploy left its receipt behind.
+    node.receipt.write_text(
+        json.dumps({"commit": node.old_sha, "version": "0.1.7", "at": "2026-10-01T00:00:00Z",
+                    "by": "someone-else", "previous": None}),
+        encoding="utf-8",
+    )
+    (node.root / "meta-commit").write_text(node.new_sha, encoding="utf-8")
+
+    result = node.run("--ref", "main")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The install verify compared against the commit that was installed.
+    assert f"expected '{node.new_sha}'" not in result.stderr, result.stderr
+    # And the receipt now names the NEW commit.
+    assert node.receipt_data()["commit"] == node.new_sha
 
 
 def test_the_one_line_receipt_is_printed(node: Node) -> None:

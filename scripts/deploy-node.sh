@@ -148,10 +148,25 @@ installed_version() {
   "$VENV/bin/python" -c 'import lh_harness; print(lh_harness.__version__)' 2>/dev/null || true
 }
 
-# The commit the installed package was built from (src/lh_harness/build_info.py).
+# The commit the installed PACKAGE was built from (the _build_info.json that
+# is stamped into the wheel).
+#
+# It must be the PACKAGE's commit, NOT the deploy receipt's: build_info()
+# prefers the receipt (that is what makes /api/meta report the deployed
+# commit), so reading it here would report the PREVIOUS deploy's commit while
+# this deploy's install is being verified -- and the second deploy would then
+# fail its own verify against a commit it never installed.  package_build_info()
+# is the package-only view.
+#
 # Empty for a build that predates build info: "unknown", never a guess.
 installed_commit() {
-  "$VENV/bin/python" -m lh_harness.build_info 2>/dev/null || true
+  "$VENV/bin/python" - <<'PY' 2>/dev/null || true
+try:
+    from lh_harness.build_info import package_build_info
+except Exception:
+    raise SystemExit(0)
+print(package_build_info().get("commit") or "")
+PY
 }
 
 # The path of the installed package's metadata directory (the dist-info that
