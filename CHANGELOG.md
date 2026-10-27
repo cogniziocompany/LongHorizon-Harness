@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports it as 429 rather than an unhandled 500.  This change is source
   only -- it is not deployed here, and the live CT110 node picks the cap and
   the memory gate up only on its next deploy (Paxton's go).
+- **The memory headroom gate now measures REMAINING memory, and an
+  unreadable live-run inventory blocks admission.** The headroom the
+  launcher gates on is the memory a new worker can still touch, not the
+  cgroup's limit: each cgroup level contributes
+  `memory.max - memory.current`, the tightest such value is taken over the
+  container's own cgroup and every ancestor cgroup that carries a finite
+  `memory.max`, and that remaining is bounded by the host's
+  `MemAvailable`.  Reading only `memory.max` overstated the room a nearly
+  full container had, which is the shape that ends in an OOM kill.  When
+  the live-run enumeration FAILS, the count is unknown rather than zero,
+  so the last known admission state is kept and admission is refused with
+  the `inventory_unavailable` blocked reason until an enumeration
+  succeeds -- an unknown inventory is not an empty node, and treating it
+  as one would let the node over-admit into the last slot.  No run is
+  killed and no entry is failed; the blocked entries stay pending and the
+  block clears by itself.  `docs/operations/admission.md` now describes
+  the remaining-based headroom and the `inventory_unavailable` state.
 - **The launcher enforces a node-level active-run ceiling.** `[queue] node_max_runs`
   is the maximum number of runs the launcher will let be active on THIS node at
   once — the value the fleet registry advertises as `maxConcurrentRuns`. Until
