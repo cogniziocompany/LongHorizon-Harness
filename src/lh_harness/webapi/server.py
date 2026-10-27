@@ -27,6 +27,8 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from ..dashboard.state import DashboardState
 from ..launcher import Launcher
+from ..interaction.auth import InteractionAssertionError, verify_interaction_assertion
+from ..interaction.local import InteractionError, LocalInteractiveService
 from ..mcp_profiles import _default_profile_for_role, gateway_configured, list_available_profiles
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
 from ..model_catalog import discover_model_catalog
@@ -849,6 +851,8 @@ def create_app(
     auth_token: str | None = None,
     allowed_origins: set[str] | list[str] | tuple[str, ...] | None = None,
     bind_host: str = "127.0.0.1",
+    interactive_service: LocalInteractiveService | None = None,
+    interaction_assertion_secret: str | None = None,
 ) -> FastAPI:
     """Create an API app over a live shared state or a historical runs root."""
 
@@ -902,6 +906,8 @@ def create_app(
     async def _lifespan(app: FastAPI) -> Any:
         if launcher is not None:
             await launcher.start()
+        if interactive_service is not None:
+            interactive_service.recover()
         yield
         if launcher is not None:
             await launcher.stop()
@@ -912,6 +918,8 @@ def create_app(
     app.state.auth_token = token
     app.state.allowed_origins = origins
     app.state.bind_host = bind_host
+    app.state.interactive_service = interactive_service
+    assertion_secret = interaction_assertion_secret or os.environ.get("LH_HARNESS_INTERACTION_ASSERTION_SECRET")
     _maybe_start_fleet_reporter(registry, supervisor, queue_store)
     app.state.launcher = launcher
     if supervisor is not None:
@@ -1686,6 +1694,105 @@ def create_app(
         if receipt is None:
             raise HTTPException(status_code=404, detail="command receipt not found")
         return receipt
+
+    def _interactive() -> LocalInteractiveService:
+        if interactive_service is None:
+            raise HTTPException(status_code=501, detail="Interactive Office local fixture is not configured")
+        return interactive_service
+
+    def _interaction_principal(
+        request: Request,
+        *,
+        run_id: str,
+        action: str,
+        body: dict[str, Any],
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return verify_interaction_assertion(
+                request.headers.get("X-Interaction-Assertion"),
+                assertion_secret,
+                run_id=run_id,
+                action=action,
+                body=body,
+                role=role,
+            )
+        except InteractionAssertionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    @app.exception_handler(InteractionError)
+    async def _interaction_error(_request: Request, exc: InteractionError) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
+
+    @app.get("/api/interactive/stages")
+    def interactive_stages() -> dict[str, Any]:
+        return LocalInteractiveService.manifest()
+
+    @app.get("/api/interactive/runs")
+    def interactive_runs() -> dict[str, Any]:
+        return _interactive().list_runs()
+
+    @app.post("/api/interactive/runs")
+    def interactive_create(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        run_id = str(body.get("run_id") or "")
+        principal = _interaction_principal(request, run_id=run_id, action="create", body=body)
+        return _interactive().create_run(body, principal=principal, idempotency_key=_bounded_command_id(request.headers.get("Idempotency-Key")))
+
+    @app.get("/api/interactive/runs/{run_id}")
+    def interactive_projection(run_id: str) -> dict[str, Any]:
+        return _interactive().projection(run_id)
+
+    @app.get("/api/interactive/runs/{run_id}/evidence")
+    def interactive_evidence(run_id: str) -> dict[str, Any]:
+        return _interactive().evidence(run_id)
+
+    @app.get("/api/interactive/runs/{run_id}/artifacts/{artifact_id}")
+    def interactive_artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
+        return _interactive().artifact_content(run_id, artifact_id)
+
+    @app.get("/api/interactive/runs/{run_id}/workspace/{name:path}")
+    def interactive_workspace_file(run_id: str, name: str, revision: str | None = None) -> dict[str, Any]:
+        return _interactive().workspace_file(run_id, name, revision)
+
+    @app.post("/api/interactive/runs/{run_id}/pause")
+    def interactive_pause(run_id: str, request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        principal = _interaction_principal(request, run_id=run_id, action="pause", body=body)
+        return _interactive().request_pause(run_id, principal=principal, command_id=_bounded_command_id(request.headers.get("Idempotency-Key")))
+
+    @app.post("/api/interactive/runs/{run_id}/resume")
+    def interactive_resume(run_id: str, request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        principal = _interaction_principal(request, run_id=run_id, action="resume", body=body)
+        return _interactive().request_resume(run_id, principal=principal, command_id=_bounded_command_id(request.headers.get("Idempotency-Key")))
+
+    @app.post("/api/interactive/runs/{run_id}/changes")
+    def interactive_change(run_id: str, request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        principal = _interaction_principal(request, run_id=run_id, action="change", body=body)
+        return _interactive().request_change(run_id, body, principal=principal, command_id=_bounded_command_id(request.headers.get("Idempotency-Key")))
+
+    @app.post("/api/interactive/runs/{run_id}/estimates/{estimate_id}/decision")
+    def interactive_decision(run_id: str, estimate_id: str, request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        principal = _interaction_principal(request, run_id=run_id, action="decide", body=body)
+        return _interactive().decide(run_id, estimate_id, body, principal=principal, command_id=_bounded_command_id(request.headers.get("Idempotency-Key")))
+
+    @app.post("/api/interactive/runs/{run_id}/attempts/{attempt_id}/restart")
+    def interactive_restart(run_id: str, attempt_id: str, request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        principal = _interaction_principal(request, run_id=run_id, action="restart", body=body)
+        return _interactive().restart(run_id, attempt_id, body, principal=principal, command_id=_bounded_command_id(request.headers.get("Idempotency-Key")))
+
+    @app.post("/api/interactive/runs/{run_id}/conversations/{role}/turns")
+    def interactive_turn(run_id: str, role: str, request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        principal = _interaction_principal(request, run_id=run_id, action="turn", body=body, role=role)
+        return _interactive().post_turn(run_id, role, body, principal=principal, command_id=_bounded_command_id(request.headers.get("Idempotency-Key")))
+
+    @app.post("/api/interactive/runs/{run_id}/customer/done")
+    def interactive_done(run_id: str, request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        principal = _interaction_principal(request, run_id=run_id, action="customer_done", body=body)
+        return _interactive().set_customer_done(run_id, body, principal=principal, command_id=_bounded_command_id(request.headers.get("Idempotency-Key")))
+
+    @app.post("/api/interactive/runs/{run_id}/customer/rating")
+    def interactive_rating(run_id: str, request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        principal = _interaction_principal(request, run_id=run_id, action="customer_rating", body=body)
+        return _interactive().set_customer_rating(run_id, body, principal=principal, command_id=_bounded_command_id(request.headers.get("Idempotency-Key")))
 
     # Compress JSON API responses when the client accepts gzip.  The snapshot
     # route handles compression explicitly for large payloads; this covers the

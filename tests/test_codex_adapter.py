@@ -133,3 +133,10 @@ def test_web_meta_does_not_claim_missing_explicit_binary(monkeypatch, tmp_path: 
     assert is_agent_binary_available(missing) is False
     assert codex["available"] is False
     assert codex["binary"] == missing
+
+
+def test_codex_wire_api_is_explicit_and_validated() -> None:
+    assert 'wire_api = "responses"' in codex_adapter_module._config_overrides(base_url="https://example.invalid", api_key="scoped")[0]
+    assert 'wire_api = "chat"' in codex_adapter_module._config_overrides(base_url="https://example.invalid", api_key="scoped", wire_api="chat")[0]
+    with pytest.raises(ValueError, match="responses or chat"):
+        codex_adapter_module._config_overrides(base_url="https://example.invalid", api_key="scoped", wire_api="invalid")
