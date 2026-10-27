@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headroom gate that refuses when `MemAvailable` minus the startup allowance
   `LH_HARNESS_RUN_STARTUP_MB` (default 600) is below the floor
   `LH_HARNESS_MEM_FLOOR_MB` (default 1024), recording `memory_headroom` as
-  the entry's latest skip reason.  The same cap is enforced a second time
+  the entry's latest skip reason -- the new per-entry
+  `latest_skip_reason` field, which is `None` on an entry that was never
+  skipped and is returned by the queue API alongside the full
+  `skip_reasons` history.  The same cap is enforced a second time
   at the shared launch boundary (`RunSupervisor.create_run`), where every
   launch path -- including a direct `POST /api/runs` -- takes a PENDING
   STARTUP reservation under a lock before any worker is spawned; the

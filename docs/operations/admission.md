@@ -64,6 +64,14 @@ always wins; no gate can override another.
    the node cap alone bounds admission -- a missing probe must never freeze
    the queue.
 
+   The refusal is written to the entry's `latest_skip_reason` field (and
+   appended to its `skip_reasons` history). `latest_skip_reason` is the
+   single field to read for "why did this entry not start": it is `None`
+   on an entry that was never skipped, and it is what the queue API
+   returns per entry. Both admission gates write it, so it carries
+   `memory_headroom` when the memory gate refused and the node-capacity
+   text when the node cap refused.
+
 All three limits hot-reload: the settings are read from the settings DB at
 the start of every launch pass, so an operator change applies on the next
 pass with no restart (same mechanism as the lane caps).
@@ -199,6 +207,9 @@ see it -- still holds its slot.
   exits or crashes.
 - `src/lh_harness/settings_store.py` -- the three setting names in the
   catalog.
+- `src/lh_harness/queue.py` and `src/lh_harness/pg_queue.py` -- the
+  entry's `latest_skip_reason` field (the file store and the Postgres
+  column), written by `record_skip` wherever the refusal is recorded.
 - `src/lh_harness/webapi/protocol.py` and `src/lh_harness/webapi/server.py`
   -- the `/api/meta` `admission` object.
 - `tests/webapi/test_launcher_node_admission.py` -- the launcher-side
