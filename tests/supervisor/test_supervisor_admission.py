@@ -319,6 +319,67 @@ def test_reconcile_keeps_only_active_lifecycle_statuses(tmp_path) -> None:
     assert snapshot["starting"] == 0
 
 
+def test_status_of_a_crashed_run_releases_its_node_slot(tmp_path) -> None:
+    """Deliverable C: resolving a crashed run's status frees its node slot.
+
+    This is the PRODUCTION path, not the admission object in isolation: the
+    run is published (holding a slot), its durable status turns terminal --
+    the OOM-kill shape, where the worker died and the supervisor wrote
+    ``failed`` -- and reading that run's status through the supervisor
+    releases the slot.  Without this wiring the node would keep a slot for
+    every crashed run forever, and the node gate would refuse launches on a
+    node whose workers are all gone.
+    """
+
+    supervisor = _supervisor(tmp_path)
+    # The run is alive and holds a node slot.
+    _write_run_dir(supervisor, "crashed-run", "running")
+    supervisor.admission.publish("crashed-run", "running")
+    snapshot = supervisor.admission.snapshot()
+    assert snapshot["running"] == 1
+
+    # The worker dies: the durable status turns terminal.
+    run_dir = supervisor._run_dir("crashed-run")  # noqa: SLF001 - test fixture
+    (run_dir / "control" / "status.json").write_text(
+        json.dumps(
+            {
+                "run_id": "crashed-run",
+                "status": "failed",
+                "managed": True,
+                "alive": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Resolving the status releases the slot.
+    status = supervisor.status("crashed-run")
+    assert status.get("status") == "failed"
+    snapshot = supervisor.admission.snapshot()
+    assert snapshot["running"] == 0
+    assert snapshot["starting"] == 0
+
+
+def test_status_of_a_running_run_keeps_its_node_slot(tmp_path, live_worker) -> None:
+    """The other half of the wiring: an alive run keeps holding its slot.
+
+    The release must not be so eager that a healthy run loses its slot and
+    the node admits past its maximum.
+    """
+
+    supervisor = _supervisor(tmp_path)
+    _write_run_dir(supervisor, "live-run", "running", pid=live_worker.pid)
+    supervisor._processes["live-run"] = live_worker  # noqa: SLF001 - test fixture
+    supervisor.admission.publish("live-run", "running")
+
+    status = supervisor.status("live-run")
+
+    assert status.get("status") == "running"
+    snapshot = supervisor.admission.snapshot()
+    assert snapshot["running"] == 1
+    assert snapshot["starting"] == 0
+
+
 # ---------------------------------------------------------------------------
 # The settings resolver.
 # ---------------------------------------------------------------------------
