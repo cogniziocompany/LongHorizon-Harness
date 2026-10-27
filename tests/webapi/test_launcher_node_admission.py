@@ -575,22 +575,29 @@ def test_admission_snapshot_blocked_reason_memory(tmp_path: Path) -> None:
 def test_regression_sum_of_lane_caps_over_node_max_never_admits_more(tmp_path: Path) -> None:
     """THE regression test for the incident shape.
 
-    Lane caps sum to 20 across seven lanes against node_max 5 -- the shape
-    of a queue_capacity table whose lanes were configured far above what
-    the node could hold.  With an empty node and 20 pending entries spread
-    over every lane, no sequence of passes may ever leave more than
-    node_max runs running+starting, even though every single lane cap still
-    has room.  That invariant is what per-lane checks alone could not
-    express.
+    Lane caps sum to 18 across the two configured lanes against node_max 5
+    -- the shape of a queue_capacity table whose lanes were configured far
+    above what the node could hold.  With an empty node and 20 pending
+    entries spread over every lane, no sequence of passes may ever leave
+    more than node_max runs running+starting, even though every single
+    lane cap still has room.  That invariant is what per-lane checks
+    alone could not express.
+
+    Every cap here is deliberately far ABOVE node_max so the per-lane
+    checks can never be the binding constraint: the node gate must be the
+    only thing that stops the launches.  (A cap of 1 or 2 on a lane would
+    let the lane check bound the total first and the node gate would never
+    be exercised -- the regression would then pass even with the node gate
+    removed.)
     """
 
-    caps = {
-        "glm_max": 5, "minimax_max": 4, "qwen_max": 4, "zai_max": 2,
-        "mm31f_max": 2, "zaiq_max": 2, "kimi_max": 1,
-    }
+    caps = {"kimi_max": 9, "qwen_max": 9}
     launcher, store, supervisor = _launcher(tmp_path, capacity=caps)
-    assert sum(caps.values()) == 20
+    assert sum(caps.values()) == 18
     assert sum(caps.values()) > DEFAULT_NODE_MAX_ADMISSION
+    # No single lane cap may bind below node_max: only the node gate can
+    # stop these launches.
+    assert min(caps.values()) > DEFAULT_NODE_MAX_ADMISSION
     trios = [key[: -len("_max")] for key in caps]
     for i in range(20):
         store.create(_base_entry(trio=trios[i % len(trios)], priority=20 - i, workspace=f"./w{i}"))
@@ -603,6 +610,11 @@ def test_regression_sum_of_lane_caps_over_node_max_never_admits_more(tmp_path: P
     # The launcher did run and did launch: the cap bound real launches,
     # not an inert gate.
     assert len(supervisor.created) >= 1
+    # The node gate is the ONLY thing that could have stopped these
+    # launches (every lane cap has room), so it must be the gate that
+    # stopped them: the refusal is reported as node_max.
+    assert snapshot["blocked_reason"] == "node_max"
+    assert len(supervisor.created) == DEFAULT_NODE_MAX_ADMISSION
 
 
 def test_caps_over_node_max_logs_a_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
