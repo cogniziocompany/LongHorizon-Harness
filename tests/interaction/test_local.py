@@ -219,6 +219,13 @@ def test_out_of_scope_records_decision_before_one_linked_restart(tmp_path: Path,
     assert after["restarts"][0]["decision_id"] == decision["decision_id"]
     assert after["restarts"][0]["estimate_id"] == estimate["estimate_id"]
     assert after["decisions"][-1]["decision"] == "allowed"
+    next_estimate = service.request_change(
+        "run-1",
+        {"request": "Add XML export", "criteria": ["XML export"], "selected_stage": "auditor.verify", "estimate": {"minutes": 3}},
+        principal=_PRINCIPAL,
+    )
+    assert next_estimate["estimate_id"] != estimate["estimate_id"]
+    assert next_estimate["revision"] > estimate["revision"]
     with pytest.raises(InteractionError, match="append-only"):
         service.decide("run-1", estimate["estimate_id"], {"decision": "denied"}, principal=_PRINCIPAL)
 
@@ -303,6 +310,16 @@ def test_executor_checkpoint_supports_versioned_restart(tmp_path: Path, repo: Pa
     assert after["attempt_id"] != before["attempt_id"]
     assert after["attempts"][0]["status"] == "superseded"
     assert after["failure_reason"] is None
+
+
+def test_checkpoint_distinguishes_task_prefix_from_secret_tokens(tmp_path: Path, repo: Path, agents: dict[str, RoleAgent]) -> None:
+    service = _service(tmp_path, repo, agents)
+    (repo / "task_report.py").write_text("TASK_NAME = 'task-report'\n", encoding="utf-8")
+    before = _git_commit(repo)
+    assert service._checkpoint_workspace(repo, "attempt-check") != before
+    (repo / "task_report.py").write_text("TOKEN = 'sk-1234567890abcdef'\n", encoding="utf-8")
+    with pytest.raises(InteractionError, match="potential secret"):
+        service._checkpoint_workspace(repo, "attempt-check")
 
 
 def _git_commit(repo: Path) -> str:

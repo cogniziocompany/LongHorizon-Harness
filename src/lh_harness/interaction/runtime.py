@@ -5,7 +5,7 @@ from pathlib import Path
 
 import uvicorn
 
-from ..adapters.claude_code import ClaudeCodeAdapter
+from ..adapters.codex import CodexAdapter
 from ..webapi.server import create_app
 from .local import LocalInteractiveService
 
@@ -21,21 +21,15 @@ def build_interactive_service() -> LocalInteractiveService:
     model = os.environ.get("LH_HARNESS_INTERACTIVE_MODEL") or None
     base_url = os.environ.get("ANTHROPIC_BASE_URL") or None
     api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or None
-    roles = {
-        "manager": "manager",
-        "executor": "cli_executor",
-        "auditor": "cli_auditor",
-        "final_response": "final_response",
-    }
 
-    def factory(role: str) -> ClaudeCodeAdapter:
-        return ClaudeCodeAdapter(
+    def factory(role: str) -> CodexAdapter:
+        return CodexAdapter(
             model=model,
             api_key=api_key,
             base_url=base_url,
             workspace_path=str(source_path),
             prompt_dir=str(prompt_dir),
-            role=roles[role],
+            wire_api="responses",
         )
 
     return LocalInteractiveService(root_path, source_root=source_path, adapter_factory=factory)

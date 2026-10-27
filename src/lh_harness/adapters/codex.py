@@ -36,6 +36,7 @@ class CodexAdapter(CommandAgentAdapter):
         sandbox_mode: str | None = None,
         hidden_paths: tuple[str, ...] = (),
         reasoning_effort: str | None = None,
+        wire_api: str = "responses",
     ) -> None:
         effort = normalise_reasoning_effort(reasoning_effort)
         env_parts: list[str] = []
@@ -63,7 +64,7 @@ class CodexAdapter(CommandAgentAdapter):
         else:
             command_parts.append("--dangerously-bypass-approvals-and-sandbox")
 
-        for override in _config_overrides(base_url=base_url, api_key=api_key):
+        for override in _config_overrides(base_url=base_url, api_key=api_key, wire_api=wire_api):
             command_parts.extend(["-c", shlex.quote(override)])
 
         # Codex has no `--effort` flag; the reasoning depth is a config value.
@@ -104,14 +105,16 @@ class CodexAdapter(CommandAgentAdapter):
         )
 
 
-def _config_overrides(*, base_url: str | None, api_key: str | None) -> list[str]:
+def _config_overrides(*, base_url: str | None, api_key: str | None, wire_api: str = "responses") -> list[str]:
     """Build the `-c key=value` overrides that point Codex at our endpoint."""
     if not base_url and not api_key:
         return []
+    if wire_api not in {"responses", "chat"}:
+        raise ValueError("wire_api must be responses or chat")
     provider = {
         "name": "LongHorizon-Harness",
         "base_url": _normalize_base_url(base_url),
-        "wire_api": "responses",
+        "wire_api": wire_api,
     }
     if api_key:
         provider["env_key"] = "OPENAI_API_KEY"

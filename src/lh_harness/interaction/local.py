@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -226,8 +227,8 @@ class LocalInteractiveService:
             raise InteractionError("checkpoint contains a potential secret path; capture it explicitly or remove it", 422)
         _git(workspace, "add", "-A")
         staged = _git(workspace, "diff", "--cached", "--")
-        secret_markers = ("begin private key", "anthropic_auth_token=", "openai_api_key=", "password=", "sk-")
-        if any(marker in staged.lower() for marker in secret_markers):
+        secret_markers = ("begin private key", "anthropic_auth_token=", "openai_api_key=", "password=")
+        if any(marker in staged.lower() for marker in secret_markers) or re.search(r"\bsk-[A-Za-z0-9_-]{16,}\b", staged, flags=re.IGNORECASE):
             _git(workspace, "reset")
             raise InteractionError("checkpoint diff contains potential secret material; no commit was created", 422)
         if not _git(workspace, "diff", "--cached", "--name-only"):
@@ -480,7 +481,11 @@ class LocalInteractiveService:
                     self._update_attempt(run_id, attempt_id, lambda current: {**current, "status": "running"})
                     self._start(run_id, attempt_id, "executor.build")
                 return record
-            estimates = _records(self._attempt_dir(run_id, attempt_id) / "control" / "estimates.jsonl")
+            estimates = [
+                record
+                for attempt in self._lineage(run_id, attempt_id)
+                for record in _records(self._attempt_dir(run_id, str(attempt["attempt_id"])) / "control" / "estimates.jsonl")
+            ]
             revision = max((int(item.get("revision") or 0) for item in estimates), default=0) + 1
             selected = str(body.get("selected_stage") or "manager.plan")
             self._validate_stage(selected)
