@@ -44,6 +44,7 @@ _COLUMN_STATUS = "status"
 _COLUMN_RUN_ID = "run_id"
 _COLUMN_REASON = "reason"
 _COLUMN_SKIP_REASONS = "skip_reasons"
+_COLUMN_LATEST_SKIP_REASON = "latest_skip_reason"
 _COLUMN_CREATED_AT = "created_at"
 _COLUMN_UPDATED_AT = "updated_at"
 _COLUMN_LAUNCHED_AT = "launched_at"
@@ -86,6 +87,7 @@ _QUEUE_COLUMNS = (
     _COLUMN_RUN_ID,
     _COLUMN_REASON,
     _COLUMN_SKIP_REASONS,
+    _COLUMN_LATEST_SKIP_REASON,
     _COLUMN_CREATED_AT,
     _COLUMN_UPDATED_AT,
     _COLUMN_LAUNCHED_AT,
@@ -115,6 +117,19 @@ _MIGRATION_TASK_OVERRIDES_SQL = """\
 ALTER TABLE harness.queue
     ADD COLUMN IF NOT EXISTS model VARCHAR(256),
     ADD COLUMN IF NOT EXISTS roles JSONB;
+"""
+
+# LHH-CT110-MEMORY-ADMISSION (deliverable B): the entry's LATEST skip reason
+# on the Postgres queue backend, mirroring the file store's persistence of
+# QueueEntry.latest_skip_reason (queue.py).  The admission gates write their
+# refusal here -- the ``memory_headroom`` marker and the node-capacity text
+# -- so the reason an entry did not start is readable without walking the
+# whole ``skip_reasons`` history.  Same ADD COLUMN IF NOT EXISTS pattern as
+# migrations 005/006: a no-op once the column exists, existing rows read
+# back NULL exactly like a legacy file-store entry.
+_MIGRATION_LATEST_SKIP_REASON_SQL = """\
+ALTER TABLE harness.queue
+    ADD COLUMN IF NOT EXISTS latest_skip_reason VARCHAR(1024);
 """
 
 # Same bound the file store applies in ``QueueStore.requeue``.
@@ -182,6 +197,7 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         entry.run_id,
         entry.reason,
         json.dumps(entry.skip_reasons),
+        getattr(entry, "latest_skip_reason", None),
         entry.created_at,
         entry.updated_at,
         entry.launched_at,
@@ -324,6 +340,12 @@ class PgQueueStore:
                 # store connect can never leave a schema that accepts the old
                 # columns but not the new ones.
                 txn.execute(_MIGRATION_TASK_OVERRIDES_SQL)
+                # LHH-CT110-MEMORY-ADMISSION (deliverable B): the latest skip
+                # reason column, applied in the same single committed unit
+                # (see _MIGRATION_LATEST_SKIP_REASON_SQL) so a store connect
+                # can never leave a schema that writes the new column but
+                # has no column to write it into.
+                txn.execute(_MIGRATION_LATEST_SKIP_REASON_SQL)
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"migration failed: {exc}") from exc
@@ -677,7 +699,12 @@ class PgQueueStore:
             return None
         if entry.status != "pending":
             return None
-        entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
+        text = str(reason)[:_MAX_QUEUE_REASON_CHARS]
+        entry.skip_reasons.append(text)
+        # LHH-CT110-MEMORY-ADMISSION (deliverable B): the refusal that stops
+        # this entry is ALSO its latest skip reason (the file store's
+        # ``record_skip`` writes the same field the same way).
+        entry.latest_skip_reason = text
         return self.update(entry)
 
     def record_block(self, queue_id: str) -> QueueEntry | None:

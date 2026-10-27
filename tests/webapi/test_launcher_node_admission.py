@@ -244,6 +244,105 @@ def test_memory_headroom_gate_refuses_and_records_the_skip_reason(tmp_path: Path
     assert supervisor.created == []
 
 
+def test_memory_refusal_is_the_entry_latest_skip_reason(tmp_path: Path) -> None:
+    """Deliverable B names the field: the refusal is the LATEST skip reason.
+
+    The entry carries the refusal in ``latest_skip_reason`` (the field the
+    deliverable names), not only inside the ``skip_reasons`` history list:
+    an operator reading the entry sees why it did not start without
+    walking the whole history.  The marker is the ``memory_headroom``
+    one, so the reason is greppable.
+    """
+
+    launcher, store, supervisor = _launcher(tmp_path, meminfo_mb=1500.0, capacity={"kimi_max": 5})
+    entry = store.create(_base_entry(trio="kimi", workspace="./free"))
+    asyncio.run(launcher.tick())
+
+    refused = store.get(entry.queue_id)
+    assert refused is not None
+    assert refused.status == "pending"
+    assert refused.latest_skip_reason is not None
+    assert refused.latest_skip_reason.startswith(MEMORY_HEADROOM_SKIP_REASON), (
+        refused.latest_skip_reason
+    )
+    # The history list still holds the same text: the latest reason is a
+    # view of the history, not a replacement for it.
+    assert refused.skip_reasons[-1] == refused.latest_skip_reason
+
+
+def test_node_capacity_refusal_is_the_entry_latest_skip_reason(tmp_path: Path) -> None:
+    """The node cap's refusal is recorded as the latest skip reason too."""
+
+    launcher, store, supervisor = _launcher(tmp_path, capacity={"kimi_max": 9})
+    for i in range(5):
+        supervisor.add_run(f"active-{i}", f"./busy-{i}", status="running", trio="kimi")
+    entry = store.create(_base_entry(trio="kimi", workspace="./free"))
+    asyncio.run(launcher.tick())
+
+    refused = store.get(entry.queue_id)
+    assert refused is not None
+    assert refused.status == "pending"
+    assert refused.latest_skip_reason is not None
+    assert "node at capacity" in refused.latest_skip_reason, refused.latest_skip_reason
+
+
+def test_latest_skip_reason_is_none_before_any_skip(tmp_path: Path) -> None:
+    """A never-skipped entry has no latest skip reason."""
+
+    launcher, store, supervisor = _launcher(tmp_path, meminfo_mb=8000.0, capacity={"kimi_max": 5})
+    entry = store.create(_base_entry(trio="kimi", workspace="./free"))
+    asyncio.run(launcher.tick())
+
+    launched = store.get(entry.queue_id)
+    assert launched is not None
+    assert launched.status == "launched"
+    assert launched.latest_skip_reason is None
+
+
+def test_latest_skip_reason_survives_a_store_reload(tmp_path: Path) -> None:
+    """The field is persisted: a reloaded entry still carries the refusal."""
+
+    from lh_harness.queue import QueueStore
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    entry = store.create(_base_entry(trio="kimi", workspace="./free"))
+    store.record_skip(entry.queue_id, "memory_headroom: MemAvailable 900 MB")
+
+    reloaded = QueueStore(root).get(entry.queue_id)
+    assert reloaded is not None
+    assert reloaded.latest_skip_reason == "memory_headroom: MemAvailable 900 MB"
+    assert reloaded.skip_reasons == ["memory_headroom: MemAvailable 900 MB"]
+
+
+def test_latest_skip_reason_is_exposed_by_the_queue_api(tmp_path: Path) -> None:
+    """The API's queue entry payload carries the latest skip reason."""
+
+    from fastapi.testclient import TestClient
+
+    from lh_harness.webapi.server import create_app
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    supervisor = FakeSupervisor(root)
+    app = create_app(runs_root=root, supervisor=supervisor)
+    client = TestClient(app)
+
+    # Skip an entry through the app's own store: the API must surface the
+    # refusal an operator reads to learn why the entry did not start.
+    store = app.state.queue_store
+    entry = store.create(_base_entry(trio="kimi", workspace="./free"))
+    store.record_skip(entry.queue_id, "memory_headroom: MemAvailable 900 MB")
+
+    listed = client.get("/api/queue")
+    assert listed.status_code == 200, listed.text
+    payload = listed.json()
+    entries = payload.get("entries") if isinstance(payload, dict) else payload
+    served = next(e for e in entries if e.get("queue_id") == entry.queue_id)
+    assert served["latest_skip_reason"] == "memory_headroom: MemAvailable 900 MB"
+
+
 def test_memory_headroom_gate_passes_with_headroom(tmp_path: Path) -> None:
     """MemAvailable 3000: 3000 - 600 >= 1024, so the launch goes through."""
 
