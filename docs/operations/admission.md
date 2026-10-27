@@ -9,6 +9,20 @@ runs ran at once than the node could hold; the OOM killer took
 without a final report`. Admission is now decided at the NODE level, per
 launch cycle, under a lock, before any launch.
 
+## Deployment boundary
+
+This change is source only. It is not deployed, and it does not restart any
+service. The live CT110 node keeps running the old launcher until the next
+ordinary deploy of this code lands there, so **the node-wide cap and the
+memory headroom gate are NOT active on CT110 yet** -- they take effect on
+that node's next deploy, and only then (Paxton's go). Until that deploy,
+CT110 still admits per lane only.
+
+Nothing in this change touches a running node at merge time: no restart, no
+kill of in-flight runs, no change to the live settings DB. The three
+settings take their documented defaults on the first deploy; an operator
+may then change them from the admin screen at runtime (they hot-reload).
+
 ## The three limits and how they compose
 
 A launch must pass all three gates, checked in this order. The tighter one
@@ -106,6 +120,20 @@ is marked failed with the same crash-naming reason the supervisor's own
 reconciliation uses (`worker disappeared without a final report`); the
 launcher never requeues such an orphan itself -- the existing `retry_of`
 retry logic alone decides that, exactly as for any other failure.
+
+## What a refusal does to the entry
+
+A refusal is NOT a failure. Nothing was started, so the entry is not
+failed, does not consume one of its retries, and is retried on a later
+pass. The refusal is recorded as the entry's latest skip reason, so the
+entry's history shows why it did not start -- with the `memory_headroom`
+marker when the memory gate refused, and the node-capacity text when the
+node cap refused.
+
+The same holds for the direct API path: `POST /api/runs` answers **429**
+when the shared boundary refuses, not 400 and not 500. The request was
+well formed; the node was simply at capacity or short on memory, so the
+caller should retry later.
 
 ## Where the decision is enforced (two layers, one cap)
 

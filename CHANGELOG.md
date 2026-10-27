@@ -37,7 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   node gate clamps) when the lane caps sum past the node maximum -- with a
   regression test pinning that incident shape.  See
   docs/operations/admission.md for how the three limits compose and how to
-  raise caps safely.
+  raise caps safely.  A refusal from the shared supervisor boundary is now
+  treated as a skip, not a launch failure: the queue entry stays PENDING
+  with the refusal recorded as its latest skip reason (so it keeps the
+  `memory_headroom` marker and does not burn a retry), and `POST /api/runs`
+  reports it as 429 rather than an unhandled 500.  This change is source
+  only -- it is not deployed here, and the live CT110 node picks the cap and
+  the memory gate up only on its next deploy (Paxton's go).
 - **The launcher enforces a node-level active-run ceiling.** `[queue] node_max_runs`
   is the maximum number of runs the launcher will let be active on THIS node at
   once — the value the fleet registry advertises as `maxConcurrentRuns`. Until
