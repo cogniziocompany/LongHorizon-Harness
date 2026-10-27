@@ -372,6 +372,98 @@ def test_reconcile_keeps_only_active_lifecycle_statuses(tmp_path) -> None:
     assert snapshot["starting"] == 0
 
 
+# ---------------------------------------------------------------------------
+# P1-2: an enumeration FAILURE blocks admission; it is never read as "empty".
+# ---------------------------------------------------------------------------
+
+class _FakeInventory:
+    """A supervisor whose live-run enumeration can be made to fail.
+
+    ``items`` is the durable status projection the supervisor's
+    ``list_run_summaries`` returns; when ``fail`` is set the enumeration
+    raises instead, which is the shape of an unreadable runs root.
+    """
+
+    def __init__(self, items: list[dict[str, str]] | None = None, *, fail: bool = False) -> None:
+        self.items = list(items or [])
+        self.fail = fail
+
+    def list_run_summaries(self) -> list[dict[str, str]]:
+        if self.fail:
+            raise OSError("runs root is unreadable")
+        return list(self.items)
+
+
+def test_inventory_failure_at_startup_blocks_admission() -> None:
+    """A failed enumeration at start admits NOTHING.
+
+    At startup the last known state is empty, so the count would be zero
+    and the node would look free.  That is exactly the wrong answer: the
+    inventory is UNKNOWN, so admission must be blocked.
+    """
+
+    admission = _admission()
+    admission.reconcile_from_supervisor(_FakeInventory(fail=True))
+
+    with pytest.raises(AdmissionRefused) as excinfo:
+        admission.reserve_startup("run-1")
+    assert excinfo.value.blocked_reason == "inventory_unavailable"
+    snapshot = admission.snapshot()
+    assert snapshot["blocked_reason"] == "inventory_unavailable"
+
+
+def test_inventory_failure_while_populated_keeps_the_known_state() -> None:
+    """A failure while the node is populated keeps the known state.
+
+    The known running runs still count (their slots are not released by
+    an unrelated read failure), and no new admission is allowed on top
+    of an unknown inventory.
+    """
+
+    admission = _admission()
+    admission.reconcile_from_supervisor(
+        _FakeInventory([{"id": "run-a", "status": "running"}])
+    )
+    assert admission.snapshot()["running"] == 1
+
+    admission.reconcile_from_supervisor(_FakeInventory(fail=True))
+
+    # The last known state is KEPT, not replaced with an empty set.
+    snapshot = admission.snapshot()
+    assert snapshot["running"] == 1
+    assert snapshot["blocked_reason"] == "inventory_unavailable"
+
+    # And no new admission on top of it.
+    with pytest.raises(AdmissionRefused) as excinfo:
+        admission.reserve_startup("run-b")
+    assert excinfo.value.blocked_reason == "inventory_unavailable"
+
+
+def test_admission_resumes_after_a_successful_enumeration() -> None:
+    """Recovery: a successful enumeration clears the block.
+
+    The next successful enumeration restores the inventory and the node
+    admits again -- the block is not sticky.
+    """
+
+    admission = _admission()
+    admission.reconcile_from_supervisor(_FakeInventory(fail=True))
+    with pytest.raises(AdmissionRefused):
+        admission.reserve_startup("run-1")
+
+    admission.reconcile_from_supervisor(
+        _FakeInventory([{"id": "run-a", "status": "running"}])
+    )
+
+    snapshot = admission.snapshot()
+    assert snapshot["blocked_reason"] is None
+    assert snapshot["running"] == 1
+
+    # Admission resumes: the reservation is granted.
+    admission.reserve_startup("run-b")
+    assert admission.snapshot()["starting"] == 1
+
+
 def test_status_of_a_crashed_run_releases_its_node_slot(tmp_path) -> None:
     """Deliverable C: resolving a crashed run's status frees its node slot.
 

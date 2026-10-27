@@ -66,6 +66,14 @@ DEFAULT_MEM_FLOOR_MB = 1024
 # their own numbers after the marker; greps key on the marker alone.
 MEMORY_HEADROOM_SKIP_REASON = "memory_headroom"
 
+# Blocked reason used when the live-run INVENTORY could not be read
+# (P1-2).  An unknown inventory is NOT an empty node: treating a failed
+# enumeration as "zero running runs" would let the node over-admit into
+# the last slot, which is the very failure this whole change exists to
+# prevent.  So the last known state is kept and new admissions are
+# refused until an enumeration succeeds.
+INVENTORY_UNAVAILABLE_BLOCKED_REASON = "inventory_unavailable"
+
 # The crash-naming reason the supervisor's own reconciliation writes
 # (supervisor/service.py, "worker disappeared without a final report");
 # the queue launcher reuses the same sentence for orphaned launched
@@ -349,6 +357,12 @@ class NodeAdmission:
             "mem_available_mb": None,
             "blocked_reason": None,
         }
+        # P1-2: whether the live-run inventory could be read.  False means
+        # the last enumeration FAILED, so the published set is the last
+        # KNOWN state (possibly empty at startup) and no new admission is
+        # allowed until an enumeration succeeds.
+        self._inventory_ok = True
+        self._inventory_error: str | None = None
 
     # ----------------------------------------------------------- settings --
 
@@ -493,6 +507,20 @@ class NodeAdmission:
             self._drop_stale_locked(_now())
             running, starting = self._counts_locked()
             node_max = int(settings.get("node_max", DEFAULT_NODE_MAX_RUNS))
+            if not self._inventory_ok:
+                # P1-2: the live-run inventory is UNKNOWN (the last
+                # enumeration failed), so the count above is not
+                # trustworthy.  Refuse: an unknown inventory is not an
+                # empty node.
+                self._refresh_snapshot_locked(
+                    settings, available, INVENTORY_UNAVAILABLE_BLOCKED_REASON
+                )
+                raise AdmissionRefused(
+                    INVENTORY_UNAVAILABLE_BLOCKED_REASON,
+                    "live run inventory unavailable: "
+                    f"{self._inventory_error or 'enumeration failed'}; "
+                    "admission is blocked until an enumeration succeeds",
+                )
             if running + starting >= node_max:
                 self._refresh_snapshot_locked(
                     settings, available, "node_max"
@@ -627,6 +655,13 @@ class NodeAdmission:
         worker).  Reconciling the admission count must be a pure READ:
         it runs at supervisor construction, and a side effect there would
         change the behaviour of every restart on the node.
+
+        P1-2: when the enumeration FAILS, the last known published set is
+        KEPT (it is not replaced with an empty set) and new admission is
+        BLOCKED until an enumeration succeeds.  A failed enumeration means
+        the inventory is UNKNOWN, and an unknown inventory is not an empty
+        node: reconciling it as empty would understate the count and let
+        the node over-admit into the last slot.
         """
 
         live: dict[str, str] = {}
@@ -635,8 +670,18 @@ class NodeAdmission:
                 run_id = str(item.get("id") or "")
                 if run_id:
                     live[run_id] = str(item.get("status") or "unknown")
-        except Exception:  # noqa: BLE001 - an unreadable runs root reconciles empty
-            live = {}
+        except Exception as exc:  # noqa: BLE001 - the inventory is UNKNOWN, not empty
+            # P1-2: an enumeration failure must NOT be read as "the node is
+            # empty".  Keep the last known published set, remember the
+            # failure, and block new admission until an enumeration
+            # succeeds: the counts would otherwise be wrong (too low) and
+            # the node would over-admit into the last slot.
+            self._inventory_ok = False
+            self._inventory_error = f"{type(exc).__name__}: {exc}"
+            with self._lock:
+                self._recount_locked()
+                self._snapshot["blocked_reason"] = INVENTORY_UNAVAILABLE_BLOCKED_REASON
+            return
         # Only runs that still hold a slot count; a terminal run recorded
         # in a run dir is not live and must not consume admission.
         live = {
@@ -644,7 +689,15 @@ class NodeAdmission:
             for run_id, status in live.items()
             if status in ACTIVE_LIFECYCLE_STATUSES
         }
+        # The enumeration succeeded, so the inventory is known again:
+        # admission resumes and the block is cleared.
+        self._inventory_ok = True
+        self._inventory_error = None
         self.reconcile(live)
+        with self._lock:
+            # The stale block is gone: the inventory is known, so the
+            # counts are trustworthy again.
+            self._snapshot["blocked_reason"] = None
 
     # ------------------------------------------------------------ reporting --
 
@@ -675,7 +728,11 @@ class NodeAdmission:
             running, starting = self._counts_locked()
             node_max = int(settings.get("node_max", DEFAULT_NODE_MAX_RUNS))
             blocked = None
-            if running + starting >= node_max:
+            if not self._inventory_ok:
+                # P1-2: the inventory is unknown, so the counts cannot be
+                # trusted; the block is what the gate is really refusing.
+                blocked = INVENTORY_UNAVAILABLE_BLOCKED_REASON
+            elif running + starting >= node_max:
                 blocked = "node_max"
             else:
                 memory_reason = self.memory_headroom_reason(settings, available)

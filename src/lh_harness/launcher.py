@@ -51,6 +51,7 @@ from .queue import (
     read_lease,
 )
 from .settings_store import SettingsStore, active_runtime, open_from_environment, trio_role_overrides
+from .supervisor.admission import INVENTORY_UNAVAILABLE_BLOCKED_REASON
 from .supervisor.admission import AdmissionRefused
 from .supervisor.admission import read_cgroup_headroom_mb
 from .supervisor.admission import read_mem_available_mb as _admission_read_mem_available_mb
@@ -1739,7 +1740,40 @@ class Launcher:
             if memory_reason is not None:
                 self._admission["blocked_reason"] = MEMORY_HEADROOM_SKIP_REASON
                 return memory_reason, settings
+            # P1-2: the shared supervisor boundary cannot enumerate the
+            # live runs, so the count above is not trustworthy.  Admit
+            # nothing until an enumeration succeeds: an unknown inventory
+            # is not an empty node.
+            inventory_reason = self._supervisor_inventory_reason()
+            if inventory_reason is not None:
+                self._admission["blocked_reason"] = INVENTORY_UNAVAILABLE_BLOCKED_REASON
+                return inventory_reason, settings
         return None, settings
+
+    def _supervisor_inventory_reason(self) -> str | None:
+        """Why the shared supervisor boundary refuses, when it does.
+
+        The supervisor's own admission object is the shared boundary (the
+        POST /api/runs path and the queue launcher both go through it).
+        When its live-run enumeration failed it refuses every launch
+        (``inventory_unavailable``); the launcher refuses the same way so
+        both paths report one truth.
+        """
+
+        admission = getattr(self.supervisor, "admission", None)
+        if admission is None:
+            return None
+        try:
+            snapshot = admission.snapshot()
+        except Exception:  # noqa: BLE001 - a broken snapshot must not crash the pass
+            return None
+        if snapshot.get("blocked_reason") != INVENTORY_UNAVAILABLE_BLOCKED_REASON:
+            return None
+        return (
+            f"{INVENTORY_UNAVAILABLE_BLOCKED_REASON}: the live run inventory "
+            "could not be enumerated; admission is blocked until an "
+            "enumeration succeeds"
+        )
 
     def admission_snapshot(self) -> dict[str, Any]:
         """The ``admission`` object /api/meta exposes (deliverable D).
