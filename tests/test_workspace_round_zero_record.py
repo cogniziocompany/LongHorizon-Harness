@@ -1752,3 +1752,330 @@ async def test_the_gate_reports_a_readiness_gap_as_its_own_outcome(
     # And the snapshot-facing field of the start event carries them too.
     start = next(item for item in events if item["event"] == "role_harness_start")
     assert start["workspace_preflight"]["readiness_gap"]["code"] == "manifest_missing"
+
+
+# ---------------------------------------------------------------------------
+# P1: no-test applicability is a DECLARATION, never a filesystem inference.
+#
+# The manager used to derive ``no_tests_applicable`` from the workspace's
+# shape: ``workspace_base_mode == "not-a-repo"``, or -- when the mode was
+# unknown -- the mere absence of a ``.git`` directory.  Both are facts about
+# the filesystem, and both are equally what a wrong working directory, an
+# exported code tree, or a Node tree without ``.git`` looks like.  So a real
+# code workspace could skip the readiness check entirely: the preflight
+# reported a healthy environment for a tree it had never verified.
+#
+# The fix: applicability comes ONLY from an explicit task/profile
+# declaration, and ``_readiness_gap_for`` no longer returns ``None`` early
+# for the flag -- the missing/unreadable-manifest and unsupported-suite
+# checks stay reachable.
+#
+# These are integration tests: they go through the real manager hook
+# (``lh_harness.manager.run``) so the whole path -- config -> manager ->
+# preflight -> gate -- is exercised, not just the preflight function.
+# ---------------------------------------------------------------------------
+
+
+def _preflight_receipt(tmp_path: Path) -> dict[str, Any]:
+    """Read the run-dir preflight receipt the manager wrote."""
+
+    return json.loads(
+        (tmp_path / "logs" / "role_orchestration" / "workspace_preflight.json")
+        .read_text(encoding="utf-8")
+    )
+
+
+async def _run_manager_with_config(
+    tmp_path: Path,
+    workspace: Path,
+    config: HarnessConfig,
+) -> dict[str, Any]:
+    """Run the real manager over ``workspace`` and return its report."""
+
+    class DoneAgent:
+        async def run_episode(self, prompt, _env, _budget, live_trajectory_path=None):
+            return EpisodeResult(status="done", actions_log=_DONE)
+
+    return await run(
+        agent=DoneAgent(),
+        task="work in the workspace",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=config,
+        resume=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_p1_a_code_workspace_without_a_git_dir_is_refused(
+    tmp_path: Path,
+) -> None:
+    """P1 (a): a code workspace with no ``.git`` is refused, not skipped.
+
+    This is the evasion the review named: the manager used to read the
+    absence of ``.git`` as "this run has no tests", so a workspace that was
+    plainly code (it declares a Python test suite) sailed past the
+    readiness check and was reported as a healthy environment.
+
+    Now the absence of ``.git`` buys nothing.  The workspace has a
+    manifest and no manifest-error, so the *only* thing that could excuse
+    it is the missing manifest -- and this one has a manifest.  The run
+    must therefore be stopped by a readiness gap, not waved through.
+    """
+
+    workspace = tmp_path / "exported-code"
+    workspace.mkdir()
+    (workspace / "pyproject.toml").write_text(
+        "[project]\nname = \"exported\"\nversion = \"0.1.0\"\n",
+        encoding="utf-8",
+    )
+    (workspace / "README.md").write_text("exported code tree\n", encoding="utf-8")
+    # No ``.git`` on purpose: this is an exported code tree.
+
+    config = HarnessConfig(
+        workspace_path=str(workspace),
+        harness_dir=str(tmp_path / "harness"),
+        log_dir=str(tmp_path / "logs"),
+        runs_root=str(tmp_path / "runs"),
+    )
+
+    report = await _run_manager_with_config(tmp_path, workspace, config)
+
+    receipt = _preflight_receipt(tmp_path)
+    assert receipt["readiness_gap"] is not None, (
+        "a missing .git must not excuse a code workspace from the readiness "
+        f"check: {receipt}"
+    )
+    assert receipt["prerequisite"] is None
+    # The gate fired before round 1 was dispatched.
+    assert report["rounds_run"] == 0
+    assert report["abort_reason"] == "preflight_readiness_gap"
+    assert report["completion_satisfied"] is False
+
+
+@pytest.mark.asyncio
+async def test_p1_a_missing_manifest_is_refused(
+    tmp_path: Path,
+) -> None:
+    """P1 (b): a missing manifest is refused through the real manager.
+
+    A workspace with no manifest and no explicit declaration is the
+    partial-checkout / wrong-working-directory shape.  It must produce a
+    typed readiness gap, not a green.
+    """
+
+    workspace = tmp_path / "no-manifest"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("no manifest here\n", encoding="utf-8")
+    _git_init_workspace(workspace)
+
+    config = HarnessConfig(
+        workspace_path=str(workspace),
+        harness_dir=str(tmp_path / "harness"),
+        log_dir=str(tmp_path / "logs"),
+        runs_root=str(tmp_path / "runs"),
+    )
+
+    report = await _run_manager_with_config(tmp_path, workspace, config)
+
+    receipt = _preflight_receipt(tmp_path)
+    assert receipt["readiness_gap"]["code"] == "manifest_missing"
+    assert receipt["prerequisite"] is None
+    assert report["rounds_run"] == 0
+    assert report["abort_reason"] == "preflight_readiness_gap"
+
+
+@pytest.mark.asyncio
+async def test_p1_b_an_unreadable_manifest_is_refused(
+    tmp_path: Path,
+) -> None:
+    """P1 (b): an unreadable manifest is refused even for a declared task.
+
+    This is the check the early return used to bypass.  A manifest that
+    exists but cannot be read is a broken workspace, not a non-code task,
+    so the explicit declaration must not suppress it.
+    """
+
+    workspace = tmp_path / "unreadable-manifest"
+    workspace.mkdir()
+    manifest = workspace / "pyproject.toml"
+    manifest.write_text("[project]\nname = \"x\"\n", encoding="utf-8")
+    # The workspace is made a real checkout *first*: the git fixture indexes
+    # the tree, and it cannot index a mode-000 file.
+    _git_init_workspace(workspace)
+    manifest.chmod(0o000)
+    try:
+        import os
+
+        if os.access(manifest, os.R_OK):
+            pytest.skip("this host can read a mode-000 file (running as root)")
+
+        config = HarnessConfig(
+            workspace_path=str(workspace),
+            harness_dir=str(tmp_path / "harness"),
+            log_dir=str(tmp_path / "logs"),
+            runs_root=str(tmp_path / "runs"),
+            # The explicit declaration is present and must NOT bypass the
+            # unreadable-manifest check.
+            no_tests_applicable=True,
+        )
+
+        report = await _run_manager_with_config(tmp_path, workspace, config)
+
+        receipt = _preflight_receipt(tmp_path)
+        assert receipt["readiness_gap"]["code"] == "manifest_unreadable"
+        assert report["rounds_run"] == 0
+        assert report["abort_reason"] == "preflight_readiness_gap"
+    finally:
+        manifest.chmod(0o644)
+
+
+@pytest.mark.asyncio
+async def test_p1_c_an_unsupported_suite_is_refused(
+    tmp_path: Path,
+) -> None:
+    """P1 (c): a declared Node suite is refused through the real manager.
+
+    The unsupported-suite check is the other one the early return used to
+    bypass.  A repo that declares a Node suite must be reported as a gap
+    naming its runner -- the preflight never forces a Python runner onto
+    a non-Python repo, and it never claims such a repo has no tests.
+    """
+
+    workspace = tmp_path / "node-repo"
+    workspace.mkdir()
+    (workspace / "package.json").write_text(
+        json.dumps({"name": "node-repo", "scripts": {"test": "node --test"}}),
+        encoding="utf-8",
+    )
+    _git_init_workspace(workspace)
+
+    config = HarnessConfig(
+        workspace_path=str(workspace),
+        harness_dir=str(tmp_path / "harness"),
+        log_dir=str(tmp_path / "logs"),
+        runs_root=str(tmp_path / "runs"),
+        # Even with the explicit declaration, a *declared* suite the
+        # preflight cannot drive is still a gap.
+        no_tests_applicable=True,
+    )
+
+    report = await _run_manager_with_config(tmp_path, workspace, config)
+
+    receipt = _preflight_receipt(tmp_path)
+    assert receipt["readiness_gap"]["code"] == "unsupported_suite"
+    assert receipt["readiness_gap"]["detail"]["suite_kind"] == "node"
+    assert receipt["readiness_gap"]["detail"]["declared_runner"] == "npm test"
+    assert report["rounds_run"] == 0
+    assert report["abort_reason"] == "preflight_readiness_gap"
+
+
+@pytest.mark.asyncio
+async def test_p1_d_an_explicitly_declared_non_code_task_passes(
+    tmp_path: Path,
+) -> None:
+    """P1 (d): an explicitly declared non-code task passes.
+
+    The declaration is the *only* legitimate way to run against a
+    manifest-less workspace.  It comes from the task/profile, never from
+    the filesystem, so it passes even though this workspace has neither a
+    manifest nor a ``.git``.
+    """
+
+    workspace = tmp_path / "declared-non-code"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("nothing to test here\n", encoding="utf-8")
+
+    config = HarnessConfig(
+        workspace_path=str(workspace),
+        harness_dir=str(tmp_path / "harness"),
+        log_dir=str(tmp_path / "logs"),
+        runs_root=str(tmp_path / "runs"),
+        # The explicit task/profile declaration.
+        no_tests_applicable=True,
+    )
+
+    report = await _run_manager_with_config(tmp_path, workspace, config)
+
+    receipt = _preflight_receipt(tmp_path)
+    assert receipt["readiness_gap"] is None, receipt
+    assert receipt["prerequisite"] is None
+    assert receipt["ok"] is True
+    # The gate did not fire: the run was allowed to start.
+    assert report["abort_reason"] != "preflight_readiness_gap"
+
+
+@pytest.mark.asyncio
+async def test_p1_the_not_a_repo_base_mode_is_not_applicability(
+    tmp_path: Path,
+) -> None:
+    """P1: the launcher's ``not-a-repo`` mode no longer means "no tests".
+
+    ``workspace_base_mode`` records whether the run was relocated; it does
+    not declare anything about the task.  A workspace the launcher resolved
+    as ``not-a-repo`` must still be held to the readiness check unless the
+    task/profile declared the task non-code.
+    """
+
+    workspace = tmp_path / "not-a-repo-workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("not a repo\n", encoding="utf-8")
+    _git_init_workspace(workspace)
+
+    config = HarnessConfig(
+        workspace_path=str(workspace),
+        harness_dir=str(tmp_path / "harness"),
+        log_dir=str(tmp_path / "logs"),
+        runs_root=str(tmp_path / "runs"),
+        # The launcher's own resolution of this workspace.
+        workspace_base_mode="not-a-repo",
+    )
+
+    report = await _run_manager_with_config(tmp_path, workspace, config)
+
+    receipt = _preflight_receipt(tmp_path)
+    assert receipt["readiness_gap"]["code"] == "manifest_missing"
+    assert report["rounds_run"] == 0
+    assert report["abort_reason"] == "preflight_readiness_gap"
+
+
+def test_p1_the_readiness_gap_check_does_not_short_circuit_on_the_flag() -> None:
+    """P1: ``_readiness_gap_for`` stays reachable for every check.
+
+    The flag must not short-circuit the function: an unreadable manifest
+    and an unsupported suite are both gaps even when the flag is set.
+    This is the unit-level counterpart of the integration tests above.
+    """
+
+    from lh_harness.workspace_preflight import (
+        READINESS_GAP_MANIFEST_UNREADABLE,
+        READINESS_GAP_UNSUPPORTED_SUITE,
+        _readiness_gap_for,
+    )
+    from lh_harness.workspace_preflight import ManifestInfo
+
+    root = Path("/nonexistent-workspace")
+
+    unreadable = ManifestInfo(
+        manifest_path=str(root / "pyproject.toml"),
+        manifest_found=True,
+        manifest_error="permission denied",
+    )
+    gap = _readiness_gap_for(unreadable, root, no_tests_applicable=True)
+    assert gap is not None
+    assert gap.code == READINESS_GAP_MANIFEST_UNREADABLE
+
+    node_suite = ManifestInfo(
+        manifest_path=str(root / "package.json"),
+        manifest_found=True,
+        ecosystem="node",
+        suite_kind="node",
+        node_test_scripts=("test",),
+    )
+    gap = _readiness_gap_for(node_suite, root, no_tests_applicable=True)
+    assert gap is not None
+    assert gap.code == READINESS_GAP_UNSUPPORTED_SUITE
+
+    # A manifest-less workspace is the one case the explicit declaration
+    # legitimately covers.
+    missing = ManifestInfo(manifest_found=False)
+    assert _readiness_gap_for(missing, root, no_tests_applicable=True) is None

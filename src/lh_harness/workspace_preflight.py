@@ -1299,20 +1299,35 @@ def _readiness_gap_for(
     * **the suite is unknown** -- a manifest was found but it declares
       nothing that identifies a test runner at all.
 
-    ``no_tests_applicable`` (the explicit task/profile signal) and the
-    repo's own ``declared_no_tests`` declaration both suppress the gap:
-    those are the two ways an absent suite is *truthfully* established.
+    ``no_tests_applicable`` is the **explicit** task/profile signal: it
+    says "this run is a declared non-code task, so there is nothing to
+    test".  It is the *only* thing that may establish that a workspace has
+    no suite -- it is never inferred from the filesystem.  A missing
+    ``.git``, a ``not-a-repo`` launch, an exported code tree, or a Node
+    tree without ``.git`` are all facts about the *filesystem*, and none
+    of them is a declaration that the task has no tests.
+
+    Accordingly this function does **not** return ``None`` early for the
+    flag.  Every check below stays reachable:
+
+    * an unreadable manifest is a gap even for a declared non-code task
+      (a manifest that exists and cannot be read is a broken workspace,
+      not a non-code task);
+    * a manifest that declares a suite this preflight cannot drive (Node,
+      Go, or an unrecognised one) is a gap even for a declared non-code
+      task (the declaration contradicts the repo's own manifest);
+    * a *missing* manifest is the one case the explicit declaration
+      covers: "declared non-code" is precisely "there is no manifest
+      here", so the absence is truthful rather than a gap.
+
+    The repo's own ``declared_no_tests`` declaration is honoured the same
+    way: it is a truthful statement by the repo about itself.
 
     A wrong working directory is worth calling out on its own: a
     directory that is not a git checkout and holds no manifest is exactly
     what "the preflight was pointed at the wrong path" looks like, so the
     gap message says so.
     """
-
-    if no_tests_applicable:
-        # The task/profile established that there is no test suite.  That is
-        # an explicit applicability, so the absence is not a gap.
-        return None
 
     if manifest.manifest_error:
         return PreflightReadinessGap(
@@ -1329,15 +1344,19 @@ def _readiness_gap_for(
         )
 
     if not manifest.manifest_found:
-        # A workspace that is not a git checkout at all is a *legitimate*
-        # non-repo workspace -- the launcher's own guard calls it
-        # ``not-a-repo`` and hands it over as found (a docs-only tree, a
-        # scratch directory).  Such a workspace has no declared test suite,
-        # and the caller establishes that explicitly.
-        #
-        # A workspace that *is* a checkout but carries no manifest is a
-        # different fact: a partial checkout, or the preflight pointed at
-        # the wrong directory.  That is a readiness gap.
+        if no_tests_applicable:
+            # The task/profile explicitly declared this a non-code task.
+            # That is the *only* way a manifest-less workspace is not a
+            # readiness gap, and it is a declaration -- never a fact about
+            # the filesystem.  A missing ``.git`` does not reach here.
+            return None
+        # A workspace that is not a git checkout at all is *not* a
+        # legitimate non-repo workspace by itself: the launcher's
+        # ``not-a-repo`` mode says only that the directory holds no git
+        # metadata, and that is equally what a wrong working directory, an
+        # exported code tree, or a Node tree without ``.git`` looks like.
+        # Without an explicit declaration the absence of a manifest is a
+        # readiness gap.
         is_checkout = (root / ".git").exists()
         if not is_checkout:
             message = (
@@ -1345,7 +1364,10 @@ def _readiness_gap_for(
                 "manifest (pyproject.toml, requirements*.txt, package.json, "
                 "go.mod), so the declared test suite could not be determined; "
                 "this is what a wrong working directory looks like, and it "
-                "is not a declaration that the repo has no tests"
+                "is not a declaration that the repo has no tests. A missing "
+                ".git is a fact about the filesystem, not an explicit "
+                "non-code declaration; only a declared non-code task makes "
+                "the absence of a manifest legitimate"
             )
         else:
             message = (

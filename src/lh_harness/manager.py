@@ -376,6 +376,7 @@ async def _run_impl(
         events_path=events_path,
         log_dir=log_dir,
         workspace_base_mode=getattr(config, "workspace_base_mode", None),
+        no_tests_applicable=bool(getattr(config, "no_tests_applicable", False)),
     )
     if preflight_record is not None and not preflight_record.ok:
         prerequisite = preflight_record.prerequisite or {}
@@ -2760,6 +2761,7 @@ def _run_workspace_preflight(
     events_path: Path,
     log_dir: Path,
     workspace_base_mode: str | None = None,
+    no_tests_applicable: bool = False,
 ) -> PreflightRecord | None:
     """Run the workspace preflight and record its receipts.
 
@@ -2773,31 +2775,28 @@ def _run_workspace_preflight(
     The preflight never raises: a preflight that crashes is a preflight that
     consumed the run, so every failure degrades to a recorded prerequisite.
 
-    ``workspace_base_mode`` is the launcher's own resolution of the
-    workspace (``not-a-repo`` / ``on-default`` / ``in-place`` / ``worktree``
-    / ``stash`` / ``continuation``).  The ``not-a-repo`` mode is the
-    launcher's statement that the workspace is a legitimate non-git
-    directory handed over as found -- a docs-only tree or a scratch
-    directory -- so there is no declared test suite to verify.  That is the
-    explicit applicability the preflight honours, and it is the *only*
-    shape in which a manifest-less workspace is not a readiness gap: a
-    checkout without a manifest (a partial checkout, or the wrong working
-    directory) still is.
+    ``no_tests_applicable`` is the **explicit** task/profile declaration
+    that this run is a non-code task and therefore has nothing to test.
+    It is the *only* source of that applicability.
+
+    It is deliberately **not** derived from the filesystem or from
+    ``workspace_base_mode``.  A missing ``.git``, a ``not-a-repo`` launch,
+    an exported code tree, and a Node tree without ``.git`` are all facts
+    about the *shape of the directory*, and every one of them is equally
+    what a wrong working directory looks like.  Treating them as "this
+    task has no tests" let a real code workspace skip the readiness check
+    altogether: the preflight reported a healthy environment for a tree it
+    had never actually been able to verify.  So a manifest-less workspace
+    is now a **readiness gap** unless the task/profile said so explicitly.
+
+    ``workspace_base_mode`` is still recorded (it says whether the run was
+    relocated), but it no longer decides applicability.
     """
 
-    no_tests_applicable = workspace_base_mode == "not-a-repo"
-    if workspace_base_mode is None:
-        # The mode is unknown (a direct ``lh-harness run``, or a launch that
-        # did not go through the queue).  Apply the launcher's own rule --
-        # the guard resolves a directory with no ``.git`` as ``not-a-repo``
-        # and hands it over as found -- so a manifest-less, non-checkout
-        # workspace is the legitimate no-test case it is.  A *checkout*
-        # without a manifest is still a readiness gap.
-        no_tests_applicable = not Path(workspace_path).joinpath(".git").exists()
     try:
         record = run_preflight(
             workspace_path,
-            no_tests_applicable=no_tests_applicable,
+            no_tests_applicable=bool(no_tests_applicable),
         )
     except Exception as exc:  # noqa: BLE001 - the gate must not crash the run
         logger.exception("workspace preflight raised; recording it as failed")
