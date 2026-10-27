@@ -435,6 +435,33 @@ def _fake_shared_site_packages(tmp_path: Path) -> Path:
     return fake
 
 
+def _pyvenv_cfg_text() -> str:
+    """Return a ``pyvenv.cfg`` body that describes *this* interpreter.
+
+    The ``home`` key is what a virtualenv uses to locate the base
+    installation: CPython resolves it into ``sys.base_prefix``, and the
+    standard library is then looked up under it.  A fixture that hard-codes
+    ``home = /usr`` therefore only works on a host whose interpreter really
+    lives under ``/usr`` -- on a setup-python CI runner the interpreter lives
+    under ``/opt/hostedtoolcache/Python/<version>/x64``, so the hard-coded
+    ``home`` sends the child to a stdlib that is not there and the probe dies
+    with ``ModuleNotFoundError: No module named 'math'`` (a C extension that
+    lives in ``lib-dynload``, which is why the failure surfaced only once the
+    import chain reached it).
+
+    Deriving ``home`` from the interpreter under test makes the fixture
+    describe *its own* base installation on every host, which is what a real
+    virtualenv's ``pyvenv.cfg`` does.
+    """
+
+    base_prefix = Path(sys.base_prefix).resolve()
+    return (
+        f"home = {base_prefix}\n"
+        "include-system-site-packages = false\n"
+        f"version = {sys.version_info.major}.{sys.version_info.minor}\n"
+    )
+
+
 def _git_init_workspace(workspace: Path) -> None:
     """Make a fixture workspace a real git repo with one commit.
 
@@ -598,7 +625,7 @@ def test_preflight_records_the_workspace_venv_interpreter_without_following_its_
     # A symlinked interpreter, the way a real venv lays it out.
     (bin_dir / "python").symlink_to(Path(sys.executable))
     (venv_dir / "pyvenv.cfg").write_text(
-        "home = /usr\ninclude-system-site-packages = false\nversion = 3.12.3\n",
+        _pyvenv_cfg_text(),
         encoding="utf-8",
     )
 
@@ -1132,7 +1159,7 @@ def test_preflight_resolves_the_module_from_the_workspace_venv_after_sanitizatio
     interpreter = bin_dir / "python"
     interpreter.symlink_to(Path(sys.executable))
     (venv_dir / "pyvenv.cfg").write_text(
-        f"home = /usr\ninclude-system-site-packages = false\nversion = {sys.version_info.major}.{sys.version_info.minor}\n",
+        _pyvenv_cfg_text(),
         encoding="utf-8",
     )
     real_site_packages = Path(sysconfig.get_paths()["purelib"])
