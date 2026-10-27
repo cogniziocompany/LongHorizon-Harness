@@ -591,3 +591,94 @@ def test_api_meta_omits_admission_when_no_launcher(tmp_path: Path) -> None:
 
     client = TestClient(create_app(runs_root=tmp_path / "runs"))
     assert "admission" not in client.get("/api/meta").json()
+
+# ---------------------------------------------------------------------------
+# A refusal from the shared supervisor boundary is a SKIP, not a failure.
+#
+# The launcher's own per-cycle gate refuses before it ever calls
+# create_run, but the shared boundary (RunSupervisor.create_run) can
+# refuse too -- that is the backstop for a launch that did not come
+# through the queue launcher, and for a run whose startup window was
+# invisible to the launcher.  When it refuses, nothing was started:
+# the entry must stay PENDING with the reason recorded as a skip, and
+# it must NOT burn one of the entry's retries.
+# ---------------------------------------------------------------------------
+
+def test_supervisor_admission_refusal_keeps_the_entry_pending(tmp_path: Path) -> None:
+    """A refusal from create_run leaves the entry pending, not failed."""
+
+    from lh_harness.supervisor.admission import AdmissionRefused
+
+    launcher, store, supervisor = _launcher(tmp_path)
+
+    def refusing_create_run(**kwargs: Any) -> dict[str, Any]:
+        raise AdmissionRefused(
+            "node_max", "node at capacity: 5 running+starting runs, node max 5"
+        )
+
+    supervisor.create_run = refusing_create_run  # type: ignore[method-assign]
+    entry = store.create(_base_entry())
+
+    assert launcher._launch(entry) is False
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "pending"
+    assert updated.skip_reasons, "the refusal reason must be recorded as a skip reason"
+    assert "node max" in updated.skip_reasons[-1]
+
+
+def test_supervisor_memory_refusal_records_the_memory_headroom_reason(tmp_path: Path) -> None:
+    """The memory refusal reaches the entry's skip reason verbatim."""
+
+    from lh_harness.supervisor.admission import AdmissionRefused
+
+    launcher, store, supervisor = _launcher(tmp_path)
+
+    def refusing_create_run(**kwargs: Any) -> dict[str, Any]:
+        raise AdmissionRefused(
+            MEMORY_HEADROOM_SKIP_REASON,
+            f"{MEMORY_HEADROOM_SKIP_REASON}: MemAvailable 900 MB minus startup "
+            f"allowance 600 MB is below the 1024 MB floor",
+        )
+
+    supervisor.create_run = refusing_create_run  # type: ignore[method-assign]
+    entry = store.create(_base_entry())
+
+    assert launcher._launch(entry) is False
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "pending"
+    assert MEMORY_HEADROOM_SKIP_REASON in updated.skip_reasons[-1]
+
+
+def test_api_run_creation_refusal_is_429_not_500(tmp_path: Path) -> None:
+    """POST /api/runs reports an admission refusal as 429, not a 500.
+
+    A refusal means the node is at capacity or short on memory: the
+    request itself was fine and nothing was started, so the caller
+    should retry later.  An unhandled refusal would surface as a 500
+    and read as a server fault.
+    """
+
+    from fastapi.testclient import TestClient
+
+    from lh_harness.supervisor.admission import AdmissionRefused
+    from lh_harness.webapi.server import create_app
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    supervisor = FakeSupervisor(root)
+
+    def refusing_create_run(**kwargs: Any) -> dict[str, Any]:
+        raise AdmissionRefused(
+            "node_max", "node at capacity: 5 running+starting runs, node max 5"
+        )
+
+    supervisor.create_run = refusing_create_run  # type: ignore[method-assign]
+    client = TestClient(create_app(runs_root=root, supervisor=supervisor))
+
+    response = client.post("/api/runs", json={"task": "do something"})
+    assert response.status_code == 429
+    assert "node max" in response.json()["detail"]

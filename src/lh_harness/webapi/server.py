@@ -60,6 +60,7 @@ from ..overseer_state import resolve_overseer_root
 from . import mcp_jsonrpc as mcp_protocol
 from ..build_info import build_info
 from ..model_catalog import discover_model_catalog
+from ..supervisor.admission import AdmissionRefused
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import (
     ACTIVE_STATUSES,
@@ -3377,6 +3378,18 @@ def create_app(
                     _emit_run_created_event(supervisor, run_id, base, guarded_workspace)
         except IdempotencyConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AdmissionRefused as exc:
+            # LHH-CT110-MEMORY-ADMISSION: the shared supervisor boundary
+            # refused to admit this run -- the node cap, or the memory
+            # headroom gate.  A refusal is NOT a bad request and NOT a
+            # server error: nothing was started, so the caller should be
+            # told 429 (too many requests) and retry later, exactly like
+            # the queue launcher keeps the entry pending.  Without this
+            # the refusal escaped as an unhandled 500.
+            raise HTTPException(
+                status_code=429,
+                detail=exc.reason or exc.blocked_reason,
+            ) from exc
         except (TypeError, ValueError, OSError) as exc:
             detail = str(exc)
             if isinstance(exc, ValueError) and "reserved by another launch" in detail:

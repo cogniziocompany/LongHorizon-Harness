@@ -51,6 +51,7 @@ from .queue import (
     read_lease,
 )
 from .settings_store import SettingsStore, active_runtime, open_from_environment, trio_role_overrides
+from .supervisor.admission import AdmissionRefused
 from .supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
 from .supervisor.service import auditor_read_only_violation
 from .workspace_guard import (
@@ -2295,6 +2296,21 @@ class Launcher:
                 trio=entry.trio,
             )
             run_id = str(created.get("id") or "")
+        except AdmissionRefused as exc:
+            # LHH-CT110-MEMORY-ADMISSION: the SHARED supervisor boundary
+            # refused to admit this run (the node cap, or the memory
+            # headroom gate).  A refusal is NOT a launch failure: the run
+            # was never started, so the entry must stay PENDING and be
+            # retried on a later pass, and it must NOT burn one of the
+            # entry's retries.  The refusal reason is recorded as the
+            # entry's latest skip reason (deliverable B), the same way the
+            # launcher's own per-cycle gate records its refusals.
+            reason = exc.reason or exc.blocked_reason
+            if self._observe:
+                self._shadow_skip(entry, reason)
+            else:
+                self._skip(entry, reason)
+            return False
         except Exception as exc:
             failure_reason = f"launch failed: {exc}"
             updated = self.queue_store.mark_failed(entry.queue_id, failure_reason)
