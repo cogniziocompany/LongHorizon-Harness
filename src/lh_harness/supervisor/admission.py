@@ -123,24 +123,114 @@ def admission_settings_from_values(
     }
 
 
+def _read_cgroup_bytes(path: Path) -> int | None:
+    """Read a cgroup v2 memory knob as bytes, or None when it is absent.
+
+    ``"max"`` (v2's "no limit") and v1's ``"-1"`` mean NO limit, so they
+    are reported as None: the caller must not treat them as a number.
+    """
+
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return None
+    if not raw or raw in ("max", "-1"):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def cgroup_headroom_mb(cgroup_dir: Path) -> float | None:
+    """Remaining memory (MB) of ONE cgroup: memory.max - memory.current.
+
+    A cgroup's LIMIT is not its headroom: what a new worker can still
+    touch is the limit minus what the cgroup ALREADY holds.  Reading
+    only ``memory.max`` therefore overstates the room a nearly full
+    container has, which is exactly the shape that ends in an OOM kill.
+
+    Returns None when the cgroup has no finite limit (no knob, or
+    ``"max"``) -- such a cgroup does not bound the headroom.
+    """
+
+    limit_bytes = _read_cgroup_bytes(cgroup_dir / "memory.max")
+    if limit_bytes is None:
+        return None
+    current_bytes = _read_cgroup_bytes(cgroup_dir / "memory.current")
+    if current_bytes is None:
+        # No accounting file: the whole limit is unclaimed headroom.
+        current_bytes = 0
+    return max(0.0, (limit_bytes - current_bytes) / (1024.0 * 1024.0))
+
+
+def read_cgroup_headroom_mb(
+    cgroup_root: str | Path = "/sys/fs/cgroup",
+    cgroup_path: str | None = None,
+) -> float | None:
+    """Smallest remaining memory (MB) over this cgroup and its ancestors.
+
+    A container's own limit is not the whole story: every ANCESTOR
+    cgroup that carries a finite ``memory.max`` bounds this process too,
+    and the tightest one is the real ceiling.  So the walk starts at the
+    container's own cgroup and climbs to the unified root, and each level
+    that has a limit contributes ``memory.max - memory.current``.
+
+    Returns None when no level carries a finite limit (nothing to bound
+    the headroom by).
+    """
+
+    root = Path(cgroup_root)
+    if cgroup_path is None:
+        try:
+            from ..worker_isolation import CGROUP_ROOT, own_cgroup_path
+
+            root = Path(CGROUP_ROOT)
+            cgroup_path = own_cgroup_path()
+        except Exception:  # noqa: BLE001 - no cgroup info: no cgroup bound
+            return None
+    relative = str(cgroup_path or "").strip("/")
+    if not relative:
+        return None
+    headroom: float | None = None
+    # From the container's own cgroup up to the unified root.
+    levels = relative.split("/")
+    for index in range(len(levels)):
+        directory = root.joinpath(*levels[: index + 1])
+        level_headroom = cgroup_headroom_mb(directory)
+        if level_headroom is None:
+            continue
+        headroom = level_headroom if headroom is None else min(headroom, level_headroom)
+    return headroom
+
+
 def read_mem_available_mb(
     proc_meminfo: str | Path = "/proc/meminfo",
     cgroup_memory_max: str | Path = "/sys/fs/cgroup/memory.max",
     *,
     follow_self_cgroup: bool = True,
+    cgroup_root: str | Path | None = None,
+    cgroup_path: str | None = None,
 ) -> float | None:
-    """MemAvailable in MB, bounded by the cgroup limit when present.
+    """MemAvailable in MB, bounded by the cgroup HEADROOM when present.
 
     Reads ``MemAvailable`` from procfs.  When this process runs inside a
     cgroup v2 with a finite ``memory.max`` (CT110's LXC), the host-wide
     MemAvailable can overstate what the container may actually touch, so
-    the smaller of the two is the honest headroom.  When the given knob
-    does not exist, ``follow_self_cgroup`` (default on) resolves this
-    process's own cgroup via /proc/self/cgroup and reads ITS ``memory.max``;
-    tests pass explicit fake paths with the flag off.  ``"max"`` on the
-    knob (and v1's ``-1``) means no limit and is ignored.  Any read
-    failure returns None; the caller decides whether that blocks or
-    passes, never this helper.
+    the smaller of the two is the honest headroom.
+
+    The cgroup side is the REMAINING memory of the container's own
+    cgroup and of every ancestor cgroup that carries a limit: for each
+    such level ``memory.max - memory.current``, and the smallest of
+    them.  The limit alone is not enough -- a container that is nearly
+    full has almost no headroom even when the host has plenty of RAM.
+
+    When the given knob does not exist, ``follow_self_cgroup`` (default
+    on) resolves this process's own cgroup via /proc/self/cgroup and
+    walks it plus its ancestors; tests pass explicit fake paths with the
+    flag off.  ``"max"`` on the knob (and v1's ``-1``) means no limit and
+    is ignored.  Any read failure returns None; the caller decides
+    whether that blocks or passes, never this helper.
     """
 
     available: float | None = None
@@ -159,8 +249,8 @@ def read_mem_available_mb(
     if follow_self_cgroup and not knob.exists():
         # The default knob is the unified root; inside a delegated
         # container this process lives deeper in the tree, so follow
-        # /proc/self/cgroup to OUR OWN limit before giving up on the
-        # cgroup side of the bound.
+        # /proc/self/cgroup (worker_isolation.own_cgroup_path) to OUR OWN
+        # limit before giving up on the cgroup side of the bound.
         try:
             from ..worker_isolation import CGROUP_ROOT, own_cgroup_path
 
@@ -169,12 +259,36 @@ def read_mem_available_mb(
                 knob = CGROUP_ROOT / path.strip("/") / "memory.max"
         except Exception:  # noqa: BLE001 - no cgroup info: MemAvailable alone stands
             knob = Path(cgroup_memory_max)
-    try:
-        raw = knob.read_text(encoding="utf-8").strip()
-        if raw and raw not in ("max", "-1"):
-            limit_mb = int(raw) / (1024.0 * 1024.0)
-    except (OSError, ValueError):
-        limit_mb = None
+    # A cgroup bound is the REMAINING memory of that cgroup, not its
+    # limit: memory.current is subtracted so a nearly full cgroup is
+    # refused even when the host still has gigabytes free.
+    limit_bytes = _read_cgroup_bytes(knob)
+    if limit_bytes is not None:
+        current_bytes = _read_cgroup_bytes(knob.parent / "memory.current")
+        if current_bytes is None:
+            current_bytes = 0
+        limit_mb = max(0.0, (limit_bytes - current_bytes) / (1024.0 * 1024.0))
+    if follow_self_cgroup:
+        # Every ancestor cgroup with a limit bounds this process too; the
+        # tightest level wins.  The walk needs the cgroup ROOT and the
+        # process's path WITHIN that root, so both are resolved here.
+        walk_root = cgroup_root
+        walk_path = cgroup_path
+        if walk_root is None or walk_path is None:
+            try:
+                from ..worker_isolation import CGROUP_ROOT, own_cgroup_path
+
+                if walk_root is None:
+                    walk_root = CGROUP_ROOT
+                if walk_path is None:
+                    walk_path = own_cgroup_path()
+            except Exception:  # noqa: BLE001 - no cgroup info: no cgroup bound
+                walk_root = None
+                walk_path = None
+        if walk_root is not None and walk_path:
+            ancestor_mb = read_cgroup_headroom_mb(walk_root, walk_path)
+            if ancestor_mb is not None:
+                limit_mb = ancestor_mb if limit_mb is None else min(limit_mb, ancestor_mb)
     if available is None:
         return limit_mb
     if limit_mb is not None:
@@ -212,11 +326,17 @@ class NodeAdmission:
         *,
         settings_reader: Callable[[], Mapping[str, Any] | None] | None = None,
         meminfo_probe: Callable[[], float | None] | None = None,
+        cgroup_probe: Callable[[], float | None] | None = None,
     ) -> None:
         # Both readers are fail-open seams: production resolves the live
         # settings store and /proc/meminfo; tests inject fakes (F).
         self._settings_reader = settings_reader
         self._meminfo_probe = meminfo_probe
+        # The cgroup headroom probe: the REMAINING memory of the
+        # container's own cgroup and of every ancestor cgroup with a
+        # limit.  The effective headroom is the smaller of the host
+        # reading and this one.
+        self._cgroup_probe = cgroup_probe
         self._lock = threading.Lock()
         self._reservations: dict[str, float] = {}
         # The published live set, refreshed by ``publish``/``reconcile``:
@@ -248,14 +368,49 @@ class NodeAdmission:
         return admission_settings_from_values(values)
 
     def mem_available_mb(self) -> float | None:
-        """MemAvailable in MB via the probe seam, else the real read."""
+        """Effective memory headroom in MB: host MemAvailable AND cgroup.
+
+        The host reading is what /proc/meminfo says; the cgroup reading is
+        the REMAINING memory (``memory.max - memory.current``) of the
+        container's own cgroup and of every ancestor cgroup that carries a
+        limit.  The effective headroom is the SMALLER of the two: a host
+        with plenty of RAM does not help when the container's own limit is
+        nearly used up.
+        """
 
         if self._meminfo_probe is not None:
+            # A test owns the HOST side of the reading through this seam;
+            # the cgroup side is the fake probe when one is injected too.
             try:
-                return self._meminfo_probe()
+                available = self._meminfo_probe()
             except Exception:  # noqa: BLE001 - a broken probe must not crash a launch
-                return None
+                available = None
+            cgroup_headroom = self._cgroup_headroom_mb()
+            if cgroup_headroom is None:
+                return available
+            if available is None:
+                return cgroup_headroom
+            return min(available, cgroup_headroom)
+        # Production: one read of /proc/meminfo bounded by the cgroup
+        # headroom (the container's own cgroup and every ancestor with a
+        # limit), so the smaller of the two is the effective headroom.
         return read_mem_available_mb()
+
+    def _cgroup_headroom_mb(self) -> float | None:
+        """Remaining memory (MB) of the cgroups that bound this process.
+
+        Only the fake probe is consulted here: production reads the
+        cgroup tree inside ``read_mem_available_mb``, so that the host
+        reading and the cgroup reading are taken in one place.  A test
+        that fakes only the host side therefore owns the whole reading.
+        """
+
+        if self._cgroup_probe is None:
+            return None
+        try:
+            return self._cgroup_probe()
+        except Exception:  # noqa: BLE001 - a broken probe must not crash a launch
+            return None
 
     def memory_headroom_reason(
         self, settings: dict[str, int], available: float | None

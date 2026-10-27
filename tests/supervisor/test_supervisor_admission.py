@@ -36,6 +36,7 @@ from lh_harness.supervisor.admission import (
     AdmissionRefused,
     NodeAdmission,
     admission_settings_from_values,
+    read_cgroup_headroom_mb,
     read_mem_available_mb,
 )
 from lh_harness.supervisor.service import RunSupervisor, _pid_start_identity
@@ -202,6 +203,58 @@ def test_read_mem_available_mb_ignores_an_unlimited_cgroup(tmp_path) -> None:
 
     available = read_mem_available_mb(meminfo, cgroup, follow_self_cgroup=False)
     assert available == pytest.approx(2048.0)
+
+
+def test_cgroup_headroom_is_the_remaining_memory_not_the_limit(tmp_path) -> None:
+    """The cgroup bound is memory.max - memory.current, not memory.max.
+
+    A 4 GiB cgroup that already holds 3 GiB has 1 GiB of headroom left,
+    not 4 GiB.  Reading only the limit would let a nearly full container
+    admit another worker -- the shape that ends in an OOM kill.
+    """
+
+    cgroup_root = tmp_path / "cgroup"
+    directory = cgroup_root / "lxc" / "container"
+    directory.mkdir(parents=True)
+    (directory / "memory.max").write_text(str(4 * 1024 * 1024 * 1024), encoding="utf-8")
+    (directory / "memory.current").write_text(str(3 * 1024 * 1024 * 1024), encoding="utf-8")
+
+    assert read_cgroup_headroom_mb(cgroup_root, "/lxc/container") == pytest.approx(1024.0)
+
+
+def test_ancestor_cgroup_limit_bounds_the_headroom(tmp_path) -> None:
+    """An ancestor cgroup with a limit bounds the container too.
+
+    The container's own cgroup is roomy, but its parent caps the whole
+    subtree; the tightest level is the real ceiling.
+    """
+
+    cgroup_root = tmp_path / "cgroup"
+    parent = cgroup_root / "lxc" / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    (parent / "memory.max").write_text(str(8 * 1024 * 1024 * 1024), encoding="utf-8")
+    (parent / "memory.current").write_text(str(7 * 1024 * 1024 * 1024), encoding="utf-8")
+    (child / "memory.max").write_text(str(8 * 1024 * 1024 * 1024), encoding="utf-8")
+    (child / "memory.current").write_text("0", encoding="utf-8")
+
+    assert read_cgroup_headroom_mb(cgroup_root, "/lxc/parent/child") == pytest.approx(1024.0)
+
+
+def test_nearly_full_cgroup_refuses_the_supervisor_gate_with_plentiful_host_ram() -> None:
+    """Plenty of host RAM, but a nearly full cgroup: the gate REFUSES.
+
+    The shared supervisor boundary is where the POST /api/runs path
+    admits, so the cgroup headroom has to bind there too: the host
+    reading alone (32 GB free) would admit, but the cgroup has only
+    200 MB left, which is under the 600 MB startup allowance plus the
+    1024 MB floor.
+    """
+
+    admission = NodeAdmission(meminfo_probe=lambda: 32768.0, cgroup_probe=lambda: 200.0)
+    with pytest.raises(AdmissionRefused) as excinfo:
+        admission.reserve_startup("run-1")
+    assert excinfo.value.blocked_reason == MEMORY_HEADROOM_SKIP_REASON
 
 
 # ---------------------------------------------------------------------------

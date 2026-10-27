@@ -30,6 +30,7 @@ from lh_harness.launcher import (
     WORKER_DISAPPEARED_REASON,
     Launcher,
     _admission_settings_from_values,
+    read_cgroup_headroom_mb,
     read_mem_available_mb,
 )
 from lh_harness.queue import default_queue_config
@@ -437,6 +438,140 @@ def test_read_mem_available_mb_with_fake_meminfo(tmp_path: Path) -> None:
     # Neither readable -> None (the caller decides fail-open).
     broken = tmp_path / "broken"
     assert read_mem_available_mb(broken, broken, follow_self_cgroup=False) is None
+
+
+# ---------------------------------------------------------------------------
+# P1-1: the cgroup gate uses the REMAINING memory, over the whole tree.
+# ---------------------------------------------------------------------------
+
+def _fake_cgroup(
+    root: Path,
+    path: str,
+    *,
+    limit_bytes: int | None,
+    current_bytes: int | None,
+) -> Path:
+    """Build a fake cgroup v2 level with its memory knobs.
+
+    ``limit_bytes`` None writes ``"max"`` (no limit); ``current_bytes``
+    None writes no ``memory.current`` file at all.
+    """
+
+    directory = root.joinpath(*path.strip("/").split("/"))
+    directory.mkdir(parents=True, exist_ok=True)
+    if limit_bytes is None:
+        (directory / "memory.max").write_text("max", encoding="utf-8")
+    else:
+        (directory / "memory.max").write_text(str(limit_bytes), encoding="utf-8")
+    if current_bytes is not None:
+        (directory / "memory.current").write_text(str(current_bytes), encoding="utf-8")
+    return directory
+
+
+def test_cgroup_headroom_is_the_remaining_memory_not_the_limit(tmp_path: Path) -> None:
+    """The cgroup bound is memory.max - memory.current, not memory.max.
+
+    A 4 GiB cgroup that already holds 3 GiB has 1 GiB of headroom left,
+    not 4 GiB.  Reading only the limit would let a nearly full container
+    admit another worker -- the shape that ends in an OOM kill.
+    """
+
+    cgroup_root = tmp_path / "cgroup"
+    _fake_cgroup(
+        cgroup_root,
+        "/lxc/container",
+        limit_bytes=4 * 1024 * 1024 * 1024,
+        current_bytes=3 * 1024 * 1024 * 1024,
+    )
+
+    headroom = read_cgroup_headroom_mb(cgroup_root, "/lxc/container")
+    assert headroom == pytest.approx(1024.0)
+
+    # An empty cgroup has its whole limit free.
+    _fake_cgroup(
+        cgroup_root,
+        "/lxc/empty",
+        limit_bytes=4 * 1024 * 1024 * 1024,
+        current_bytes=0,
+    )
+    assert read_cgroup_headroom_mb(cgroup_root, "/lxc/empty") == pytest.approx(4096.0)
+
+
+def test_ancestor_cgroup_limit_bounds_the_headroom(tmp_path: Path) -> None:
+    """An ancestor cgroup with a limit bounds the container too.
+
+    The container's own cgroup is roomy, but its parent caps the whole
+    subtree; the tightest level is the real ceiling.
+    """
+
+    cgroup_root = tmp_path / "cgroup"
+    _fake_cgroup(
+        cgroup_root,
+        "/lxc/parent",
+        limit_bytes=8 * 1024 * 1024 * 1024,
+        current_bytes=7 * 1024 * 1024 * 1024,
+    )
+    _fake_cgroup(
+        cgroup_root,
+        "/lxc/parent/child",
+        limit_bytes=8 * 1024 * 1024 * 1024,
+        current_bytes=0,
+    )
+
+    headroom = read_cgroup_headroom_mb(cgroup_root, "/lxc/parent/child")
+    assert headroom == pytest.approx(1024.0)
+
+
+def test_nearly_full_cgroup_refuses_admission_with_plentiful_host_ram(tmp_path: Path) -> None:
+    """Plenty of host RAM, but a nearly full cgroup: the launch is REFUSED.
+
+    This is the P1-1 shape: the host has 32 GB free, so the old
+    host-only reading would admit the run; the container's own cgroup
+    has only 200 MB left, which is under the 600 MB startup allowance
+    plus the 1024 MB floor, so the memory gate must refuse and record
+    ``memory_headroom`` on the entry.
+    """
+
+    launcher, store, supervisor = _launcher(tmp_path, meminfo_mb=32768.0, capacity={"kimi_max": 5})
+    # The container's cgroup has 200 MB left: memory.max 4 GiB minus
+    # memory.current just under 4 GiB.
+    launcher._cgroup_probe = lambda: 200.0
+    entry = store.create(_base_entry(trio="kimi", workspace="./free"))
+    asyncio.run(launcher.tick())
+
+    refused = store.get(entry.queue_id)
+    assert refused is not None
+    assert refused.status == "pending"
+    latest = refused.latest_skip_reason
+    assert latest is not None
+    assert latest.startswith(MEMORY_HEADROOM_SKIP_REASON), refused.skip_reasons
+    assert supervisor.created == []
+
+
+def test_cgroup_headroom_gates_admission_even_with_a_plentiful_host(tmp_path: Path) -> None:
+    """The effective headroom is the SMALLER of host RAM and cgroup room.
+
+    With the host reading at 32 GB and the cgroup headroom at 4 GB, the
+    gate uses 4 GB -- which still passes (4000 - 600 >= 1024).  When the
+    cgroup headroom is the smaller number the refusal follows it.
+    """
+
+    launcher, store, supervisor = _launcher(tmp_path, meminfo_mb=32768.0, capacity={"kimi_max": 5})
+    launcher._cgroup_probe = lambda: 4000.0
+    entry = store.create(_base_entry(trio="kimi", workspace="./free"))
+    asyncio.run(launcher.tick())
+    assert store.get(entry.queue_id).status == "launched"
+
+    launcher2, store2, supervisor2 = _launcher(
+        tmp_path / "tight", meminfo_mb=32768.0, capacity={"kimi_max": 5}
+    )
+    launcher2._cgroup_probe = lambda: 1000.0
+    entry2 = store2.create(_base_entry(trio="kimi", workspace="./free"))
+    asyncio.run(launcher2.tick())
+    refused = store2.get(entry2.queue_id)
+    assert refused.status == "pending"
+    assert refused.latest_skip_reason.startswith(MEMORY_HEADROOM_SKIP_REASON)
+    assert supervisor2.created == []
 
 
 # ---------------------------------------------------------------------------
