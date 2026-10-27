@@ -127,6 +127,8 @@ def test_initial_estimate_requires_decision_and_creation_replays(tmp_path: Path,
     completed = service.wait_for_idle("run-1")
     assert completed["status"] == "completed"
     assert [item["stage"] for item in completed["stages"] if item["event"] == "stage_entry"] == list(INTERACTIVE_STAGES)
+    for agent in agents.values():
+        assert agent.workspace_path == service._attempt_status("run-1", "attempt-001")["workspace"]
 
 
 @pytest.mark.parametrize("stage", INTERACTIVE_STAGES)
@@ -310,6 +312,9 @@ def test_executor_checkpoint_supports_versioned_restart(tmp_path: Path, repo: Pa
     assert after["attempt_id"] != before["attempt_id"]
     assert after["attempts"][0]["status"] == "superseded"
     assert after["failure_reason"] is None
+    listed = service.list_runs()["runs"]
+    assert [item["attempt_id"] for item in listed] == [before["attempt_id"], after["attempt_id"]]
+    assert listed[0]["status"] == "superseded" and listed[1]["status"] == "completed"
 
 
 def test_checkpoint_distinguishes_task_prefix_from_secret_tokens(tmp_path: Path, repo: Path, agents: dict[str, RoleAgent]) -> None:

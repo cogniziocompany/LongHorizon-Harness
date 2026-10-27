@@ -146,14 +146,16 @@ class LocalInteractiveService:
             if path.is_symlink() or not path.is_dir():
                 continue
             projection = self.projection(path.name)
-            runs.append({
-                "run_id": path.name,
-                "attempt_id": projection["attempt_id"],
-                "status": projection["status"],
-                "current_stage": projection["current_stage"],
-                "revision": projection["revision"],
-            })
-        return {"runs": sorted(runs, key=lambda item: item["run_id"])}
+            for attempt in projection["attempts"]:
+                runs.append({
+                    "run_id": path.name,
+                    "attempt_id": attempt["attempt_id"],
+                    "parent_attempt_id": attempt.get("parent_attempt_id"),
+                    "status": attempt["status"],
+                    "current_stage": projection["current_stage"] if attempt["attempt_id"] == projection["attempt_id"] else attempt.get("selected_stage"),
+                    "revision": attempt["revision"],
+                })
+        return {"runs": sorted(runs, key=lambda item: (item["run_id"], item["attempt_id"]))}
 
     def _run_dir(self, run_id: str) -> Path:
         _safe_id(run_id, "run_id")
@@ -1152,6 +1154,7 @@ class LocalInteractiveService:
         adapter = self.adapter_factory(role)
         if adapter is None:
             raise InteractionError(f"no Harness adapter is configured for {role}", 501)
+        adapter.workspace_path = str(status["workspace"])
         env = _WorkspaceEnvironment(Path(str(status["workspace"])), self._attempt_dir(str(status["run_id"]), attempt_id) / "tmp")
         trajectory = self._attempt_dir(str(status["run_id"]), attempt_id) / "trajectories" / live_name
         return await adapter.run_episode(prompt, env, EpisodeBudget(max_duration_seconds=300), live_trajectory_path=str(trajectory))
@@ -1181,7 +1184,7 @@ class LocalInteractiveService:
         if stage == "manager.plan":
             text = extract_role_manager_plan_text(text).strip()
             if parse_role_manager_next_step(text) != MANAGER_NEXT_CLI:
-                raise InteractionError("local fixture requires Manager to emit exactly a CLI build plan")
+                raise InteractionError("local fixture requires Manager to emit exactly a CLI build plan; output: " + (text[:400] or "<empty>"))
         artifact = self._persist_artifact(run_id, attempt_id, stage, role, execution_id, text)
         def complete(current: dict[str, Any]) -> dict[str, Any]:
             outputs = {**current.get("outputs", {}), stage: artifact}
