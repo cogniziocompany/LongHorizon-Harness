@@ -88,6 +88,12 @@ async def _run(
         config=HarnessConfig(
             max_total_episodes=max_rounds,
             workspace_path=str(tmp_path / "workspace"),
+            # The workspace here is a bare temp directory: it holds no test
+            # suite at all.  That is an explicit fact about the task, so it is
+            # declared explicitly -- the preflight never infers "no tests" from the
+            # shape of the filesystem (a missing .git, a not-a-repo workspace, a
+            # manifest-less directory).
+            no_tests_applicable=True,
             harness_dir=str(tmp_path / "harness"),
             log_dir=str(tmp_path / "logs"),
         ),

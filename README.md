@@ -198,6 +198,35 @@ Steps 1–2 are once per machine; step 3 is once per project. Then run tasks fro
 
 Run `lh-harness doctor` at any point to check all of the above; see [Verify the environment](#verify-the-environment).
 
+#### Test environment preflight
+
+Before a run dispatches its first round, the harness runs a **workspace preflight** on the run's workspace. It reads the repo's manifest and lock files (`pyproject.toml`, `poetry.lock`, `uv.lock`, `requirements*.txt`, `package.json` with its lock, `go.mod`), resolves the interpreter the repo declares, records that interpreter's version and installed package set, checks that the declared test extras are actually importable, and runs a test-collection smoke (`pytest --collect-only -q`). It also records the git baseline (HEAD, dirty files, stashes) and whether the profile tools the task needs are genuinely available.
+
+A **collected count of zero is a failure**, not a green light — a skipped or empty collection never counts as a healthy environment. The only exceptions are a repo that explicitly declares it has no tests, and an explicit task- or profile-level applicability signal that the run has no test suite at all.
+
+If the declared test extras are missing, the preflight creates a `.venv-task` environment **inside the workspace** from the repo's own manifest (`pip install -e '.[test]'`) and uses that same interpreter for the baseline and the candidate. The shared harness virtualenv is never used and never written to: it is shared by every run on the host, so a per-run install into it would corrupt other runs and hide a broken workspace behind another run's packages.
+
+The preflight also **sanitizes the environment** it hands to every step. `PYTHONPATH`, `VIRTUAL_ENV`, and `PYTHONHOME` are cleared before any install and before any collection, for the baseline and the candidate alike. This matters because the harness shell exports `PYTHONPATH=/home/harness/venv/lib/python3.12/site-packages`: without sanitization a child launched with the *workspace* interpreter still resolves packages from the *shared harness* venv, so the preflight would report a healthy environment that a real test run cannot reproduce.
+
+To make that leak visible rather than silent, the receipt carries the **provenance** of the environment: `sys.executable`, the full `sys.path`, and the resolved file paths of the repo's own package and of `pytest`. If any of them lands under the shared harness virtualenv, the preflight refuses the environment with the same typed prerequisite — naming **infra onboarding** — and the run stops at the gate before any round is consumed.
+
+When a dependency cannot be satisfied from the repo's own manifest, the preflight fails fast with a typed prerequisite naming its owner (**infra onboarding**) and the run stops at that gate — before any round is consumed — instead of spending a round discovering the missing package.
+
+The preflight distinguishes two kinds of "not green", because they call for different responses:
+
+| Outcome | Meaning | What happens |
+|---|---|---|
+| **Typed prerequisite** | A dependency the preflight cannot satisfy from the repo's own manifest (or an environment that resolves packages from the shared harness venv). | The run stops at the gate and names the owner (**infra onboarding**). |
+| **Typed readiness gap** | The preflight could not *determine* the workspace's declared test suite: the manifest is missing or unreadable, or the repo declares a suite the preflight cannot drive (a Node or Go suite). | The run stops at the gate with `abort_reason: preflight_readiness_gap` and no owner is named — this is not a dependency problem. |
+
+A **missing manifest is not "the repo declares no tests"**. A wrong working directory, a partial checkout, and a repo whose manifest this preflight does not recognise all produce a readiness gap rather than a green. The only two ways an absent test suite is legitimate are an explicit declaration in the repo's own manifest (for example `testpaths = []`) and an explicit task- or profile-level applicability signal; neither is inferred.
+
+**No-test applicability is a declaration, never a filesystem inference.** A missing `.git`, a `not-a-repo` launch, an exported code tree, and a Node tree without `.git` are all facts about the *shape of the directory* — and every one of them is equally what a wrong working directory looks like. So none of them makes a workspace test-exempt: a manifest-less workspace produces a readiness gap unless the task or profile **explicitly** declared the run a non-code task (`--no-tests-applicable` on the CLI, `HarnessConfig.no_tests_applicable` in-process). The launcher's `not-a-repo` mode says only that the directory holds no git metadata, so the worker does no branch work; it does not say the task has no tests.
+
+The declaration covers exactly one thing: the absence of a manifest. It does not suppress the other checks — an unreadable manifest and a repo that declares a suite the preflight cannot drive are still gaps, because a broken manifest and a declared Node suite contradict the declaration rather than satisfy it. The preflight never forces a Python runner onto a non-Python repository: a declared Node suite is reported as a gap naming its runner (`npm test`), not collected with pytest.
+
+The preflight leaves a receipt in the run directory (`role_orchestration/workspace_preflight.json`) and the same fields in the run snapshot, so you can see exactly what the run saw before it started: the candidate SHA, the env manifest, the interpreter, the collected count, the tool availability, and the provenance fields. A readiness gap rides in both carriers under its own `kind`, beside — and distinct from — the prerequisite.
+
 #### 1. Install LongHorizon-Harness
 
 ```bash

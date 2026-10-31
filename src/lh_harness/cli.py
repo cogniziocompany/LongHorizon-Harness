@@ -684,7 +684,19 @@ def main(argv: list[str] | None = None) -> int:
         "(task 201); recorded in the round-zero workspace record. Set by the "
         "supervisor for queue-triggered launches. 'not-a-repo' (task 252) is a "
         "legitimate non-git workspace: the worker runs in place with no branch "
-        "work — no default-branch lookup, no branch cut, no push.",
+        "work — no default-branch lookup, no branch cut, no push. It says "
+        "nothing about whether the task has tests: use --no-tests-applicable "
+        "for that.",
+    )
+    run_parser.add_argument(
+        "--no-tests-applicable",
+        action="store_true",
+        default=False,
+        help="Declare that this run is a non-code task and therefore has no "
+        "test suite to verify. This is the ONLY way the workspace preflight "
+        "accepts a manifest-less workspace: the declaration is explicit, and "
+        "is never inferred from the filesystem. A missing .git or a "
+        "'not-a-repo' workspace is a readiness gap, not a skip.",
     )
     run_parser.add_argument(
         "--prompt-language",
@@ -1978,6 +1990,7 @@ def _run_command(args: argparse.Namespace) -> int:
         log_dir=log_dir,
         runs_root=args.runs_root,
         workspace_base_mode=getattr(args, "workspace_base_mode", None),
+        no_tests_applicable=bool(getattr(args, "no_tests_applicable", False)),
         prompt_language=args.prompt_language,
         experience=bool(getattr(args, "experience", False)),
         **context_cap_defaults,

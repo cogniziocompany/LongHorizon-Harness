@@ -221,6 +221,12 @@ async def test_provider_failure_stops_without_round_limit_approval(tmp_path: Pat
         max_total_episodes=30,
         manager_budget=EpisodeBudget(max_duration_seconds=10),
         workspace_path=str(tmp_path / "workspace"),
+        # The workspace here is a bare temp directory: it holds no test
+        # suite at all.  That is an explicit fact about the task, so it is
+        # declared explicitly -- the preflight never infers "no tests" from the
+        # shape of the filesystem (a missing .git, a not-a-repo workspace, a
+        # manifest-less directory).
+        no_tests_applicable=True,
         harness_dir=str(tmp_path / "harness"),
         log_dir=str(tmp_path / "logs"),
     )
@@ -271,6 +277,12 @@ async def test_episode_timeout_is_preserved_and_recovers_in_the_next_round(tmp_p
         max_total_episodes=2,
         manager_budget=EpisodeBudget(max_duration_seconds=10),
         workspace_path=str(tmp_path / "workspace"),
+        # The workspace here is a bare temp directory: it holds no test
+        # suite at all.  That is an explicit fact about the task, so it is
+        # declared explicitly -- the preflight never infers "no tests" from the
+        # shape of the filesystem (a missing .git, a not-a-repo workspace, a
+        # manifest-less directory).
+        no_tests_applicable=True,
         harness_dir=str(tmp_path / "harness"),
         log_dir=str(tmp_path / "logs"),
     )
@@ -315,6 +327,12 @@ async def test_executor_timeout_preserves_partial_output_for_recovery(tmp_path: 
         config=HarnessConfig(
             max_total_episodes=2,
             workspace_path=str(tmp_path / "workspace"),
+            # The workspace here is a bare temp directory: it holds no test
+            # suite at all.  That is an explicit fact about the task, so it is
+            # declared explicitly -- the preflight never infers "no tests" from the
+            # shape of the filesystem (a missing .git, a not-a-repo workspace, a
+            # manifest-less directory).
+            no_tests_applicable=True,
             harness_dir=str(tmp_path / "harness"),
             log_dir=str(tmp_path / "logs"),
         ),
@@ -349,6 +367,12 @@ async def test_auditor_timeout_keeps_executor_result_and_recovers(tmp_path: Path
         config=HarnessConfig(
             max_total_episodes=2,
             workspace_path=str(tmp_path / "workspace"),
+            # The workspace here is a bare temp directory: it holds no test
+            # suite at all.  That is an explicit fact about the task, so it is
+            # declared explicitly -- the preflight never infers "no tests" from the
+            # shape of the filesystem (a missing .git, a not-a-repo workspace, a
+            # manifest-less directory).
+            no_tests_applicable=True,
             harness_dir=str(tmp_path / "harness"),
             log_dir=str(tmp_path / "logs"),
         ),
@@ -387,6 +411,12 @@ async def test_late_crash_report_preserves_completed_rounds(tmp_path: Path) -> N
         max_total_episodes=2,
         manager_budget=EpisodeBudget(max_duration_seconds=10),
         workspace_path=str(tmp_path / "workspace"),
+        # The workspace here is a bare temp directory: it holds no test
+        # suite at all.  That is an explicit fact about the task, so it is
+        # declared explicitly -- the preflight never infers "no tests" from the
+        # shape of the filesystem (a missing .git, a not-a-repo workspace, a
+        # manifest-less directory).
+        no_tests_applicable=True,
         harness_dir=str(tmp_path / "harness"),
         log_dir=str(log_dir),
     )
