@@ -660,8 +660,148 @@ def _origin_allowed(origin: str | None, host: str, allowed_origins: set[str]) ->
 
 
 # Upper bounds for the web process's per-run in-memory state (2026-10-07 leak fix).
+#
+# LHH-WEB-LEAK-FIX c1: the per-run state cache bound moved to the
+# ``LH_HARNESS_WEB_STATE_CACHE`` knob (see ``_STATE_REGISTRY_CACHE_MAX``
+# below).  ``_STATE_REGISTRY_MAX`` is kept as the LEGACY knob: when
+# ``LH_HARNESS_WEB_STATE_CACHE`` is unset, the legacy
+# ``LH_HARNESS_STATE_REGISTRY_MAX`` value still bounds the cache, so an
+# operator (or a test) that already tuned the old knob keeps working.
 _STATE_REGISTRY_MAX = int(os.environ.get("LH_HARNESS_STATE_REGISTRY_MAX", "64") or 64)
 _SNAPSHOT_CACHE_MAX = int(os.environ.get("LH_HARNESS_SNAPSHOT_CACHE_MAX", "64") or 64)
+
+# LHH-WEB-LEAK-FIX c1: the run-state cache bounds and TTL.
+#
+# ``LH_HARNESS_WEB_STATE_CACHE`` bounds the per-run state cache.  The old
+# fixed bound of 64 was SMALLER than the number of runs on a busy node
+# (~800 on CT110), so the cache could never hold a full listing: every
+# ``GET /api/runs`` evicted the entries it had just built and re-walked
+# every run boundary from scratch.  The default now exceeds CT110's run
+# count so the whole listing fits.
+_STATE_REGISTRY_CACHE_MAX = int(
+    os.environ.get("LH_HARNESS_WEB_STATE_CACHE")
+    or os.environ.get("LH_HARNESS_STATE_REGISTRY_MAX")
+    or 2048
+)
+# How long a cached run boundary may be trusted without re-walking it.
+_STATE_REGISTRY_TTL_S = float(os.environ.get("LH_HARNESS_WEB_STATE_TTL_S", "30") or 30)
+
+# LHH-WEB-LEAK-FIX c1: the web process's own RSS watchdog.
+#
+# ``LH_HARNESS_WEB_RSS_WARN_MB`` is the resident-set threshold (MiB) above
+# which the web process logs ONE warning line.  ``0`` disables the watchdog.
+# The watchdog is LOG ONLY: it never exits, never restarts the process, and
+# never changes the behaviour of any request.
+_RSS_WARN_MB_DEFAULT = 3072
+_RSS_WARN_INTERVAL_S = 60.0
+
+
+def _rss_warn_threshold_mb() -> int | None:
+    """The configured RSS warning threshold in MiB, or ``None`` if disabled.
+
+    ``LH_HARNESS_WEB_RSS_WARN_MB`` is read on EVERY call (not at import time)
+    so an operator can change the knob and have the running web process pick
+    it up on its next sample.  A value of ``0`` disables the watchdog; so does
+    an unset or unparseable value falling back to the default.
+    """
+
+    raw = os.environ.get("LH_HARNESS_WEB_RSS_WARN_MB")
+    if raw is None or not str(raw).strip():
+        return _RSS_WARN_MB_DEFAULT
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _RSS_WARN_MB_DEFAULT
+    if value <= 0:
+        return None
+    return value
+
+
+def _process_rss_mb() -> float:
+    """This process's CURRENT resident set size in MiB (0.0 when unavailable).
+
+    ``/proc/self/status`` ``VmRSS`` is the current RSS.  The ``resource``
+    fallback is only used when ``/proc`` is unavailable; note that
+    ``ru_maxrss`` is the PEAK RSS on Linux, so it is a conservative
+    over-estimate, never an under-report.
+    """
+
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import resource
+
+        # ``ru_maxrss`` is KiB on Linux and is the PEAK RSS.
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    except Exception:
+        return 0.0
+
+
+def _rss_watchdog_loop(stop_event: threading.Event) -> None:
+    """Sample this process's RSS every 60 s and log ONE warning when exceeded.
+
+    LHH-WEB-LEAK-FIX c1.  The watchdog is LOG ONLY: it never exits, never
+    restarts the process, and never touches any request path.  It exists so
+    the operator can see the web process crossing the memory threshold that
+    precedes the symptom (the root page stops answering) on the node where
+    it happens, instead of inferring it from a restart.
+
+    The warning line is exactly::
+
+        web RSS <mb> MB above LH_HARNESS_WEB_RSS_WARN_MB=<n>
+
+    ONE line is logged per crossing: the watchdog warns when the RSS first
+    goes above the threshold and stays quiet on the following samples for as
+    long as the RSS stays above it.  It warns again only after the RSS has
+    dropped back below the threshold and crossed it once more, so a long
+    leak does not turn into one log line per minute.
+    """
+
+    above = False
+    while not stop_event.wait(_RSS_WARN_INTERVAL_S):
+        threshold = _rss_warn_threshold_mb()
+        if threshold is None:
+            above = False
+            continue
+        rss_mb = _process_rss_mb()
+        if rss_mb <= 0.0:
+            continue
+        if rss_mb > threshold:
+            if not above:
+                logger.warning(
+                    "web RSS %.0f MB above LH_HARNESS_WEB_RSS_WARN_MB=%d",
+                    rss_mb,
+                    threshold,
+                )
+            above = True
+        else:
+            above = False
+
+
+def _start_rss_watchdog() -> threading.Event | None:
+    """Start the RSS watchdog thread, if the knob is enabled.
+
+    Returns the stop event so the caller can shut the thread down, or
+    ``None`` when the watchdog is disabled (knob set to ``0``).
+    """
+
+    if _rss_warn_threshold_mb() is None:
+        return None
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_rss_watchdog_loop,
+        args=(stop_event,),
+        name="lh-web-rss-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event
+
 
 
 _QUEUE_PAGE_DEFAULT = 100
@@ -746,6 +886,24 @@ class StateRegistry:
         # memory with its read caches. The base run is pinned; other entries are
         # evicted least-recently-used beyond ``_STATE_REGISTRY_MAX``.
         self._states: OrderedDict[str, DashboardState] = OrderedDict()
+        # LHH-WEB-LEAK-FIX c1: the validated boundary stamp per cached run id.
+        #
+        # Pre-fix, a cache HIT still re-walked the whole run boundary
+        # (``_run_paths`` -> ``safe_run_dir``/``safe_run_logs``/``safe_run_
+        # control``/``safe_run_rounds``/``safe_run_role``, each of which
+        # realpaths every component).  ``GET /api/runs`` calls ``state_for``
+        # once per run, so one request performed O(runs) boundary walks and a
+        # listing of N runs cost O(N^2) realpath calls -- the per-request
+        # re-walk that made the web process grow to gigabytes.
+        #
+        # The stamp is ``(st_mtime_ns, st_ino)`` of the run directory, taken
+        # with ONE ``os.stat``.  While the stamp is unchanged AND the entry is
+        # younger than ``LH_HARNESS_WEB_STATE_TTL_S``, the cached boundary is
+        # trusted and the boundary is NOT re-walked.  A changed stamp or an
+        # expired TTL re-walks the boundary exactly as pre-fix.
+        self._boundary_stamps: dict[str, tuple[int, int]] = {}
+        # Monotonic timestamp of the last successful boundary validation.
+        self._boundary_checked_at: dict[str, float] = {}
         if self.base_run_id:
             self._states[self.base_run_id] = state
 
@@ -791,6 +949,48 @@ class StateRegistry:
             return None
         return run_dir, log_dir
 
+    def _run_stamp(self, run_id: str) -> tuple[int, int] | None:
+        """ONE ``os.stat`` of the run directory, as ``(st_mtime_ns, st_ino)``.
+
+        This is the cheap validation used on a cache hit.  It answers "has
+        this run directory been replaced or modified since the boundary was
+        last walked?" without realpath-ing every component of the boundary.
+        ``None`` means the run directory could not be stat'ed at all (it was
+        removed, or it is not a directory), which is a change.
+        """
+
+        root = self.runs_root
+        if root is None:
+            return None
+        run_dir = root / run_id
+        try:
+            stat_result = os.stat(run_dir)
+        except (OSError, ValueError):
+            return None
+        return (int(stat_result.st_mtime_ns), int(stat_result.st_ino))
+
+    def _cached_boundary_is_fresh(self, run_id: str) -> bool:
+        """Is the cached boundary for ``run_id`` still trustworthy?
+
+        True when the run directory's stamp is UNCHANGED since the last walk
+        AND the entry is younger than ``LH_HARNESS_WEB_STATE_TTL_S``.  When
+        this returns False the caller re-walks the boundary, exactly as the
+        pre-fix code always did.
+        """
+
+        previous = self._boundary_stamps.get(run_id)
+        if previous is None:
+            return False
+        checked_at = self._boundary_checked_at.get(run_id)
+        if checked_at is None:
+            return False
+        if (time.monotonic() - checked_at) > _STATE_REGISTRY_TTL_S:
+            return False
+        current = self._run_stamp(run_id)
+        if current is None or current != previous:
+            return False
+        return True
+
     def state_for(self, run_id: str) -> DashboardState | None:
         if not _safe_run_id(run_id):
             return None
@@ -806,19 +1006,33 @@ class StateRegistry:
             self._states.move_to_end(run_id)
             if self.runs_root is not None:
                 # The base DashboardState may have auto-selected a run during
-                # construction. Revalidate the cached path on every request;
-                # otherwise a symlinked ``runs/<id>`` could bypass the normal
-                # state_for boundary check simply because it was already in
-                # the registry cache.
-                paths = self._run_paths(run_id)
-                if paths is None:
-                    return None
-                _, log_dir = paths
-                try:
-                    if cached.log_dir.resolve(strict=False) != log_dir:
+                # construction. Revalidate the cached path; otherwise a
+                # symlinked ``runs/<id>`` could bypass the normal state_for
+                # boundary check simply because it was already in the
+                # registry cache.
+                #
+                # LHH-WEB-LEAK-FIX c1: the revalidation is ONE ``os.stat`` of
+                # the run directory while the cached stamp is unchanged and
+                # the entry is within the TTL.  Only a changed stamp or an
+                # expired TTL re-walks the boundary -- pre-fix EVERY cache
+                # hit re-walked it, which is what made the run listing
+                # quadratic.
+                if not self._cached_boundary_is_fresh(run_id):
+                    paths = self._run_paths(run_id)
+                    if paths is None:
+                        self._forget_boundary(run_id)
                         return None
-                except (OSError, RuntimeError, ValueError):
-                    return None
+                    _, log_dir = paths
+                    try:
+                        if cached.log_dir.resolve(strict=False) != log_dir:
+                            self._forget_boundary(run_id)
+                            return None
+                    except (OSError, RuntimeError, ValueError):
+                        self._forget_boundary(run_id)
+                        return None
+                    # Remember the freshly walked boundary so the next hit
+                    # can be validated with a single stat.
+                    self._remember_boundary(run_id)
             return self._refresh_control_capability(run_id, cached)
         if self.runs_root is None or not _safe_run_id(run_id):
             return None
@@ -832,16 +1046,34 @@ class StateRegistry:
             control_enabled=False,
         )
         self._states[run_id] = state
+        self._remember_boundary(run_id)
         self._evict_states()
         return self._refresh_control_capability(run_id, state)
 
+    def _remember_boundary(self, run_id: str) -> None:
+        """Record the boundary stamp for a freshly walked run."""
+
+        stamp = self._run_stamp(run_id)
+        if stamp is None:
+            self._forget_boundary(run_id)
+            return
+        self._boundary_stamps[run_id] = stamp
+        self._boundary_checked_at[run_id] = time.monotonic()
+
+    def _forget_boundary(self, run_id: str) -> None:
+        """Drop the cached boundary stamp for a run."""
+
+        self._boundary_stamps.pop(run_id, None)
+        self._boundary_checked_at.pop(run_id, None)
+
     def _evict_states(self) -> None:
         """Drop least-recently-used states beyond the bound; the base run is pinned."""
-        excess = len(self._states) - _STATE_REGISTRY_MAX
+        excess = len(self._states) - _STATE_REGISTRY_CACHE_MAX
         if excess <= 0:
             return
         for key in [k for k in self._states if k != self.base_run_id][:excess]:
             self._states.pop(key, None)
+            self._forget_boundary(key)
 
     def default_state(self) -> tuple[str, DashboardState]:
         if self.base_state.current_run_id:
@@ -1840,9 +2072,16 @@ def create_app(
     async def _lifespan(app: FastAPI) -> Any:
         if launcher is not None:
             await launcher.start()
-        yield
-        if launcher is not None:
-            await launcher.stop()
+        # LHH-WEB-LEAK-FIX c1: the RSS watchdog runs for the lifetime of the
+        # web process.  It only logs; it never exits or restarts anything.
+        rss_stop_event = _start_rss_watchdog()
+        try:
+            yield
+        finally:
+            if rss_stop_event is not None:
+                rss_stop_event.set()
+            if launcher is not None:
+                await launcher.stop()
 
     app = FastAPI(title="LongHorizon-Harness Web API", version="1", lifespan=_lifespan)
     # Read the build identity once, at startup: /api/meta must describe the
