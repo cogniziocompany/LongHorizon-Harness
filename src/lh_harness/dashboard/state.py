@@ -49,7 +49,21 @@ _TRAJECTORY_ROLES = (
 _MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 _MAX_TRAJECTORY_BYTES = 16 * 1024 * 1024
 _MAX_TRAJECTORY_STEPS = 5_000
-_MAX_ROUND_TEXT_BYTES = 512 * 1024
+# LHH-WEB-LEAK-FIX c1: the per-role text budget embedded in a snapshot.
+#
+# The round text was read with a 512 KiB cap per field, so a snapshot could
+# inline ~512 KiB of executor output and ~512 KiB of auditor report for EVERY
+# round.  The snapshot body carries the round list twice (the top-level
+# ``rounds`` and the ``legacy`` overlay), so one poll could pull megabytes of
+# role text into the web process -- the operator's dashboard lead saw a
+# ~4.4 MB executor role output.
+#
+# The budget keeps the human-readable prefix of each role text (so the UI can
+# still render a plan/output/report excerpt and the verdict derivation still
+# works) and marks the rest as truncated.  The authoritative FULL text stays
+# reachable through the artifact path (``read_round_artifact``), which uses
+# its own ``_MAX_ARTIFACT_BYTES`` limit and is unchanged.
+_MAX_ROUND_TEXT_BYTES = 8 * 1024
 _MAX_JSON_BYTES = 8 * 1024 * 1024
 _MAX_JSONL_BYTES = 8 * 1024 * 1024
 _MAX_JSONL_LINE_BYTES = 512 * 1024
