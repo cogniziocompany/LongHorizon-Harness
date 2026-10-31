@@ -452,5 +452,59 @@ def build_snapshot(state: DashboardState, *, run_id: str | None = None) -> dict[
             "cursor_gap": False,
             "resync_required": False,
         },
-        "legacy": raw,
+        "legacy": _legacy_overlay(raw),
     }
+
+
+# The per-role text fields of a round.  The snapshot carries the round list
+# twice (the top-level ``rounds`` and the ``legacy`` overlay), so keeping the
+# text in both places doubles the bytes every poll has to move.
+_LEGACY_ROUND_TEXT_FIELDS = (
+    "executor_output",
+    "auditor_report",
+    "executor_claim",
+    "auditor_findings",
+)
+
+# The legacy overlay's run listing is a compatibility artifact: the canonical
+# run list is ``GET /api/runs``.  Embedding every run directory in EVERY
+# snapshot made one poll cost O(runs) bytes -- at CT110's ~800 run dirs that
+# is a payload the browser has to parse on every refresh.  The overlay keeps
+# a bounded head of the list; the full list stays available from the run-list
+# endpoint.
+_MAX_LEGACY_RUN_ROWS = 64
+
+
+def _legacy_overlay(raw: dict[str, Any]) -> dict[str, Any]:
+    """The legacy compatibility overlay, without the duplicated heavy parts.
+
+    LHH-WEB-LEAK-FIX c1.  ``legacy`` is the pre-projection snapshot shape.
+    Two parts of it made every poll expensive:
+
+    * its round list carried a FULL second copy of every round's per-role
+      text, so one poll moved the role text twice;
+    * its run listing carried EVERY run directory under the runs root, so one
+      poll cost O(runs) bytes.
+
+    The overlay keeps the round metadata (index, status, sizes, in-progress
+    flags) and a bounded head of the run listing.  The role text is already
+    present -- budgeted -- in the top-level ``rounds``, and the full run list
+    stays available from ``GET /api/runs``.
+    """
+
+    overlay = dict(raw)
+    raw_rounds = overlay.get("rounds")
+    if isinstance(raw_rounds, list):
+        stripped: list[Any] = []
+        for item in raw_rounds:
+            if not isinstance(item, dict):
+                stripped.append(item)
+                continue
+            light = {k: v for k, v in item.items() if k not in _LEGACY_ROUND_TEXT_FIELDS}
+            stripped.append(light)
+        overlay["rounds"] = stripped
+    raw_runs = overlay.get("runs")
+    if isinstance(raw_runs, list) and len(raw_runs) > _MAX_LEGACY_RUN_ROWS:
+        overlay["runs"] = raw_runs[:_MAX_LEGACY_RUN_ROWS]
+        overlay["runs_truncated"] = len(raw_runs) - _MAX_LEGACY_RUN_ROWS
+    return overlay

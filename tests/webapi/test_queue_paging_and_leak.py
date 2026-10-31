@@ -127,7 +127,10 @@ def test_snapshot_cache_is_bounded_and_drops_expired() -> None:
 
 
 def test_state_registry_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server_mod, "_STATE_REGISTRY_MAX", 4)
+    # LHH-WEB-LEAK-FIX c1: the cache bound is ``LH_HARNESS_WEB_STATE_CACHE``
+    # (default 2048); the legacy ``_STATE_REGISTRY_MAX`` knob still works as
+    # a fallback but no longer bounds the cache on its own.
+    monkeypatch.setattr(server_mod, "_STATE_REGISTRY_CACHE_MAX", 4)
     root = tmp_path / "runs"
     for i in range(10):
         (root / f"20261007T00000{i}Z_aaaaaaa{i}" / "lh_harness").mkdir(parents=True)
