@@ -52,6 +52,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -313,6 +314,13 @@ def _drain_queue(root: Path) -> None:
 # ---------------------------------------------------------------------------
 # child server
 # ---------------------------------------------------------------------------
+# LHH-WEB-LEAK-FIX c2 -- MEASUREMENT-ONLY instrumentation.
+#
+# ``--tracemalloc`` starts tracemalloc inside the CHILD web-server process and
+# dumps the top allocation sites (file:line) to the child's stderr when the
+# process is asked to stop.  It is diagnostic only: no application behaviour
+# changes, no request path is touched, and the app under test is exactly the
+# same object as in an uninstrumented run.
 _CHILD_BOOTSTRAP = """
 import json, os, sys
 sys.path.insert(0, {src!r})
@@ -334,6 +342,112 @@ import uvicorn
 uvicorn.run(app, host="127.0.0.1", port={port}, log_level="warning")
 """
 
+# The tracemalloc variant of the bootstrap.  It is a separate string so the
+# uninstrumented path stays byte-identical to the pre-c2 bootstrap above.
+#
+# NOTE: this template is filled with ``%``-style substitution, NOT
+# ``str.format``: the dump code below is full of ``{}`` braces, which
+# ``str.format`` would try to interpret as replacement fields.
+_CHILD_BOOTSTRAP_TRACEMALLOC = """
+import json, os, sys
+sys.path.insert(0, %(src)r)
+from lh_harness.webapi.server import create_app
+from lh_harness.supervisor.service import RunSupervisor
+
+# LHH-WEB-LEAK-FIX c2 -- MEASUREMENT-ONLY.  tracemalloc is started BEFORE the
+# app is created so the top allocation sites include the app's own import and
+# start-up objects.  Nothing else about the app changes.
+#
+# ``tracemalloc.start(nframe)`` sets the number of STACK FRAMES stored per
+# allocation, NOT the number of top sites printed.  The first version of this
+# instrumentation passed the top-site count (15) here, which made every
+# allocation carry a 15-frame traceback: ``GET /api/runs`` over 300 run dirs
+# went from 18.5 s to >300 s (it timed out) and the request path could not be
+# polled at all.  One frame is enough to name the allocating line and keeps
+# the overhead to roughly 9x.
+import tracemalloc
+tracemalloc.start(1)
+
+runs_root = %(runs_root)r
+supervisor = RunSupervisor(runs_root)
+app = create_app(
+    runs_root=runs_root,
+    supervisor=supervisor,
+    control_enabled=False,
+    bind_host="127.0.0.1",
+    bind_port=%(port)d,
+    probe_open_pr=None,
+    caller_configs=None,
+)
+import uvicorn
+
+# The BASELINE marker is taken AFTER the app exists, so the "diff vs start"
+# table shows only what the REQUEST PATH allocated.  With the marker taken
+# before ``create_app`` the diff was dominated by import-time objects
+# (importlib, uvloop, fastapi routing), which say nothing about what grows
+# while polling.
+_tracemalloc_marker = tracemalloc.take_snapshot()
+
+# LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): a SECOND marker, taken at the
+# midpoint of the poll sequence (SIGUSR2), so the dump can report what the
+# SECOND HALF of the polls allocated on top of the first half.  A single
+# end-of-run snapshot cannot distinguish "this site is big" from "this site
+# GROWS with every poll" -- only a mid-run marker can.
+_tracemalloc_marker_mid = None
+_tracemalloc_marker_mid_poll = None
+
+def _write_sites(out, stats, limit, size_key, count_key):
+    for index, stat in enumerate(stats[:limit], start=1):
+        frame = stat.traceback[0]
+        out.write("%%3d. %%10d B  %%8d B  %%s:%%s\\n" %% (
+            index, getattr(stat, size_key), getattr(stat, count_key),
+            frame.filename, frame.lineno))
+        for line in stat.traceback.format():
+            out.write("       " + line + "\\n")
+
+def _dump_tracemalloc(*_args, **_kwargs):
+    global _tracemalloc_marker_mid, _tracemalloc_marker_mid_poll
+    snap = tracemalloc.take_snapshot()
+    limit = %(trace_limit)d
+    out = sys.stderr
+    out.write("=== TRACEMALLOC TOP %%d SITES (cumulative, current) ===\\n" %% limit)
+    _write_sites(out, snap.statistics("lineno"), limit, "size", "count")
+    out.write("=== TRACEMALLOC TOP %%d SITES (cumulative, diff vs start) ===\\n" %% limit)
+    diff = snap.compare_to(_tracemalloc_marker, "lineno")
+    _write_sites(out, diff, limit, "size_diff", "count_diff")
+    # The growth table: what the polls AFTER the midpoint allocated on top of
+    # what the polls BEFORE the midpoint had already allocated.  This is the
+    # table that names the site that GROWS.
+    if _tracemalloc_marker_mid is not None:
+        out.write("=== TRACEMALLOC TOP %%d SITES (GROWTH, diff vs poll %%s) ===\\n" %% (
+            limit, _tracemalloc_marker_mid_poll))
+        growth = snap.compare_to(_tracemalloc_marker_mid, "lineno")
+        _write_sites(out, growth, limit, "size_diff", "count_diff")
+    out.write("=== END TRACEMALLOC ===\\n")
+    out.flush()
+
+import atexit
+import signal
+atexit.register(_dump_tracemalloc)
+def _on_sigusr1(*_args):
+    # SIGUSR1 is not used by uvicorn, so this handler always runs and the
+    # dump is written to stderr while the server is still serving.
+    _dump_tracemalloc()
+def _on_sigusr2(*_args):
+    # SIGUSR2 marks the midpoint of the poll sequence: it takes the second
+    # marker and then dumps, so the dump carries the GROWTH table.
+    global _tracemalloc_marker_mid, _tracemalloc_marker_mid_poll
+    _tracemalloc_marker_mid = tracemalloc.take_snapshot()
+    _tracemalloc_marker_mid_poll = %(midpoint_poll)r
+    _dump_tracemalloc()
+try:
+    signal.signal(signal.SIGUSR1, _on_sigusr1)
+    signal.signal(signal.SIGUSR2, _on_sigusr2)
+except Exception:
+    pass
+uvicorn.run(app, host="127.0.0.1", port=%(port)d, log_level="warning")
+"""
+
 
 def _child_env() -> dict[str, str]:
     env = dict(os.environ)
@@ -345,16 +459,42 @@ def _child_env() -> dict[str, str]:
     return env
 
 
-def _start_server(runs_root: Path, port: int) -> subprocess.Popen[bytes]:
-    code = _CHILD_BOOTSTRAP.format(
-        src=str(_REPO / "src"), runs_root=str(runs_root), port=port
-    )
-    return subprocess.Popen(
+def _start_server(
+    runs_root: Path,
+    port: int,
+    *,
+    tracemalloc: bool = False,
+    trace_limit: int = 15,
+    stderr_path: Path | None = None,
+    midpoint_poll: int = 0,
+) -> subprocess.Popen[bytes]:
+    if tracemalloc:
+        code = _CHILD_BOOTSTRAP_TRACEMALLOC % {
+            "src": str(_REPO / "src"),
+            "runs_root": str(runs_root),
+            "port": port,
+            "trace_limit": trace_limit,
+            "midpoint_poll": midpoint_poll,
+        }
+    else:
+        code = _CHILD_BOOTSTRAP.format(
+            src=str(_REPO / "src"), runs_root=str(runs_root), port=port
+        )
+    stderr_target: Any = subprocess.DEVNULL
+    stderr_handle = None
+    if stderr_path is not None:
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_handle = stderr_path.open("wb")
+        stderr_target = stderr_handle
+    proc = subprocess.Popen(
         [_PYTHON, "-c", code],
         env=_child_env(),
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_target,
     )
+    # Keep the handle alive for the process lifetime; the caller closes it.
+    proc._repro_stderr_handle = stderr_handle  # type: ignore[attr-defined]
+    return proc
 
 
 def _wait_for_port(port: int, proc: subprocess.Popen[bytes], timeout: float = 60.0) -> bool:
@@ -454,10 +594,35 @@ def drive_traffic(
     queue_ids: list[str],
     timeout: float = 30.0,
     include_full_runs: bool = True,
+    poll_mix: str = "full",
+    midpoint_poll: int = 0,
+    server_pid: int = 0,
+    rss_sampler: Any = None,
+    poll_rows: list[dict[str, Any]] | None = None,
+    on_poll: Any = None,
 ) -> list[dict[str, Any]]:
-    """Drive the poll mix the dashboard/fleet use; return per-batch rows."""
+    """Drive the poll mix the dashboard/fleet use; return per-batch rows.
+
+    LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): ``rss_sampler`` is called after
+    every completed poll round and ``poll_rows`` collects one row per poll
+    round, so the RSS-vs-poll-count curve has one sample per poll rather than
+    one per batch.  Neither argument changes what is requested.
+
+    ``poll_mix`` selects WHICH endpoints a poll round hits:
+
+    ``"full"``
+        the original dashboard/fleet mix (eight endpoints per round).
+    ``"c2"``
+        exactly the four endpoints the c2 request names -- ``GET /api/runs``,
+        ``GET /api/runs?fields=summary``, ``GET /api/runs/<id>/snapshot`` and
+        ``GET /api/queue``.  The other four (queue summary/stats, events,
+        trajectory, meta) are dropped because under tracemalloc they dominate
+        the wall clock and are not what the c2 request measures.  It is the
+        same four request paths, polled the same number of times.
+    """
 
     rows: list[dict[str, Any]] = []
+    poll_index = 0
     for batch in range(batches):
         latencies: dict[str, list[float]] = {}
         statuses: dict[str, int] = {}
@@ -471,14 +636,23 @@ def drive_traffic(
         # a per-run snapshot read on a DISTINCT run id every time so the
         # snapshot cache cannot serve the same entry twice in a row.
         for _ in range(polls_per_batch):
-            for label, path in (
-                ("queue_full", "/api/queue"),
-                ("queue_summary", "/api/queue?view=summary&limit=50"),
-                ("queue_stats", "/api/queue/stats"),
-                ("runs_summary", "/api/runs?fields=summary"),
-            ):
+            # LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): the "c2" mix polls
+            # exactly the four endpoints the c2 request names.  The other
+            # four are dropped for this mix only.
+            if poll_mix == "c2":
+                queue_paths = (("queue_full", "/api/queue"),)
+            else:
+                queue_paths = (
+                    ("queue_full", "/api/queue"),
+                    ("queue_summary", "/api/queue?view=summary&limit=50"),
+                    ("queue_stats", "/api/queue/stats"),
+                )
+            for label, path in queue_paths:
                 status, size, elapsed = _get(port, path, timeout=timeout)
                 record(label, status, elapsed, size)
+
+            status, size, elapsed = _get(port, "/api/runs?fields=summary", timeout=timeout)
+            record("runs_summary", status, elapsed, size)
 
             # The full run-list projection is the O(runs^2) path.  It is the
             # wedge; it is polled once per batch so the growth trend is
@@ -487,27 +661,67 @@ def drive_traffic(
                 status, size, elapsed = _get(port, "/api/runs", timeout=timeout)
                 record("runs_full", status, elapsed, size)
 
-            run_id = run_ids[(batch * polls_per_batch + len(latencies)) % len(run_ids)]
+            # LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): rotate the run id on
+            # EVERY poll so the snapshot cache cannot serve the same entry
+            # twice in a row.  The previous expression used ``len(latencies)``,
+            # which is CONSTANT within a batch (one entry per distinct
+            # endpoint label), so it picked the same run id for every poll in
+            # the batch and the per-run snapshot path was barely exercised.
+            run_id = run_ids[
+                (batch * polls_per_batch + poll_index) % len(run_ids)
+            ]
             status, size, elapsed = _get(
                 port, f"/api/runs/{run_id}/snapshot", timeout=timeout
             )
             record("snapshot", status, elapsed, size)
 
-            status, size, elapsed = _get(
-                port, f"/api/runs/{run_id}/events?limit=50", timeout=timeout
-            )
-            record("events", status, elapsed, size)
+            # LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): the events, trajectory
+            # and control endpoints are part of the "full" mix only.
+            if poll_mix != "c2":
+                status, size, elapsed = _get(
+                    port, f"/api/runs/{run_id}/events?limit=50", timeout=timeout
+                )
+                record("events", status, elapsed, size)
 
-            role = _ROLES[batch % len(_ROLES)]
-            status, size, elapsed = _get(
-                port, f"/api/runs/{run_id}/trajectory/{role}", timeout=timeout
-            )
-            record("trajectory", status, elapsed, size)
+                role = _ROLES[batch % len(_ROLES)]
+                status, size, elapsed = _get(
+                    port, f"/api/runs/{run_id}/trajectory/{role}", timeout=timeout
+                )
+                record("trajectory", status, elapsed, size)
 
-            # The control endpoint: it must stay flat.  On CT110 the
-            # unauthenticated probe answered in 5-10 ms while /api/queue hung.
-            status, size, elapsed = _get(port, "/api/meta", timeout=timeout)
-            record("control_meta", status, elapsed, size)
+                # The control endpoint: it must stay flat.  On CT110 the
+                # unauthenticated probe answered in 5-10 ms while /api/queue hung.
+                status, size, elapsed = _get(port, "/api/meta", timeout=timeout)
+                record("control_meta", status, elapsed, size)
+
+            # LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): one RSS sample per
+            # completed poll round.
+            poll_index += 1
+            # LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): at the MIDPOINT of the
+            # poll sequence, ask the child (SIGUSR2) to take its second
+            # tracemalloc marker.  The final dump then reports what the polls
+            # after the midpoint grew, which is what names the leaking site.
+            if midpoint_poll and poll_index == midpoint_poll and server_pid:
+                try:
+                    os.kill(server_pid, signal.SIGUSR2)
+                except OSError:
+                    pass
+            if rss_sampler is not None:
+                rss_kb, threads = rss_sampler()
+                row = {
+                    "poll": poll_index,
+                    "batch": batch,
+                    "rss_kb": rss_kb,
+                    "threads": threads,
+                    "snapshot_ms": latencies.get("snapshot", [0.0])[-1] * 1000,
+                    "runs_full_ms": latencies.get("runs_full", [0.0])[-1] * 1000,
+                    "runs_summary_ms": latencies.get("runs_summary", [0.0])[-1] * 1000,
+                    "queue_full_ms": latencies.get("queue_full", [0.0])[-1] * 1000,
+                }
+                if on_poll is not None:
+                    on_poll(row)
+                elif poll_rows is not None:
+                    poll_rows.append(row)
 
         # A few queue mutations, like the dashboard's "cancel" button.
         for queue_id in queue_ids[batch : batch + 2]:
@@ -659,6 +873,66 @@ def main(argv: list[str] | None = None) -> int:
         default=_TRAJECTORY_BYTES,
         help="Bytes per per-role normalized trajectory.",
     )
+    # LHH-WEB-LEAK-FIX c2 -- MEASUREMENT-ONLY flags.
+    parser.add_argument(
+        "--poll-mix",
+        choices=("full", "c2"),
+        default="full",
+        help=(
+            "MEASUREMENT-ONLY: which endpoints one poll round hits. "
+            "'c2' polls exactly the four endpoints the c2 request names "
+            "(/api/runs, /api/runs?fields=summary, a per-run snapshot and "
+            "/api/queue); 'full' is the original eight-endpoint mix."
+        ),
+    )
+    parser.add_argument(
+        "--midpoint-poll",
+        type=int,
+        default=0,
+        help=(
+            "MEASUREMENT-ONLY: the poll index at which the child takes its "
+            "second tracemalloc marker (SIGUSR2).  The final dump then "
+            "reports what the polls AFTER this point grew."
+        ),
+    )
+    parser.add_argument(
+        "--tracemalloc",
+        action="store_true",
+        help=(
+            "MEASUREMENT-ONLY: run the child web server under tracemalloc and "
+            "dump the top allocation sites (file:line) when it exits."
+        ),
+    )
+    parser.add_argument(
+        "--tracemalloc-top",
+        type=int,
+        default=15,
+        help="How many allocation sites the tracemalloc dump prints.",
+    )
+    parser.add_argument(
+        "--tracemalloc-out",
+        type=Path,
+        default=None,
+        help="Write the child's tracemalloc dump to this file.",
+    )
+    parser.add_argument(
+        "--rss-out",
+        type=Path,
+        default=None,
+        help="Write the RSS-vs-poll table (CSV) to this file.",
+    )
+    # NOTE: RSS is sampled after EVERY poll round unconditionally (the
+    # ``rss_sampler`` hook in ``drive_traffic``), so the RSS-vs-poll-count
+    # curve always has one row per poll.  No flag is needed for that.
+    parser.add_argument(
+        "--include-full-runs",
+        action="store_true",
+        help=(
+            "Poll the FULL ``GET /api/runs`` projection on every poll round "
+            "(not just once per batch).  This is the c2 request path under "
+            "test."
+        ),
+    )
     args = parser.parse_args(argv)
 
     temp_root = Path(tempfile.mkdtemp(prefix="lh-web-leak-repro-"))
@@ -679,7 +953,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"[repro] fixtures built in {time.monotonic() - started:.1f}s")
 
-        proc = _start_server(runs_root, port)
+        proc = _start_server(
+            runs_root,
+            port,
+            tracemalloc=args.tracemalloc,
+            trace_limit=args.tracemalloc_top,
+            midpoint_poll=args.midpoint_poll,
+            stderr_path=args.tracemalloc_out if args.tracemalloc else None,
+        )
         if not _wait_for_port(port, proc):
             print("[repro] server did not come up", file=sys.stderr)
             return 2
@@ -694,6 +975,36 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         queue_ids = [f"q{i:06d}" for i in range(args.queue)]
+        # LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): per-poll RSS sampling.
+        poll_rows: list[dict[str, Any]] = []
+        # The CSV is written INCREMENTALLY (one row per poll, flushed each
+        # time) so a run that is killed by a wall-clock timeout still leaves
+        # usable evidence behind.
+        rss_handle = None
+        if args.rss_out is not None:
+            args.rss_out.parent.mkdir(parents=True, exist_ok=True)
+            rss_handle = args.rss_out.open("w", encoding="utf-8")
+            rss_handle.write(
+                "poll,batch,rss_kb,rss_mib,threads,"
+                "runs_full_ms,runs_summary_ms,queue_full_ms,snapshot_ms\n"
+            )
+            rss_handle.flush()
+
+        def _sample() -> tuple[int, int]:
+            return _proc_rss_kb(proc.pid), _proc_threads(proc.pid)  # type: ignore[union-attr]
+
+        def _record_poll(row: dict[str, Any]) -> None:
+            poll_rows.append(row)
+            if rss_handle is not None:
+                rss_handle.write(
+                    "{poll},{batch},{rss_kb},{rss_mib:.3f},{threads},"
+                    "{runs_full_ms:.3f},{runs_summary_ms:.3f},"
+                    "{queue_full_ms:.3f},{snapshot_ms:.3f}\n".format(
+                        rss_mib=row["rss_kb"] / 1024.0, **row
+                    )
+                )
+                rss_handle.flush()
+
         rows = drive_traffic(
             port,
             run_ids,
@@ -701,8 +1012,36 @@ def main(argv: list[str] | None = None) -> int:
             polls_per_batch=args.polls_per_batch,
             queue_ids=queue_ids,
             timeout=args.request_timeout,
-            include_full_runs=False,
+            include_full_runs=args.include_full_runs,
+            poll_mix=args.poll_mix,
+            midpoint_poll=args.midpoint_poll,
+            server_pid=proc.pid if proc is not None else 0,
+            rss_sampler=_sample,
+            poll_rows=poll_rows,
+            on_poll=_record_poll,
         )
+        if rss_handle is not None:
+            rss_handle.close()
+
+        if poll_rows:
+            print()
+            print("[repro] RSS vs poll count (MEASUREMENT-ONLY)")
+            print(
+                f"{'poll':>5} {'RSS MiB':>9} {'dRSS MiB':>9} {'thr':>4} "
+                f"{'runs_full ms':>14} {'runs_sum ms':>12} {'queue ms':>10} {'snap ms':>9}"
+            )
+            prev = baseline_rss
+            for row in poll_rows:
+                rss = row["rss_kb"]
+                print(
+                    f"{row['poll']:>5} {rss / 1024:>9.1f} {(rss - prev) / 1024:>9.1f} "
+                    f"{row['threads']:>4} {row['runs_full_ms']:>14.1f} "
+                    f"{row['runs_summary_ms']:>12.1f} {row['queue_full_ms']:>10.1f} "
+                    f"{row['snapshot_ms']:>9.1f}"
+                )
+                prev = rss
+            if args.rss_out is not None:
+                print(f"[repro] RSS table written to {args.rss_out}")
 
         print()
         print("[repro] growth table")
@@ -832,12 +1171,35 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         if proc is not None and proc.poll() is None:
-            proc.terminate()
+            # LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): ask the child for its
+            # tracemalloc dump BEFORE terminating it.  SIGUSR1 is not handled
+            # by uvicorn, so the dump is always written while the process is
+            # still alive.
+            if args.tracemalloc:
+                try:
+                    os.kill(proc.pid, signal.SIGUSR1)
+                    proc.wait(timeout=30)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
+        elif proc is not None:
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
+                pass
+        # Close the child's stderr handle so the tracemalloc dump is flushed.
+        stderr_handle = getattr(proc, "_repro_stderr_handle", None) if proc is not None else None
+        if stderr_handle is not None:
+            try:
+                stderr_handle.close()
+            except OSError:
+                pass
         if args.keep:
             print(f"[repro] fixtures kept at {temp_root}")
         else:
