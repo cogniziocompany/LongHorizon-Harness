@@ -992,6 +992,28 @@ async def _run_impl(
             integrity_status=audit.integrity_status,
             contract_audit_status=audit.contract_audit_status,
         )
+        # A clean, complete audit verifies the deliverable. Stop here instead of
+        # spending another manager round (and whatever it routes) on a task the
+        # auditor already verified. This is the same predicate the manager's own
+        # ``Next: done`` request is held to below, so it cannot accept more than
+        # completion already required: a report that is not clean AND complete
+        # falls through to the ordinary progress gate, unchanged.
+        if _latest_auditor_is_clean_complete(rounds, language=config.prompt_language):
+            gate.completion_satisfied = True
+            _append_event(
+                events_path,
+                "completion_accepted_at_clean_audit",
+                {
+                    "round": round_index,
+                    "role": next_step,
+                    "audit_status": audit.status,
+                    "integrity_status": audit.integrity_status,
+                    "contract_audit_status": audit.contract_audit_status,
+                },
+            )
+            if await _human_gate(gate, "completed", round_index, current_task_state):
+                break
+            continue
         if await _human_gate(gate, "progress", round_index, current_task_state):
             break
 
