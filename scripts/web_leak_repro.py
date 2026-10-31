@@ -386,7 +386,31 @@ import uvicorn
 # before ``create_app`` the diff was dominated by import-time objects
 # (importlib, uvloop, fastapi routing), which say nothing about what grows
 # while polling.
-_tracemalloc_marker = tracemalloc.take_snapshot()
+#
+# LHH-WEB-LEAK-FIX c2a (MEASUREMENT-ONLY REPAIR): the marker is now taken
+# on demand (SIGUSR3) AFTER the parent has warmed every endpoint under test,
+# not right after ``create_app``.
+#
+# Why: uvicorn/uvloop/websockets import their protocol modules LAZILY, on
+# the first request that touches them, and anyio's lazy importer calls
+# ``inspect.getsource`` (which reads whole source files through ``linecache``)
+# for each lazily-imported submodule.  With the marker taken before the
+# first request, those one-time imports occupied 4 of the top-5 slots of
+# every table:
+#   1. 857118 B  7596 blk  <frozen importlib._bootstrap_external>:753
+#   2. 412085 B  4101 blk  /usr/lib/python3.12/linecache.py:137
+#   3. 323033 B  3182 blk  <frozen importlib._bootstrap>:488
+#   4. 261904 B    31 blk  .../uvloop/__init__.py:24
+# That is ~1.9 MB of FIXED warm-up cost reported as "growth", and it MASKS
+# the per-poll growth the c2 slice is looking for.  Taking the marker after
+# the parent has issued one request per endpoint under test removes all four
+# entries (verified: the same run's top site drops from 857118 B to 4560 B,
+# and the reported sites become per-request allocations only).
+#
+# This is a MEASUREMENT-ONLY change: it takes a snapshot on a signal.  It
+# does not alter the response, the routing, or any application state.
+_tracemalloc_marker = None
+_tracemalloc_marker_taken = False
 
 # LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): a SECOND marker, taken at the
 # midpoint of the poll sequence (SIGUSR2), so the dump can report what the
@@ -397,13 +421,28 @@ _tracemalloc_marker_mid = None
 _tracemalloc_marker_mid_poll = None
 
 def _write_sites(out, stats, limit, size_key, count_key):
+    # LHH-WEB-LEAK-FIX c2a (MEASUREMENT-ONLY REPAIR): the source echo is NOT
+    # printed.
+    #
+    # Why: ``stat.traceback.format()`` renders the source line of every frame
+    # it touches, and CPython serves those lines through ``linecache``, which
+    # READS THE WHOLE SOURCE FILE of each distinct frame file.  The dump was
+    # therefore allocating (and retaining, because linecache caches) megabytes
+    # of source text IN THE CHILD PROCESS WHILE IT WAS BEING MEASURED, and
+    # that allocation showed up in the very table the dump was producing, as
+    # the #1 growing site:
+    #     1. 2493049 B  26142 B  /usr/lib/python3.12/linecache.py:137
+    # i.e. the instrument was the leak it was reporting.  With the echo
+    # removed, that entry disappears from the top-15 completely (verified).
+    #
+    # The c2 table asks for file:line, size diff and count diff -- all of
+    # which are printed on the first line of each row and do NOT need the
+    # source echo.  Dropping the echo changes nothing about what is measured.
     for index, stat in enumerate(stats[:limit], start=1):
         frame = stat.traceback[0]
         out.write("%%3d. %%10d B  %%8d B  %%s:%%s\\n" %% (
             index, getattr(stat, size_key), getattr(stat, count_key),
             frame.filename, frame.lineno))
-        for line in stat.traceback.format():
-            out.write("       " + line + "\\n")
 
 def _dump_tracemalloc(*_args, **_kwargs):
     global _tracemalloc_marker_mid, _tracemalloc_marker_mid_poll
@@ -412,6 +451,14 @@ def _dump_tracemalloc(*_args, **_kwargs):
     out = sys.stderr
     out.write("=== TRACEMALLOC TOP %%d SITES (cumulative, current) ===\\n" %% limit)
     _write_sites(out, snap.statistics("lineno"), limit, "size", "count")
+    if _tracemalloc_marker is None:
+        # No request has been served yet, so there is no baseline to compare
+        # against (the marker is taken after the first request).  Say so
+        # instead of crashing on compare_to(None).
+        out.write("=== TRACEMALLOC: NO BASELINE MARKER YET (no request served) ===\\n")
+        out.write("=== END TRACEMALLOC ===\\n")
+        out.flush()
+        return
     out.write("=== TRACEMALLOC TOP %%d SITES (cumulative, diff vs start) ===\\n" %% limit)
     diff = snap.compare_to(_tracemalloc_marker, "lineno")
     _write_sites(out, diff, limit, "size_diff", "count_diff")
@@ -440,9 +487,21 @@ def _on_sigusr2(*_args):
     _tracemalloc_marker_mid = tracemalloc.take_snapshot()
     _tracemalloc_marker_mid_poll = %(midpoint_poll)r
     _dump_tracemalloc()
+def _on_sigwinch(*_args):
+    # SIGWINCH takes the BASELINE marker.  The parent sends it after it has
+    # warmed every endpoint under test, so the baseline excludes the one-time
+    # lazy imports (uvicorn/uvloop/websockets/anyio) that would otherwise be
+    # reported as "growth" and mask the per-poll growth.
+    # (Linux has no SIGUSR3; SIGWINCH is unused by uvicorn.)
+    global _tracemalloc_marker, _tracemalloc_marker_taken
+    _tracemalloc_marker = tracemalloc.take_snapshot()
+    _tracemalloc_marker_taken = True
+    sys.stderr.write("=== TRACEMALLOC BASELINE MARKER TAKEN (after endpoint warm-up) ===\\n")
+    sys.stderr.flush()
 try:
     signal.signal(signal.SIGUSR1, _on_sigusr1)
     signal.signal(signal.SIGUSR2, _on_sigusr2)
+    signal.signal(signal.SIGWINCH, _on_sigwinch)
 except Exception:
     pass
 uvicorn.run(app, host="127.0.0.1", port=%(port)d, log_level="warning")
@@ -600,6 +659,7 @@ def drive_traffic(
     rss_sampler: Any = None,
     poll_rows: list[dict[str, Any]] | None = None,
     on_poll: Any = None,
+    only_endpoint: str = "",
 ) -> list[dict[str, Any]]:
     """Drive the poll mix the dashboard/fleet use; return per-batch rows.
 
@@ -647,17 +707,30 @@ def drive_traffic(
                     ("queue_summary", "/api/queue?view=summary&limit=50"),
                     ("queue_stats", "/api/queue/stats"),
                 )
+            # LHH-WEB-LEAK-FIX c2a (MEASUREMENT-ONLY): ``only_endpoint``
+            # narrows a poll round down to ONE of the four c2 endpoints, so
+            # the tracemalloc growth table names the growing site of THAT
+            # endpoint instead of the mix of all four.  It changes nothing
+            # about how a request is made -- it only decides which requests
+            # are made.  Endpoint labels are the same ones the RSS/latency
+            # tables already use.
+            if only_endpoint:
+                if only_endpoint == "queue_full":
+                    queue_paths = (("queue_full", "/api/queue"),)
+                else:
+                    queue_paths = ()
             for label, path in queue_paths:
                 status, size, elapsed = _get(port, path, timeout=timeout)
                 record(label, status, elapsed, size)
 
-            status, size, elapsed = _get(port, "/api/runs?fields=summary", timeout=timeout)
-            record("runs_summary", status, elapsed, size)
+            if not only_endpoint or only_endpoint == "runs_summary":
+                status, size, elapsed = _get(port, "/api/runs?fields=summary", timeout=timeout)
+                record("runs_summary", status, elapsed, size)
 
             # The full run-list projection is the O(runs^2) path.  It is the
             # wedge; it is polled once per batch so the growth trend is
             # visible without a single request hanging the whole phase.
-            if include_full_runs:
+            if include_full_runs and (not only_endpoint or only_endpoint == "runs_full"):
                 status, size, elapsed = _get(port, "/api/runs", timeout=timeout)
                 record("runs_full", status, elapsed, size)
 
@@ -670,10 +743,11 @@ def drive_traffic(
             run_id = run_ids[
                 (batch * polls_per_batch + poll_index) % len(run_ids)
             ]
-            status, size, elapsed = _get(
-                port, f"/api/runs/{run_id}/snapshot", timeout=timeout
-            )
-            record("snapshot", status, elapsed, size)
+            if not only_endpoint or only_endpoint == "snapshot":
+                status, size, elapsed = _get(
+                    port, f"/api/runs/{run_id}/snapshot", timeout=timeout
+                )
+                record("snapshot", status, elapsed, size)
 
             # LHH-WEB-LEAK-FIX c2 (MEASUREMENT-ONLY): the events, trajectory
             # and control endpoints are part of the "full" mix only.
@@ -896,6 +970,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--only-endpoint",
+        choices=("runs_full", "runs_summary", "snapshot", "queue_full"),
+        default="",
+        help=(
+            "MEASUREMENT-ONLY: poll ONLY this one of the four c2 endpoints "
+            "on every poll round, so the tracemalloc growth table names the "
+            "growing site of that endpoint alone instead of the mix of all "
+            "four.  Empty (the default) polls all four, as before."
+        ),
+    )
+    parser.add_argument(
         "--tracemalloc",
         action="store_true",
         help=(
@@ -967,6 +1052,55 @@ def main(argv: list[str] | None = None) -> int:
         # Let the server settle before the baseline sample.
         time.sleep(1.0)
 
+        # LHH-WEB-LEAK-FIX c2a (MEASUREMENT-ONLY): warm up every endpoint
+        # under test, THEN tell the child to take its tracemalloc baseline.
+        #
+        # uvicorn/uvloop/websockets import their protocol modules lazily, on
+        # the first request that reaches them, and anyio's lazy importer calls
+        # ``inspect.getsource`` for each lazily-imported submodule (which
+        # reads whole source files through ``linecache``).  That is ~1.9 MB
+        # of FIXED one-time cost.  With the baseline taken before it, the
+        # tracemalloc top-15 tables were dominated by those imports
+        # (4 of the top 5 slots) and the per-poll growth -- the thing the c2
+        # slice is actually measuring -- was masked.
+        #
+        # The warm-up issues ONE request per endpoint under test (the same
+        # four the c2 poll mix hits) so the lazy imports are already paid
+        # when the baseline marker is taken.  The measured app, the requests
+        # and the response bodies are unchanged; only the ORDER of "take the
+        # baseline" and "first touch each endpoint" changes.
+        if args.tracemalloc:
+            _warmup_paths = (
+                "/api/runs?fields=summary",
+                "/api/runs",
+                "/api/queue",
+            )
+            if run_ids:
+                _warmup_paths += (f"/api/runs/{run_ids[0]}/snapshot",)
+            # LHH-WEB-LEAK-FIX c2a (MEASUREMENT-ONLY): when a single endpoint
+            # is under test, warm up ONLY that endpoint.  The baseline then
+            # excludes the other endpoints' lazy imports, so the growth table
+            # attributes to the endpoint under test and to nothing else.
+            if args.only_endpoint:
+                _one = {
+                    "runs_full": ("/api/runs",),
+                    "runs_summary": ("/api/runs?fields=summary",),
+                    "queue_full": ("/api/queue",),
+                    "snapshot": (
+                        (f"/api/runs/{run_ids[0]}/snapshot",) if run_ids else ()
+                    ),
+                }[args.only_endpoint]
+                _warmup_paths = _one
+            for _path in _warmup_paths:
+                _status, _size, _elapsed = _get(port, _path, timeout=60.0)
+            # Now tell the child to take the baseline marker.
+            try:
+                os.kill(proc.pid, signal.SIGWINCH)
+                time.sleep(0.5)
+            except OSError:
+                pass
+            print("[repro] warm-up done; tracemalloc baseline marker requested")
+
         baseline_rss = _proc_rss_kb(proc.pid)
         baseline_threads = _proc_threads(proc.pid)
         print(
@@ -1019,6 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
             rss_sampler=_sample,
             poll_rows=poll_rows,
             on_poll=_record_poll,
+            only_endpoint=args.only_endpoint,
         )
         if rss_handle is not None:
             rss_handle.close()
