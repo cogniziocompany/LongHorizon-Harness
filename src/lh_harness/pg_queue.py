@@ -69,6 +69,20 @@ _COLUMN_ROLES = "roles"
 # owns the task -- ``overseer1`` or ``overseer1-op``.  Migration 007 adds the
 # column; a row written before it (NULL) reads back as the default manager.
 _COLUMN_GTM_MANAGER = "gtm_manager"
+# The migration tombstone link columns (LHH-QUEUE-MIGRATION-TOMBSTONE, slice A,
+# migration 008).  ``migrated_to`` lives on the SOURCE entry and names the
+# destination; ``migrated_from`` lives on the DESTINATION entry and names the
+# source.  Both are JSONB objects (``{"node", "queue_id", "at"}``); both are
+# NULL on an entry that was never part of a migration.  ``migration_epoch`` is
+# the monotonic counter stamped on the source tombstone.
+_COLUMN_MIGRATED_TO = "migrated_to"
+_COLUMN_MIGRATED_FROM = "migrated_from"
+_COLUMN_MIGRATION_EPOCH = "migration_epoch"
+# The destination API root of a SOURCE tombstone (LHH-QUEUE-MIGRATION-TOMBSTONE,
+# slice C).  The recovery sweep needs to REACH the destination to ask whether
+# it already holds the work; the node name alone is not an address.  NULL on
+# every entry that was never migrated.
+_COLUMN_MIGRATED_DEST_BASE_URL = "migrated_dest_base_url"
 # ``requester`` (task 300) still has no column; see ``create``.
 _QUEUE_COLUMNS = (
     _COLUMN_QUEUE_ID,
@@ -100,6 +114,10 @@ _QUEUE_COLUMNS = (
     _COLUMN_MODEL,
     _COLUMN_ROLES,
     _COLUMN_GTM_MANAGER,
+    _COLUMN_MIGRATED_TO,
+    _COLUMN_MIGRATED_FROM,
+    _COLUMN_MIGRATION_EPOCH,
+    _COLUMN_MIGRATED_DEST_BASE_URL,
 )
 
 # LHH-QUEUE-HOTRELOAD R9: the two per-task override columns, applied in-code
@@ -166,6 +184,26 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         gtm_manager = DEFAULT_GTM_MANAGER
     else:
         gtm_manager = gtm_manager.strip()
+    # The migration tombstone links (LHH-QUEUE-MIGRATION-TOMBSTONE, slice A).
+    # Serialised like ``roles``/``skip_reasons`` into the JSONB columns; a
+    # missing or non-dict value is stored as NULL, so the column is NULL for
+    # every entry that was never part of a migration -- exactly how the file
+    # store loads an entry written before the fields existed.
+    migrated_to = getattr(entry, "migrated_to", None)
+    migrated_to_json = json.dumps(migrated_to) if isinstance(migrated_to, dict) else None
+    migrated_from = getattr(entry, "migrated_from", None)
+    migrated_from_json = json.dumps(migrated_from) if isinstance(migrated_from, dict) else None
+    # The migration epoch is a monotonic counter; a non-int value is stored as
+    # NULL rather than as a bogus number, so a later repair can tell "no epoch
+    # recorded" from "epoch recorded".
+    migration_epoch = getattr(entry, "migration_epoch", None)
+    if isinstance(migration_epoch, bool) or not isinstance(migration_epoch, int):
+        migration_epoch = None
+    # The destination API root of a source tombstone (slice C); NULL on every
+    # entry that was never migrated.
+    migrated_dest_base_url = getattr(entry, "migrated_dest_base_url", None)
+    if not isinstance(migrated_dest_base_url, str) or not migrated_dest_base_url.strip():
+        migrated_dest_base_url = None
     return [
         entry.queue_id,
         entry.name,
@@ -196,6 +234,10 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         model,
         roles_json,
         gtm_manager,
+        migrated_to_json,
+        migrated_from_json,
+        migration_epoch,
+        migrated_dest_base_url,
     ]
 
 
@@ -582,6 +624,29 @@ class PgQueueStore:
                     return None
                 return parsed if isinstance(parsed, dict) else None
             return None
+        if column in {"migrated_to", "migrated_from"}:
+            # LHH-QUEUE-MIGRATION-TOMBSTONE: the migration link columns are
+            # JSONB objects; psycopg decodes them to a dict itself, a raw
+            # string is decoded explicitly.  Anything that is not a dict
+            # round-trips to None -- the "this entry carries no migration
+            # link" state NULL models.
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+            return None
+        if column == "migration_epoch":
+            # The monotonic migration counter; a non-int value reads back as
+            # None ("no epoch recorded") rather than as a bogus number.
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            return value
         if column == "skip_reasons":
             if value is None:
                 return []
