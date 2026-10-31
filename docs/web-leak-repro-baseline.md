@@ -315,3 +315,84 @@ env -u PYTHONPATH /tmp/lhci-venv/bin/python -m pytest \
 ## Post-fix numbers
 
 _Filled in after the fix lands — see the PR body._
+
+---
+
+## After slice c1 — stop the per-request run-boundary re-walk
+
+**LHH-WEB-LEAK-FIX deliverable C, slice c1.** The change under test is in
+`src/lh_harness/webapi/server.py`:
+
+* on a cache **HIT** the cached run boundary is validated with **ONE**
+  `os.stat` of the run directory (`st_mtime_ns` + `st_ino`); the boundary is
+  re-walked only when that stamp changed or the entry is older than
+  `LH_HARNESS_WEB_STATE_TTL_S` (default 30);
+* the per-run state cache bound is `LH_HARNESS_WEB_STATE_CACHE` (default
+  2048, which exceeds a busy node's ~800 run dirs) instead of the old fixed
+  64;
+* `LH_HARNESS_WEB_RSS_WARN_MB` (default 3072, `0` disables) makes a background
+  thread sample the web process RSS every 60 s and log **one** line
+  `web RSS <mb> MB above LH_HARNESS_WEB_RSS_WARN_MB=<n>` when the RSS crosses
+  the threshold. Log only: it never exits, never restarts, never touches a
+  request path.
+
+### Same reproduction, `GET /api/runs` latency at 50 / 100 / 200 run dirs
+
+Measured with the **same script and the same fixture builder** as the
+pre-fix numbers above (`scripts/web_leak_repro.py`, this checkout's `src`
+first on `sys.path`, synthetic run dirs in a `tempfile.mkdtemp()` root,
+nothing under a harness-owned path read or written):
+
+```bash
+python scripts/web_leak_repro.py --runs 50  --queue 20 --batches 2 --polls-per-batch 5
+python scripts/web_leak_repro.py --runs 100 --queue 20 --batches 2 --polls-per-batch 5
+python scripts/web_leak_repro.py --runs 200 --queue 20 --batches 2 --polls-per-batch 5
+```
+
+The latency is the script's own **wedge measurement** — one `GET /api/runs`
+(the full projection the dashboard uses) against the warmed-up child server.
+
+| run dirs | `GET /api/runs` before c1 | `GET /api/runs` **after c1** | `GET /api/runs?fields=summary` after | `GET /api/queue` after |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 8 874 ms | **1 290 ms** | 27 ms | 11 ms |
+| 100 | 10 225 ms | **2 456 ms** | 86 ms | 10 ms |
+| 200 | **62 842 ms** | **5 407 ms** | 115 ms | 8 ms |
+
+**Reading of these numbers.** After c1 the full projection scales roughly
+**linearly** in the run count: 4× the run dirs (50 → 200) costs ~4.2× the
+wall clock (1.29 s → 5.41 s). Before c1 the same 4× cost ~7× and the curve
+was superlinear (the pre-fix profile is in Measurement 1 above). At 200 run
+dirs the full projection went from **62.8 s to 5.4 s — an 11.6× reduction** —
+and it now answers instead of wedging.
+
+`GET /api/runs?fields=summary` (the cheap projection) and `GET /api/queue`
+were already cheap and are unchanged in kind; `/api/queue` stays flat at
+~10 ms across the whole range because it never touches the run directories.
+
+### What c1 does NOT fix
+
+This slice removes the **per-request run-boundary re-walk**, not the whole
+request cost. Two mechanisms from the root-cause analysis are still live and
+are the remaining deliverable C, queued as **slice c2**:
+
+1. **Index / cache for the listing** — the run list itself is still
+   re-derived per request; there is no indexed run directory.
+2. **Scans off the request path** — the full run-dir scan still happens on
+   the request path (mechanism 3, `state.snapshot()` → `list_runs()`), and a
+   read endpoint still performs durable writes while serving a read
+   (mechanism 4, `_maybe_park_terminal_workspace` → `update_status`).
+
+The c1 change is what makes the per-request boundary walk O(1) instead of
+O(runs); c2 is what makes the listing itself O(1) instead of O(runs).
+
+### Reproduction commands (after c1)
+
+```bash
+# the same reproduction as a test
+python -m pytest tests/webapi/test_web_leak_repro.py -q
+
+# the after-c1 latency table above
+python scripts/web_leak_repro.py --runs 50  --queue 20 --batches 2 --polls-per-batch 5
+python scripts/web_leak_repro.py --runs 100 --queue 20 --batches 2 --polls-per-batch 5
+python scripts/web_leak_repro.py --runs 200 --queue 20 --batches 2 --polls-per-batch 5
+```
