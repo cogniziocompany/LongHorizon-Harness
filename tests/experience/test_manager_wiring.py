@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,10 +14,15 @@ from lh_harness.adapters.claude_permissions import (
     snapshot_workspace,
     workspace_snapshot_diff,
 )
+from lh_harness.auditor_launch import AuditorLaunch
 from lh_harness.environment.local import LocalEnvironment
 from lh_harness.experience.capture import ENV_FLAG
 from lh_harness.experience.store import EXPERIENCE_FILENAME
 from lh_harness.manager import run
+from lh_harness.safe_subprocess import (
+    AuditorBoundary,
+    AuditorBoundaryKind,
+)
 from lh_harness.types import EpisodeResult, HarnessConfig
 
 _PLAN = "Next: cli\n\nCurrent Task State:\nstill working\n\nPlan:\nkeep going"
@@ -47,12 +53,36 @@ def _ledger_dir(tmp_path: Path) -> Path:
     return tmp_path / "logs" / "role_orchestration"
 
 
+def _patched_auditor_launch(monkeypatch) -> AsyncMock:
+    """Skip the host-level isolation probe for tests that build their
+    own ``SequencedAgent`` (no real boundary launcher). The
+    fixture boundary mirrors what :class:`AuditorBoundary` returns on
+    a deployment where ``unshare -U`` provides a real kernel-level
+    boundary; the manager's gate accepts it and the
+    ``SequencedAgent``'s audit reply passes through unchanged.
+    """
+    boundary = AuditorBoundary(
+        kind=AuditorBoundaryKind.USER_NAMESPACE,
+        launcher="/usr/bin/unshare",
+        probe_uid=1,
+        rationale="fixture boundary for unit tests",
+    )
+    launch = AuditorLaunch("/tmp/lh-auditor-launch-fixture", boundary)
+    patched = AsyncMock(return_value=launch)
+    monkeypatch.setattr(
+        "lh_harness.manager.prepare_auditor_launch", patched
+    )
+    return patched
+
+
 async def _two_round_run(
     tmp_path: Path,
     *,
     workspace: Path,
     replies: list[str] | None = None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> dict:
+    _patched_auditor_launch(monkeypatch)
     return await run(
         task="finish the refactor",
         env=LocalEnvironment(str(tmp_path / "tmp")),
@@ -94,7 +124,7 @@ async def test_flag_off_writes_nothing(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    report = await _two_round_run(tmp_path, workspace=workspace)
+    report = await _two_round_run(tmp_path, workspace=workspace, monkeypatch=monkeypatch)
 
     assert report["status"] == "complete"
     assert not (_ledger_dir(tmp_path) / EXPERIENCE_FILENAME).exists()
@@ -112,9 +142,9 @@ async def test_report_content_is_identical_with_the_flag_on_or_off(
     (off_dir / "workspace").mkdir(parents=True)
     (on_dir / "workspace").mkdir(parents=True)
 
-    await _two_round_run(off_dir, workspace=off_dir / "workspace")
+    await _two_round_run(off_dir, workspace=off_dir / "workspace", monkeypatch=monkeypatch)
     monkeypatch.setenv(ENV_FLAG, "1")
-    await _two_round_run(on_dir, workspace=on_dir / "workspace")
+    await _two_round_run(on_dir, workspace=on_dir / "workspace", monkeypatch=monkeypatch)
 
     # report.json is finalized before the capture hook and must carry the
     # same content modulo wall-clock timing, whichever way the gate resolved.
@@ -130,7 +160,7 @@ async def test_flag_on_captures_one_redacted_record_per_round(
     workspace.mkdir()
     before = snapshot_workspace(str(workspace))
 
-    report = await _two_round_run(tmp_path, workspace=workspace)
+    report = await _two_round_run(tmp_path, workspace=workspace, monkeypatch=monkeypatch)
 
     after = snapshot_workspace(str(workspace))
     diff = workspace_snapshot_diff(before, after)
@@ -169,7 +199,7 @@ async def test_capture_failure_is_a_non_fatal_event(tmp_path: Path, monkeypatch)
         "lh_harness.experience.capture.persist_run_experience", _boom
     )
 
-    report = await _two_round_run(tmp_path, workspace=workspace)
+    report = await _two_round_run(tmp_path, workspace=workspace, monkeypatch=monkeypatch)
 
     assert report["status"] == "complete"
     events = _events(tmp_path)
@@ -181,6 +211,7 @@ async def test_capture_failure_is_a_non_fatal_event(tmp_path: Path, monkeypatch)
 @pytest.mark.asyncio
 async def test_env_var_off_overrides_config_on(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv(ENV_FLAG, "0")
+    _patched_auditor_launch(monkeypatch)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
@@ -204,6 +235,7 @@ async def test_env_var_off_overrides_config_on(tmp_path: Path, monkeypatch) -> N
 @pytest.mark.asyncio
 async def test_config_flag_enables_without_the_env_var(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv(ENV_FLAG, raising=False)
+    _patched_auditor_launch(monkeypatch)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
