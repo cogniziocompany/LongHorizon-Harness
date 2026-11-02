@@ -229,6 +229,21 @@ class DashboardState:
         # run is auto-selected so the UI shows something immediately; the user
         # can switch to any other run from the UI.
         self.runs_root = Path(runs_root).expanduser().resolve() if runs_root else None
+        # LHH-WEB-RUNS-SCAN-CACHE: the runs listing is recomputed from scratch
+        # on every request, and each recomputation walks every run directory
+        # (iterdir + a stat per role dir + a report.json read).  With many
+        # concurrent pollers the web process saturated its thread pool on
+        # filesystem work instead of serving requests.
+        #
+        # ``_runs_scan_cache`` holds the (scan timestamp, run list) pair and
+        # ``_runs_scan_lock`` serialises the rescan so that only one thread
+        # walks the runs root at a time; the others wait for that result and
+        # then reuse it (single-flight).
+        #
+        # Both are set up before the first ``_scan_runs()`` call below, which
+        # runs during construction to auto-select the newest run.
+        self._runs_scan_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._runs_scan_lock = threading.Lock()
         resolved = Path(log_dir) if log_dir else None
         if resolved is None and self.runs_root is not None:
             runs = self._scan_runs()
@@ -248,7 +263,60 @@ class DashboardState:
     # ------------------------------------------------------------------
     # Run selection (manual dashboard browsing across per-run result folders)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _runs_scan_ttl() -> float:
+        """Return the runs-scan cache TTL in seconds.
+
+        ``LH_HARNESS_RUNS_SCAN_TTL`` overrides it; the default is 5 seconds
+        and ``0`` disables caching entirely (every call rescans).
+        """
+
+        raw = os.environ.get("LH_HARNESS_RUNS_SCAN_TTL")
+        if raw is None:
+            return 5.0
+        try:
+            ttl = float(raw)
+        except (TypeError, ValueError):
+            return 5.0
+        if ttl < 0:
+            return 0.0
+        return ttl
+
+    def _invalidate_runs_scan_cache(self) -> None:
+        """Drop the cached runs listing so the next call rescans."""
+
+        with self._runs_scan_lock:
+            self._runs_scan_cache = None
+
     def _scan_runs(self) -> list[dict[str, Any]]:
+        """Return the runs listing, reusing a recent scan when possible.
+
+        The cached value is a (timestamp, list) pair held on the instance.
+        While the cache is younger than ``LH_HARNESS_RUNS_SCAN_TTL`` seconds
+        the previous scan is reused.  A rescan happens under a lock, so a
+        burst of concurrent callers produces exactly one walk of the runs
+        root and the remaining threads reuse that result.  The returned list
+        is a shallow copy, so callers cannot mutate the cached list.
+        """
+
+        ttl = self._runs_scan_ttl()
+        if ttl > 0:
+            cached = self._runs_scan_cache
+            if cached is not None and (time.monotonic() - cached[0]) < ttl:
+                return list(cached[1])
+
+        with self._runs_scan_lock:
+            # Re-check under the lock: another thread may have completed the
+            # rescan while this one was waiting for it.
+            if ttl > 0:
+                cached = self._runs_scan_cache
+                if cached is not None and (time.monotonic() - cached[0]) < ttl:
+                    return list(cached[1])
+            runs = self._scan_runs_uncached()
+            self._runs_scan_cache = (time.monotonic(), runs)
+            return list(runs)
+
+    def _scan_runs_uncached(self) -> list[dict[str, Any]]:
         root = self.runs_root
         if root is None:
             return []
@@ -330,6 +398,9 @@ class DashboardState:
         with self._lock:
             self.log_dir = log_dir
             self.task = ""  # will be re-read from the selected run's report
+        # Selecting a run is a state.py path that touches the runs tree, so the
+        # cached runs listing is dropped and the next listing rescans.
+        self._invalidate_runs_scan_cache()
         return True
 
     @property
