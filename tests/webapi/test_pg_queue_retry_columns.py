@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -85,6 +86,17 @@ def test_row_values_normalise_like_the_file_store() -> None:
     entry.wait_reason = "x" * 200
     values = dict(zip(pg_queue._QUEUE_COLUMNS, pg_queue._entry_values(entry)))
     assert values["wait_reason"] == "x" * 64
+
+
+def test_parent_wait_persists_without_a_backoff_deadline() -> None:
+    entry = QueueEntry(
+        queue_id="q-parent", name="n", task="t", workspace="w", max_rounds=3,
+        trio="kimi", priority=1, requested_by="ci", status="launched",
+        run_id="run-parent", wait_reason="needs_parent_input",
+    )
+    values = dict(zip(pg_queue._QUEUE_COLUMNS, pg_queue._entry_values(entry)))
+    assert values["not_before"] is None
+    assert values["wait_reason"] == "needs_parent_input"
 
 
 # --- hermetic: a recording fake connection ----------------------------------
@@ -270,6 +282,26 @@ def _live_store() -> pg_queue.PgQueueStore:
     except Exception as exc:
         pytest.skip(f"could not connect to Postgres backend: {exc}")
     return store
+
+
+def test_live_parent_wait_survives_a_fresh_connection() -> None:
+    store = _live_store()
+    request = {"name": "parent task", "task": "bounded task", "workspace": "/w",
+               "trio": "kimi", "requested_by": "ci", "dedup_key": "parent-" + uuid.uuid4().hex}
+    entry = store.create(request)
+    launched = store.mark_launched(entry.queue_id, "run-parent")
+    assert launched is not None
+    launched.wait_reason = "needs_parent_input"
+    store.update(launched)
+    fresh = _live_store()
+    read = fresh.get(entry.queue_id)
+    assert read is not None
+    assert read.status == "launched" and read.run_id == "run-parent"
+    assert read.not_before is None and read.wait_reason == "needs_parent_input"
+    assert fresh.create(request).queue_id == entry.queue_id
+    read.wait_reason = None
+    fresh.update(read)
+    assert store.get(entry.queue_id).wait_reason is None
 
 
 def test_live_requeue_backoff_survives_a_fresh_connection() -> None:

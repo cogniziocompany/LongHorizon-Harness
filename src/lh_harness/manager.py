@@ -26,6 +26,7 @@ from .environment.base import Environment
 from .environment.remote_files import ensure_remote_dir, write_remote_text
 from .runtime_signals import hard_signal_labels
 from .provider_errors import classify_agent_runtime_failure
+from .manager_reflection import parse_reflection, reflection_prompt
 from .trajectory_artifacts import persist_trajectory_artifacts
 from .role_prompts import (
     MANAGER_NEXT_BLOCKED,
@@ -186,6 +187,7 @@ async def _run_impl(
     auditor_format_repair_agent: AgentAdapter | None = None,
     final_response_agent: AgentAdapter | None = None,
     human_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+    parent_debrief_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     pending_instructions: Callable[[], list[str]] | None = None,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
     resume: bool = False,
@@ -215,6 +217,14 @@ async def _run_impl(
 
     ``progress`` is an optional synchronous ``(event, payload)`` sink for
     operator-facing status lines (the CLI prints them to the console).
+
+    ``parent_debrief_hook`` is an optional trusted runtime adapter called at the
+    round boundary before the human gate. It owns Manager reflection and the
+    authenticated full parent packet; it returns a matching checkpoint, durable
+    ``receipt_ref``, explicit ``reply_required`` and continue/wait/stop disposition.
+    Required replies additionally need an adapter-validated ``parent_reply_ref``.
+    Missing evidence or adapter failure holds the run without extending its budget.
+    This callback is not exposed to model tool arguments or the web intake API.
     """
 
     def emit(event: str, **payload: Any) -> None:
@@ -267,6 +277,8 @@ async def _run_impl(
     rounds_dir = role_dir / "rounds"
     _ensure_dir_nofollow(rounds_dir)
     events_path = role_dir / "events.jsonl"
+    if parent_debrief_hook is not None:
+        _write_local(role_dir / "parent_debrief_enabled.json", json.dumps({"version": 1}))
     started = time.monotonic()
 
     await _ensure_remote_layout(env, config)
@@ -338,6 +350,7 @@ async def _run_impl(
     # directly and reads the results straight back from `gate`.
     gate = _GateContext(
         human_hook=human_hook,
+        parent_debrief_hook=parent_debrief_hook,
         task=task,
         rounds=rounds,
         log_dir=log_dir,
@@ -347,6 +360,7 @@ async def _run_impl(
         env=env,
         role_dir=role_dir,
         response_agent=final_response_agent or manager_agent,
+        reflection_agent=manager_agent if parent_debrief_hook is not None else None,
         emit=emit,
     )
     if _run_progress is not None:
@@ -356,7 +370,8 @@ async def _run_impl(
         _run_progress.gate = gate
         _run_progress.started_at = started
 
-    while round_index < gate.round_budget:
+    parent_resume_held = resume and await _resume_parent_debrief(gate)
+    while not parent_resume_held and round_index < gate.round_budget:
         round_index += 1
         round_dir = rounds_dir / f"round_{round_index:03d}"
         _ensure_dir_nofollow(round_dir)
@@ -1121,11 +1136,13 @@ class _GateContext:
     config: HarnessConfig
     events_path: Path
     round_budget: int
+    parent_debrief_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     # The gate writes the user-facing reply before asking the operator to decide,
     # so it needs the pieces an episode requires.
     env: Environment | None = None
     role_dir: Path | None = None
     response_agent: AgentAdapter | None = None
+    reflection_agent: AgentAdapter | None = None
     emit: Callable[..., None] = field(default=_discard_progress)
     completion_satisfied: bool = False
     abort_reason: str = ""
@@ -1144,6 +1161,172 @@ class _GateContext:
     failure_reason: str = ""
 
 
+async def _parent_debrief(ctx: _GateContext, outcome: str, round_index: int, task_state: str, question: str) -> bool:
+    """Invoke an admitted runtime adapter before the next round can be launched.
+
+    The trusted adapter owns Manager reflection, the full authorized packet,
+    durable outbox and authenticated reply validation. This compact projection is
+    not itself a delegation packet or a source of identity/permissions. Neither
+    transport ACK nor parent context can extend the admitted round budget.
+    """
+    if ctx.parent_debrief_hook is None:
+        return False
+    record = next((item for item in reversed(ctx.rounds) if item.round_index == round_index), None)
+    projection = {
+        "phase": "manager_parent_debrief",
+        "round_index": round_index, "outcome": outcome,
+        "remaining_rounds": max(0, ctx.round_budget-round_index),
+        "task_state": task_state[:8000], "question": question[:8000],
+        "auditor_report": record.auditor_report[:8000] if record else "",
+        "harness_feedback": record.harness_feedback[:8000] if record else "",
+        "evidence_refs": list(record.related_report_refs[:100]) if record else [],
+        "completion_satisfied": ctx.completion_satisfied,
+    }
+    if ctx.reflection_agent is not None:
+        projection["executor_summary"] = record.executor_output[:4000] if record else ""
+        projection["summary_truncated"] = bool(record and (
+            len(record.executor_output)>4000 or len(record.auditor_report)>8000
+            or len(record.harness_feedback)>8000 or len(task_state)>8000
+        ))
+        reflection = None
+        try:
+            prompt = reflection_prompt(ctx.task, projection)
+            if len(prompt) > ctx.config.role_verified_context_chars:
+                raise ValueError("mandatory reflection context exceeds configured budget")
+            round_dir = ctx.log_dir / "role_orchestration" / "rounds" / f"round_{round_index:03d}"
+            _ensure_dir_nofollow(round_dir)
+            _write_local(round_dir / "manager_reflection_input.txt", prompt)
+            ctx.emit("role_start", round=round_index, role="manager_reflection")
+            result = await _run_role_episode(ctx.reflection_agent, prompt, ctx.env,
+                ctx.config.manager_budget, live_trajectory_path=str(round_dir / "manager_reflection_raw_trajectory.jsonl"))
+            _save_role_result(round_dir, "manager_reflection", result,
+                episode_root=ctx.log_dir / "manager_reflection_episodes")
+            if result.status == "done":
+                reflection = parse_reflection(_visible_output(result),
+                    evidence_refs=projection["evidence_refs"], remaining_rounds=projection["remaining_rounds"],
+                    completion_satisfied=ctx.completion_satisfied)
+        except Exception:
+            # Keep provider/tool diagnostics in their owned artifacts, never in
+            # a parent packet or as an inferred approval to continue.
+            reflection = None
+        projection["reflection"] = ({"status": "qualified", **reflection} if reflection is not None
+                                    else {"status": "unavailable", "reason": "reflection_unqualified"})
+        _append_event(ctx.events_path, "manager_reflection_done", {
+            "round": round_index, "status": projection["reflection"]["status"],
+            "disposition": reflection["disposition"] if reflection is not None else None,
+        })
+        ctx.emit("role_done", round=round_index, role="manager_reflection",
+                 status="done" if reflection is not None else "error")
+    snapshot = {
+        "version": 1, "round_digest": _debrief_digest(asdict(record) if record else None),
+        "task_digest": _debrief_digest(ctx.task), "round_budget": ctx.round_budget,
+        "projection": projection,
+    }
+    checkpoint = _debrief_digest(snapshot)
+    projection["checkpoint"] = checkpoint
+    # Persist before calling the adapter: crashes and parent restarts must revisit
+    # this original checkpoint rather than synthesize a new resume budget.
+    _write_local(ctx.log_dir / "role_orchestration" / "parent_debrief.json", json.dumps(snapshot))
+    return await _deliver_parent_debrief(ctx, projection)
+
+
+def _debrief_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+async def _resume_parent_debrief(ctx: _GateContext) -> bool:
+    path = ctx.log_dir / "role_orchestration" / "parent_debrief.json"
+    if not os.path.lexists(path):
+        if ctx.rounds and os.path.lexists(path.with_name("parent_debrief_enabled.json")):
+            ctx.abort_reason = "needs_parent_input"
+            ctx.completion_satisfied = False
+            _append_event(ctx.events_path, "parent_debrief_resume_held", {"reason": "missing_checkpoint"})
+            return True
+        return False
+    raw = _read_local_bytes(path, 256 * 1024)
+    try:
+        snapshot = json.loads(raw) if raw is not None else None
+        if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+            raise ValueError("invalid debrief snapshot")
+        projection = snapshot["projection"]
+        checkpoint = projection.pop("checkpoint")
+        if checkpoint != _debrief_digest(snapshot):
+            raise ValueError("changed debrief snapshot")
+        projection["checkpoint"] = checkpoint
+        index = projection["round_index"]
+        if type(index) is not int or not ctx.rounds:
+            raise ValueError("missing source round")
+        if index < ctx.rounds[-1].round_index:
+            # A new round record without its own debrief snapshot is a crash
+            # window, not proof the parent dependency has been fulfilled.
+            raise ValueError("missing latest-round debrief")
+        if index != ctx.rounds[-1].round_index or snapshot["round_digest"] != _debrief_digest(asdict(ctx.rounds[-1])):
+            raise ValueError("changed source round")
+        if snapshot["task_digest"] != _debrief_digest(ctx.task):
+            raise ValueError("changed task")
+        budget = snapshot["round_budget"]
+        if type(budget) is not int or not index <= budget <= MAX_ROUNDS:
+            raise ValueError("invalid original budget")
+        ctx.round_budget = budget
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        ctx.abort_reason = "needs_parent_input"
+        ctx.completion_satisfied = False
+        _append_event(ctx.events_path, "parent_debrief_resume_held", {"reason": "invalid_checkpoint"})
+        return True
+    if ctx.parent_debrief_hook is None:
+        ctx.abort_reason = "needs_parent_input"
+        ctx.completion_satisfied = False
+        _append_event(ctx.events_path, "parent_debrief_resume_held", {"reason": "adapter_unavailable"})
+        return True
+    return await _deliver_parent_debrief(ctx, projection)
+
+
+async def _deliver_parent_debrief(ctx: _GateContext, projection: dict[str, Any]) -> bool:
+    checkpoint = projection["checkpoint"]
+    round_index = projection["round_index"]
+    _append_event(ctx.events_path, "parent_debrief_pending", {
+        "round": round_index, "checkpoint": checkpoint,
+    })
+    try:
+        decision = await ctx.parent_debrief_hook(projection)
+    except Exception:
+        decision = {}
+    qualified = (
+        isinstance(decision, dict)
+        and decision.get("checkpoint") == checkpoint
+        and isinstance(decision.get("receipt_ref"), str)
+        and 0 < len(decision["receipt_ref"]) <= 500
+        and type(decision.get("reply_required")) is bool
+        and decision.get("action") in ("continue", "wait", "stop")
+    )
+    answered = qualified and isinstance(decision.get("parent_reply_ref"), str) and 0 < len(decision["parent_reply_ref"]) <= 500
+    action = decision["action"] if qualified else "wait"
+    if qualified and decision["reply_required"] and not answered:
+        action = "wait"
+    reflection = projection.get("reflection", {})
+    if reflection.get("status") == "unavailable":
+        action = "wait"
+    elif reflection.get("disposition") == "stop":
+        action = "stop"
+    elif (reflection.get("disposition") == "wait" or reflection.get("question")) and not answered:
+        action = "wait"
+    _append_event(ctx.events_path, "parent_debrief_disposition", {
+        "round": round_index, "checkpoint": checkpoint, "action": action,
+        "receipt_ref": decision["receipt_ref"] if qualified else None,
+        "parent_reply_ref": decision["parent_reply_ref"] if answered else None,
+    })
+    if action != "continue":
+        ctx.completion_satisfied = False
+        ctx.abort_reason = "needs_parent_input" if action == "wait" else "parent_debrief_stopped"
+        return True
+    if answered:
+        instructions = decision.get("instructions", "")
+        if isinstance(instructions, str) and instructions.strip():
+            ctx.carryover_instructions = "\n".join(filter(None, [ctx.carryover_instructions, instructions[:8000].strip()]))
+            ctx.operator_instructions.append(instructions[:8000].strip())
+    return False
+
+
 async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_state: str, question: str = "", answers: list[str] | None = None) -> bool:
     """End-of-round human-in-the-loop gate; mutates ``ctx``, returns True to stop.
 
@@ -1155,6 +1338,8 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
     reopens / extends the budget and stores any injected instructions (including
     the human's answer to an ``ask``) on ``ctx``.
     """
+    if await _parent_debrief(ctx, outcome, round_index, task_state, question):
+        return True
     reached_max = (not ctx.completion_satisfied) and round_index >= ctx.round_budget
     # `ctx.abort_reason` is only assigned below, so the reason is derived here to
     # keep "ran out of rounds" distinguishable from "blocked" in the reply. `ask`
