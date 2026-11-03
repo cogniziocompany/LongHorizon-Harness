@@ -557,7 +557,7 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
             "harness_list_queue",
             _LIST_QUEUE_DESCRIPTION,
             {
-                "status": _string_param("Filter by status (comma list): pending, launched, done, failed, blocked.", required=False),
+                "status": _string_param("Filter by status (comma list): pending, launched, done, failed, blocked, migrated.", required=False),
                 "name": _string_param("Only entries whose name contains this text (case-insensitive).", required=False),
                 "trio": _string_param("Only entries for this trio (e.g. qwen, kimi, glm, zai, zaiq, minimax).", required=False),
                 "limit": _string_param("Page size, 1-500 (default 50).", required=False),
