@@ -328,6 +328,14 @@ class QueueEntry:
     run_id: str | None = None
     reason: str | None = None
     skip_reasons: list[str] = field(default_factory=list)
+    # LHH-CT110-MEMORY-ADMISSION (deliverable B): the entry's LATEST skip
+    # reason, kept alongside the full ``skip_reasons`` history.  The
+    # admission gates record their refusal here -- the node cap's
+    # "node at capacity" text and the memory gate's ``memory_headroom``
+    # marker -- so an operator (and the API) can read WHY the entry did
+    # not start without walking the whole history list.  ``None`` when the
+    # entry has never been skipped.
+    latest_skip_reason: str | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     launched_at: float | None = None
@@ -399,6 +407,7 @@ class QueueEntry:
             "run_id",
             "reason",
             "skip_reasons",
+            "latest_skip_reason",
             "created_at",
             "updated_at",
             "launched_at",
@@ -1710,7 +1719,13 @@ class QueueStore:
         # Allow recording skips on pending and failed entries
         if entry.status not in ("pending", "failed"):
             return None
-        entry.skip_reasons.append(str(reason)[:_MAX_QUEUE_REASON_CHARS])
+        text = str(reason)[:_MAX_QUEUE_REASON_CHARS]
+        entry.skip_reasons.append(text)
+        # LHH-CT110-MEMORY-ADMISSION (deliverable B): the refusal that stops
+        # this entry is ALSO its latest skip reason, so the admission gates'
+        # text (the ``memory_headroom`` marker, the node-capacity message)
+        # is readable without walking the whole history list.
+        entry.latest_skip_reason = text
         return self.update(entry)
 
     def record_block(self, queue_id: str) -> QueueEntry | None:

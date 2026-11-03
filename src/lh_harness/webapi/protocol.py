@@ -41,6 +41,7 @@ def build_meta(
     launcher_stall_cycles: int | None = None,
     build: dict[str, Any] | None = None,
     disk: dict[str, Any] | None = None,
+    admission: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the stable handshake payload used by both clients."""
 
@@ -112,4 +113,10 @@ def build_meta(
     # numeric field the dashboard plots.
     if disk is not None:
         result["disk"] = disk
+    # LHH-CT110-MEMORY-ADMISSION: the node-wide admission snapshot.  Exactly
+    # five keys: node_max, running, starting, mem_available_mb, blocked_reason.
+    # ``blocked_reason`` names the gate that currently refuses launches
+    # ("node_max" or "memory_headroom") or None when the launcher admits.
+    if admission is not None:
+        result["admission"] = admission
     return result

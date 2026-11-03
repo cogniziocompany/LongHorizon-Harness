@@ -229,6 +229,31 @@ CATALOG: tuple[SettingSpec, ...] = (
         False,
         restart=False,
     ),
+    # LHH-CT110-MEMORY-ADMISSION: the node-wide admission limits.  The
+    # launcher reads them by name (lh_harness.launcher._admission_settings);
+    # defaults live in the launcher module next to the gate that enforces
+    # them, exactly like the disk-retention thresholds above.
+    SettingSpec(
+        "LH_HARNESS_NODE_MAX_RUNS",
+        "Node-wide cap on running+starting runs across ALL lanes (default 5); "
+        "refuses launches once reached even when every lane cap still has room",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_RUN_STARTUP_MB",
+        "Reserved MB of MemAvailable for one starting run (default 600); "
+        "the launcher holds this back before comparing against the memory floor",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_MEM_FLOOR_MB",
+        "Minimum MemAvailable (MB) that must remain after the startup "
+        "allowance before the launcher admits a new run (default 1024)",
+        False,
+        restart=False,
+    ),
 )
 CATALOG_BY_NAME = {spec.name: spec for spec in CATALOG}
 

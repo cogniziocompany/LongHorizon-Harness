@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Node-wide atomic run admission and a memory headroom gate in the launcher**
+  (LHH-CT110-MEMORY-ADMISSION, after the OOM incident in which lane caps
+  summing past the node maximum let far more runs run at once than the node
+  could hold: the OOM killer took `lh-harness.service` and every launched
+  run ended "worker disappeared without a final report").  Before any
+  launch, the launcher now makes ONE admission decision per launch cycle
+  under a lock: it counts running + starting runs across ALL lanes from the
+  authoritative run store and refuses once the count reaches
+  `LH_HARNESS_NODE_MAX_RUNS` (new setting, default 5, stored in the settings
+  DB like the lane caps), regardless of lane caps; then it applies a memory
+  headroom gate that refuses when `MemAvailable` minus the startup allowance
+  `LH_HARNESS_RUN_STARTUP_MB` (default 600) is below the floor
+  `LH_HARNESS_MEM_FLOOR_MB` (default 1024), recording `memory_headroom` as
+  the entry's latest skip reason -- the new per-entry
+  `latest_skip_reason` field, which is `None` on an entry that was never
+  skipped and is returned by the queue API alongside the full
+  `skip_reasons` history.  The same cap is enforced a second time
+  at the shared launch boundary (`RunSupervisor.create_run`), where every
+  launch path -- including a direct `POST /api/runs` -- takes a PENDING
+  STARTUP reservation under a lock before any worker is spawned; the
+  reservation is released when the worker is published, when the start
+  fails, and when the worker exits or crashes.  At service start the
+  launcher reconciles from live processes and run dirs and marks orphaned
+  launched entries failed with the existing crash-naming reason, never
+  requeueing them beyond `retry_of`.  A node already over the cap at start
+  kills nothing and admits nothing until the count drops below it.
+  `/api/meta` gains `admission: {node_max, running, starting,
+  mem_available_mb, blocked_reason}`, and a startup check warns (and the
+  node gate clamps) when the lane caps sum past the node maximum -- with a
+  regression test pinning that incident shape.  See
+  docs/operations/admission.md for how the three limits compose and how to
+  raise caps safely.  A refusal from the shared supervisor boundary is now
+  treated as a skip, not a launch failure: the queue entry stays PENDING
+  with the refusal recorded as its latest skip reason (so it keeps the
+  `memory_headroom` marker and does not burn a retry), and `POST /api/runs`
+  reports it as 429 rather than an unhandled 500.  This change is source
+  only -- it is not deployed here, and the live CT110 node picks the cap and
+  the memory gate up only on its next deploy (Paxton's go).
+- **The memory headroom gate now measures REMAINING memory, and an
+  unreadable live-run inventory blocks admission.** The headroom the
+  launcher gates on is the memory a new worker can still touch, not the
+  cgroup's limit: each cgroup level contributes
+  `memory.max - memory.current`, the tightest such value is taken over the
+  container's own cgroup and every ancestor cgroup that carries a finite
+  `memory.max`, and that remaining is bounded by the host's
+  `MemAvailable`.  Reading only `memory.max` overstated the room a nearly
+  full container had, which is the shape that ends in an OOM kill.  When
+  the live-run enumeration FAILS, the count is unknown rather than zero,
+  so the last known admission state is kept and admission is refused with
+  the `inventory_unavailable` blocked reason until an enumeration
+  succeeds -- an unknown inventory is not an empty node, and treating it
+  as one would let the node over-admit into the last slot.  No run is
+  killed and no entry is failed; the blocked entries stay pending and the
+  block clears by itself.  `docs/operations/admission.md` now describes
+  the remaining-based headroom and the `inventory_unavailable` state.
 - **The launcher enforces a node-level active-run ceiling.** `[queue] node_max_runs`
   is the maximum number of runs the launcher will let be active on THIS node at
   once — the value the fleet registry advertises as `maxConcurrentRuns`. Until
