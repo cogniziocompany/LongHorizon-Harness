@@ -298,13 +298,21 @@ class FleetReporter:
         # status, but only non-terminal runs are serialized into ``runs[]``.
         # Unknown/blank statuses canonicalize to "idle" (non-terminal), so a
         # malformed record is reported, never silently dropped.
+        #
+        # An ``idle`` status whose worker is NOT alive is not an active run:
+        # it is a stopped or never-started worker whose durable status file
+        # still says "idle".  Counting it as active made a node advertise more
+        # active runs than it was allowed to run.  The guard lives HERE, on
+        # the single heartbeat emission path, so it holds for every path that
+        # produces the run list — the TTL-cached runs scan and the fresh scan
+        # alike.
         runs_total = len(runs)
         runs_by_status: dict[str, int] = {}
         active_runs: list[dict[str, Any]] = []
         for run in runs:
             status = canonical_lifecycle_status(run.get("status"))
             runs_by_status[status] = runs_by_status.get(status, 0) + 1
-            if status not in TERMINAL_STATUSES:
+            if status not in TERMINAL_STATUSES and not _is_inert_idle(run):
                 active_runs.append(run)
         # Hard cap on the active list itself (most recent first by the
         # summary's ``updated_at``; the raw registry ``mtime`` is the
@@ -703,6 +711,34 @@ def _tail_last_event(run_id: str, log_dir: Any) -> Any | None:
     except Exception:
         return None
     return events[-1] if events else None
+
+
+def _is_inert_idle(run: dict[str, Any]) -> bool:
+    """Is this run an ``idle`` row whose worker is known to be not alive?
+
+    An ``idle`` status with ``alive`` false describes a worker that is not
+    running — stopped, never started, or gone.  It must never be counted as
+    an active run: doing so is what let a node advertise more active runs
+    than it was allowed to run.
+
+    ``alive`` is absent when the durable ``control/status.json`` carries no
+    liveness field at all.  An absent value is NOT treated as "not alive" —
+    only an explicit ``alive: false`` makes an idle row inert, so a run whose
+    status file predates the liveness field keeps its previous behaviour.
+    """
+
+    if "alive" not in run:
+        return False
+    alive = run.get("alive")
+    if alive is None:
+        return False
+    if bool(alive):
+        return False
+    # Imported lazily: ``supervisor`` eagerly pulls in ``control_bus``, which
+    # imports this module, so a module-level import would be circular.
+    from ..supervisor.lifecycle import canonical_lifecycle_status
+
+    return canonical_lifecycle_status(run.get("status")) == "idle"
 
 
 def _heartbeat_run_row(run: dict[str, Any], *, now: float) -> dict[str, Any]:

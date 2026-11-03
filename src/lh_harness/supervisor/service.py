@@ -64,6 +64,7 @@ from ..utils.run_boundary import (
     LEGACY_LOG_DIR,
     OSWORLD_COMPAT_LOG_DIR,
     _MAX_RUN_ID_CHARS,
+    run_is_servable,
     safe_run_control,
     safe_run_dir,
     safe_run_logs,
@@ -1716,6 +1717,15 @@ class RunSupervisor:
             run_id = entry.name
             if _run_component_name(run_id) is None:
                 continue
+            # A control-only leftover is not a run: its worker files were
+            # pruned or never created, so only a control reservation (or
+            # nothing) is left.  Such a folder is skipped here with the SAME
+            # predicate ``/api/runs/<id>`` uses to answer 404, so it can
+            # never be listed as a run and then 404 for the same id.  Without
+            # this skip a control-only folder is reported as an "idle" run
+            # with no task, and the fleet aggregate counts it as active.
+            if not run_is_servable(self.runs_root, Path(entry.path)):
+                continue
             try:
                 mtime = float(entry.stat().st_mtime)
             except OSError:
@@ -1756,6 +1766,11 @@ class RunSupervisor:
                     "agent": owner.get("agent"),
                     "model": owner.get("model"),
                     "log_dir": str(logs_dir),
+                    # Liveness of the worker, taken from the durable
+                    # ``control/status.json`` this row already read.  The
+                    # active-run aggregate needs it: an ``idle`` status whose
+                    # worker is not alive is a stopped run, not an active one.
+                    "alive": bool(status.get("alive")) if isinstance(status, dict) and "alive" in status else None,
                     # First non-empty task line (<=120 chars) so cheap callers
                     # (Hydra's fleet list, fields=summary) keep a run label
                     # without downloading the full task text.
@@ -1804,6 +1819,15 @@ class RunSupervisor:
             run_dirs = [attached] if _safe_entry(attached) else []
         for run_dir in run_dirs:
             if not _safe_entry(run_dir):
+                continue
+            # A control-only leftover is not a run: its worker files were
+            # pruned or never created, so only a control reservation (or
+            # nothing) is left.  Such a folder is skipped here with the SAME
+            # predicate ``/api/runs/<id>`` uses to answer 404, so it can
+            # never be listed as a run and then 404 for the same id.  Without
+            # this skip a control-only folder is reported as an "idle" run
+            # with no task, and the fleet aggregate counts it as active.
+            if not run_is_servable(self.runs_root, run_dir):
                 continue
             logs = safe_run_logs(self.runs_root, run_dir, allow_missing=True)
             control = safe_run_control(self.runs_root, run_dir, allow_missing=True)
