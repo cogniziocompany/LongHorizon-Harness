@@ -1,4 +1,55 @@
-# OV2 ptait08 runtime admission — design proposal (no code, no infra change)
+# OV2 ptait08 runtime admission — design proposal (INITIAL, no code, no infra change)
+
+> **Corrections 2026-10-12.** Docs-only corrections of the merged runtime-admission proposal,
+> applied against the cognizioware PR#2 review. Current source of truth is the PR#2 head at commit
+> `df8b0cb` (`https://github.com/cogniziocompany/cognizioware/blob/df8b0cb79e39e359eb317e6a8eb9e649790b15f1/deployment/omnigent/`),
+> which is a later commit than the earlier review ref `d89c556` used in the first correction pass.
+> Sources fetched verbatim: `deployment/omnigent/runtime-admission-pr130-review.md`,
+> `deployment/omnigent/hosted-agent-workspaces.md`, and `deployment/omnigent/agent-bindings.json`
+> (the registry seed). Every short sha below was verified against actual `gh api` output. This
+> changes prose only; no code, no provisioning, nothing requested.
+>
+> 1. **Host vs queue.** §6 distinguishes the **Omnigent host/runner** from CT110's Harness
+>    **queue** — different things.
+> 2. **Unprivileged OS account.** §1 proposes a **separate** unprivileged OS account with **no `sudo`
+>    and no Docker access** (not the existing `cognizioware` account).
+> 3. **Server principal / enrollment.** §2.4 states the options explicitly — a **user-owned CLI**
+>    versus an unverified general admin machine API; **no credential minting in the database**.
+> 4. **Parent route mandatory.** §2.5 marks the **Fleet Chat parent / span / tenant route** mandatory.
+> 5. **PVE tailnet host vs guest.** §2.6 says the verified `100.78.157.127` enrollment is the
+>    **host, not the guest**, and states what is unverified for the guest.
+> 6. **Gateway PRs merged.** §2 (ordering rules) notes **PRs 481 and 480 are already merged**.
+> 7. **Short SHAs verified.** §6 carries the `gh api`-verified short SHAs for cognizioware PR2
+>    (`d89c556` → re-fetched at `df8b0cb`), claude-code-teams PR29 (`77599bf`), LHH PR127
+>    (`f3338b7`); all matched, no mismatches flagged.
+> 8. **Initial, not cutover.** §1 header marks this **INITIAL** admission, not the final paired-role
+>    cutover.
+> 9. **Shared Omnigent umbrella (6 unregistered slots).** §2 / §9 adds the umbrella
+>    `https://agents.easybutt0n.ai`: families **overseer1, infraops1, devspecops1**, each with a
+>    Claude runtime + an `-op` runtime + one effect writer = **6 slots**, all **UNREGISTERED** (the
+>    `agent-bindings.json` seed shows every `session_id`/`runtime`/`runtimes` as `null`). No live
+>    session ids are invented here.
+> 10. **Host/agent/workspace distinction.** §2 / §10 carries the hosted-family acceptance criteria
+>     from `hosted-agent-workspaces.md` — workspace must hold the admitted branch/repo, role
+>     instructions, effective MCP/model config, and bounded evidence/parent state; equal duties do
+>     not imply sharing one credential or giving every role admin access; an existing independent
+>     Claude process is not auto-imported; plus the existing claude-code-teams migration.
+>
+> **Two targeted corrections (2026-10-12, applied on top of the 10-point pass above).**
+> 1. **Migration paragraph (§10, hosted-family migration bullet).** claude-code-teams PR #29
+>    (`77599bf`, verified) is now described as evidence of **parent-channel RECEIPTS only**; any
+>    wording implying the hosted-family migration of the three families / six slots is complete is
+>    removed (it is stated nowhere as complete).
+> 2. **Enrollment principal (§2 step 4 + §5).** Decided as a **dedicated scoped machine identity**
+>    (host-bound, expiring, revocable, no user-token fallback); the `[PAXTON DECISION]` marker is
+>    removed from §2.4; the Paxton-owned CLI host is listed as the **rejected alternative**; and a
+>    reference to cognizioware PR #2's `deployment/omnigent/` enrollment artifact is added.
+>    *Flagged:* the directive's `deployment/omnigent/machine-host-enrollment.md` does not exist in the
+>    cognizioware repo at `df8b0cb`; the reference points at the real `enroll-ptait08-tailscale.sh`
+>    instead.
+>
+> **Kept open for Paxton (not resolved):** every account and grant choice remains a decision — see
+> §5. The approval-by-link (Entra) design is preserved unchanged.
 
 Written 2026-10-11. This is a **design document only**: nothing in it has been built, deployed,
 keyed, or requested for real. Its purpose is to let Paxton and Overseer1 review and approve a plan
@@ -28,17 +79,22 @@ exists on VM310, with the smallest set of rights that still lets it launch and s
 under a brand-new gateway identity that is scoped to exactly one workload — so it can be audited,
 rate-limited, and revoked on its own, without touching any other key in the fleet.
 
-**OS account.** Run as `cognizioware` (UID 1000) — per the v2 build session report, the only user
-on VM310, with `sudo` and `docker` group membership. Creating a second, dedicated service account
-is the textbook least-privilege answer, but it is a change on the host, which this round forbids
-and which only Paxton can order. So the proposal is two-phase:
+**OS account.** This is a **proposed separate unprivileged OS account**, not the existing one.
+Do **not** run the runtime as `cognizioware` (UID 1000) — per the v2 build session report, the only
+user on VM310, with `sudo` and `docker` group membership. The textbook least-privilege answer is a
+dedicated, unprivileged account with **no `sudo` and no `docker` (Docker socket/group) access**: a
+run account that can launch and supervise its own work, nothing host-level. Creating that account
+is a change on the host, which this round forbids and which only Paxton can order, so the decision
+is a **[PAXTON DECISION]** — see section 5, item 1. Until Paxton chooses, the OS-account column is
+left as options, not as a chosen value.
 
-- **Phase 1 (this proposal):** run as `cognizioware`, confined by convention and configuration —
+- **Proposed phase 1:** run as the new dedicated unprivileged account, confined by configuration —
   a dedicated working directory for the v2 runtime, no cron/systemd units owned by other users, no
-  interactive shell sessions sharing the account while a run is live.
-- **Phase 2 (optional, Paxton's call, listed in section 5):** migrate to a dedicated unprivileged
-  account once the runtime has proven itself, so VM310 ends up matching the separation VM211
-  already has.
+  interactive shell sessions sharing the account while a run is live, and no `sudo`/`docker` at
+  runtime.
+- **Proposed phase 2 (Paxton's call, listed in section 5):** harden the account (narrower shell
+  scope, rotated credentials) once the runtime has proven itself, so VM310 ends up matching the
+  separation VM211 already has.
 
 **What it does and does not need.**
 
@@ -87,35 +143,108 @@ step beneath them until resolved.
 2. **Decide the account and key-scope questions in section 5.** The enrollment cannot start until
    the OS-account phase, key alias name, model allow-list, and MCP profile are chosen, because
    steps 3–5 all consume those answers. *Owner: Paxton.* **[PAXTON DECISION]**
-3. **Install the host client on VM310.** Install the LongHorizon-Harness node runtime (the "host
-   client" in the v2 build report) plus its `config.toml` defining the trios/models this node
-   serves. This is an install-time `sudo` step; after it, the runtime runs unprivileged as
-   `cognizioware`. *Owner: infraops1.* (Execute only after steps 1–2; blocked until then.)
-4. **Create the workload-scoped gateway key.** Mint the LiteLLM virtual key under the alias chosen
-   in step 2, with its model allow-list, MCP access groups, and tool allowlist exactly as approved.
-   Key material goes only to the approved secret store on VM310 — never into this repo, a doc, or
-   a chat. *Owner: devspecops1 (owns LiteLLM/gateway key creation and allowlists).* **[PAXTON
-   DECISION on the scope before devspecops1 executes — the request text is section 3, sent only
-   after Paxton approves it]**
-5. **Register the gateway route / parent route.** Register the v2 runtime's route (and parent
-   route, if the fleet's routing design requires one) so calls from the new key land in the right
-   deployment group and spend is attributable to `lh-overseer-v2-ptait08` (or the approved
-   alias). *Owner: devspecops1.* **[PAXTON DECISION if the route introduces a new parent/egress
-   path — devspecops1 flags it rather than choosing]**
-6. **Enroll VM310 in Tailscale.** Re-issue the login link, enroll the node, tag it, and confirm
-   ACLs let it reach only what an execution node needs. Status and blockers: section 4. *Owner:
-   infraops1 executes; the login-link re-issue is Paxton's.* **[PAXTON DECISION — login-link
-   re-issue]**
+3. **Install the host client on VM310.** Install the Omnigent host/runner (the "host client" in
+   the v2 build report) plus its `config.toml` defining the trios/models this node serves. This is
+   an install-time elevated step; after it, the runtime runs unprivileged as the dedicated account
+   chosen in step 1. *Owner: infraops1.* (Execute only after steps 1–2; blocked until then.)
+4. **Enrollment principal decided: a dedicated scoped machine identity.** Per Paxton 2026-10-12,
+   the effective server principal is **decided** (not left open): the v2 runtime binds as a
+   **dedicated, scoped machine identity** — **host-bound** (tied to this host's host ID), **expiring**
+   (not a long-lived principal), **revocable** (revoked without a separate user action), and with
+   **no user-token fallback** (a bare user login does not stand in for the scoped identity). The
+   supported path is the **user-owned CLI login** (e.g. the patched Omnigent host client,
+   `enroll-ptait08-tailscale.sh`), which produces exactly that scoped host identity. The **only
+   rejected alternative** is a **Paxton-owned CLI host** (a general, wide-scope CLI identity) — it was
+   considered and **rejected** because it does not narrow the server token to this host and so is not
+   the principal. **Do not mint any credentials or write tokens into the database** to bridge this gap.
+   This enrollment happens under the **Shared Omnigent umbrella** (`https://agents.easybutt0n.ai`;
+   see §9): the runtime binds to a stable family workspace and the umbrella is the shared management
+   surface for the three infrastructure-agent families, not a per-role grant. *Owner: devspecops1
+   executes (principal already decided above; the request text is section 3, sent only after Paxton
+   approves it).*
+   - **Reference (source of the decided shape):** cognizioware PR #2, `deployment/omnigent/` — the
+     enrollment artifact is `enroll-ptait08-tailscale.sh` (host-bound, authenticated by the owner,
+     verified at head `df8b0cb`). *Discrepancy flagged:* the operator's directive referenced a
+     `deployment/omnigent/machine-host-enrollment.md`; that file **does not exist** in the cognizioware
+     repo at `df8b0cb` (full-tree + PR#2 search returned 0 hits), so the reference points at the real
+     enrollment script instead of a non-existent path.
+5. **Register the gateway route / parent route.** The **Fleet Chat parent channel and verified
+   parent/span/tenant binding are mandatory** for every delegated span — the parent route is not
+   optional. Register the v2 runtime's route under that parent route so calls from the new key land
+   in the right deployment group and spend is attributable to `lh-overseer-v2-ptait08` (or the
+   approved alias). Use explicit return/ACK receipts; session labels and chat `from` fields are not
+   authenticated authority. *Owner: devspecops1.* **[PAXTON DECISION if the route introduces a new
+   parent/egress path — devspecops1 flags it rather than choosing]**
+6. **Verify hypervisor enrollment, then decide guest scope.** PVE host **ptait08 is verified
+   Running/Online at `100.78.157.127`**. This is **hypervisor enrollment — it is the host, not the
+   guest.** It does **not** prove that VM310 is independently enrolled or reachable. From the network
+   design, decide whether a **separate guest identity** is needed for VM310 rather than repeat the
+   completed hypervisor authorization. The login-link re-issue that stands in the way is **Paxton's**.
+   *Owner: infraops1 executes the guest-side enrollment; the login-link re-issue is Paxton's.*
+   **[PAXTON DECISION — login-link re-issue and whether a separate guest identity is required]**
 7. **Verify admission, read-only.** Confirm from existing fleet surfaces that the node answers,
    its runs launch, and its queue entries appear — without resolving any gate and without writing
    any production tick. *Owner: Overseer1 (verification only; writer duties unchanged).*
 8. **First-workload go/no-go.** Paxton decides when the first real task may run on the new host.
    *Owner: Paxton.* **[PAXTON DECISION]**
 
+9. **Shared Omnigent umbrella: six unregistered slots (docs-only, nothing provisioned).** This
+   proposal describes the *envelope* the v2 runtime will bind into — not a grant this round creates.
+   Source: `cognizioware` PR#2 `deployment/omnigent/hosted-agent-workspaces.md` (fetched verbatim at
+   head `df8b0cb`; `agent-bindings.json` registry seed at the same ref).
+   - The umbrella server `https://agents.easybutt0n.ai` is the shared management umbrella for all
+     three infrastructure-agent families. A deployed server, a successful Microsoft login, or an
+     empty registry entry does **not** by itself fulfill the "admitted workspace" requirement.
+   - **Logical families:** `overseer1`, `infraops1`, `devspecops1`. Each family pairs a Claude
+     runtime with an `-op` runtime and **one active effect writer** — that is **6 runtime slots**
+     total (overseer1 / overseer1-op, infraops1 / infraops1-op, devspecops1 / devspecops1-op).
+   - The registry seed `agent-bindings.json` (ref `df8b0cb`) declares all three families with
+     `session_id: null`, `runtime: null`, and `runtimes: { <name>: {session_id: null} }` for every
+     runtime. **All six slots are UNREGISTERED.** This document states the slots and their `null`
+     state; it invents **no live session ids** and does not label any unconnected slot active.
+   - `overseer1-omi` is management metadata, **not** a seventh reasoning runtime. Each pair keeps
+     separate authenticated principals and sessions, one shared logical inbox/checkpoint, and one
+     active effect writer. Equal duties do not imply sharing one credential between runtimes or
+     giving every role admin access.
+   - **What this round does not do:** provision the isolated OS runtime account, install the
+     qualified client, enroll ptait08, or bind real session ids through the controller. Those are
+     the deployment steps in `hosted-agent-workspaces.md` §Deployment acceptance (item 1 onward);
+     this design document only carries the umbrella shape and the *current gap* (on 2026-10-12 the
+     delivered seed contained only an unbound overseer1).
+
+10. **Host / agent / workspace distinction and acceptance criteria (docs-only).** Carried from
+    `hosted-agent-workspaces.md` so a reviewer sees the hosted-family acceptance criteria this
+    proposal must eventually satisfy. These are the *full deployment* criteria — the v2 runtime is
+    the admission step §1–§8 covers; items below are what the controller enforces afterward.
+    - **Workspace contents (required stable entry).** A runtime's workspace must contain the
+      admitted branch/repo, the role instructions, the effective MCP/model configuration, and
+      bounded evidence/parent state. This is verified against the workspace's contents, not against
+      a deployed server or a Microsoft login.
+    - **Credential separation.** Each pair (e.g. overseer1 / overseer1-op) retains separate
+      authenticated principals and sessions. Equal duties do **not** imply sharing one credential
+      between runtimes, nor giving every role admin access.
+    - **Existing independent processes.** An existing independent Claude process is **not**
+      automatically imported or managed just because the management server is running. Preserve its
+      production history and writer while verifying its connection/migration independently.
+    - **Existing migration (claude-code-teams).** The claude-code-teams PR#29 evidence
+      (`77599bf9817d97bd04e6daf18f89b49901fb33c6`, verified) is evidence of the parent-channel
+      **RECEIPTS only** — PR29's file is `agents/orchestrator/plans/fleet-chat-prod-migration.txt`,
+      which lets the Fleet Chat deploy pipeline manage its own live prod pipeline (the parent
+      channel's receipts), not a hosted-family migration of the three families or the six slots.
+      This proposal does not reopen it; it is carried here only so the reviewer knows the umbrella's
+      acceptance criteria already include that parent-channel receipt lineage, and so the hosted-family
+      migration of the three families and the six slots is **not** stated anywhere as complete.
+    - **The admitted controller.** Additions to the registry seed are applied through the admitted
+      controller — preserving existing session links — once that controller is operational. The
+      updater deliberately preserves an existing registry rather than overwriting live bindings.
+    - **Session binding is real, not fabricated.** A session binds an agent, a host, and a
+      workspace. Before any effect writer moves, verify failover fencing and resume; never fabricate
+      session ids or label an unconnected slot active.
+
 Ordering rules: steps 3–6 may interleave once steps 1–2 are resolved, but step 7 requires all of
-3–6 complete, and step 8 requires step 7's read-back. Nothing in this plan merges
-`cognizioware-mcp-tools` PR #481 — that PR is merge-ready and separate, and its merge is Paxton's
-call (section 5, item 8).
+3–6 complete, and step 8 requires step 7's read-back. §9 and §10 describe the umbrella and its
+acceptance criteria; they are the shape the runtime binds into, not steps this round performs.
+Gateway PRs **481 and 480 are already merged** — PR481 (`c9beba9`, deployment38160892455 succeeded) and PR480 (`5744932`, deployment38162461821 succeeded) are not merge choices here; remove any outstanding merge decisions.
 
 ## 3. devspecops1 request text (ready-to-send, placeholders only)
 
@@ -230,21 +359,39 @@ Plain language first: three PRs carry the v2 build evidence, one further PR is t
 ptait08 onboard, and a graphify query found no existing ptait08 admission code anywhere — so this
 proposal does not duplicate or conflict with anything.
 
-- **`cogniziocompany/cognizioware` PR #2** (`bd6248e`) — build evidence per the task context.
-- **`cogniziocompany/claude-code-teams` PR #29** (`62edc11`) — build evidence per the task context.
+- **`cogniziocompany/cognizioware` PR #2** — build evidence per the task context. Verified head
+  commit `df8b0cb` (full `df8b0cb79e39e359eb317e6a8eb9e649790b15f1`). A later commit than the
+  earlier round's review ref `d89c556` (full `d89c5560867485ab877f58c01dde76950ffa365b`), which
+  still matches the actual commit. The review doc, `hosted-agent-workspaces.md`, and
+  `agent-bindings.json` (the registry seed) were fetched verbatim at head `df8b0cb`; the short sha
+  matches the actual commit.
+- **`cogniziocompany/cognizioware` shared umbrella server** — fetched verbatim at `df8b0cb`: the
+  umbrella server `https://agents.easybutt0n.ai` is the shared management umbrella for the three
+  infrastructure-agent families (overseer1 / infraops1 / devspecops1). This is a real fetched fact,
+  not a host on this proposal's touch list.
+- **`cogniziocompany/claude-code-teams` PR #29** — build evidence per the task context; verified
+  head commit `77599bf` (full `77599bf9817d97bd04e6daf18f89b49901fb33c6`). The short sha matches
+  the actual commit.
 - **`cogniziocompany/LongHorizon-Harness` PR #127** — cited in the task context as "(draft,
   `f3338b7`)". Verified directly against GitHub on 2026-10-11: it is **OPEN**, **a draft**, head
   branch `codex/manager-parent-debrief`, head commit `f3338b7`
   ("Reflect with Manager before parent debrief and bound continuation claims"), base `main`,
-  title "Add checkpoint-bound Manager parent debrief boundary". The draft/commit reference matches
-  the task context; the PR's own subject is the manager-debrief work, which is how the build
-  session referenced it.
-- **Graphify pre-edit query (required before authoring this file).** The graphify MCP server was
-  **not callable in this run**: no `graphify-query_graph` (or `graphifyuat-*`) tool was exposed to
-  the session, and the gateway that hosts it
-  (`litellm-gateway-api.cognizioware.com/mcp/` / LAN `http://192.168.21.161:4000/mcp/`, per
-  `src/lh_harness/mcp_profiles.py`) is a host outside the workspace, which this run is forbidden
-  to contact. The local-repo equivalent was performed instead: a full-tree search of
+  title "Add checkpoint-bound Manager parent debrief boundary". The short sha matches the actual
+  commit.
+- **Short-sha verification (all three matched, re-verified at `df8b0cb`).** Verified via
+  `gh api .../commits/<short>` on 2026-10-12 before writing: cognizioware PR2 `d89c556` =
+  `d89c5560867485ab877f58c01dde76950ffa365b`; claude-code-teams PR29 `77599bf` =
+  `77599bf9817d97bd04e6daf18f89b49901fb33c6`; LHH PR127 `f3338b7` =
+  `f3338b7a494f21863636fad8fdbabda8d174bfd2`. No mismatches to flag. This pass additionally
+  re-verified the cognizioware PR#2 head: `df8b0cb` = `df8b0cb79e39e359eb317e6a8eb9e649790b15f1`
+  (the current source of truth for points 9–10; `d89c556` is a prior commit on the same PR that
+  still matches the actual commit).
+- **Graphify pre-edit query (required before authoring this file).** This run queried the **live**
+  graphify index at `repo::path` for `LongHorizon-Harness::docs/handoffs/ov2-ptait08-runtime-admission.md`
+  (the local graphify index, `graphify-out/graph.json`, at `origin/main`). The index registers
+  `handoffs` as a `.register_handoffs()` callable rather than a per-file node — the exact file path
+  is not a standalone graphified node. The file nonetheless exists on disk and is the authoritative
+  input being corrected here; the local-repo equivalent was also performed: a full-tree search of
   `cogniziocompany/LongHorizon-Harness` at `origin/main` (`3d68b56`, 2026-10-11) for `ptait08`,
   `192.168.21.176`, and `VM310` returned **zero hits** — no admission code, no host references.
   The task context additionally reports graphify's finding that the only tailscale-adjacent
