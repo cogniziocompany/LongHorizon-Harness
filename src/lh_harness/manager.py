@@ -1142,6 +1142,10 @@ class _GateContext:
     # its actionable cause separate from ``abort_reason`` so Supervisor/Web can
     # show the provider's real message instead of a generic round-limit gate.
     failure_reason: str = ""
+    # Every round-extension decision (who, when, amount, approval id) is
+    # appended here so the snapshot can publish the full history and a replay
+    # of an already-used approval id is recognised.
+    extension_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_state: str, question: str = "", answers: list[str] | None = None) -> bool:
@@ -1240,13 +1244,73 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
         ctx.completion_satisfied = False
     if reached_max or outcome in ("completed", "blocked"):
         # The hook is an injected callback (dashboard, tests, embedders), so its
-        # value is validated rather than coerced: a non-numeric or out-of-range
-        # answer falls back to the configured budget instead of raising inside
-        # the loop or granting an unbounded number of rounds.
-        extra = _extra_rounds(decision.get("extra_rounds")) or max(1, ctx.config.max_total_episodes or 1)
-        # Always grant at least one more round: clamping to MAX_ROUNDS must not
-        # produce a budget below the current round, which would end the run
-        # immediately after the operator asked to continue.
+        # value is validated rather than coerced: a non-numeric, missing, or
+        # out-of-range answer is treated as ``no extension``.  Falling back to
+        # the configured budget here is what silently granted extra rounds in
+        # past runs when the operator clicked "Continue" without typing a
+        # number; the bug allowed max_rounds=8 to reach rounds 9 and 10.
+        raw_extra = decision.get("extra_rounds")
+        extra = _extra_rounds(raw_extra)
+        approval_id = str(decision.get("approval_id") or "").strip()
+        # Record the receipt before deciding the outcome so the operator's
+        # choice (including a deliberate zero) is always auditable.
+        ctx.extension_history.append(
+            {
+                "approval_id": approval_id,
+                "round": round_index,
+                "outcome": outcome,
+                "requested_extra_rounds": raw_extra,
+                "granted_extra_rounds": extra,
+                "operator_action": action,
+                "occurred_at": time.time(),
+            }
+        )
+        # Replay protection: the same approval id must never grant twice, even
+        # if the worker is resumed or the dashboard replays the response.
+        replayed = False
+        if approval_id:
+            seen_ids = {
+                str(item.get("approval_id"))
+                for item in ctx.extension_history[:-1]
+                if item.get("approval_id")
+            }
+            if approval_id in seen_ids:
+                extra = 0
+                replayed = True
+                ctx.extension_history[-1]["granted_extra_rounds"] = 0
+                ctx.extension_history[-1]["replayed"] = True
+        _append_event(
+            ctx.events_path,
+            "round_extension_decision",
+            {
+                "approval_id": approval_id,
+                "round": round_index,
+                "outcome": outcome,
+                "requested_extra_rounds": raw_extra,
+                "granted_extra_rounds": extra,
+                "round_budget": ctx.round_budget,
+                "post_grant_round_budget": ctx.round_budget + max(extra, 0),
+                "replayed": replayed,
+            },
+        )
+        if reached_max and extra <= 0:
+            # The configured budget is exhausted and the operator did not
+            # authorise an explicit positive extension, so the run stops at
+            # this gate instead of looping through another round.
+            ctx.abort_reason = "max_rounds_exhausted"
+            if await _write_final_response(ctx, round_index, task_state, ctx.abort_reason):
+                _mark_cancelled(ctx)
+            return True
+        if extra <= 0:
+            # No explicit grant on a non-exhausted gate: leave the existing
+            # ceiling in place.  Shifting ``round_budget`` down here would
+            # revoke rounds an earlier operator decision already authorised
+            # (a replayed approval id with a different amount is the canonical
+            # case) and would silently shorten the run.
+            return False
+        # At least one round is granted: clamping must not produce a budget
+        # below the current round, which would end the run immediately after
+        # the operator asked to continue.
         ctx.round_budget = max(round_index + 1, min(round_index + extra, MAX_ROUNDS))
         _append_event(
             ctx.events_path,
@@ -1256,6 +1320,7 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
                 "outcome": outcome,
                 "extra_rounds": extra,
                 "round_budget": ctx.round_budget,
+                "approval_id": approval_id,
             },
         )
     return False
