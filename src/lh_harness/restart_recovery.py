@@ -856,50 +856,6 @@ def detect_run_effects(
     return effects
 
 
-def pid_is_alive(pid: int) -> bool:
-    """True when ``pid`` names a live process.
-
-    The launch gate for a restart successor: a worker of the interrupted
-    run that is still alive must not be joined by a second worker for the
-    same task.  ``os.kill(pid, 0)`` is the standard liveness probe and
-    raises ``PermissionError`` (an ``OSError``) for a process owned by
-    another user, which still means the pid EXISTS.
-    """
-
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # The process exists; we simply may not signal it.
-        return True
-    except OSError:
-        return False
-    return True
-
-
-def worker_is_alive(owner: dict[str, Any] | None) -> bool:
-    """True when the worker described by ``owner`` is still running.
-
-    The owner record's ``pid`` is the worker process (the supervisor writes
-    it at launch); ``pgid`` is the same value for a ``pgid``-signalled
-    worker.  A run whose owner was cleared on termination (``pid`` 0) is
-    not alive.
-    """
-
-    if not isinstance(owner, dict):
-        return False
-    for key in ("pid", "pgid"):
-        value = owner.get(key)
-        if isinstance(value, bool) or not isinstance(value, int):
-            continue
-        if value > 0 and pid_is_alive(value):
-            return True
-    return False
-
-
 def workspace_worker_is_alive(workspace: str | Path, run_id: str) -> bool:
     """True when a worker process for ``run_id`` is still alive.
 
