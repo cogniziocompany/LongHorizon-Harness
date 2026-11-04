@@ -1756,6 +1756,7 @@ class QueueStore:
         *,
         not_before: float | None = None,
         wait_reason: str | None = None,
+        name_suffix: str = "",
     ) -> QueueEntry | None:
         """Create a successor pending entry for a failed entry.
 
@@ -1765,6 +1766,9 @@ class QueueStore:
             not_before: Optional epoch seconds before which the launcher must
                 not launch the successor (provider-quota backoff)
             wait_reason: Optional label for the wait, shown in the skip reason
+            name_suffix: Optional suffix appended to the successor's name, so
+                a retry that must be distinguishable from the original task
+                (the restart second chance's ``-r1``) is visible in the queue
 
         Returns:
             The new successor QueueEntry, or None if the original entry not found
@@ -1804,7 +1808,7 @@ class QueueStore:
         # specific model/roles must not silently fall back to trio defaults.
         successor = QueueEntry(
             queue_id=f"q-{uuid.uuid4().hex[:16]}",
-            name=entry.name,
+            name=f"{entry.name}{name_suffix}" if name_suffix else entry.name,
             task=entry.task,
             workspace=entry.workspace,
             max_rounds=entry.max_rounds,

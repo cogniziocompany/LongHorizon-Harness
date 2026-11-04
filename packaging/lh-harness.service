@@ -59,6 +59,22 @@ ExecStart=/home/harness/work/LongHorizon-Harness/.venv/bin/lh-harness web
 EnvironmentFile=/home/harness/.lh-harness-secrets.env
 Restart=on-failure
 RestartSec=5s
+# KillMode is NOT set here, so the unit runs with systemd's default
+# KillMode=control-group: when the service stops (or is SIGKILLed and
+# restarted by Restart=on-failure), systemd tears down EVERY process in the
+# unit's cgroup — including the live per-run workers.  That is what happened
+# on CT111 on 2026-11-04 (13:04:41Z): the unit was killed and restarted with
+# two runs live, and both runs' workers died with it and ended failed with
+# "worker disappeared without a final report".
+#
+# This is DOCUMENTED, NOT CHANGED: the KillMode value stays exactly as it is
+# (the default, control-group) in this PR.  The unit is not the place where
+# the interruption is fixed — the queue's restart recovery is
+# (src/lh_harness/restart_recovery.py): a run whose worker died with the
+# service is classified interrupted_by_restart and gets exactly one fenced
+# second chance.  Changing KillMode here would change which processes die
+# with the unit and is deliberately out of scope.
+#
 # A child OOM kill (e.g. one run's pytest) must not take the unit — and every
 # other live run's worker — down with it (TASK 202).
 OOMPolicy=continue

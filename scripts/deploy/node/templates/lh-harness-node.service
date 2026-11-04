@@ -35,6 +35,14 @@ ExecStart=/home/harness/venv/bin/python -m lh_harness web --host 0.0.0.0 --port 
 EnvironmentFile=/home/harness/.lh-harness-secrets.env
 Restart=on-failure
 RestartSec=5s
+# KillMode is NOT set here, so the unit runs with systemd's default
+# KillMode=control-group: when the service stops (or is SIGKILLed and
+# restarted by Restart=on-failure), systemd tears down EVERY process in the
+# unit's cgroup -- including the live per-run workers.  This is DOCUMENTED,
+# NOT CHANGED: the KillMode value stays exactly as it is (the default,
+# control-group).  See packaging/lh-harness.service for the full note; the
+# interruption is handled by the queue's restart recovery
+# (src/lh_harness/restart_recovery.py), not by changing the unit.
 OOMPolicy=continue
 Delegate=memory pids
 

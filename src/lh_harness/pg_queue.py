@@ -727,6 +727,7 @@ class PgQueueStore:
         *,
         not_before: float | None = None,
         wait_reason: str | None = None,
+        name_suffix: str = "",
     ) -> QueueEntry | None:
         """Create a successor pending entry for a failed entry.
 
@@ -738,6 +739,9 @@ class PgQueueStore:
                 in the ``not_before`` column (migration 005)
             wait_reason: Optional label for the wait (``wait_reason`` column,
                 at most 64 characters, kept only together with ``not_before``)
+            name_suffix: Optional suffix appended to the successor's name, so
+                a retry that must be distinguishable from the original task
+                (the restart second chance's ``-r1``) is visible in the queue
 
         Returns:
             The new successor QueueEntry, or None if the original entry not found
@@ -775,7 +779,7 @@ class PgQueueStore:
 
         successor = QueueEntry(
             queue_id=f"q-{uuid.uuid4().hex[:16]}",
-            name=entry.name,
+            name=f"{entry.name}{name_suffix}" if name_suffix else entry.name,
             task=entry.task,
             workspace=entry.workspace,
             max_rounds=entry.max_rounds,
