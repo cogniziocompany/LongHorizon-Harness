@@ -46,6 +46,7 @@ from .restart_recovery import (
     begin_service_epoch,
     classify_worker_death,
     reconcile_interrupted_run,
+    workspace_worker_is_alive,
 )
 from .settings_store import SettingsStore, active_runtime, open_from_environment, trio_role_overrides
 from .supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
@@ -1370,6 +1371,9 @@ class Launcher:
                 epoch=self._service_epoch,
                 status=status,
                 owner=owner,
+                # The launcher's own open-PR probe seam, so the effect
+                # detection uses the same probe the launch guard uses.
+                probe_pr=self.probe_open_pr,
             )
         except ValueError as exc:
             # The requeue cap refused the successor: log it, never raise it
@@ -1393,6 +1397,30 @@ class Launcher:
             },
         )
         return successor
+
+    def _interrupted_worker_alive_reason(self, entry: QueueEntry) -> str | None:
+        """Return a skip reason while the interrupted run's worker lives.
+
+        Only a restart successor is gated: it names the interrupted run in
+        ``interrupted_run``, and that run's worker is checked for liveness.
+        Every other entry is untouched, so the ordinary launch path is
+        unchanged.
+
+        The check is by RUN ID (the worker's command line carries
+        ``--run-id=<id>``), not by pid: a recycled pid must not be mistaken
+        for the interrupted run's worker, and a re-parented worker must not
+        be missed.
+        """
+
+        interrupted_run = str(getattr(entry, "interrupted_run", "") or "")
+        if not interrupted_run:
+            return None
+        if workspace_worker_is_alive(entry.workspace, interrupted_run):
+            return (
+                f"interrupted run {interrupted_run} still has a live worker; "
+                "waiting before the restart successor launches"
+            )
+        return None
 
     def _time_limit_minutes(self, entry: QueueEntry) -> int | None:
         """The entry's own limit, else ``[queue] default_time_limit_minutes``."""
@@ -1676,6 +1704,15 @@ class Launcher:
             node_reason = self._node_capacity_reason(node_active)
             if node_reason is not None:
                 return node_reason
+        # Restart second chance (task easybutt0n-17): a successor for a
+        # restart-interrupted run must NOT launch while the interrupted run's
+        # own worker is still alive -- two workers for one task is the thing
+        # this gate exists to prevent.  The successor stays PENDING with the
+        # reason recorded and is re-attempted on the next pass, so it waits
+        # for the stale worker to go away instead of racing it.
+        interrupted_reason = self._interrupted_worker_alive_reason(entry)
+        if interrupted_reason is not None:
+            return interrupted_reason
         entry_workspace = _normalize_workspace(entry.workspace)
         # Use the shared supervisor reservation primitive so queue launches
         # race-safely with POST /api/runs. A reservation takes priority over the

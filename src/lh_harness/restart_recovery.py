@@ -34,6 +34,29 @@ Three properties are load-bearing and are asserted by the tests:
   stays recoverable in a named stash, and the stash name is logged in the
   run's report.
 
+The operator correction (2026-11-04 14:24Z) adds three more, all of them
+about what the interrupted run left behind:
+
+* **The effects are detected before the successor is created.**  A branch the
+  interrupted run pushed, a PR it opened, commits it made that never reached
+  the remote, the files it left behind.  A successor that started fresh would
+  silently drop all of them, so a pushed branch or an open PR makes the
+  successor CONTINUE that branch (the repo's existing ``continue_branch``
+  continuation opt-in) instead of cutting a fresh base.
+* **An undecidable effect is never guessed.**  A git probe that fails leaves
+  the effect undecided; an undecided effect marks the entry ``needs_review``
+  and creates NO successor, for a human to look at.  Nothing is deleted and
+  nothing is resubmitted blindly.
+* **The lineage is recorded on both ends.**  The successor carries
+  ``retry_of`` and ``interrupted_run``; the original entry carries the
+  successor's queue id.  The stash name and the detected effects are written
+  into the interrupted run's durable report.
+
+A successor also never launches while the interrupted run's own worker is
+still alive (the launch gate): two workers for one task is what the gate
+exists to prevent, and the successor waits instead of racing the stale
+worker.
+
 Fencing is untouched.  A round that was never replayed is not replayed here;
 this module only decides whether a *run* gets a successor queue entry.
 """
@@ -46,9 +69,10 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .safe_subprocess import child_env, git_argv
+from .workspace_guard import probe_open_pr_gh
 
 # The canonical failure-cause label for a run whose worker died because the
 # service itself stopped.  It is a *cause*, not a status: the entry is still
@@ -58,6 +82,11 @@ INTERRUPTED_BY_RESTART = "interrupted_by_restart"
 
 # The suffix appended to the interrupted entry's name for its successor.
 RETRY_NAME_SUFFIX = "-r1"
+
+# The reason recorded on an entry whose restart recovery could not decide
+# safely (the interrupted run's effects could not be determined).  Such an
+# entry gets NO successor: a human looks at it.
+NEEDS_REVIEW_REASON = "needs_review: restart recovery could not determine the interrupted run's effects"
 
 # The failure reason the supervisor writes when a worker vanished without
 # leaving a report.  Compared case-insensitively; the supervisor owns the
@@ -75,6 +104,9 @@ EPOCH_FILENAME = "service_epoch.json"
 _SHUTDOWN_SIGNALS = frozenset({"SIGKILL", "SIGTERM"})
 
 _GIT_TIMEOUT = 90
+
+# The bound the launcher applies to a queue entry's ``reason`` field.
+_MAX_REASON_LEN = 500
 
 
 @dataclass
@@ -445,6 +477,7 @@ def log_stash_in_report(
     stash_name: str,
     *,
     workspace: str = "",
+    lineage: dict[str, Any] | None = None,
 ) -> bool:
     """Record the stash name in the interrupted run's durable report.
 
@@ -453,6 +486,11 @@ def log_stash_in_report(
     A missing report is created (the supervisor writes one for a vanished
     worker); a report that cannot be written is not fatal — the stash
     itself is already durable in the workspace.
+
+    The restart-recovery lineage (the original queue id, the successor's
+    queue id, the interrupted run id and the detected effects) is written
+    into the same report, so the lineage is readable from the run's own
+    durable artifact and not only from the queue rows.
     """
 
     path = _report_path(runs_root, run_id)
@@ -471,6 +509,8 @@ def log_stash_in_report(
     payload["stash"] = stash_name
     payload["stash_workspace"] = str(workspace)
     payload["interrupted_by"] = INTERRUPTED_BY_RESTART
+    if lineage:
+        payload["restart_recovery"] = dict(lineage)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
@@ -479,6 +519,267 @@ def log_stash_in_report(
     except OSError:
         return False
     return True
+
+
+# ----------------------------------------------------------------------
+# Effect detection (operator correction, task easybutt0n-17).
+#
+# Before a successor is created, the interrupted run's effects are
+# detected: a branch it pushed, a PR it opened, commits it made that never
+# reached the remote, and the files it left behind.  A successor that
+# started fresh would silently drop all of them, so:
+#
+# * a pushed branch or an open PR means the successor CONTINUES that
+#   branch (the repo's existing ``continue_branch`` continuation opt-in,
+#   task 201) instead of cutting a fresh base;
+# * an effect that cannot be determined is not guessed: the entry is
+#   marked ``needs_review`` and NO successor is created.
+#
+# Nothing is ever deleted here, and nothing is resubmitted blindly.
+# ----------------------------------------------------------------------
+
+
+@dataclass
+class RunEffects:
+    """What the interrupted run left behind in its workspace.
+
+    ``decided`` is False when the effects could not be determined (a git
+    probe failed, the workspace is not a repository, ...).  An undecided
+    probe is never treated as "no effects": the caller marks the entry
+    ``needs_review`` instead of creating a successor.
+    """
+
+    # The branch the workspace had checked out, when it had one.
+    branch: str = ""
+    # True when that branch exists on the remote (git ls-remote).
+    branch_pushed: bool = False
+    # The open PR on that branch, when one exists.
+    open_pr: str = ""
+    # Commits on the branch that are not on the remote's default branch.
+    local_commits: int = 0
+    # Modified or untracked files left in the workspace.
+    dirty: bool = False
+    # False when any of the above could not be determined.
+    decided: bool = True
+
+    @property
+    def has_effects(self) -> bool:
+        """True when the interrupted run left work that must be continued."""
+
+        return bool(self.branch_pushed or self.open_pr or self.local_commits)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "branch": self.branch,
+            "branch_pushed": self.branch_pushed,
+            "open_pr": self.open_pr,
+            "local_commits": self.local_commits,
+            "dirty": self.dirty,
+            "decided": self.decided,
+        }
+
+
+def _git_out(repo: Path, *args: str) -> tuple[bool, str | None]:
+    """Run a git probe; ``(ok, output)``.
+
+    ``ok`` is False when the command could not be run or failed, which is
+    what makes an effect *undecided* rather than *absent*.
+    """
+
+    try:
+        proc = subprocess.run(
+            git_argv("-C", str(repo), *args),
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+            env=child_env(),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False, None
+    if proc.returncode != 0:
+        return False, None
+    return True, proc.stdout.strip()
+
+
+def detect_run_effects(
+    workspace: str | Path,
+    *,
+    probe_pr: Callable[[Path, str], str | None] | None = probe_open_pr_gh,
+) -> RunEffects:
+    """Detect what the interrupted run left behind in ``workspace``.
+
+    Four independent probes, each of which may come back *undecided*:
+
+    * the checked-out branch (``git rev-parse --abbrev-ref HEAD``);
+    * whether that branch reached the remote (``git ls-remote --heads
+      origin <branch>``);
+    * an open PR on that branch (the repo's existing ``gh`` probe);
+    * commits on the branch that never reached ``origin/main``, and
+      modified/untracked files left in the tree.
+
+    A probe that fails leaves the effect undecided rather than absent:
+    ``decided`` is False and the caller must not create a successor.
+    """
+
+    repo = Path(workspace).expanduser()
+    effects = RunEffects()
+    if not repo.is_dir():
+        # No workspace at all: nothing to continue and nothing to decide.
+        return effects
+
+    ok, inside = _git_out(repo, "rev-parse", "--is-inside-work-tree")
+    if not ok:
+        # Not a git repository (or git failed).  There is no branch work to
+        # continue; the effect set is empty and decided.
+        return effects
+    if inside != "true":
+        return effects
+
+    ok, branch = _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if not ok:
+        effects.decided = False
+        return effects
+    branch = (branch or "").strip()
+    if not branch or branch == "HEAD":
+        # Detached HEAD: no branch to continue.
+        branch = ""
+    effects.branch = branch
+
+    if branch:
+        ok, remote_heads = _git_out(repo, "ls-remote", "--heads", "origin", branch)
+        if not ok:
+            # The remote could not be reached: whether the branch was pushed
+            # is UNDECIDABLE, and an undecided pushed-branch effect must not
+            # be read as "not pushed" (that would drop the interrupted run's
+            # published work).
+            effects.decided = False
+        else:
+            effects.branch_pushed = bool(remote_heads)
+
+    if branch and probe_pr is not None:
+        try:
+            open_pr = probe_pr(repo, branch)
+        except Exception:  # noqa: BLE001 - a broken probe must not crash the pass
+            open_pr = None
+        effects.open_pr = str(open_pr or "")
+
+    # Commits on the branch that never reached the remote's default branch.
+    ok, origin_main = _git_out(repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main")
+    if not ok:
+        # No origin/main ref to compare against: the local-commit effect is
+        # undecided (the same fail-open-but-not-guessing discipline the
+        # launcher's own occupancy probe uses).
+        effects.decided = False
+    elif branch:
+        ok, count = _git_out(repo, "rev-list", "--count", f"refs/remotes/origin/main..{branch}")
+        if not ok:
+            effects.decided = False
+        else:
+            try:
+                effects.local_commits = int(count or "0")
+            except ValueError:
+                effects.decided = False
+
+    ok, status = _git_out(repo, "status", "--porcelain")
+    if not ok:
+        effects.decided = False
+    else:
+        effects.dirty = bool((status or "").strip())
+
+    return effects
+
+
+def pid_is_alive(pid: int) -> bool:
+    """True when ``pid`` names a live process.
+
+    The launch gate for a restart successor: a worker of the interrupted
+    run that is still alive must not be joined by a second worker for the
+    same task.  ``os.kill(pid, 0)`` is the standard liveness probe and
+    raises ``PermissionError`` (an ``OSError``) for a process owned by
+    another user, which still means the pid EXISTS.
+    """
+
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The process exists; we simply may not signal it.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def worker_is_alive(owner: dict[str, Any] | None) -> bool:
+    """True when the worker described by ``owner`` is still running.
+
+    The owner record's ``pid`` is the worker process (the supervisor writes
+    it at launch); ``pgid`` is the same value for a ``pgid``-signalled
+    worker.  A run whose owner was cleared on termination (``pid`` 0) is
+    not alive.
+    """
+
+    if not isinstance(owner, dict):
+        return False
+    for key in ("pid", "pgid"):
+        value = owner.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if value > 0 and pid_is_alive(value):
+            return True
+    return False
+
+
+def workspace_worker_is_alive(workspace: str | Path, run_id: str) -> bool:
+    """True when a worker process for ``run_id`` is still alive.
+
+    The gate is by RUN ID, not by pid: the interrupted run's worker may
+    have been re-parented and its pid recycled, so the worker's command
+    line is matched for the run id.  This is the "never two workers for one
+    task" gate: a successor must not launch while the interrupted run's
+    own worker is still running.
+    """
+
+    repo = Path(workspace).expanduser()
+    if not repo.is_dir():
+        return False
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+            env=child_env(),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    if proc.returncode != 0:
+        return False
+    needle = f"--run-id={run_id}"
+    for line in (proc.stdout or "").splitlines():
+        if needle in line and "lh_harness" in line:
+            return True
+    return False
+
+
+def log_lineage_in_report(
+    runs_root: str | Path,
+    run_id: str,
+    lineage: dict[str, Any],
+) -> bool:
+    """Write the restart-recovery lineage into the run's durable report."""
+
+    return log_stash_in_report(
+        runs_root,
+        run_id,
+        str(lineage.get("stash") or ""),
+        workspace=str(lineage.get("stash_workspace") or ""),
+        lineage=lineage,
+    )
+
 
 
 def reconcile_interrupted_run(
@@ -490,13 +791,31 @@ def reconcile_interrupted_run(
     status: dict[str, Any] | None = None,
     owner: dict[str, Any] | None = None,
     cause: str = INTERRUPTED_BY_RESTART,
+    probe_pr: Callable[[Path, str], str | None] | None = probe_open_pr_gh,
 ) -> Any | None:
     """Create the single ``-r1`` successor for a restart-interrupted entry.
 
     Returns the successor entry, or ``None`` when no successor was created —
     either because the death is not restart-interrupted, or because a
     successor already exists (idempotent), or because the entry already had
-    its one restart second chance.
+    its one restart second chance, or because the interrupted run's effects
+    could not be determined (the entry is then marked ``needs_review``).
+
+    The order of the steps is load-bearing:
+
+    1. the death is classified as restart-interrupted;
+    2. the reconcile is checked for idempotency and for the entry's one
+       second chance;
+    3. the interrupted run's EFFECTS are detected — a pushed branch, an
+       open PR, local commits, a dirty tree.  An effect that cannot be
+       decided marks the entry ``needs_review`` and creates NO successor;
+       a pushed branch or an open PR makes the successor CONTINUE that
+       branch (``continue_branch``);
+    4. the workspace is stashed (the stash is kept) and the stash name is
+       logged in the run's report;
+    5. the successor is created with the lineage (``retry_of``,
+       ``interrupted_run``), and the original entry records the successor's
+       queue id.
     """
 
     if epoch is None:
@@ -529,17 +848,75 @@ def reconcile_interrupted_run(
 
     workspace = str(getattr(entry, "workspace", "") or "")
     run_id = str(getattr(entry, "run_id", "") or "")
+
+    # --- step 3: detect the interrupted run's effects BEFORE creating any
+    # successor.  An effect that cannot be determined is never guessed.
+    effects = detect_run_effects(workspace, probe_pr=probe_pr) if workspace else RunEffects()
+    if not effects.decided:
+        _mark_needs_review(queue_store, entry, original_queue_id)
+        return None
+
+    # --- step 4: the workspace is cleaned with a KEPT stash.
     stash_name = ""
     if workspace and run_id:
         stash_name = stash_interrupted_workspace(workspace, run_id) or ""
-        if stash_name:
-            log_stash_in_report(runs_root, run_id, stash_name, workspace=workspace)
 
+    # A pushed branch or an open PR means the interrupted run's work is
+    # already published: the successor must CONTINUE that branch instead of
+    # cutting a fresh base (which would drop the published work).
+    continue_branch = bool(effects.branch_pushed or effects.open_pr)
+
+    # --- step 5: the one successor, with the lineage.
     successor = queue_store.requeue(
         original_queue_id,
         cause,
         name_suffix=RETRY_NAME_SUFFIX,
+        interrupted_run=run_id or None,
+        continue_branch=True if continue_branch else None,
     )
     if successor is None:
         return None
+
+    # The original entry records its successor, so the lineage is readable
+    # from either end.
+    _record_successor(queue_store, entry, successor.queue_id)
+
+    lineage = {
+        "original_queue_id": original_queue_id,
+        "successor_queue_id": successor.queue_id,
+        "interrupted_run": run_id,
+        "stash": stash_name,
+        "stash_workspace": workspace,
+        "effects": effects.as_dict(),
+        "continue_branch": continue_branch,
+    }
+    if run_id:
+        log_lineage_in_report(runs_root, run_id, lineage)
     return successor
+
+
+def _mark_needs_review(queue_store: Any, entry: Any, original_queue_id: str) -> None:
+    """Mark the entry ``needs_review``; create NO successor.
+
+    The interrupted run's effects could not be determined, so the recovery
+    does not know whether a successor would drop published work.  The entry
+    is flagged for a human instead, and nothing is deleted and nothing is
+    resubmitted blindly.
+    """
+
+    try:
+        entry.needs_review = True
+        entry.reason = NEEDS_REVIEW_REASON[:_MAX_REASON_LEN]
+        queue_store.update(entry)
+    except Exception:  # noqa: BLE001 - the flag is best-effort, never fatal
+        return
+
+
+def _record_successor(queue_store: Any, entry: Any, successor_queue_id: str) -> None:
+    """Record ``successor`` on the original entry."""
+
+    try:
+        entry.successor = successor_queue_id
+        queue_store.update(entry)
+    except Exception:  # noqa: BLE001 - the lineage link is best-effort
+        return

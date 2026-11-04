@@ -69,6 +69,15 @@ _COLUMN_ROLES = "roles"
 # owns the task -- ``overseer1`` or ``overseer1-op``.  Migration 007 adds the
 # column; a row written before it (NULL) reads back as the default manager.
 _COLUMN_GTM_MANAGER = "gtm_manager"
+# Restart-recovery lineage (task easybutt0n-17, migration 008): the successor's
+# ``interrupted_run`` (the run whose worker died with the service), the
+# original's ``successor`` (the one entry created for it), and the
+# ``needs_review`` flag (set when the interrupted run's effects could not be
+# determined, so NO successor is created and a human looks at the entry).
+# Same persistence story as the file store's JSON.
+_COLUMN_INTERRUPTED_RUN = "interrupted_run"
+_COLUMN_SUCCESSOR = "successor"
+_COLUMN_NEEDS_REVIEW = "needs_review"
 # ``requester`` (task 300) still has no column; see ``create``.
 _QUEUE_COLUMNS = (
     _COLUMN_QUEUE_ID,
@@ -100,6 +109,9 @@ _QUEUE_COLUMNS = (
     _COLUMN_MODEL,
     _COLUMN_ROLES,
     _COLUMN_GTM_MANAGER,
+    _COLUMN_INTERRUPTED_RUN,
+    _COLUMN_SUCCESSOR,
+    _COLUMN_NEEDS_REVIEW,
 )
 
 # LHH-QUEUE-HOTRELOAD R9: the two per-task override columns, applied in-code
@@ -115,6 +127,21 @@ _MIGRATION_TASK_OVERRIDES_SQL = """\
 ALTER TABLE harness.queue
     ADD COLUMN IF NOT EXISTS model VARCHAR(256),
     ADD COLUMN IF NOT EXISTS roles JSONB;
+"""
+
+# Task easybutt0n-17: the restart-recovery lineage columns, applied in-code
+# (same pattern and same single committed unit as _MIGRATION_TASK_OVERRIDES_SQL).
+# A no-op once the columns exist; a row written before them reads back NULL /
+# false, exactly how the file store loads an entry written before the fields
+# existed.
+_MIGRATION_RESTART_RECOVERY_SQL = """\
+-- easybutt0n-17: restart-recovery lineage on the Postgres queue backend,
+-- mirroring the file store's persistence of QueueEntry.interrupted_run /
+-- QueueEntry.successor / QueueEntry.needs_review (queue.py).
+ALTER TABLE harness.queue
+    ADD COLUMN IF NOT EXISTS interrupted_run VARCHAR(128),
+    ADD COLUMN IF NOT EXISTS successor VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS needs_review BOOLEAN NOT NULL DEFAULT FALSE;
 """
 
 # Same bound the file store applies in ``QueueStore.requeue``.
@@ -196,6 +223,9 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         model,
         roles_json,
         gtm_manager,
+        getattr(entry, "interrupted_run", None),
+        getattr(entry, "successor", None),
+        bool(getattr(entry, "needs_review", False)),
     ]
 
 
@@ -324,6 +354,9 @@ class PgQueueStore:
                 # store connect can never leave a schema that accepts the old
                 # columns but not the new ones.
                 txn.execute(_MIGRATION_TASK_OVERRIDES_SQL)
+                # easybutt0n-17: the restart-recovery lineage columns, in the
+                # same single committed unit as the migrations above.
+                txn.execute(_MIGRATION_RESTART_RECOVERY_SQL)
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"migration failed: {exc}") from exc
@@ -728,6 +761,8 @@ class PgQueueStore:
         not_before: float | None = None,
         wait_reason: str | None = None,
         name_suffix: str = "",
+        interrupted_run: str | None = None,
+        continue_branch: bool | None = None,
     ) -> QueueEntry | None:
         """Create a successor pending entry for a failed entry.
 
@@ -742,6 +777,14 @@ class PgQueueStore:
             name_suffix: Optional suffix appended to the successor's name, so
                 a retry that must be distinguishable from the original task
                 (the restart second chance's ``-r1``) is visible in the queue
+            interrupted_run: The run id whose worker died with the service, so
+                the successor records the lineage of what it continues (task
+                easybutt0n-17); persisted in the ``interrupted_run`` column
+                (migration 008)
+            continue_branch: Force the successor's continuation opt-in on (or
+                leave it carrying the original's) -- the restart second
+                chance sets it when the interrupted run left a pushed branch
+                or an open PR behind (task easybutt0n-17)
 
         Returns:
             The new successor QueueEntry, or None if the original entry not found
@@ -789,12 +832,15 @@ class PgQueueStore:
             # Like the file store (task 233): a retried continuation task
             # stays a continuation task.
             branch=entry.branch,
-            continue_branch=entry.continue_branch,
+            continue_branch=(
+                entry.continue_branch if continue_branch is None else bool(continue_branch)
+            ),
             base_check=entry.base_check,
             status="pending",
             retry_of=entry.queue_id,
             attempt=entry.attempt + 1,
             failure_cause=cause,
+            interrupted_run=interrupted_run,
             created_at=time.time(),
             updated_at=time.time(),
             dedup_key=None,  # retries must not collide with original dedup_key

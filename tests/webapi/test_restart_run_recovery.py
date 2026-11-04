@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -32,10 +33,12 @@ from lh_harness.launcher import Launcher
 from lh_harness.queue import QueueEntry, QueueStore, default_queue_config
 from lh_harness.restart_recovery import (
     INTERRUPTED_BY_RESTART,
+    NEEDS_REVIEW_REASON,
     ServiceEpoch,
     already_restart_retried,
     begin_service_epoch,
     classify_worker_death,
+    detect_run_effects,
     find_restart_successor,
     reconcile_interrupted_run,
     stash_interrupted_workspace,
@@ -602,3 +605,418 @@ def test_shipped_unit_documents_killmode_without_changing_it(unit: Path) -> None
         if line.strip().startswith("KillMode=")
     ]
     assert active == [], f"KillMode must not be changed in this PR: {active}"
+
+
+# --- (e) a pushed branch / an open PR means the successor CONTINUES it ----
+#
+# The operator correction (2026-11-04 14:24Z): the interrupted run's
+# effects are detected BEFORE the successor is created.  A successor that
+# started fresh would silently drop a branch the interrupted run pushed or
+# a PR it opened, so the successor carries the repo's existing
+# ``continue_branch`` continuation opt-in instead.
+
+
+def _push_branch(repo: Path, branch: str, message: str = "interrupted work") -> None:
+    """Commit on ``branch`` and push it to origin (a published effect)."""
+
+    _git(repo, "checkout", "-B", branch)
+    (repo / "README.md").write_text(f"{message}\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", message)
+    _git(repo, "push", "-q", "-u", "origin", branch)
+
+
+def test_effect_detection_sees_a_pushed_branch(tmp_path: Path) -> None:
+    """A branch the interrupted run pushed is detected as a published effect."""
+
+    repo = _make_repo(tmp_path)
+    _push_branch(repo, "feature/interrupted")
+
+    effects = detect_run_effects(repo, probe_pr=None)
+
+    assert effects.decided is True
+    assert effects.branch == "feature/interrupted"
+    assert effects.branch_pushed is True
+    assert effects.has_effects is True
+
+
+def test_effect_detection_sees_an_open_pr(tmp_path: Path) -> None:
+    """An open PR on the interrupted run's branch is detected."""
+
+    repo = _make_repo(tmp_path)
+    _push_branch(repo, "feature/interrupted")
+
+    effects = detect_run_effects(
+        repo, probe_pr=lambda _repo, branch: f"#42 'interrupted task' https://example.invalid/{branch}"
+    )
+
+    assert effects.decided is True
+    assert effects.open_pr.startswith("#42")
+    assert effects.has_effects is True
+
+
+def test_effect_detection_sees_local_commits_not_on_origin(tmp_path: Path) -> None:
+    """Commits on the branch that never reached origin/main are detected."""
+
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "-B", "feature/local-only")
+    (repo / "README.md").write_text("local only\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "local only")
+
+    effects = detect_run_effects(repo, probe_pr=None)
+
+    assert effects.decided is True
+    assert effects.local_commits == 1
+    assert effects.branch_pushed is False
+    assert effects.has_effects is True
+
+
+def test_pushed_branch_makes_the_successor_continue_that_branch(tmp_path: Path) -> None:
+    """(e) A pushed branch -> the successor continues it (``continue_branch``)."""
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _Supervisor(root)
+    repo = _make_repo(tmp_path)
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config(), probe_open_pr=None)
+
+    entry = store.create(
+        {
+            "name": "interrupted task",
+            "task": "do the thing",
+            "workspace": str(repo),
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 0,
+            "requested_by": "ci",
+        }
+    )
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    assert launched.run_id
+
+    # The interrupted run published a branch before it died.
+    _push_branch(repo, "feature/interrupted")
+    supervisor.kill(launched.run_id, owner_pid=999_999, started_at=1.0)
+
+    asyncio.run(launcher.tick())
+
+    [successor] = _successors(store, entry.queue_id)
+    # The successor CONTINUES the pushed branch instead of starting fresh.
+    assert successor.continue_branch is True
+    # ...and the lineage names what it continues.
+    assert successor.interrupted_run == launched.run_id
+    assert successor.retry_of == entry.queue_id
+    # The original entry records its successor.
+    assert store.get(entry.queue_id).successor == successor.queue_id
+
+
+def test_open_pr_makes_the_successor_continue_that_branch(tmp_path: Path) -> None:
+    """An open PR on the interrupted run's branch -> the successor continues."""
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _Supervisor(root)
+    repo = _make_repo(tmp_path)
+    # The launcher's own open-PR probe seam reports an open PR on the
+    # interrupted run's branch.
+    launcher = Launcher(
+        supervisor,
+        store,
+        queue_config=default_queue_config(),
+        probe_open_pr=lambda _repo, branch: (
+            f"#42 'interrupted task' https://example.invalid/{branch}"
+        ),
+    )
+
+    entry = store.create(
+        {
+            "name": "interrupted task",
+            "task": "do the thing",
+            "workspace": str(repo),
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 0,
+            "requested_by": "ci",
+        }
+    )
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    assert launched.run_id
+
+    _push_branch(repo, "feature/interrupted")
+    supervisor.kill(launched.run_id, owner_pid=999_999, started_at=1.0)
+
+    asyncio.run(launcher.tick())
+
+    [successor] = _successors(store, entry.queue_id)
+    assert successor.continue_branch is True
+    assert successor.interrupted_run == launched.run_id
+
+
+def test_uncertain_effects_mark_the_entry_needs_review_and_create_no_successor(
+    tmp_path: Path,
+) -> None:
+    """An UNDECIDABLE effect -> ``needs_review``, and NO successor.
+
+    Nothing is deleted and nothing is resubmitted blindly: the entry is
+    flagged for a human instead.
+    """
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _Supervisor(root)
+    repo = _make_repo(tmp_path)
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config(), probe_open_pr=None)
+
+    entry = store.create(
+        {
+            "name": "interrupted task",
+            "task": "do the thing",
+            "workspace": str(repo),
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 0,
+            "requested_by": "ci",
+        }
+    )
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    assert launched.run_id
+    supervisor.kill(launched.run_id, owner_pid=999_999, started_at=1.0)
+    failed = store.get(entry.queue_id)
+    failed.status = "failed"
+    store.update(failed)
+
+    # The remote is unreachable, so "was the branch pushed?" is undecidable.
+    _git(repo, "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git"))
+
+    successor = reconcile_interrupted_run(
+        store,
+        failed,
+        runs_root=root,
+        epoch=launcher._service_epoch,
+        status=supervisor.status(launched.run_id),
+        owner=supervisor.owner(launched.run_id),
+        probe_pr=None,
+    )
+
+    assert successor is None
+    assert _successors(store, entry.queue_id) == []
+    reviewed = store.get(entry.queue_id)
+    assert reviewed.needs_review is True
+    assert reviewed.reason == NEEDS_REVIEW_REASON
+
+
+def test_needs_review_is_not_set_when_the_effects_are_decided(tmp_path: Path) -> None:
+    """A decided effect set leaves the entry alone."""
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _Supervisor(root)
+    repo = _make_repo(tmp_path)
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config(), probe_open_pr=None)
+
+    entry = store.create(
+        {
+            "name": "interrupted task",
+            "task": "do the thing",
+            "workspace": str(repo),
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 0,
+            "requested_by": "ci",
+        }
+    )
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    supervisor.kill(launched.run_id, owner_pid=999_999, started_at=1.0)
+
+    asyncio.run(launcher.tick())
+
+    assert store.get(entry.queue_id).needs_review is False
+    assert len(_successors(store, entry.queue_id)) == 1
+
+
+# --- (f) a live stale worker -> the successor waits ------------------------
+#
+# The operator correction: the successor may not launch while a worker for
+# the interrupted run id is still alive -- never two workers for one task.
+
+
+def test_live_stale_worker_makes_the_successor_wait(tmp_path: Path) -> None:
+    """(f) A live worker for the interrupted run id -> the successor waits."""
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _Supervisor(root)
+    repo = _make_repo(tmp_path)
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config(), probe_open_pr=None)
+
+    entry = store.create(
+        {
+            "name": "interrupted task",
+            "task": "do the thing",
+            "workspace": str(repo),
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 0,
+            "requested_by": "ci",
+        }
+    )
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    assert launched.run_id
+    supervisor.kill(launched.run_id, owner_pid=999_999, started_at=1.0)
+
+    asyncio.run(launcher.tick())
+    [successor] = _successors(store, entry.queue_id)
+    assert successor.interrupted_run == launched.run_id
+
+    # A stale worker for the interrupted run is still alive.
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "lh_harness",
+            "run",
+            f"--run-id={launched.run_id}",
+            "--no-dashboard",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        # The gate sees the live worker and refuses the launch.
+        reason = launcher._interrupted_worker_alive_reason(successor)
+        assert reason is not None
+        assert launched.run_id in reason
+        assert "live worker" in reason
+
+        # ...and the launcher really skips the successor instead of
+        # launching a second worker for the same task.
+        asyncio.run(launcher.tick())
+        waiting = store.get(successor.queue_id)
+        assert waiting.status == "pending"
+        assert waiting.run_id is None
+        assert any("live worker" in r for r in waiting.skip_reasons)
+    finally:
+        worker.terminate()
+        worker.wait(timeout=30)
+
+
+def test_the_successor_launches_once_the_stale_worker_is_gone(tmp_path: Path) -> None:
+    """With no live worker for the interrupted run, the gate lets it launch."""
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _Supervisor(root)
+    repo = _make_repo(tmp_path)
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config(), probe_open_pr=None)
+
+    entry = store.create(
+        {
+            "name": "interrupted task",
+            "task": "do the thing",
+            "workspace": str(repo),
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 0,
+            "requested_by": "ci",
+        }
+    )
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    supervisor.kill(launched.run_id, owner_pid=999_999, started_at=1.0)
+
+    asyncio.run(launcher.tick())
+    [successor] = _successors(store, entry.queue_id)
+
+    # No live worker for the interrupted run id.
+    assert launcher._interrupted_worker_alive_reason(successor) is None
+
+    asyncio.run(launcher.tick())
+    relaunched = store.get(successor.queue_id)
+    assert relaunched.status == "launched"
+    assert relaunched.run_id
+
+
+def test_an_ordinary_entry_is_not_gated_by_the_stale_worker_gate(tmp_path: Path) -> None:
+    """The gate applies to restart successors only; other entries are
+    untouched."""
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _Supervisor(root)
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config(), probe_open_pr=None)
+
+    ordinary = store.create(
+        {
+            "name": "ordinary task",
+            "task": "do the thing",
+            "workspace": "./ws",
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 0,
+            "requested_by": "ci",
+        }
+    )
+    assert launcher._interrupted_worker_alive_reason(ordinary) is None
+
+
+# --- the lineage is recorded on both ends and in the report -----------------
+
+
+def test_the_lineage_is_written_into_the_run_report(tmp_path: Path) -> None:
+    """The stash name and the lineage land in the interrupted run's report."""
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _Supervisor(root)
+    repo = _make_repo(tmp_path)
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config(), probe_open_pr=None)
+
+    entry = store.create(
+        {
+            "name": "interrupted task",
+            "task": "do the thing",
+            "workspace": str(repo),
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 0,
+            "requested_by": "ci",
+        }
+    )
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    assert launched.run_id
+    # The interrupted run leaves uncommitted work behind (the shape the
+    # qualification evidence measured).
+    (repo / "README.md").write_text("interrupted work\n", encoding="utf-8")
+    (repo / "graphify-out").mkdir()
+    (repo / "graphify-out" / "result.json").write_text("{}\n", encoding="utf-8")
+    supervisor.kill(launched.run_id, owner_pid=999_999, started_at=1.0)
+
+    asyncio.run(launcher.tick())
+
+    [successor] = _successors(store, entry.queue_id)
+    report_path = root / launched.run_id / "lh_harness" / "report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    lineage = report["restart_recovery"]
+    assert lineage["original_queue_id"] == entry.queue_id
+    assert lineage["successor_queue_id"] == successor.queue_id
+    assert lineage["interrupted_run"] == launched.run_id
+    assert lineage["stash"] == f"lh-harness interrupted {launched.run_id}"
+    # The detected effects are recorded too.
+    assert lineage["effects"]["decided"] is True
+    # The stash is kept.
+    assert f"lh-harness interrupted {launched.run_id}" in _git(repo, "stash", "list")

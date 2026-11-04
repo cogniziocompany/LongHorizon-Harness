@@ -88,10 +88,13 @@ def test_column_list_covers_both_overrides_append_only() -> None:
     # Append-only after the migration-006 column, so the 001..006 row shape
     # (and every existing assertion zipping columns to values) is untouched.
     # The gtm_manager column (migration 007, GTM-MANAGER-G1-a) is appended
-    # after the two override columns, so it sits at the end of the list.
-    assert columns[-4] == "time_limit_minutes"
-    assert columns[-3:-1] == OVERRIDE_COLUMNS
-    assert columns[-1] == "gtm_manager"
+    # after the two override columns, and the restart-recovery lineage
+    # columns (migration 008, easybutt0n-17) after that, so the list keeps
+    # growing at its tail only.
+    assert columns[-7] == "time_limit_minutes"
+    assert columns[-6:-4] == OVERRIDE_COLUMNS
+    assert columns[-4] == "gtm_manager"
+    assert columns[-3:] == ("interrupted_run", "successor", "needs_review")
     assert _OVERRIDE_COLUMNS_SQL_MARKERS()
 
 
