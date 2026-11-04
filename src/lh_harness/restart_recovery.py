@@ -57,6 +57,14 @@ still alive (the launch gate): two workers for one task is what the gate
 exists to prevent, and the successor waits instead of racing the stale
 worker.
 
+Only a death that PROVES the service stopped counts.  The proof is the
+service epoch: the dead worker belonged to an EARLIER service instance, so
+it was live when this instance started and this instance's start-up is what
+ended it.  A shutdown signal alone does NOT prove it -- a single worker
+killed out of band (OOM killer, operator, another process) dies on the same
+``SIGKILL``/``SIGTERM`` while the service keeps running, and such a death
+stays an ordinary failure with no successor.
+
 Fencing is untouched.  A round that was never replayed is not replayed here;
 this module only decides whether a *run* gets a successor queue entry.
 """
@@ -255,6 +263,64 @@ def _is_worker_disappeared(failure_reason: str | None) -> bool:
     return WORKER_DISAPPEARED_REASON.lower() in text
 
 
+def worker_belonged_to_previous_epoch(
+    owner: dict[str, Any] | None,
+    epoch: ServiceEpoch | None,
+) -> bool:
+    """True when the worker's owner proves it belonged to an EARLIER epoch.
+
+    This is the *required* evidence that the SERVICE stopped: the worker was
+    launched by a service instance that is not the current one, so it was
+    live when the current instance took over, and its later death is a
+    restart interruption rather than a spontaneous crash.
+
+    The owner record names the service instance that launched the worker
+    (``supervisor_pid``/``service_pid``) and when it launched it
+    (``started_at``).  Three ways to prove a previous epoch:
+
+    * the owner pid is the epoch's ``previous_pid`` -- the instance this one
+      explicitly replaced (the strongest evidence: the epoch record itself
+      names the predecessor);
+    * the owner pid is a different pid from the current epoch's pid -- the
+      worker was launched by some earlier instance;
+    * the owner carries no pid but predates the current epoch's start --
+      an older run whose owner predates this service instance.
+
+    A worker whose owner pid EQUALS the current epoch's pid belongs to THIS
+    service instance: its death is a plain failure, whatever signal it
+    died of.  A worker with no usable owner evidence at all is likewise
+    NOT provably from a previous epoch, so it stays a plain failure.
+    """
+
+    if epoch is None:
+        return False
+    owner = owner if isinstance(owner, dict) else {}
+
+    owner_pid = _owner_pid(owner)
+    if owner_pid is not None:
+        # The epoch record names the instance it replaced: an owner pid that
+        # matches it is a previous-epoch worker by direct record.
+        if epoch.previous_pid is not None and owner_pid == epoch.previous_pid:
+            return True
+        # Any other differing pid means an EARLIER instance launched it.
+        # A matching pid means THIS instance launched it, so the worker is
+        # NOT from a previous epoch.
+        return owner_pid != epoch.pid
+
+    # No pid in the owner record (an older run, or one whose owner was
+    # written before the pid was recorded): fall back to the launch
+    # timestamp -- a run that started before this service instance began
+    # was live across the start-up.
+    owner_started_at = _owner_started_at(owner)
+    if (
+        owner_started_at is not None
+        and epoch.started_at > 0
+        and owner_started_at < epoch.started_at
+    ):
+        return True
+    return False
+
+
 def _signal_is_shutdown_signal(value: Any) -> bool:
     """True when a recorded exit signal means "the service was stopping".
 
@@ -272,6 +338,33 @@ def _signal_is_shutdown_signal(value: Any) -> bool:
     return value in (9, 15)
 
 
+def death_took_a_shutdown_signal(
+    status: dict[str, Any] | None,
+    owner: dict[str, Any] | None = None,
+) -> bool:
+    """True when the worker died on a service-shutdown signal.
+
+    This is CORROBORATING evidence for a restart interruption, never
+    sufficient on its own: the same ``SIGKILL``/``SIGTERM`` kills a single
+    worker out of band while the service keeps running, so a signal says how
+    the worker died, not that the service went down.  The launcher records it
+    alongside the classification so the evidence behind a restart successor
+    is readable in the logs.
+    """
+
+    status = status if isinstance(status, dict) else {}
+    owner = owner if isinstance(owner, dict) else {}
+    for key in ("exit_signal", "signal", "term_signal", "killed_by_signal"):
+        if _signal_is_shutdown_signal(status.get(key)):
+            return True
+    exit_code = status.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        exit_code = None
+    if exit_code is not None and _signal_is_shutdown_signal(exit_code):
+        return True
+    return _signal_is_shutdown_signal(owner.get("exit_signal"))
+
+
 def classify_worker_death(
     *,
     failure_reason: str | None,
@@ -286,20 +379,27 @@ def classify_worker_death(
     memory kill, a human stop — every one of which keeps its current
     behaviour).
 
-    Two independent signals say "the service stopped":
+    The REQUIRED evidence is that the SERVICE stopped: the run was live when
+    the current service instance (launcher epoch) started, so the dead worker
+    belonged to a PREVIOUS epoch.  That is proved by the run's owner record
+    (see ``worker_belonged_to_previous_epoch``): the owner names an earlier
+    service instance, either as the epoch's recorded ``previous_pid`` or as a
+    different pid, or the owner's launch timestamp predates this epoch's
+    start.
 
-    1. **The run was live at service start-up.**  The run's owner record
-       names a supervisor pid that is not this service instance's pid, so the
-       worker was launched by an *earlier* service instance and was still
-       running when this one took over.  (The owner may also predate the
-       current epoch's start.)
-    2. **The worker exited on a shutdown signal while the service was
-       stopping.**  A recorded ``SIGKILL``/``SIGTERM`` exit is what systemd's
-       ``KillMode=control-group`` does to the whole unit's children.
+    A shutdown signal is only CORROBORATING, never sufficient on its own.
+    ``SIGKILL``/``SIGTERM`` (and the exit codes that carry them) say how the
+    worker died, not that the service went down: a single worker killed out
+    of band -- by the OOM killer, by an operator, by another process -- dies
+    on the very same signals while the service keeps running.  Treating such
+    a death as restart-interrupted would hand an ordinary failure a successor
+    entry, which is exactly the over-match this classification must not
+    have.  So a signal is recorded only as supporting evidence for a worker
+    that already belongs to a previous epoch.
 
-    A death with no report and no such signal is NOT restart-interrupted: it
-    keeps the existing "worker disappeared" failure and the existing
-    (absent) retry behaviour.
+    A death with no report, or with a worker that provably belongs to THIS
+    epoch, is NOT restart-interrupted: it keeps the existing "worker
+    disappeared" failure and the existing (absent) retry behaviour.
     """
 
     if not _is_worker_disappeared(failure_reason):
@@ -310,43 +410,19 @@ def classify_worker_death(
     status = status if isinstance(status, dict) else {}
     owner = owner if isinstance(owner, dict) else {}
 
-    # Signal 2: the worker was killed by the service's own shutdown.
-    for key in ("exit_signal", "signal", "term_signal", "killed_by_signal"):
-        if _signal_is_shutdown_signal(status.get(key)):
-            return INTERRUPTED_BY_RESTART
-    exit_code = status.get("exit_code")
-    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
-        exit_code = None
-    if exit_code is not None and _signal_is_shutdown_signal(exit_code):
-        return INTERRUPTED_BY_RESTART
-    owner_signal = owner.get("exit_signal")
-    if _signal_is_shutdown_signal(owner_signal):
-        return INTERRUPTED_BY_RESTART
-
-    # Signal 1: the worker belonged to a previous service instance, so it was
-    # live across this service's start-up.
-    owner_pid = _owner_pid(owner)
-    if owner_pid is not None:
-        # The owner names the service instance that launched the worker.  A
-        # different pid means an EARLIER instance launched it, so the worker
-        # was live when this instance started.  This is the strong signal:
-        # when the pid matches, the run belongs to THIS service instance and
-        # its death is NOT restart-interrupted, whatever the timestamps say.
-        if owner_pid != epoch.pid:
-            return INTERRUPTED_BY_RESTART
+    # REQUIRED evidence: the worker belonged to a PREVIOUS service instance,
+    # so it was live across this service's start-up.  Without it the death is
+    # an ordinary one, whatever signal killed the worker.
+    if not worker_belonged_to_previous_epoch(owner, epoch):
         return None
-    # No pid in the owner record (an older run, or one whose owner was
-    # written before the pid was recorded): fall back to the launch
-    # timestamp -- a run that started before this service instance began
-    # was live across the start-up.
-    owner_started_at = _owner_started_at(owner)
-    if (
-        owner_started_at is not None
-        and epoch.started_at > 0
-        and owner_started_at < epoch.started_at
-    ):
-        return INTERRUPTED_BY_RESTART
-    return None
+
+    # The previous-epoch evidence already proves the service stopped (the
+    # worker was live when this instance started, so this instance's
+    # start-up is what ended it).  A shutdown signal -- what systemd's
+    # ``KillMode=control-group`` does to the whole unit's children -- merely
+    # CORROBORATES that story; it cannot make a same-epoch death
+    # restart-interrupted, and its absence does not weaken the proof.
+    return INTERRUPTED_BY_RESTART
 
 
 def find_restart_successor(entries: list[Any], original_queue_id: str) -> Any | None:

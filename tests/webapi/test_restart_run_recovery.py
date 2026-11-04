@@ -149,6 +149,7 @@ class _Supervisor:
         reason: str = WORKER_DISAPPEARED,
         owner_pid: int | None = None,
         started_at: float | None = None,
+        exit_signal: str | None = None,
     ) -> None:
         """Make a run look like a worker that vanished."""
 
@@ -157,12 +158,15 @@ class _Supervisor:
             owner["supervisor_pid"] = owner_pid
         if started_at is not None:
             owner["started_at"] = started_at
-        self._statuses[run_id] = {
+        status: dict[str, Any] = {
             "status": "failed",
             "run_id": run_id,
             "failure_reason": reason,
             "alive": False,
         }
+        if exit_signal is not None:
+            status["exit_signal"] = exit_signal
+        self._statuses[run_id] = status
 
 
 @pytest.fixture()
@@ -256,6 +260,82 @@ def test_non_interrupted_worker_death_gets_no_successor(env) -> None:
 
     assert store.get(entry.queue_id).status == "failed"
     assert _successors(store, entry.queue_id) == []
+
+
+# --- (a2) a signal alone is not enough: the epoch decides ------------------
+
+
+def test_same_epoch_worker_sigkill_gets_no_successor(env) -> None:
+    """A worker of THIS service instance killed out of band gets NO successor.
+
+    The worker took ``SIGKILL``, but the service never stopped: the owner
+    names the CURRENT service instance's pid, so the worker belonged to the
+    current epoch and its death is an ordinary failure.  Handing it a
+    successor would re-run a task whose service was healthy -- the
+    over-match this classification must not have.
+    """
+
+    root, store, supervisor, make = env
+    launcher = make()
+    entry = _enqueue(store)
+
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    assert launched.status == "launched"
+    # The owner names THIS service instance (the launcher's own epoch pid),
+    # and the worker died on a shutdown signal.
+    assert launcher._service_epoch is not None
+    supervisor.kill(
+        launched.run_id,
+        owner_pid=launcher._service_epoch.pid,
+        exit_signal="SIGKILL",
+    )
+
+    asyncio.run(launcher.tick())
+
+    failed = store.get(entry.queue_id)
+    assert failed.status == "failed"
+    # A plain failure: NOT restart-interrupted, and NO successor.
+    assert failed.failure_cause != INTERRUPTED_BY_RESTART
+    assert _successors(store, entry.queue_id) == []
+
+
+def test_previous_epoch_worker_gets_exactly_one_successor(env) -> None:
+    """A worker of an EARLIER service instance gets exactly ONE successor.
+
+    The owner names a different pid than the current epoch's, so the worker
+    was live when this service instance started -- that is the evidence that
+    the SERVICE stopped.
+    """
+
+    root, store, supervisor, make = env
+    launcher = make()
+    entry = _enqueue(store)
+
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    assert launched.status == "launched"
+    assert launcher._service_epoch is not None
+    # The owner names an EARLIER service instance's pid: the worker was live
+    # at this service's start-up, so this instance's start-up ended it.
+    supervisor.kill(
+        launched.run_id,
+        owner_pid=launcher._service_epoch.pid + 1,
+        exit_signal="SIGKILL",
+    )
+
+    asyncio.run(launcher.tick())
+
+    failed = store.get(entry.queue_id)
+    assert failed.status == "failed"
+    assert failed.failure_cause == INTERRUPTED_BY_RESTART
+
+    successors = _successors(store, entry.queue_id)
+    assert len(successors) == 1
+    successor = successors[0]
+    assert successor.retry_of == entry.queue_id
+    assert successor.name == f"{entry.name}-r1"
+    assert successor.status == "pending"
 
 
 # --- (b) the reconcile is idempotent ---------------------------------------
@@ -516,12 +596,20 @@ def test_classify_worker_death_recognises_a_previous_service_instance() -> None:
 
 
 def test_classify_worker_death_recognises_a_shutdown_signal() -> None:
+    """A shutdown signal CORROBORATES a previous-epoch worker.
+
+    The signal says how the worker died; the epoch says the service went
+    down.  A previous-epoch worker that took ``SIGKILL``/``SIGTERM`` (what
+    systemd's ``KillMode=control-group`` does to the whole unit) is
+    restart-interrupted.
+    """
+
     epoch = ServiceEpoch(pid=100, started_at=5_000.0)
     assert (
         classify_worker_death(
             failure_reason=WORKER_DISAPPEARED,
             status={"status": "failed", "exit_signal": "SIGKILL"},
-            owner={"supervisor_pid": 100},
+            owner={"supervisor_pid": 99},
             epoch=epoch,
         )
         == INTERRUPTED_BY_RESTART
@@ -530,10 +618,63 @@ def test_classify_worker_death_recognises_a_shutdown_signal() -> None:
         classify_worker_death(
             failure_reason=WORKER_DISAPPEARED,
             status={"status": "failed", "exit_code": -15},
-            owner={"supervisor_pid": 100},
+            owner={"supervisor_pid": 99},
             epoch=epoch,
         )
         == INTERRUPTED_BY_RESTART
+    )
+
+
+def test_classify_worker_death_ignores_a_shutdown_signal_in_the_same_epoch() -> None:
+    """A signal on a SAME-epoch worker is NOT a restart interruption.
+
+    A single worker killed out of band -- OOM killer, an operator, another
+    process -- dies on the very same signals while the service keeps
+    running.  Treating that as restart-driven would hand an ordinary failure
+    a successor, so the signal alone never qualifies.
+    """
+
+    epoch = ServiceEpoch(pid=100, started_at=5_000.0)
+    for status in (
+        {"status": "failed", "exit_signal": "SIGKILL"},
+        {"status": "failed", "exit_signal": "SIGTERM"},
+        {"status": "failed", "exit_code": -9},
+        {"status": "failed", "exit_code": -15},
+        {"status": "failed", "exit_code": 137},
+    ):
+        assert (
+            classify_worker_death(
+                failure_reason=WORKER_DISAPPEARED,
+                status=status,
+                owner={"supervisor_pid": 100},
+                epoch=epoch,
+            )
+            is None
+        ), status
+
+
+def test_classify_worker_death_uses_the_epoch_recorded_previous_pid() -> None:
+    """The epoch's ``previous_pid`` is a previous-epoch owner by record."""
+
+    epoch = ServiceEpoch(pid=100, started_at=5_000.0, previous_pid=42)
+    assert (
+        classify_worker_death(
+            failure_reason=WORKER_DISAPPEARED,
+            status={"status": "failed", "exit_signal": "SIGKILL"},
+            owner={"supervisor_pid": 42},
+            epoch=epoch,
+        )
+        == INTERRUPTED_BY_RESTART
+    )
+    # The current epoch's own pid is NOT a previous epoch, however it died.
+    assert (
+        classify_worker_death(
+            failure_reason=WORKER_DISAPPEARED,
+            status={"status": "failed", "exit_signal": "SIGKILL"},
+            owner={"supervisor_pid": 100},
+            epoch=epoch,
+        )
+        is None
     )
 
 

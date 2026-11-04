@@ -45,6 +45,7 @@ from .restart_recovery import (
     ServiceEpoch,
     begin_service_epoch,
     classify_worker_death,
+    death_took_a_shutdown_signal,
     reconcile_interrupted_run,
     workspace_worker_is_alive,
 )
@@ -588,6 +589,18 @@ def _normalize_workspace(value: str) -> str:
     """Return a stable absolute form for workspace-path comparison."""
 
     return os.path.normcase(os.path.normpath(os.path.abspath(str(value or ""))))
+
+
+def _owner_pid_for_log(owner: dict[str, Any]) -> Any:
+    """Return the service pid a run's owner record names, for logging."""
+
+    for key in ("supervisor_pid", "service_pid"):
+        value = owner.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if value > 0:
+            return value
+    return None
 
 
 def _read_report_json(path: Path) -> dict[str, Any]:
@@ -1242,11 +1255,14 @@ class Launcher:
                     # whatever the report says about the interrupted round.
                     cause = f"{TIME_LIMIT_CAUSE} | {cause}"
                 # Restart-interrupted run recovery (task easybutt0n-17).  A
-                # worker that vanished because the SERVICE stopped (the run
-                # was live at service start-up, or the worker took a
-                # shutdown signal while the service was going down) is not an
-                # ordinary crash: it gets ONE fenced second chance -- a single
-                # ``-r1`` successor -- instead of a silent terminal failure.
+                # worker that vanished because the SERVICE stopped (its
+                # owner proves it belonged to an EARLIER service instance,
+                # so it was live at this instance's start-up) is not an
+                # ordinary crash: it gets ONE fenced second chance -- a
+                # single ``-r1`` successor -- instead of a silent terminal
+                # failure.  A shutdown signal alone is not enough: a single
+                # worker killed out of band dies on the same signal while
+                # the service keeps running, and stays an ordinary failure.
                 # The classification is read from the same supervisor status
                 # the "worker disappeared" reason was written to, and the
                 # retry itself is the ordinary ``requeue`` path with
@@ -1317,7 +1333,10 @@ class Launcher:
         ``None`` means the death is an ordinary one (a crash, a memory kill,
         a human stop) and keeps its current behaviour.  The classification
         needs the run's owner record: a run whose owner names an EARLIER
-        service instance's pid was live across this service's start-up.
+        service instance's pid was live across this service's start-up, which
+        is what proves the service stopped.  A shutdown signal on its own is
+        NOT enough -- a worker killed out of band dies on the same signal
+        while the service keeps running.
         """
 
         epoch = self._service_epoch
@@ -1336,6 +1355,18 @@ class Launcher:
             epoch=epoch,
         ) != INTERRUPTED_BY_RESTART:
             return None
+        # The classification is driven by the EPOCH (the worker belonged to an
+        # earlier service instance); a shutdown signal only corroborates it.
+        # Both are logged so the evidence behind a restart successor is
+        # readable.
+        logger.info(
+            "restart interruption for run %s: owner pid %s is not this epoch's "
+            "pid %s (shutdown signal: %s)",
+            run_id,
+            _owner_pid_for_log(owner),
+            epoch.pid,
+            death_took_a_shutdown_signal(status, owner),
+        )
         return INTERRUPTED_BY_RESTART
 
     def _recover_interrupted_run(
