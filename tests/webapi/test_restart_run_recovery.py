@@ -34,12 +34,14 @@ from lh_harness.queue import QueueEntry, QueueStore, default_queue_config
 from lh_harness.restart_recovery import (
     INTERRUPTED_BY_RESTART,
     NEEDS_REVIEW_REASON,
+    PROBE_UNKNOWN,
     ServiceEpoch,
     already_restart_retried,
     begin_service_epoch,
     classify_worker_death,
     detect_run_effects,
     find_restart_successor,
+    probe_open_pr_gh_strict,
     reconcile_interrupted_run,
     stash_interrupted_workspace,
 )
@@ -1161,3 +1163,266 @@ def test_the_lineage_is_written_into_the_run_report(tmp_path: Path) -> None:
     assert lineage["effects"]["decided"] is True
     # The stash is kept.
     assert f"lh-harness interrupted {launched.run_id}" in _git(repo, "stash", "list")
+
+
+# --- (g) the open-PR probe tells "unknown" apart from "no open PR" ---------
+#
+# Review finding 2 (PR #182, comment 6635183102): the launch guard's
+# ``probe_open_pr_gh`` returns ``None`` BOTH when there is no open PR and
+# when ``gh`` could not answer (missing CLI, non-zero exit, timeout).  For
+# effect detection that collapse is not harmless: an undetectable PR on a
+# branch pushed nowhere else would be read as "no PR", the successor would
+# cut a fresh base, and the interrupted run's published work would be
+# silently dropped.
+#
+# The recovery path therefore has its own probe: an UNKNOWN result leaves
+# the effects undecided -> ``needs_review`` and NO successor, while a
+# genuine "no open PR" stays decided.
+
+
+def _fake_gh(tmp_path: Path, name: str, *, body: str = "", exit_code: int = 0) -> Path:
+    """A fake ``gh`` executable that prints ``body`` and exits ``exit_code``."""
+
+    script = tmp_path / name
+    script.write_text(
+        "#!/bin/sh\n"
+        f"cat <<'EOF'\n{body}\nEOF\n"
+        f"exit {exit_code}\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def test_probe_reports_unknown_when_gh_is_missing(tmp_path: Path, monkeypatch) -> None:
+    """``gh`` not installed -> the probe reports UNKNOWN, not "no open PR"."""
+
+    monkeypatch.setattr("lh_harness.restart_recovery.shutil.which", lambda _name: None)
+
+    result = probe_open_pr_gh_strict(tmp_path, "feature/interrupted")
+
+    assert result == PROBE_UNKNOWN
+    assert result is not None
+
+
+def test_probe_reports_unknown_when_gh_exits_non_zero(tmp_path: Path, monkeypatch) -> None:
+    """``gh`` failing (non-zero exit) -> UNKNOWN, not "no open PR"."""
+
+    gh = _fake_gh(tmp_path, "gh", body="gh: not authenticated", exit_code=1)
+    monkeypatch.setattr("lh_harness.restart_recovery.shutil.which", lambda _name: str(gh))
+
+    result = probe_open_pr_gh_strict(tmp_path, "feature/interrupted")
+
+    assert result == PROBE_UNKNOWN
+    assert result is not None
+
+
+def test_probe_reports_unknown_when_gh_times_out(tmp_path: Path, monkeypatch) -> None:
+    """``gh`` timing out -> UNKNOWN, not "no open PR"."""
+
+    class _Timeout:
+        returncode = 0
+        stdout = ""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    def _raise_timeout(*args: Any, **kwargs: Any) -> Any:
+        raise subprocess.TimeoutExpired(cmd="gh", timeout=30)
+
+    monkeypatch.setattr("lh_harness.restart_recovery.shutil.which", lambda _name: "/bin/false")
+    monkeypatch.setattr("lh_harness.restart_recovery.subprocess.run", _raise_timeout)
+
+    result = probe_open_pr_gh_strict(tmp_path, "feature/interrupted")
+
+    assert result == PROBE_UNKNOWN
+    assert result is not None
+
+
+def test_probe_reports_no_open_pr_as_a_distinct_result(tmp_path: Path, monkeypatch) -> None:
+    """``gh`` answering with an empty list -> "no open PR", NOT unknown."""
+
+    gh = _fake_gh(tmp_path, "gh", body="[]")
+    monkeypatch.setattr("lh_harness.restart_recovery.shutil.which", lambda _name: str(gh))
+
+    result = probe_open_pr_gh_strict(tmp_path, "feature/interrupted")
+
+    assert result is None
+    assert result != PROBE_UNKNOWN
+
+
+def test_probe_reports_the_open_pr_when_there_is_one(tmp_path: Path, monkeypatch) -> None:
+    """``gh`` answering with a PR -> the PR's description."""
+
+    body = '[{"number": 42, "title": "interrupted task", "url": "https://example.invalid/pr/42"}]'
+    gh = _fake_gh(tmp_path, "gh", body=body)
+    monkeypatch.setattr("lh_harness.restart_recovery.shutil.which", lambda _name: str(gh))
+
+    result = probe_open_pr_gh_strict(tmp_path, "feature/interrupted")
+
+    assert result is not None
+    assert result != PROBE_UNKNOWN
+    assert result.startswith("#42")
+
+
+def test_unknown_probe_leaves_the_effects_undecided(tmp_path: Path) -> None:
+    """An UNKNOWN probe result -> the effects are UNDECIDED, not "no PR"."""
+
+    repo = _make_repo(tmp_path)
+    _push_branch(repo, "feature/interrupted")
+
+    effects = detect_run_effects(repo, probe_pr=lambda _repo, _branch: PROBE_UNKNOWN)
+
+    assert effects.decided is False
+    assert effects.open_pr == ""
+
+
+def test_no_open_pr_leaves_the_effects_decided(tmp_path: Path) -> None:
+    """A genuine "no open PR" -> the effects stay DECIDED (distinct path)."""
+
+    repo = _make_repo(tmp_path)
+    _push_branch(repo, "feature/interrupted")
+
+    effects = detect_run_effects(repo, probe_pr=lambda _repo, _branch: None)
+
+    assert effects.decided is True
+    assert effects.open_pr == ""
+
+
+def test_unknown_probe_marks_the_entry_needs_review_and_creates_no_successor(
+    tmp_path: Path,
+) -> None:
+    """An UNKNOWN probe -> ``needs_review``, and NO successor.
+
+    The interrupted run's published work must not be dropped on a guess: the
+    probe could not answer, so the entry is flagged for a human.
+    """
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _Supervisor(root)
+    repo = _make_repo(tmp_path)
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config(), probe_open_pr=None)
+
+    entry = store.create(
+        {
+            "name": "interrupted task",
+            "task": "do the thing",
+            "workspace": str(repo),
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 0,
+            "requested_by": "ci",
+        }
+    )
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    assert launched.run_id
+
+    _push_branch(repo, "feature/interrupted")
+    supervisor.kill(launched.run_id, owner_pid=999_999, started_at=1.0)
+    failed = store.get(entry.queue_id)
+    failed.status = "failed"
+    store.update(failed)
+
+    # The gh probe cannot answer (the CLI is not installed): UNKNOWN.
+    successor = reconcile_interrupted_run(
+        store,
+        failed,
+        runs_root=root,
+        epoch=launcher._service_epoch,
+        status=supervisor.status(launched.run_id),
+        owner=supervisor.owner(launched.run_id),
+        probe_pr=lambda _repo, _branch: PROBE_UNKNOWN,
+    )
+
+    assert successor is None
+    assert _successors(store, entry.queue_id) == []
+    reviewed = store.get(entry.queue_id)
+    assert reviewed.needs_review is True
+    assert reviewed.reason == NEEDS_REVIEW_REASON
+
+
+def test_a_no_open_pr_probe_result_does_not_force_needs_review(tmp_path: Path) -> None:
+    """A genuine "no open PR" does NOT force ``needs_review``.
+
+    The two probe outcomes must stay distinct: an answered probe (even when
+    the answer is "there is no PR") is DECIDED and the recovery proceeds.
+    """
+
+    root = tmp_path / "runs"
+    root.mkdir(parents=True)
+    store = QueueStore(root)
+    supervisor = _Supervisor(root)
+    repo = _make_repo(tmp_path)
+    launcher = Launcher(supervisor, store, queue_config=default_queue_config(), probe_open_pr=None)
+
+    entry = store.create(
+        {
+            "name": "interrupted task",
+            "task": "do the thing",
+            "workspace": str(repo),
+            "max_rounds": 5,
+            "trio": "kimi",
+            "priority": 0,
+            "requested_by": "ci",
+        }
+    )
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    assert launched.run_id
+
+    _push_branch(repo, "feature/interrupted")
+    supervisor.kill(launched.run_id, owner_pid=999_999, started_at=1.0)
+    failed = store.get(entry.queue_id)
+    failed.status = "failed"
+    store.update(failed)
+
+    # The probe ANSWERED: there is no open PR on this branch.
+    successor = reconcile_interrupted_run(
+        store,
+        failed,
+        runs_root=root,
+        epoch=launcher._service_epoch,
+        status=supervisor.status(launched.run_id),
+        owner=supervisor.owner(launched.run_id),
+        probe_pr=lambda _repo, _branch: None,
+    )
+
+    assert successor is not None
+    assert len(_successors(store, entry.queue_id)) == 1
+    assert store.get(entry.queue_id).needs_review is False
+
+
+def test_the_launcher_gives_the_recovery_path_the_strict_probe() -> None:
+    """The launcher's DEFAULT open-PR seam must not reach the recovery path.
+
+    The launch guard's default probe collapses "gh could not answer" into
+    "no open PR"; the recovery path needs the opposite semantics, so the
+    launcher swaps in the strict probe for the default seam.  An explicitly
+    injected seam stays the caller's own probe, and ``None`` keeps the
+    probe disabled.
+    """
+
+    from lh_harness.launcher import Launcher as _Launcher
+    from lh_harness.workspace_guard import probe_open_pr_gh
+
+    class _Noop:
+        pass
+
+    class _NoopQueue:
+        pass
+
+    # The DEFAULT seam -> the strict probe.
+    default_launcher = _Launcher(_Noop(), _NoopQueue())
+    assert default_launcher._restart_probe_pr() is probe_open_pr_gh_strict
+
+    # An explicitly injected seam -> honoured as-is.
+    custom = lambda _repo, _branch: "#42 'x' https://example.invalid/pr/42"
+    injected_launcher = _Launcher(_Noop(), _NoopQueue(), probe_open_pr=custom)
+    assert injected_launcher._restart_probe_pr() is custom
+
+    # An explicitly disabled probe -> stays disabled.
+    disabled_launcher = _Launcher(_Noop(), _NoopQueue(), probe_open_pr=None)
+    assert disabled_launcher._restart_probe_pr() is None

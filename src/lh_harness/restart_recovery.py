@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -80,7 +81,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .safe_subprocess import child_env, git_argv
-from .workspace_guard import probe_open_pr_gh
 
 # The canonical failure-cause label for a run whose worker died because the
 # service itself stopped.  It is a *cause*, not a status: the entry is still
@@ -115,6 +115,25 @@ _GIT_TIMEOUT = 90
 
 # The bound the launcher applies to a queue entry's ``reason`` field.
 _MAX_REASON_LEN = 500
+
+# The DISTINCT "unknown" result of the open-PR probe (review finding 2).
+#
+# ``workspace_guard.probe_open_pr_gh`` returns ``None`` both when there is
+# no open PR and when ``gh`` could not answer (missing CLI, non-zero exit,
+# timeout).  For a *launch guard* that collapse is harmless -- the probe
+# fails open and the launch proceeds.  For *effect detection* it is not:
+# an undetectable PR on a branch that was pushed nowhere else would be read
+# as "no PR", and the successor would then cut a fresh base and silently
+# drop the interrupted run's published work.
+#
+# The recovery path therefore distinguishes the two.  ``PROBE_UNKNOWN`` is
+# returned when the probe could not answer; ``None`` means "answered, and
+# there is no open PR".  An unknown leaves the effect UNDECIDED, which
+# marks the entry ``needs_review`` and creates NO successor.
+PROBE_UNKNOWN = "__lh_probe_unknown__"
+
+# The timeout bound for the recovery path's own ``gh`` probe.
+_GH_TIMEOUT = 30
 
 
 @dataclass
@@ -677,10 +696,71 @@ def _git_out(repo: Path, *args: str) -> tuple[bool, str | None]:
     return True, proc.stdout.strip()
 
 
+def probe_open_pr_gh_strict(repo: Path, branch: str) -> str | None:
+    """Return the OPEN PR on ``branch``, ``None``, or :data:`PROBE_UNKNOWN`.
+
+    The recovery path's own open-PR probe, which -- unlike the launch
+    guard's ``workspace_guard.probe_open_pr_gh`` -- tells "the probe could
+    not answer" apart from "the probe answered: there is no open PR":
+
+    * ``gh`` is not installed -> :data:`PROBE_UNKNOWN`;
+    * ``gh`` exits non-zero -> :data:`PROBE_UNKNOWN`;
+    * ``gh`` times out or cannot be spawned -> :data:`PROBE_UNKNOWN`;
+    * ``gh`` answers with a PR -> that PR's description;
+    * ``gh`` answers with an empty list -> ``None`` (decided: no open PR).
+
+    The distinction matters because effect detection must never read an
+    undetectable PR as an absent one: that would let the successor cut a
+    fresh base and silently drop the interrupted run's published work.
+    """
+
+    gh = shutil.which("gh")
+    if not gh:
+        return PROBE_UNKNOWN
+    # Control-plane credentials (web token, caller secrets, ask settings) must
+    # not be needed by, or leak into, the probe (task A3d review H-B).
+    env = child_env()
+    try:
+        proc = subprocess.run(
+            [gh, "pr", "list", "--head", branch, "--state", "open",
+             "--json", "number,title,url", "--limit", "3"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=_GH_TIMEOUT,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return PROBE_UNKNOWN
+    except (subprocess.SubprocessError, OSError):
+        return PROBE_UNKNOWN
+    if proc.returncode != 0:
+        return PROBE_UNKNOWN
+    try:
+        items = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return PROBE_UNKNOWN
+    if not isinstance(items, list):
+        return PROBE_UNKNOWN
+    if not items:
+        # The probe answered and there is no open PR: DECIDED, and distinct
+        # from the unknown above.
+        return None
+    parts = []
+    for item in items[:2]:
+        if not isinstance(item, dict):
+            return PROBE_UNKNOWN
+        number = item.get("number")
+        title = str(item.get("title") or "").strip()[:60]
+        url = item.get("url")
+        parts.append(f"#{number} '{title}' {url}".strip())
+    return ", ".join(parts)
+
+
 def detect_run_effects(
     workspace: str | Path,
     *,
-    probe_pr: Callable[[Path, str], str | None] | None = probe_open_pr_gh,
+    probe_pr: Callable[[Path, str], str | None] | None = probe_open_pr_gh_strict,
 ) -> RunEffects:
     """Detect what the interrupted run left behind in ``workspace``.
 
@@ -689,7 +769,8 @@ def detect_run_effects(
     * the checked-out branch (``git rev-parse --abbrev-ref HEAD``);
     * whether that branch reached the remote (``git ls-remote --heads
       origin <branch>``);
-    * an open PR on that branch (the repo's existing ``gh`` probe);
+    * an open PR on that branch (the recovery path's ``gh`` probe, which
+      distinguishes "no open PR" from "the probe could not answer");
     * commits on the branch that never reached ``origin/main``, and
       modified/untracked files left in the tree.
 
@@ -736,8 +817,18 @@ def detect_run_effects(
         try:
             open_pr = probe_pr(repo, branch)
         except Exception:  # noqa: BLE001 - a broken probe must not crash the pass
-            open_pr = None
-        effects.open_pr = str(open_pr or "")
+            # A probe that RAISES could not answer either: undecided, never
+            # "no open PR".
+            open_pr = PROBE_UNKNOWN
+        if open_pr == PROBE_UNKNOWN:
+            # The probe could not answer (gh missing, non-zero exit,
+            # timeout).  Whether an open PR exists is UNDECIDED: the effect
+            # must not be read as "no PR", because the successor would then
+            # cut a fresh base and drop the interrupted run's published
+            # work.  Undecided -> needs_review, NO successor.
+            effects.decided = False
+        else:
+            effects.open_pr = str(open_pr or "")
 
     # Commits on the branch that never reached the remote's default branch.
     ok, origin_main = _git_out(repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main")
@@ -867,7 +958,7 @@ def reconcile_interrupted_run(
     status: dict[str, Any] | None = None,
     owner: dict[str, Any] | None = None,
     cause: str = INTERRUPTED_BY_RESTART,
-    probe_pr: Callable[[Path, str], str | None] | None = probe_open_pr_gh,
+    probe_pr: Callable[[Path, str], str | None] | None = probe_open_pr_gh_strict,
 ) -> Any | None:
     """Create the single ``-r1`` successor for a restart-interrupted entry.
 

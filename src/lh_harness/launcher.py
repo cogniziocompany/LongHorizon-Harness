@@ -46,6 +46,7 @@ from .restart_recovery import (
     begin_service_epoch,
     classify_worker_death,
     death_took_a_shutdown_signal,
+    probe_open_pr_gh_strict,
     reconcile_interrupted_run,
     workspace_worker_is_alive,
 )
@@ -804,6 +805,28 @@ class Launcher:
         # silent terminal failure.  See ``restart_recovery``.
         self._service_epoch: ServiceEpoch | None = self._begin_service_epoch()
 
+    def _restart_probe_pr(self) -> "Callable[[Path, str], str | None] | None":
+        """The open-PR probe the RESTART RECOVERY path uses.
+
+        The launch guard's default probe (``workspace_guard.probe_open_pr_gh``)
+        returns ``None`` both for "no open PR" and for "gh could not answer".
+        That collapse is fine for a launch guard, which must fail open, but
+        it is wrong for effect detection: an undetectable PR would be read
+        as an absent one and the successor would cut a fresh base, silently
+        dropping the interrupted run's published work (review finding 2).
+
+        So the recovery path gets the strict probe, which reports "unknown"
+        separately and leaves the effects undecided (-> ``needs_review``, no
+        successor).  An explicitly injected seam is the caller's own probe
+        and is honoured as-is; ``None`` keeps the probe disabled.
+        """
+
+        if self.probe_open_pr is None:
+            return None
+        if self.probe_open_pr is probe_open_pr_gh:
+            return probe_open_pr_gh_strict
+        return self.probe_open_pr
+
     def _begin_service_epoch(self) -> ServiceEpoch | None:
         """Record this service instance's epoch; ``None`` when unavailable.
 
@@ -1402,9 +1425,16 @@ class Launcher:
                 epoch=self._service_epoch,
                 status=status,
                 owner=owner,
-                # The launcher's own open-PR probe seam, so the effect
-                # detection uses the same probe the launch guard uses.
-                probe_pr=self.probe_open_pr,
+                # The recovery path's OWN open-PR probe (review finding 2):
+                # it distinguishes "gh could not answer" from "there is no
+                # open PR", so an undetectable PR leaves the effects
+                # undecided instead of being read as absent.  The launch
+                # guard's default probe stays fail-open and is NOT reused
+                # here -- the two paths need opposite semantics.  An
+                # explicitly injected seam is honoured as-is (it is the
+                # caller's own probe), and ``probe_open_pr=None`` still
+                # disables the probe entirely.
+                probe_pr=self._restart_probe_pr(),
             )
         except ValueError as exc:
             # The requeue cap refused the successor: log it, never raise it
