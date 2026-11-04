@@ -69,7 +69,7 @@ _COLUMN_ROLES = "roles"
 # owns the task -- ``overseer1`` or ``overseer1-op``.  Migration 007 adds the
 # column; a row written before it (NULL) reads back as the default manager.
 _COLUMN_GTM_MANAGER = "gtm_manager"
-# Restart-recovery lineage (task easybutt0n-17, migration 008): the successor's
+# Restart-recovery lineage (task easybutt0n-17, migration 009): the successor's
 # ``interrupted_run`` (the run whose worker died with the service), the
 # original's ``successor`` (the one entry created for it), and the
 # ``needs_review`` flag (set when the interrupted run's effects could not be
@@ -134,10 +134,17 @@ ALTER TABLE harness.queue
 # A no-op once the columns exist; a row written before them reads back NULL /
 # false, exactly how the file store loads an entry written before the fields
 # existed.
+#
+# Migration NUMBERING: the migrations/*.sql files are numbered 001..008 (008 is
+# the queue migration tombstone, PR #173).  This in-code statement continues
+# that sequence as 009 so the two do not claim the same number; it is applied
+# in the same committed unit as the file migrations above, so a store connect
+# can never leave a schema that accepts the old columns but not the new ones.
 _MIGRATION_RESTART_RECOVERY_SQL = """\
--- easybutt0n-17: restart-recovery lineage on the Postgres queue backend,
--- mirroring the file store's persistence of QueueEntry.interrupted_run /
--- QueueEntry.successor / QueueEntry.needs_review (queue.py).
+-- easybutt0n-17 (migration 009): restart-recovery lineage on the Postgres
+-- queue backend, mirroring the file store's persistence of
+-- QueueEntry.interrupted_run / QueueEntry.successor / QueueEntry.needs_review
+-- (queue.py).
 ALTER TABLE harness.queue
     ADD COLUMN IF NOT EXISTS interrupted_run VARCHAR(128),
     ADD COLUMN IF NOT EXISTS successor VARCHAR(64),
@@ -780,7 +787,7 @@ class PgQueueStore:
             interrupted_run: The run id whose worker died with the service, so
                 the successor records the lineage of what it continues (task
                 easybutt0n-17); persisted in the ``interrupted_run`` column
-                (migration 008)
+                (migration 009)
             continue_branch: Force the successor's continuation opt-in on (or
                 leave it carrying the original's) -- the restart second
                 chance sets it when the interrupted run left a pushed branch
