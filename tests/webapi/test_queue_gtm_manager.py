@@ -309,7 +309,7 @@ def test_migration_007_adds_the_gtm_manager_column_idempotently() -> None:
 def test_pg_column_list_and_values_carry_the_gtm_manager() -> None:
     columns = pg_queue._QUEUE_COLUMNS
     # gtm_manager (migration 007) is followed by the restart-recovery lineage
-    # columns (migration 008, easybutt0n-17); the list stays append-only.
+    # columns (migration 009, easybutt0n-17); the list stays append-only.
     assert "gtm_manager" in columns
     assert columns.index("gtm_manager") < columns.index("interrupted_run")
     entry = QueueEntry(
