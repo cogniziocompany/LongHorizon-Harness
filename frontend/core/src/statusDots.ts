@@ -315,10 +315,15 @@ export function statusDotAttributes(
  * must be >= 3 (WCAG AA for non-text/UI components) in both themes.
  *
  * The hex foregrounds and the ratios are **derived from the shipped CSS**
- * (`frontend/web/src/style.css`), not written by hand: the unit test in
- * `frontend/core/test/statusDots.test.ts` re-parses that stylesheet,
- * recomputes every ratio from the real `--status-*` custom properties and
- * the real `.codex-sidebar` background, and fails if these numbers drift.
+ * (`frontend/web/src/style.css`) *as the browser resolves it*, not written
+ * by hand and not read off a raw token: the unit test in
+ * `frontend/core/test/statusDots.test.ts` parses that stylesheet, replays
+ * the cascade (selector specificity and source order) for the dot classes
+ * the mapping actually emits, resolves the `var(--status-*)` custom
+ * properties for each theme, and recomputes every ratio from the painted
+ * foreground and the painted sidebar background.  A colour change in the
+ * sheet — or a later rule that overrides a dot's colour — fails the test
+ * rather than leaving a stale figure behind.
  * `lightCssValue` / `darkCssValue` record the literal CSS declaration each
  * hex was converted from, so the table is traceable to the stylesheet.
  */

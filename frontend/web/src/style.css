@@ -94,31 +94,34 @@ button, input, textarea { color: inherit; }
 .search-field, .event-search { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: rgba(5, 11, 20, .48); color: var(--faint); }.search-field { margin: 0 3px 11px; }.search-field input, .event-search input { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font-size: 11px; }.search-field input::placeholder, .event-search input::placeholder { color: #5e7694; }
 .run-list { display: grid; gap: 5px; overflow-y: auto; padding: 0 2px; }.run-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 9px; align-items: start; width: 100%; padding: 10px 8px; border: 1px solid transparent; border-radius: 10px; text-align: left; color: var(--ink); background: transparent; }.run-row:hover, .run-row.selected { border-color: rgba(89, 151, 215, .34); background: linear-gradient(100deg, rgba(31, 60, 94, .65), rgba(18, 34, 56, .5)); }.run-copy { min-width: 0; }.run-copy strong, .run-copy small, .run-copy em { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.run-copy strong { font-size: 11px; font-weight: 700; }.run-copy small { margin-top: 4px; color: var(--muted); font-size: 10px; }.run-copy em { margin-top: 5px; color: #5f7897; font-size: 9px; font-style: normal; }.run-status { max-width: 72px; padding-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #7590ad; font-size: 9px; }
 .status { width: 8px; height: 8px; display: inline-block; flex: 0 0 auto; margin-top: 3px; border-radius: 99px; background: var(--status-neutral); }
-/* Active states share one pulse; reduced-motion users see a steady dot. */
+/* The bare per-status classes are still emitted alongside the shared mapping's
+   tone classes (frontend/core/src/statusDots.ts), but they must NOT carry a
+   colour or an animation of their own: the shared mapping is the single
+   source of truth for a status dot's appearance.  A colour here would fight
+   the mapping's tone class in the cascade and, because these rules sit
+   earlier in the sheet, a later per-component override would silently win
+   over the mapping.  Only the running family pulses, and that pulse is
+   declared with the tone class further down (see `.status-dot.status-running`),
+   so the non-colour cue set stays owned by the mapping. */
 .status-running,
 .status-starting,
-.status-active { background: var(--status-running); box-shadow: 0 0 0 4px var(--status-running-soft); animation: lh-status-pulse 1.35s ease-in-out infinite; }
+.status-active,
 .status-waiting-approval,
 .status-waiting,
 .status-pending,
-.status-reconnecting { background: var(--status-waiting); box-shadow: 0 0 0 4px var(--status-waiting-soft); animation: lh-status-pulse 1.35s ease-in-out infinite; }
+.status-reconnecting,
 .status-completed,
 .status-complete,
-.status-done { background: var(--status-completed); box-shadow: 0 0 0 4px var(--status-completed-soft); }
+.status-done,
 .status-failed,
 .status-error,
 .status-blocked,
-.status-closed { background: var(--status-failed); box-shadow: 0 0 0 4px var(--status-failed-soft); }
-/* Neutral states — not red, not alarming. */
+.status-closed,
 .status-cancelled,
 .status-stopped,
 .status-skipped,
 .status-idle,
 .status-queued { background: var(--status-neutral); }
-@media (prefers-reduced-motion: reduce) {
-  .status-running, .status-starting, .status-active,
-  .status-waiting-approval, .status-waiting, .status-pending, .status-reconnecting { animation: none; }
-}
 .sidebar-actions { margin-top: auto; padding: 14px 3px 12px; }.secondary-button { width: 100%; display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; color: #9db6d4; background: rgba(20, 35, 57, .52); font-size: 10px; }.secondary-button:hover { border-color: var(--line-strong); color: var(--ink); }.secondary-button span { color: var(--faint); }.sidebar-foot { display: flex; align-items: center; gap: 6px; padding: 0 8px; color: #55708f; font-size: 9px; white-space: nowrap; }.live-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--status-running); box-shadow: 0 0 0 3px var(--status-running-soft); }
 .split-handle { position: absolute; top: 0; bottom: 0; z-index: 5; width: 8px; padding: 0; border: 0; background: transparent; cursor: col-resize; }.split-handle::after { content: ''; position: absolute; top: 45%; left: 2px; width: 3px; height: 42px; border-radius: 99px; background: transparent; transition: background .18s ease; }.split-handle:hover::after { background: var(--blue); }.split-left { left: calc(var(--left-width, 258px) - 4px); }.split-right { right: calc(var(--right-width, 382px) - 4px); }
 .collapsed-rail { z-index: 3; width: 29px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 14px; padding-top: 24px; border: 0; border-right: 1px solid var(--line); color: var(--blue); background: rgba(11, 19, 32, .86); font-size: 22px; }.collapsed-rail span { color: var(--faint); font-size: 9px; writing-mode: vertical-rl; letter-spacing: .12em; }.right-rail { border-right: 0; border-left: 1px solid var(--line); }.left-rail { grid-column: 1; }.right-rail { grid-column: 3; }
@@ -203,7 +206,9 @@ button, input, textarea, select { font-family: inherit; }
 .session-copy strong { overflow: hidden; font-size: 12px; font-weight: 500; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
 .session-copy small { overflow: hidden; color: #777; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .status-dot { display: inline-block; width: 8px; height: 8px; flex: 0 0 auto; margin-top: 5px; border-radius: 50%; background: var(--status-neutral); }
-.status-running, .status-starting { background: var(--status-running); box-shadow: 0 0 0 3px var(--status-running-soft); }.status-completed, .status-complete { background: var(--status-completed); }.status-waiting-approval { background: var(--status-waiting); }.status-failed { background: var(--status-failed); }.status-cancelled { background: var(--status-neutral); }.sidebar-empty { padding: 20px 9px; color: #777; font-size: 12px; }
+/* The bare per-status classes carry no colour of their own — see the note
+   above.  The shared mapping's tone class supplies it. */
+.status-running, .status-starting, .status-completed, .status-complete, .status-waiting-approval, .status-failed, .status-cancelled { background: var(--status-neutral); }.sidebar-empty { padding: 20px 9px; color: #777; font-size: 12px; }
 .sidebar-footer { display: flex; align-items: center; gap: 7px; margin-top: auto; padding: 16px 8px 3px; color: #707070; font-size: 10px; }.connection-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--status-running); }
 .codex-main { display: flex; flex-direction: column; min-width: 0; height: 100dvh; min-height: 0; overflow: hidden; background: var(--codex-bg); }
 .codex-header { display: flex; align-items: center; justify-content: space-between; min-height: 54px; padding: 0 22px; border-bottom: 1px solid #303030; color: #a8a8a8; font-size: 12px; }
@@ -419,29 +424,19 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .status-eyebrow { display: block; color: #a2a3a5; font-size: 9px; font-weight: 700; letter-spacing: .12em; }
 .status-panel-head h2 { margin: 6px 0 0; color: #242629; font-size: 16px; font-weight: 650; }
 .status-panel-dot { width: 10px; height: 10px; margin-top: 5px; border-radius: 50%; background: var(--status-neutral); box-shadow: 0 0 0 4px var(--status-running-pulse); }
-.status-panel-dot.phase-active,
-.status-panel-dot.phase-running,
-.status-panel-dot.phase-starting { background: var(--status-running); box-shadow: 0 0 0 4px var(--status-running-soft); }
-.status-panel-dot.phase-done,
-.status-panel-dot.phase-completed { background: var(--status-completed); box-shadow: 0 0 0 4px var(--status-completed-soft); }
-.status-panel-dot.phase-failed,
-.status-panel-dot.phase-error { background: var(--status-failed); box-shadow: 0 0 0 4px var(--status-failed-soft); }
-.status-panel-dot.phase-waiting,
-.status-panel-dot.phase-pending,
-.status-panel-dot.phase-waiting-approval { background: var(--status-waiting); box-shadow: 0 0 0 4px var(--status-waiting-soft); }
-.status-panel-dot.phase-blocked { background: var(--status-failed); box-shadow: 0 0 0 4px var(--status-failed-soft); }
-.status-panel-dot.phase-cancelled,
-.status-panel-dot.phase-stopped,
-.status-panel-dot.phase-skipped,
-.status-panel-dot.phase-idle { background: var(--status-neutral); box-shadow: 0 0 0 4px rgba(0, 0, 0, .04); }
+/* The Run status panel dot renders the shared mapping's tone + shape classes
+   (status-running / status-shape-ring and friends) — the same classes the
+   sidebar task list and the queue view use — so it renders the same dot as
+   those two for the same status.  The `phase-*` classes carry no colour of
+   their own: they used to paint a second, parallel palette that could drift
+   from the mapping (and did: `phase-stopping` painted the dot amber while
+   the mapping said grey).  The `connection-*` classes describe the transport
+   state rather than the run status, so they keep their own colours. */
 .status-panel-dot.connection-connected { opacity: 1; background: var(--status-running); }
 .status-panel-dot.connection-idle { background: var(--status-neutral); }
 .status-panel-dot.connection-reconnecting { background: var(--status-waiting); box-shadow: 0 0 0 4px var(--status-waiting-soft); animation: lh-live-pulse 1.35s ease-in-out infinite; }
 .status-panel-dot.connection-closed,
 .status-panel-dot.connection-error { background: var(--status-failed); box-shadow: 0 0 0 4px var(--status-failed-soft); }
-/* The Run status panel dot reads the shared mapping's tone + shape classes
-   (status-running / status-shape-ring and friends), so it renders the same
-   dot as the sidebar task list and the queue view for the same status. */
 .status-panel-dot.status-running { background: var(--status-running); box-shadow: 0 0 0 4px var(--status-running-soft); }
 .status-panel-dot.status-waiting { background: var(--status-waiting); box-shadow: 0 0 0 4px var(--status-waiting-soft); }
 .status-panel-dot.status-pending { background: transparent; box-shadow: none; border: 2px solid var(--status-pending); }
@@ -673,9 +668,13 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 @keyframes lh-live-pulse { 0%, 100% { opacity: .55; box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); } 50% { opacity: 1; box-shadow: 0 0 0 4px rgba(0, 0, 0, 0); } }
 @keyframes lh-step-reveal { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes lh-status-pulse { 0%, 100% { opacity: .55; transform: scale(.94); } 50% { opacity: 1; transform: scale(1); } }
-.codex-workbench .status-panel-dot.phase-active,
-.codex-workbench .status-panel-dot.phase-running,
-.codex-workbench .status-panel-dot.phase-starting { animation: lh-live-pulse 1.35s ease-in-out infinite; }
+/* The running tone's slow pulse comes from the shared mapping's tone class
+   (`.status-panel-dot.status-running`), so the panel dot breathes exactly
+   like the sidebar and queue dots.  This rule used to key the animation off
+   the `phase-*` classes at a higher specificity, which gave the panel a
+   different pulse from the other two sites and let a non-running phase
+   animate. */
+.codex-workbench .status-panel-dot.status-running { animation: lh-status-pulse 2.4s ease-in-out infinite; }
 
 @media (max-width: 900px) {
   .codex-workbench .header-context { min-width: 0; flex: 1; }
@@ -751,13 +750,15 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .auth-dialog-actions .primary-action { border-color: #2f6f5b; color: #fff; background: #2f6f5b; }
 .auth-dialog-actions .primary-action:hover { background: #255b4a; }
 
-/* Lifecycle states that are easy to miss in a fast event stream.  A stop is
-   intentionally amber (unlike a completed cancellation) until the worker has
-   persisted its terminal report. */
-.status-panel-dot.phase-stopping,
+/* Lifecycle states that are easy to miss in a fast event stream.  The role
+   chips are text, so they keep their own amber styling; the status *dot* must
+   not: the shared mapping (frontend/core/src/statusDots.ts) is the single
+   source of truth for a dot's colour, and it maps `stopping` to the cancelled
+   tone (grey, with a slash) so the dot matches the mapping everywhere it is
+   rendered.  An override here would put a colour on the dot that the
+   mapping's own contrast table does not describe. */
 .role-marker.phase-stopping,
 .role-status-text.phase-stopping { color: var(--status-waiting); background-color: #fff8df; border-color: #dfb23d; }
-.status-panel-dot.phase-stopping { background: var(--status-waiting); box-shadow: 0 0 0 4px var(--status-waiting-soft); }
 .status-progress-stopping i { background: var(--status-waiting); }
 .stage-stopping .stage-marker { border-color: #dfb23d; color: var(--status-waiting); background: #fff8df; }
 .status-next-step.phase-stopping { border-color: #f0dfb2; background: #fffcf3; }
@@ -765,7 +766,7 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 @media (prefers-reduced-motion: reduce) {
   .codex-workbench .trajectory-spinner,
   .codex-workbench .execution-artifacts-live .execution-artifacts-label::after,
-  .codex-workbench .status-panel-dot.phase-active,
+  .codex-workbench .status-panel-dot.status-running,
   .codex-workbench .trajectory-step-row { animation: none !important; }
   .codex-workbench .status-progress i { transition: none; }
 }
@@ -826,3 +827,50 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .admin-restrictions { margin: 0; display: grid; gap: 4px; }
 .admin-restrictions dt { color: var(--muted); font-size: 11px; text-transform: capitalize; }
 .admin-restrictions dd { margin: 0; word-break: break-word; }
+
+/* ---------------------------------------------------------------------------
+   Dark scheme for the Codex workbench rail.
+
+   The Codex layer further up this file is unconditional: it paints the
+   sidebar a fixed #fcfcfc and the shell a fixed #fff.  That left the dark
+   status tokens (the @media block at the top of this file, which are tuned
+   for a dark surface) painted on a light rail, where the amber "waiting"
+   dot resolved to 1.61:1 — effectively invisible.
+
+   These rules come last on purpose: an unconditional rule earlier in the
+   sheet beats a later media-query rule at equal specificity, so a dark
+   override placed anywhere else would simply lose.  The status dots live in
+   this rail (the sidebar task list), so the rail is what has to be dark for
+   the dark palette to be legible; the rest of the workbench keeps its light
+   surface.
+
+   Every status dot now clears WCAG AA 3:1 against this rail in both
+   schemes; the unit test in frontend/core/test/statusDots.test.ts
+   recomputes the ratios from this stylesheet as the browser resolves them.
+--------------------------------------------------------------------------- */
+@media (prefers-color-scheme: dark) {
+  /* The Codex workbench layer further down this file is unconditional: it
+     paints the sidebar a fixed #fcfcfc and the shell a fixed #fff.  That
+     left the dark status tokens above painted on a light surface, where the
+     amber "waiting" dot resolved to 1.61:1 — effectively invisible.  This
+     block gives the dark scheme the dark sidebar the status palette was
+     designed for, so every status dot clears WCAG AA 3:1 in dark mode too.
+     The status dots live in this rail (the sidebar task list), so the rail
+     is what has to be dark; the rest of the workbench keeps its light
+     surface. */
+  .codex-sidebar { background: #171717; border-right-color: #292929; }
+  .codex-sidebar .session-item { color: #bdbdbd; }
+  .codex-sidebar .session-item:hover,
+  .codex-sidebar .session-item.selected { color: #f1f1f1; background: #292929; }
+  .codex-sidebar .session-copy strong { color: #dcdcdc; }
+  .codex-sidebar .session-copy small { color: #8d8d8d; }
+  .codex-sidebar .session-search > span,
+  .codex-sidebar .icon-button { color: #8d8d8d; }
+  .codex-sidebar .icon-button:hover { color: #e8e8e8; background: rgba(80, 134, 194, .18); }
+  .codex-sidebar .search-field { border-color: #333; background: rgba(5, 11, 20, .48); }
+  .codex-sidebar .section-label,
+  .codex-sidebar .sidebar-section-head { color: #6f88a8; }
+  .codex-sidebar .count-badge { border-color: #333; color: #a7bdd9; }
+  .codex-sidebar .brand-copy strong { color: #e6e6e6; }
+  .codex-sidebar .brand-copy small { color: #8d8d8d; }
+}

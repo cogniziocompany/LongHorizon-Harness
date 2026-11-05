@@ -47,6 +47,22 @@ const STATUS_SOURCES = [
 ] as const;
 
 /**
+ * The frontend's own declared status vocabulary.
+ *
+ * Some status words the UI recognises never appear in the Python backend:
+ * `aborting` and the `stop_requested` / `abort_requested` request words are
+ * declared by the web client (`frontend/core/src/commands.ts` and
+ * `frontend/web/src/App.tsx`) because the API may surface them.  A status
+ * word the UI renders still needs a dot, so the discovery covers these
+ * declarations too — otherwise `aborting` would be styled by assertion
+ * rather than by proof.
+ */
+const FRONTEND_STATUS_SOURCES = [
+  'frontend/core/src/commands.ts',
+  'frontend/web/src/App.tsx',
+] as const;
+
+/**
  * The constructs that carry an *authoritative* status vocabulary: a named
  * frozenset of statuses, or a named tuple of statuses.  These are the
  * places where the backend itself declares which status words exist, so
@@ -143,6 +159,43 @@ function backendRunStatusWords(): Set<string> {
   return words;
 }
 
+/**
+ * The status words the web client declares.
+ *
+ * The frontend names the statuses it renders in `new Set([...])` literals:
+ * the stopping set (`stopping`, `aborting`, `stop_requested`,
+ * `abort_requested`), the terminal set, and the per-language status label
+ * maps.  Every quoted word in those declarations is a status word the UI
+ * can put on screen, so it needs a dot as well.
+ */
+function frontendStatusWords(): Set<string> {
+  const words = new Set<string>();
+  for (const file of FRONTEND_STATUS_SOURCES) {
+    const text = readBackend(file);
+    // `new Set([...])` of quoted words.
+    for (const match of text.matchAll(/new Set\(\[([^\]]*)\]\)/g)) {
+      for (const word of match[1].matchAll(/["']([a-z_]+)["']/g)) {
+        words.add(word[1]);
+      }
+    }
+    // A status-label map: `running: 'Running', waiting_approval: '...'`.
+    for (const match of text.matchAll(/([a-z_]+)\s*:\s*['"`][^'"`]*['"`]/g)) {
+      words.add(match[1]);
+    }
+  }
+  for (const word of [...words]) {
+    if (NON_STATUS_WORDS.has(word)) words.delete(word);
+  }
+  return words;
+}
+
+/** Every status word the system can put on screen, from either side. */
+function everyStatusWord(): Set<string> {
+  const words = new Set<string>(backendRunStatusWords());
+  for (const word of frontendStatusWords()) words.add(word);
+  return words;
+}
+
 test('the status discovery mechanism sees every backend status word', () => {
   const words = backendRunStatusWords();
   // The regression this guards: a discovery mechanism that only matched
@@ -171,6 +224,33 @@ test('every backend run status has a dot style', () => {
     return !style.colorVar || !style.className;
   });
   assert.deepEqual(unmapped, [], `backend statuses without a dot style: ${unmapped.join(', ')}`);
+});
+
+test('every status the UI can render has a dot style', () => {
+  // The web client declares status words the Python backend never emits
+  // (`aborting`, `stop_requested`, `abort_requested`).  They still reach a
+  // dot, so the discovery covers the frontend's own declarations and the
+  // mapping has to cover what it finds.
+  const words = everyStatusWord();
+  const scope = [...words].filter((word) => !NON_STATUS_WORDS.has(word));
+  assert.ok(scope.length > 10, `expected to discover statuses, got ${scope.length}`);
+  const unmapped = scope.filter((word) => {
+    const style = statusDotStyle(word);
+    return !style.colorVar || !style.className || !style.shape;
+  });
+  assert.deepEqual(unmapped, [], `statuses without a dot style: ${unmapped.join(', ')}`);
+});
+
+test('the discovery sees the teardown statuses the UI renders', () => {
+  const words = everyStatusWord();
+  // `stopping` is written by the backend (supervisor/service.py).
+  assert.ok(words.has('stopping'), 'discovery missed "stopping"');
+  // `aborting` is declared by the web client (core/src/commands.ts and
+  // web/src/App.tsx); the backend reports both teardown paths as
+  // "stopping", but the UI must still be able to style "aborting".
+  assert.ok(words.has('aborting'), 'discovery missed "aborting"');
+  // The queue's real in-flight status, written as `entry.status = "launched"`.
+  assert.ok(words.has('launched'), 'discovery missed the queue status "launched"');
 });
 
 test('every declared backend status value has a dot style', () => {
@@ -334,18 +414,47 @@ test('the palette covers every tone the mapping can produce', () => {
 });
 
 /*
- * --- Contrast recomputed from the shipped stylesheet ---------------------
+ * --- Contrast recomputed from the CASCADE the browser actually resolves ---
  *
  * The table in `statusDots.ts` is only trustworthy if it describes the CSS
- * that actually ships.  These helpers re-read
- * `frontend/web/src/style.css`, pull the real `--status-*` custom
- * properties out of the light `:root` block and the dark
- * `prefers-color-scheme: dark` block, pull the real `.codex-sidebar`
- * background out of the light and dark theme blocks, and recompute the
- * WCAG 2.x contrast ratios.  The test below then asserts that the table
- * matches the recomputation, so a colour change in the stylesheet cannot
- * silently leave a stale ratio in the source (or in the PR body).
+ * that actually ships *and* the CSS the browser actually resolves for the
+ * dot that is on screen.  A stylesheet can declare a colour token and still
+ * paint something else: a later rule with equal-or-higher specificity wins,
+ * and `var(--token)` resolves against the custom properties that are in
+ * scope at that point in the cascade.
+ *
+ * So these helpers do not read a token and stop there.  They:
+ *
+ *   1. parse every rule in `frontend/web/src/style.css` into
+ *      (selector, declarations, theme, source order),
+ *   2. build the custom-property environment for a theme by replaying the
+ *      `:root` blocks and the `prefers-color-scheme: dark` block in source
+ *      order, and
+ *   3. for a dot's real class list, walk every rule that matches it, sort
+ *      by (specificity, source order) and take the winning declaration —
+ *      which is what the browser paints.
+ *
+ * The measured foreground is the dot's visible colour (its border for a
+ * hollow outline, its background otherwise) and the measured background is
+ * the sidebar background the dot sits on, both resolved through the same
+ * cascade.
  */
+
+/** A CSS rule, flattened out of the stylesheet. */
+interface CssRule {
+  /** The comma-separated selector list, split. */
+  selectors: string[];
+  /** The declarations in the rule body, in source order. */
+  declarations: Map<string, string>;
+  /**
+   * The theme the rule applies to.  A rule outside any media query
+   * applies to both themes; only a rule inside `@media (prefers-color-scheme:
+   * dark)` is dark-only.
+   */
+  theme: 'both' | 'light' | 'dark';
+  /** The rule's position in the stylesheet; later rules win ties. */
+  order: number;
+}
 
 /** Convert a CSS colour to 8-bit RGB.  Supports `#rrggbb` and `hsl(h s% l%)`. */
 function cssColorToRgb(value: string): [number, number, number] {
@@ -402,131 +511,420 @@ function contrastRatio(
 /** The shipped stylesheet. */
 const stylesheet = readBackend('frontend/web/src/style.css');
 
-/** The body of a CSS block that starts at `anchor`, or '' if not found. */
-function cssBlock(anchor: string): string {
-  const start = stylesheet.indexOf(anchor);
-  if (start < 0) return '';
-  const open = stylesheet.indexOf('{', start);
-  // Walk to the matching close brace so a nested rule does not truncate the
-  // block early.
-  let depth = 0;
-  for (let index = open; index < stylesheet.length; index += 1) {
-    const character = stylesheet[index];
-    if (character === '{') depth += 1;
-    else if (character === '}') {
-      depth -= 1;
-      if (depth === 0) return stylesheet.slice(open + 1, index);
-    }
-  }
-  return stylesheet.slice(open + 1);
-}
+/**
+ * The stylesheet with its comments removed.
+ *
+ * The comments in this file document the mapping in prose and mention class
+ * names (`.status-dot.status-running`); left in place, the parser would
+ * read them as selectors and "discover" rules that do not exist.
+ */
+const stylesheetWithoutComments = stylesheet.replace(/\/\*[\s\S]*?\*\//g, '');
 
-/** Read a custom property out of a CSS block body. */
-function cssVar(block: string, name: string): string {
-  const match = block.match(new RegExp(`--${name}:\\s*([^;]+);`));
-  if (!match) throw new Error(`CSS variable --${name} not found`);
-  return match[1].trim();
-}
-
-/** Every top-level `:root { ... }` block body in the stylesheet. */
-function rootBlocks(): string[] {
-  const bodies: string[] = [];
-  const pattern = /:root\s*\{/g;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(stylesheet)) !== null) {
-    const open = stylesheet.indexOf('{', match.index);
-    let depth = 0;
-    for (let index = open; index < stylesheet.length; index += 1) {
-      if (stylesheet[index] === '{') depth += 1;
-      else if (stylesheet[index] === '}') {
-        depth -= 1;
-        if (depth === 0) {
-          bodies.push(stylesheet.slice(open + 1, index));
-          pattern.lastIndex = index;
-          break;
-        }
-      }
-    }
-  }
-  return bodies;
+/**
+ * Flatten the stylesheet into rules.
+ *
+ * The walk tracks `@media (prefers-color-scheme: dark)` so a rule can be
+ * attributed to a theme, and skips `@keyframes` bodies (their inner
+ * percentages are not selectors) and other at-rules.  `order` is a single
+ * counter over the whole sheet, so source order compares rules across
+ * media blocks exactly as the browser does.
+ */
+function parseRules(): CssRule[] {
+  const rules: CssRule[] = [];
+  const counter = { order: 0 };
+  parseInto(rules, stylesheetWithoutComments, 'both', counter);
+  return rules;
 }
 
 /**
- * The light palette lives in the `:root { ... }` block that declares the
- * `--status-*` tokens; the dark palette overrides them inside
- * `@media (prefers-color-scheme: dark)`.
+ * Walk a stylesheet (or a media block's body), appending the rules it
+ * contains to `rules`.
  */
-const lightPalette = (() => {
-  for (const block of rootBlocks()) {
-    if (/--status-running\s*:/.test(block)) return block;
-  }
-  throw new Error('could not find the :root block that declares --status-running');
-})();
-const darkPalette = cssBlock('@media (prefers-color-scheme: dark)');
+function parseInto(
+  rules: CssRule[],
+  source: string,
+  theme: 'both' | 'light' | 'dark',
+  counter: { order: number },
+): void {
+  let index = 0;
+  while (index < source.length) {
+    const braceStart = source.indexOf('{', index);
+    if (braceStart < 0) break;
+    const prelude = source.slice(index, braceStart).trim();
 
-// The sidebar backgrounds the dots sit on.  The stylesheet paints
-// `.codex-sidebar` three times: the dark theme paints it with
-// `var(--codex-sidebar)` (#171717) and the final light layer paints it
-// literally (#fcfcfc).  Both values are read back out of the sheet.
-const darkSidebar = cssVar(cssBlock(':root { --codex-bg'), 'codex-sidebar');
-const lightSidebar = (() => {
-  // The light layer is the last `:root` block that redefines the sidebar.
-  for (const block of rootBlocks().reverse()) {
-    const value = block.match(/--codex-sidebar:\s*([^;]+);/);
-    if (value && value[1].trim() !== darkSidebar) return value[1].trim();
+    // Find the matching close brace so a nested rule does not truncate it.
+    let depth = 0;
+    let braceEnd = braceStart;
+    for (; braceEnd < source.length; braceEnd += 1) {
+      if (source[braceEnd] === '{') depth += 1;
+      else if (source[braceEnd] === '}') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    const body = source.slice(braceStart + 1, braceEnd);
+
+    if (prelude.startsWith('@media')) {
+      // A dark media query switches the theme for everything inside it.
+      const dark = /prefers-color-scheme\s*:\s*dark/.test(prelude);
+      parseInto(rules, body, dark ? 'dark' : theme, counter);
+    } else if (prelude.startsWith('@')) {
+      // @keyframes and friends contribute no selectors we can match.
+    } else if (prelude) {
+      rules.push({
+        selectors: prelude.split(',').map((s) => s.trim()).filter(Boolean),
+        declarations: parseDeclarations(body),
+        theme,
+        order: counter.order++,
+      });
+    }
+    index = braceEnd + 1;
   }
-  throw new Error('could not find the light --codex-sidebar');
-})();
+}
+
+/** Parse a rule body into its declarations, in source order. */
+function parseDeclarations(body: string): Map<string, string> {
+  const declarations = new Map<string, string>();
+  for (const chunk of body.split(';')) {
+    const colon = chunk.indexOf(':');
+    if (colon < 0) continue;
+    const property = chunk.slice(0, colon).trim().toLowerCase();
+    const value = chunk.slice(colon + 1).trim();
+    if (property) declarations.set(property, value);
+  }
+  return declarations;
+}
+
+const allRules = parseRules();
+
+/**
+ * The custom-property environment for a theme.
+ *
+ * The `:root` blocks are replayed in source order, and the dark theme
+ * additionally replays the declarations inside `@media (prefers-color-scheme:
+ * dark)`.  A later block overrides an earlier one, exactly as the browser
+ * does.  Note that the *final* `:root` block in this stylesheet is the light
+ * Codex layer and does not redefine the `--status-*` tokens, so light mode
+ * keeps the base `:root` values — which is what the browser does too.
+ */
+function customProperties(theme: 'light' | 'dark'): Map<string, string> {
+  const properties = new Map<string, string>();
+  const apply = (declarations: Map<string, string>) => {
+    for (const [property, value] of declarations) {
+      if (property.startsWith('--')) properties.set(property, value);
+    }
+  };
+  for (const rule of allRules) {
+    if (rule.theme !== 'both' && rule.theme !== theme) continue;
+    // `:root` blocks carry the theme's custom properties.  In the dark
+    // theme the tokens live in a `:root` inside the dark media query.
+    if (rule.selectors.some((s) => s === ':root')) apply(rule.declarations);
+  }
+  return properties;
+}
+
+/**
+ * Resolve `var(--name, fallback)` references against the custom properties.
+ *
+ * A reference can be the whole value (`background: var(--status-running)`)
+ * or one part of it (`border: 2px solid var(--status-pending)`), and a
+ * custom property can itself point at another one
+ * (`--status-neutral: var(--status-cancelled)`), so the substitution runs
+ * until it reaches a literal.
+ */
+function resolveValue(
+  value: string,
+  properties: Map<string, string>,
+  seen: Set<string> = new Set(),
+): string {
+  return value.replace(
+    /var\(\s*(--[a-z0-9-]+)\s*(?:,\s*([^)]*))?\)/gi,
+    (whole, name: string, fallback: string | undefined) => {
+      if (seen.has(name)) return whole;
+      const resolved = properties.get(name);
+      if (resolved === undefined) {
+        return fallback !== undefined ? resolveValue(fallback, properties, seen) : whole;
+      }
+      const nextSeen = new Set(seen);
+      nextSeen.add(name);
+      return resolveValue(resolved, properties, nextSeen);
+    },
+  ).trim();
+}
+
+/**
+ * Pull the colour out of a CSS value.
+ *
+ * A `border` shorthand such as `2px solid hsl(210 12% 38%)` carries the
+ * colour after the width and the line style, so the colour cannot be read
+ * from the front of the string.  Returns `null` when the value names no
+ * colour at all (`none`, `transparent`, a gradient).
+ */
+function cssColorOf(value: string): string | null {
+  const text = value.trim();
+  if (text === '' || text === 'transparent' || text === 'none' || text === 'inherit') {
+    return null;
+  }
+  if (text.includes('gradient')) return null;
+
+  // A colour function anywhere in the value: `hsl(...)`, `rgb(...)`, and
+  // their modern space-separated forms.
+  const functionCall = text.match(/(?:^|\s)((?:hsl|hwb|lab|lch|oklab|oklch|rgb|rgba|hsla)\([^)]*\))/i);
+  if (functionCall) return functionCall[1].trim();
+
+  // A bare hex.
+  const hex = text.match(/(?:^|\s)(#[0-9a-f]{3,8})(?=\s|$)/i);
+  if (hex) return hex[1];
+
+  // A named colour: a word that is not a keyword of the shorthand.
+  const keywords = new Set([
+    'solid', 'dashed', 'dotted', 'double', 'groove', 'ridge', 'inset',
+    'outset', 'none', 'hidden', 'medium', 'thin', 'thick',
+  ]);
+  for (const token of text.split(/\s+/)) {
+    if (!/^[a-z]+$/i.test(token)) continue;
+    if (keywords.has(token.toLowerCase())) continue;
+    return token;
+  }
+  return null;
+}
+
+/**
+ * The specificity of a selector, as (ids, classes, elements).
+ *
+ * Only the selector forms this stylesheet uses are supported: type
+ * selectors, class selectors, descendant combinators and the universal
+ * selector.  Anything else is scored as a plain class so it cannot be
+ * mistaken for something more specific than it is.
+ */
+function specificity(selector: string): [number, number, number] {
+  const text = selector.trim();
+  if (text.startsWith(':root')) return [0, 1, 0];
+  let ids = 0;
+  let classes = 0;
+  let elements = 0;
+  const withoutStrings = text.replace(/::?[\w-]+(\([^)]*\))?/g, (whole) => {
+    // A pseudo-class counts as a class; a pseudo-element counts as an
+    // element.
+    if (whole.startsWith('::')) { elements += 1; return ''; }
+    classes += 1;
+    return '';
+  });
+  const idMatches = withoutStrings.match(/#[A-Za-z0-9_-]+/g);
+  if (idMatches) ids += idMatches.length;
+  const classMatches = withoutStrings.match(/\.[A-Za-z0-9_-]+/g);
+  if (classMatches) classes += classMatches.length;
+  const typeMatches = withoutStrings.match(/(^|[\s>+~])([A-Za-z][A-Za-z0-9]*)/g);
+  if (typeMatches) elements += typeMatches.length;
+  return [ids, classes, elements];
+}
+
+/**
+ * Does a selector match an element with the given class list?
+ *
+ * The element is matched on its class list only, so a selector that
+ * requires an ancestor (`.codex-workbench .status-dot`) is handled by
+ * requiring every class in every compound selector to be present.
+ */
+function selectorMatches(selector: string, classes: Set<string>): boolean {
+  const text = selector.trim();
+  if (text === '*') return true;
+  // A pseudo-element selector (`::after`) styles a generated child, not the
+  // element itself, so it never contributes to the element's own
+  // background or border.
+  if (text.includes('::')) return false;
+  // Split on descendant combinators; every compound part must match.
+  const compounds = text.split(/\s+/).filter(Boolean);
+  return compounds.every((compound) => {
+    if (compound.startsWith(':root')) return false;
+    const classNames = compound.match(/\.[A-Za-z0-9_-]+/g);
+    if (!classNames) {
+      // A type selector (e.g. `span`) cannot be checked from a class list
+      // alone, so it does not contribute a match on its own.
+      return false;
+    }
+    return classNames.every((name) => classes.has(name.slice(1)));
+  });
+}
+
+/**
+ * The declarations the browser would apply to an element with these
+ * classes, in a given theme, after the cascade.
+ */
+function resolvedDeclarations(
+  classes: string[],
+  theme: 'light' | 'dark',
+): Map<string, string> {
+  const classSet = new Set(classes);
+  const winners = new Map<string, {
+    specificity: [number, number, number];
+    order: number;
+    value: string;
+  }>();
+
+  for (const rule of allRules) {
+    if (rule.theme !== 'both' && rule.theme !== theme) continue;
+
+    // The rule's most specific matching selector decides how specific the
+    // whole rule is.
+    let ruleSpec: [number, number, number] | null = null;
+    for (const selector of rule.selectors) {
+      if (!selectorMatches(selector, classSet)) continue;
+      const spec = specificity(selector);
+      if (!ruleSpec || compareSpecificity(spec, ruleSpec) > 0) ruleSpec = spec;
+    }
+    if (!ruleSpec) continue;
+
+    for (const [property, value] of rule.declarations) {
+      const seen = winners.get(property);
+      if (!seen) {
+        winners.set(property, { specificity: ruleSpec, order: rule.order, value });
+        continue;
+      }
+      // The cascade: a more specific rule wins; at equal specificity the
+      // rule that comes later in the stylesheet wins.
+      const comparison = compareSpecificity(ruleSpec, seen.specificity);
+      if (comparison > 0 || (comparison === 0 && rule.order >= seen.order)) {
+        winners.set(property, { specificity: ruleSpec, order: rule.order, value });
+      }
+    }
+  }
+
+  const properties = customProperties(theme);
+  const resolved = new Map<string, string>();
+  for (const [property, winner] of winners) {
+    resolved.set(property, resolveValue(winner.value, properties));
+  }
+  return resolved;
+}
+
+/** Compare two specificity tuples; positive means `a` is more specific. */
+function compareSpecificity(
+  a: [number, number, number],
+  b: [number, number, number],
+): number {
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  return 0;
+}
+
+/**
+ * The colour the dot actually paints, and the background it sits on.
+ *
+ * For a hollow outline the visible colour is the border; otherwise it is
+ * the background.  `transparent` means the element behind it shows through,
+ * so it is not a foreground colour.
+ */
+function renderedDotColours(
+  classes: string[],
+  theme: 'light' | 'dark',
+): { foreground: string; background: string } {
+  const declarations = resolvedDeclarations(classes, theme);
+  const properties = customProperties(theme);
+
+  const background = resolveValue(
+    declarations.get('background') ?? 'transparent',
+    properties,
+  );
+  const border = resolveValue(
+    declarations.get('border') ?? declarations.get('border-color') ?? 'transparent',
+    properties,
+  );
+
+  // A hollow dot paints a ring: the border is the visible foreground.  The
+  // width may arrive as its own longhand or inside the `border` shorthand.
+  const borderWidth = resolveValue(
+    declarations.get('border-width') ?? border,
+    properties,
+  );
+  const hollow = /(?:^|\s)([2-9]|[1-9]\d)(?:\.\d+)?px(?:\s|$)/.test(borderWidth);
+
+  const foreground = hollow ? cssColorOf(border) : cssColorOf(background);
+  if (!foreground) {
+    throw new Error(
+      `the dot for [${classes.join(' ')}] in the ${theme} theme has no visible colour `
+      + `(background: ${background}, border: ${border})`,
+    );
+  }
+  return { foreground, background: cssColorOf(background) ?? background };
+}
+
+/**
+ * The sidebar background the dots sit on, resolved through the cascade.
+ */
+function renderedSidebarBackground(theme: 'light' | 'dark'): string {
+  const declarations = resolvedDeclarations(['codex-sidebar'], theme);
+  const properties = customProperties(theme);
+  const background = resolveValue(
+    declarations.get('background') ?? 'transparent',
+    properties,
+  );
+  return cssColorOf(background) ?? background;
+}
+
+/** The dot classes the shared mapping emits for a status, for a given site. */
+function dotClassesFor(status: string, site: 'sidebar' | 'panel' | 'queue'): string[] {
+  const style = statusDotStyle(status);
+  const classes = statusDotClassName(status).split(/\s+/).filter(Boolean);
+  if (site === 'panel') {
+    // The Run status panel also carries `phase-<status>` and a connection
+    // class.  `phase-*` carries no colour of its own any more, but the
+    // connection class does, so it is part of the element that is rendered.
+    classes.push(`phase-${normalizeStatus(status)}`);
+    classes.push('status-panel-dot');
+    classes.push('connection-connected');
+  } else if (site === 'sidebar') {
+    classes.push('codex-sidebar');
+  }
+  assert.ok(style.colorVar.startsWith('--status-'));
+  return classes;
+}
 
 test('the contrast table is recomputed from the shipped stylesheet', () => {
   for (const entry of STATUS_DOT_CONTRAST) {
-    const lightCss = cssVar(lightPalette, `status-${entry.tone}`);
-    const darkCss = cssVar(darkPalette, `status-${entry.tone}`);
+    // The classes the sidebar dot really renders for this tone.
+    const classes = dotClassesFor(entry.tone, 'sidebar');
+    const light = renderedDotColours(classes, 'light');
+    const dark = renderedDotColours(classes, 'dark');
+    const lightBackground = renderedSidebarBackground('light');
+    const darkBackground = renderedSidebarBackground('dark');
+
+    const lightForeground = rgbToHex(cssColorToRgb(light.foreground));
+    const darkForeground = rgbToHex(cssColorToRgb(dark.foreground));
 
     assert.equal(
-      entry.lightCssValue, lightCss,
-      `${entry.tone}: the table's light CSS value does not match the stylesheet`,
+      entry.lightBackground.toLowerCase(), lightBackground.toLowerCase(),
+      `${entry.tone}: the table's light background is not the resolved sidebar background`,
     );
     assert.equal(
-      entry.darkCssValue, darkCss,
-      `${entry.tone}: the table's dark CSS value does not match the stylesheet`,
-    );
-
-    const lightForeground = rgbToHex(cssColorToRgb(lightCss));
-    const darkForeground = rgbToHex(cssColorToRgb(darkCss));
-    assert.equal(
-      entry.lightForeground, lightForeground,
-      `${entry.tone}: the table's light foreground does not match the stylesheet`,
+      entry.darkBackground.toLowerCase(), darkBackground.toLowerCase(),
+      `${entry.tone}: the table's dark background is not the resolved sidebar background`,
     );
     assert.equal(
-      entry.darkForeground, darkForeground,
-      `${entry.tone}: the table's dark foreground does not match the stylesheet`,
-    );
-
-    assert.equal(
-      entry.lightBackground, lightSidebar,
-      `${entry.tone}: the table's light background is not the shipped sidebar background`,
+      entry.lightForeground.toLowerCase(), lightForeground.toLowerCase(),
+      `${entry.tone}: the table's light foreground (${entry.lightForeground}) is not the resolved dot colour (${lightForeground})`,
     );
     assert.equal(
-      entry.darkBackground, darkSidebar,
-      `${entry.tone}: the table's dark background is not the shipped sidebar background`,
+      entry.darkForeground.toLowerCase(), darkForeground.toLowerCase(),
+      `${entry.tone}: the table's dark foreground (${entry.darkForeground}) is not the resolved dot colour (${darkForeground})`,
     );
 
     const lightRatio = contrastRatio(
-      cssColorToRgb(lightCss),
-      cssColorToRgb(lightSidebar),
+      cssColorToRgb(light.foreground),
+      cssColorToRgb(lightBackground),
     );
     const darkRatio = contrastRatio(
-      cssColorToRgb(darkCss),
-      cssColorToRgb(darkSidebar),
+      cssColorToRgb(dark.foreground),
+      cssColorToRgb(darkBackground),
     );
     assert.ok(
       Math.abs(lightRatio - entry.lightRatio) < 0.01,
-      `${entry.tone}: table says ${entry.lightRatio} but the stylesheet gives ${lightRatio.toFixed(2)}`,
+      `${entry.tone}: table says ${entry.lightRatio} but the resolved cascade gives ${lightRatio.toFixed(2)}`,
     );
     assert.ok(
       Math.abs(darkRatio - entry.darkRatio) < 0.01,
-      `${entry.tone}: table says ${entry.darkRatio} but the stylesheet gives ${darkRatio.toFixed(2)}`,
+      `${entry.tone}: table says ${entry.darkRatio} but the resolved cascade gives ${darkRatio.toFixed(2)}`,
     );
 
     // The acceptance criterion itself, recomputed rather than asserted.
@@ -541,12 +939,108 @@ test('the contrast table is recomputed from the shipped stylesheet', () => {
   }
 });
 
+test('every backend status clears 3:1 on the sidebar in both themes', () => {
+  // Not just the six tones: every status the backend can emit, rendered at
+  // every site that renders a dot, must be legible against the sidebar.
+  const statuses = new Set<string>(BACKEND_STATUS_VALUES);
+  for (const word of backendRunStatusWords()) statuses.add(word);
+
+  for (const status of statuses) {
+    for (const site of ['sidebar', 'panel', 'queue'] as const) {
+      const classes = dotClassesFor(status, site);
+      for (const theme of ['light', 'dark'] as const) {
+        const { foreground } = renderedDotColours(classes, theme);
+        const background = renderedSidebarBackground(theme);
+        const ratio = contrastRatio(
+          cssColorToRgb(foreground),
+          cssColorToRgb(background),
+        );
+        assert.ok(
+          ratio >= 3,
+          `${status} (${site}, ${theme}) resolves to ${foreground} on ${background}: ${ratio.toFixed(2)}:1, below WCAG AA 3:1`,
+        );
+      }
+    }
+  }
+});
+
+test('the three render sites resolve to the same colour for the same status', () => {
+  // One shared mapping means one colour: the sidebar task list, the Run
+  // status panel and the queue view must resolve identically.
+  for (const status of BACKEND_STATUS_VALUES) {
+    const sidebar = renderedDotColours(dotClassesFor(status, 'sidebar'), 'light');
+    const panel = renderedDotColours(dotClassesFor(status, 'panel'), 'light');
+    const queue = renderedDotColours(dotClassesFor(status, 'queue'), 'light');
+    assert.equal(
+      rgbToHex(cssColorToRgb(panel.foreground)),
+      rgbToHex(cssColorToRgb(sidebar.foreground)),
+      `${status}: the Run status panel resolves to a different colour than the sidebar`,
+    );
+    assert.equal(
+      rgbToHex(cssColorToRgb(queue.foreground)),
+      rgbToHex(cssColorToRgb(sidebar.foreground)),
+      `${status}: the queue view resolves to a different colour than the sidebar`,
+    );
+  }
+});
+
+test('no per-component rule overrides a dot colour outside the shared mapping', () => {
+  // Any rule that paints a dot background or border must be keyed on the
+  // shared mapping's tone class or its shape class — never on a per-status
+  // or per-phase class, which is how `phase-stopping` used to paint the Run
+  // status panel's dot amber while the mapping said grey.
+  // The class names the shared mapping actually emits: `status-<tone>` and
+  // `status-shape-<shape>`.
+  const toneClasses = new Set(
+    BACKEND_STATUS_VALUES.map((status) => `status-${statusDotStyle(status).tone}`),
+  );
+  const shapeClasses = new Set(
+    BACKEND_STATUS_VALUES.map((status) => `status-shape-${statusDotStyle(status).shape}`),
+  );
+  const allowed = new Set<string>([
+    'status-dot',
+    'status-panel-dot',
+    ...toneClasses,
+    ...shapeClasses,
+  ]);
+
+  for (const rule of allRules) {
+    const paints = rule.declarations.has('background')
+      || rule.declarations.has('border')
+      || rule.declarations.has('border-color')
+      || rule.declarations.has('background-color');
+    if (!paints) continue;
+    for (const selector of rule.selectors) {
+      if (!/\.status-dot|\.status-panel-dot/.test(selector)) continue;
+      // A rule that targets the dot by a tone or shape class is the mapping
+      // speaking; anything else is a parallel palette.
+      const classNames = (selector.match(/\.[A-Za-z0-9_-]+/g) ?? []).map((n) => n.slice(1));
+      const offMapping = classNames.filter(
+        (name) => !allowed.has(name)
+          && !name.startsWith('phase-')
+          && !name.startsWith('connection-'),
+      );
+      const perStatus = classNames.filter(
+        (name) => name.startsWith('status-')
+          && !allowed.has(name)
+          && !toneClasses.has(name)
+          && !shapeClasses.has(name),
+      );
+      assert.deepEqual(
+        offMapping, [],
+        `${selector} paints a dot outside the shared mapping (classes: ${classNames.join(' ')})`,
+      );
+      assert.deepEqual(
+        perStatus, [],
+        `${selector} paints a dot with a per-status class that the shared mapping does not define`,
+      );
+    }
+  }
+});
+
 test('the shipped sidebar background is the one the table measures against', () => {
-  assert.equal(lightSidebar, '#fcfcfc');
-  assert.equal(darkSidebar, '#171717');
-  // The dots really are painted on that background: the dark theme paints
-  // `.codex-sidebar` with the --codex-sidebar variable, and the final light
-  // layer paints it with the same literal value.
-  assert.match(stylesheet, /\.codex-sidebar\s*\{[^}]*background:\s*var\(--codex-sidebar\)/);
-  assert.match(stylesheet, /\.codex-sidebar\s*\{[^}]*background:\s*#fcfcfc/);
+  const light = renderedSidebarBackground('light');
+  const dark = renderedSidebarBackground('dark');
+  assert.equal(light.toLowerCase(), '#fcfcfc');
+  assert.equal(dark.toLowerCase(), '#171717');
 });
