@@ -284,6 +284,108 @@ def test_gh_secret_set_is_refused() -> None:
     assert "set" in message.lower()
 
 
+# ---------------------------------------------------------------------------
+# 5b. The credential-revealing spellings.
+# ---------------------------------------------------------------------------
+#
+# These are not WRITES: they PRINT a credential.  A read allowlist that
+# admitted them would put a write-capable token into the auditor's context,
+# so they are refused just the same.  Each gets its OWN named test, like
+# every other spelling in this module.
+
+
+def test_gh_auth_token_is_refused() -> None:
+    """``gh auth token`` -- prints the credential in the clear."""
+
+    message = _refusal(["gh", "auth", "token"])
+    assert "auth" in message.lower()
+
+
+def test_gh_auth_status_show_token_is_refused() -> None:
+    """``gh auth status --show-token`` -- a read that reveals the token."""
+
+    message = _refusal(["gh", "auth", "status", "--show-token"])
+    assert "auth" in message.lower()
+
+
+def test_gh_auth_status_short_token_flag_is_refused() -> None:
+    """``gh auth status -t`` -- the short form of the same reveal."""
+
+    message = _refusal(["gh", "auth", "status", "-t"])
+    assert "auth" in message.lower()
+
+
+def test_gh_auth_status_show_token_behind_another_flag_is_refused() -> None:
+    """``gh auth status --hostname github.com --show-token``.
+
+    The flag may sit behind another one, so a check that only looked at the
+    first argument would let this through.
+    """
+
+    message = _refusal(["gh", "auth", "status", "--hostname", "github.com", "--show-token"])
+    assert "auth" in message.lower()
+
+
+def test_gh_auth_login_is_refused() -> None:
+    """``gh auth login`` -- changes the credential."""
+
+    message = _refusal(["gh", "auth", "login"])
+    assert "auth" in message.lower()
+
+
+def test_gh_auth_refresh_is_refused() -> None:
+    """``gh auth refresh`` -- changes the credential."""
+
+    message = _refusal(["gh", "auth", "refresh"])
+    assert "auth" in message.lower()
+
+
+def test_gh_auth_setup_git_is_refused() -> None:
+    """``gh auth setup-git`` -- changes the credential's use."""
+
+    message = _refusal(["gh", "auth", "setup-git"])
+    assert "auth" in message.lower()
+
+
+def test_gh_auth_switch_is_refused() -> None:
+    """``gh auth switch`` -- changes which credential is in use."""
+
+    message = _refusal(["gh", "auth", "switch"])
+    assert "auth" in message.lower()
+
+
+def test_gh_config_get_oauth_token_is_refused() -> None:
+    """``gh config get oauth_token`` -- prints the credential in the clear."""
+
+    message = _refusal(["gh", "config", "get", "oauth_token"])
+    assert "config" in message.lower()
+
+
+def test_gh_config_list_is_refused() -> None:
+    """``gh config list`` -- can list the credential keys."""
+
+    message = _refusal(["gh", "config", "list"])
+    assert "config" in message.lower()
+
+
+def test_gh_secret_list_is_refused() -> None:
+    """``gh secret list`` -- names the repository's secrets."""
+
+    message = _refusal(["gh", "secret", "list"])
+    assert "secret" in message.lower()
+
+
+def test_plain_gh_auth_status_is_not_refused() -> None:
+    """The one credential-free ``gh auth`` leaf stays admissible.
+
+    ``gh auth status`` reports the account in use, not the token it would
+    use.  The refusal of the ``gh auth`` group must not take it with it.
+    """
+
+    assert_read_only_command(["gh", "auth", "status"])
+    assert_read_only_command(["gh", "auth", "status", "--hostname", "github.com"])
+
+
 def test_gh_variable_set_is_refused() -> None:
     """``gh variable set`` -- a write that hides under a read group."""
 
