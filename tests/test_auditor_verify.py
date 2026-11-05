@@ -36,6 +36,7 @@ a credential value.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -343,6 +344,11 @@ def test_unverifiable_is_distinct_from_refuted(
         ["gh", "unknowncmd"],
         # A conflicting method specification is refused rather than guessed.
         ["gh", "api", "--method=POST", "-X", "GET", "repos/o/r/pulls/1"],
+        # The credential groups are refused WHOLE, including their read leaves:
+        # ``gh secret list`` names the repository's secrets, and the ticket
+        # (easybutt0n-17, PR #187) requires every ``gh secret`` leaf to be
+        # refused rather than only the writing ones.
+        ["gh", "secret", "list"],
     ],
 )
 def test_write_intents_are_refused(argv: list[str]) -> None:
@@ -372,7 +378,6 @@ def test_write_intents_are_refused(argv: list[str]) -> None:
         ["gh", "run", "view", "1"],
         ["gh", "run", "list"],
         ["gh", "workflow", "view", "ci.yml"],
-        ["gh", "secret", "list"],
         ["gh", "variable", "list"],
         ["gh", "issue", "view", "1"],
         ["git", "rev-parse", "HEAD"],
@@ -792,3 +797,400 @@ def test_the_verifier_has_no_issue_tracker_surface() -> None:
     source = open(module.__file__, encoding="utf-8").read().lower()
     assert "youtrack" not in source
     assert "issue_tracker" not in source
+
+
+# ---------------------------------------------------------------------------
+# 8. The gh credential leak (easybutt0n-17, PR #187).
+# ---------------------------------------------------------------------------
+#
+# Overseer1's blocker (PR comment 6664047687): ``gh auth token``,
+# ``gh auth status --show-token`` and ``gh config get oauth_token`` were
+# ALLOWED, because ``auth`` / ``config`` / ``secret`` sat in
+# ``_GH_READ_SUBCOMMANDS``.  With an inherited ``gh`` login or an executor
+# ``GH_TOKEN``, those print a WRITE-CAPABLE credential into the auditor's
+# context.
+#
+# Two halves to the remedy, and both are proved here:
+#
+#   *  the COMMAND surface refuses every credential-revealing or
+#      credential-changing leaf; and
+#   *  the auditor's SUBPROCESS ENVIRONMENT is built from scratch, so the
+#      auditor has no credential to reveal in the first place.
+#
+# Every token value in this section is FAKE.  Nothing here prints a value,
+# and no real credential is used anywhere.
+
+
+#: Every argv that reveals or changes a credential.  Each one must be
+#: refused by the in-process layer.
+CREDENTIAL_REVEALING_ARGV: tuple[tuple[str, ...], ...] = (
+    # ``gh auth``: the token itself, and the token under a status leaf.
+    ("gh", "auth", "token"),
+    ("gh", "auth", "status", "--show-token"),
+    ("gh", "auth", "status", "-t"),
+    ("gh", "auth", "status", "--show-token=true"),
+    ("gh", "auth", "status", "--hostname", "github.com", "--show-token"),
+    # ``gh auth``: the leaves that change the credential.
+    ("gh", "auth", "login"),
+    ("gh", "auth", "refresh"),
+    ("gh", "auth", "setup-git"),
+    ("gh", "auth", "switch"),
+    ("gh", "auth", "logout"),
+    # ``gh config``: reading, listing and writing the token keys.
+    ("gh", "config", "get", "oauth_token"),
+    ("gh", "config", "get", "git_protocol"),
+    ("gh", "config", "get", "hosts"),
+    ("gh", "config", "list"),
+    ("gh", "config", "set", "oauth_token", "x"),
+    # ``gh secret``: every leaf, reading or writing.
+    ("gh", "secret", "list"),
+    ("gh", "secret", "set", "K", "V"),
+    ("gh", "secret", "delete", "K"),
+    ("gh", "secret", "delete", "--org", "o", "K"),
+)
+
+
+@pytest.mark.parametrize("argv", CREDENTIAL_REVEALING_ARGV)
+def test_every_credential_revealing_gh_command_is_refused(argv: tuple[str, ...]) -> None:
+    """Every credential-revealing or credential-changing ``gh`` leaf is refused."""
+
+    from lh_harness.auditor_verify import assert_read_only_command
+
+    with pytest.raises(ReadOnlyViolation) as excinfo:
+        assert_read_only_command(list(argv))
+
+    message = str(excinfo.value)
+    assert "read-only" in message.lower()
+    # The refusal names what was refused, and never a credential value.
+    assert argv[1] in message
+
+
+def test_plain_gh_auth_status_remains_allowed() -> None:
+    """The one credential-free ``gh auth`` leaf stays allowed.
+
+    ``gh auth status`` reports WHICH account is logged in, not the token it
+    would use.  The refusal of the ``gh auth`` group must not take that leaf
+    with it.
+    """
+
+    from lh_harness.auditor_verify import assert_read_only_command
+
+    assert_read_only_command(["gh", "auth", "status"])
+    assert_read_only_command(["gh", "auth", "status", "--hostname", "github.com"])
+
+
+@pytest.mark.parametrize("argv", CREDENTIAL_REVEALING_ARGV)
+def test_the_permission_layer_denies_the_same_credential_commands(
+    argv: tuple[str, ...],
+) -> None:
+    """The deny-rule layer refuses the credential commands too.
+
+    The auditor's real protection is the ``--disallowedTools`` deny list the
+    harness hands to the agent CLI.  If only the in-process layer refused
+    these, the auditor's shell-out would still be free to ask ``gh`` for a
+    credential.  So both layers have to refuse the same commands.
+    """
+
+    from lh_harness.adapters.claude_permissions import (
+        AUDITOR_GH_WRITE_DENY,
+        AUDITOR_NETWORK_GIT_DENY,
+    )
+    from lh_harness.auditor_verify import command_string, is_denied_by_auditor_policy
+
+    rules = (*AUDITOR_GH_WRITE_DENY, *AUDITOR_NETWORK_GIT_DENY)
+    command = command_string(list(argv))
+
+    assert is_denied_by_auditor_policy(command, rules) is not None, (
+        f"{command!r} is refused by the in-process layer but not by the "
+        "permission layer"
+    )
+
+
+def test_the_permission_layer_still_admits_plain_gh_auth_status() -> None:
+    """The deny list does not take the admissible leaf with it."""
+
+    from lh_harness.adapters.claude_permissions import (
+        AUDITOR_GH_WRITE_DENY,
+        AUDITOR_NETWORK_GIT_DENY,
+    )
+    from lh_harness.auditor_verify import is_denied_by_auditor_policy
+
+    rules = (*AUDITOR_GH_WRITE_DENY, *AUDITOR_NETWORK_GIT_DENY)
+
+    assert is_denied_by_auditor_policy("gh auth status", rules) is None
+    assert (
+        is_denied_by_auditor_policy("gh auth status --hostname github.com", rules)
+        is None
+    )
+
+
+def test_the_credential_groups_are_not_on_the_read_allowlist() -> None:
+    """``auth`` / ``config`` / ``secret`` are not read groups any more.
+
+    The refusal above is enforced by a leaf rule, not by an accident of the
+    allowlist, so the allowlist itself is checked too: a future edit that
+    put ``secret`` back would otherwise silently re-open the hole.
+    """
+
+    from lh_harness.auditor_verify import _GH_READ_SUBCOMMANDS
+
+    for group in ("auth", "config", "secret"):
+        assert group not in _GH_READ_SUBCOMMANDS
+
+
+def test_a_refusal_never_carries_a_credential_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusal of a credential command still names no credential value."""
+
+    from lh_harness.auditor_verify import assert_read_only_command
+
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-auditor-token-value")
+    monkeypatch.setenv("GH_TOKEN", "fake-executor-token-value")
+
+    for argv in CREDENTIAL_REVEALING_ARGV:
+        with pytest.raises(ReadOnlyViolation) as excinfo:
+            assert_read_only_command(list(argv))
+        message = str(excinfo.value)
+        assert "fake-auditor-token-value" not in message
+        assert "fake-executor-token-value" not in message
+
+
+# ---------------------------------------------------------------------------
+# 8b. The auditor subprocess environment is built FROM SCRATCH.
+# ---------------------------------------------------------------------------
+
+
+def _child_env(env: dict[str, str]) -> dict[str, str]:
+    """Spawn a REAL child with ``env`` and read back its environment.
+
+    The assertion is made on the CHILD's environment, not on the mapping the
+    builder returned: a builder that forgot a key but a wrapper that removed
+    it later would pass a mapping-only test and still leak.
+    """
+
+    import subprocess
+    import sys
+
+    completed = subprocess.run(
+        [sys.executable, "-c", "import os, json; print(json.dumps(dict(os.environ)))"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_the_auditor_child_does_not_see_the_executor_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An executor ``GH_TOKEN`` in the parent env does not reach the child."""
+
+    from lh_harness.auditor_env import build_auditor_subprocess_env
+
+    monkeypatch.setenv("GH_TOKEN", "fake-executor-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-executor-github-token")
+    monkeypatch.setenv("GH_ENTERPRISE_TOKEN", "fake-enterprise-token")
+    monkeypatch.setenv("GITHUB_ENTERPRISE_TOKEN", "fake-enterprise-github-token")
+    monkeypatch.setenv("LH_HARNESS_FLEET_GITHUB_TOKEN", "fake-fleet-token")
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-auditor-token")
+
+    child_env = _child_env(build_auditor_subprocess_env())
+
+    assert "fake-executor-token" not in child_env.values()
+    assert "fake-executor-github-token" not in child_env.values()
+    assert "fake-enterprise-token" not in child_env.values()
+    assert "fake-enterprise-github-token" not in child_env.values()
+    assert "fake-fleet-token" not in child_env.values()
+    for name in (
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "LH_HARNESS_FLEET_GITHUB_TOKEN",
+        "LH_HARNESS_FLEET_TOKEN",
+    ):
+        assert name not in child_env, f"{name} reached the auditor's child"
+
+
+def test_the_auditor_child_gh_config_dir_is_the_fresh_empty_temp_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``GH_CONFIG_DIR`` points at a fresh EMPTY directory.
+
+    An empty directory means ``gh`` finds no stored credential to fall back
+    on, so it can only authenticate with the environment's ``GH_TOKEN``.
+    """
+
+    from lh_harness.auditor_env import build_auditor_subprocess_env
+
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-auditor-token")
+
+    built = build_auditor_subprocess_env()
+    child_env = _child_env(built)
+
+    config_dir = child_env.get("GH_CONFIG_DIR")
+    assert config_dir, "the auditor's child has no GH_CONFIG_DIR"
+    assert config_dir == built["GH_CONFIG_DIR"]
+    assert Path(config_dir).is_dir()
+    assert list(Path(config_dir).iterdir()) == [], "the gh config dir is not empty"
+
+
+def test_the_auditor_token_is_the_only_gh_token_the_child_sees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The child's only ``GH_TOKEN`` is the auditor's own token."""
+
+    from lh_harness.auditor_env import build_auditor_subprocess_env
+
+    monkeypatch.setenv("GH_TOKEN", "fake-executor-token")
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-auditor-token")
+
+    child_env = _child_env(build_auditor_subprocess_env())
+
+    assert child_env.get("GH_TOKEN") == "fake-auditor-token"
+    assert "fake-executor-token" not in child_env.values()
+
+
+def test_the_auditor_child_environment_is_built_not_filtered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The environment is BUILT FROM SCRATCH, not the parent's minus names.
+
+    A filter can only remove what it knows about.  So a variable the harness
+    has never heard of, carrying a credential, must not survive either --
+    which is what "built from scratch" buys.
+    """
+
+    from lh_harness.auditor_env import build_auditor_subprocess_env
+
+    monkeypatch.setenv("SOME_UNKNOWN_FUTURE_CREDENTIAL", "fake-unknown-token")
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-auditor-token")
+
+    built = build_auditor_subprocess_env()
+    child_env = _child_env(built)
+
+    assert "SOME_UNKNOWN_FUTURE_CREDENTIAL" not in child_env
+    assert "fake-unknown-token" not in child_env.values()
+    # The base is small and explicit, not the parent's environment.  The
+    # built mapping is checked exactly; the child may carry extra variables
+    # the interpreter itself adds (LC_CTYPE and friends), never one the
+    # harness put there.
+    assert set(built) <= {
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "TMPDIR",
+        "SHELL",
+        "TERM",
+        "GH_TOKEN",
+        "GH_CONFIG_DIR",
+        "GIT_TERMINAL_PROMPT",
+        "GIT_ASKPASS",
+        "GIT_PAGER",
+        "PAGER",
+    }
+    assert set(child_env) - set(built) <= {"LC_CTYPE"}
+
+
+def test_the_auditor_child_gets_no_gh_login_to_fall_back_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No inherited ``gh`` configuration directory reaches the child.
+
+    ``gh`` reads its stored credentials from ``$GH_CONFIG_DIR`` or
+    ``$HOME/.config/gh``.  The child's ``HOME`` is the harness user's, so
+    the empty ``GH_CONFIG_DIR`` is what keeps the stored login out.
+    """
+
+    from lh_harness.auditor_env import build_auditor_subprocess_env
+
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-auditor-token")
+
+    child_env = _child_env(build_auditor_subprocess_env())
+
+    assert "GH_CONFIG_DIR" in child_env
+    # The inherited HOME's gh directory is not what the child is pointed at.
+    assert child_env["GH_CONFIG_DIR"] != str(
+        Path(child_env.get("HOME", "/nonexistent")) / ".config" / "gh"
+    )
+
+
+def test_a_shared_auditor_credential_is_refused_by_the_env_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The builder refuses to install a shared credential as the auditor's."""
+
+    from lh_harness.auditor_env import build_auditor_subprocess_env
+
+    monkeypatch.setenv("GH_TOKEN", "fake-shared-token")
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-shared-token")
+
+    with pytest.raises(AuditorCredentialError):
+        build_auditor_subprocess_env()
+
+
+def test_the_auditor_env_builder_never_prints_a_token(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Building the environment prints nothing at all."""
+
+    from lh_harness.auditor_env import build_auditor_subprocess_env
+
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-auditor-token")
+
+    build_auditor_subprocess_env()
+
+    captured = capsys.readouterr()
+    assert "fake-auditor-token" not in captured.out
+    assert "fake-auditor-token" not in captured.err
+
+
+@pytest.mark.asyncio
+async def test_the_auditor_subprocess_really_runs_with_the_scrubbed_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The REAL spawn path gives the auditor child the scrubbed environment.
+
+    The other tests in this section exercise the builder.  This one exercises
+    the ADAPTER: the auditor role's subprocess is launched through
+    ``LocalEnvironment.exec`` wrapped by the auditor environment wrapper, and
+    the child prints its own ``os.environ``.  So the assertion is made on the
+    environment a real auditor subprocess saw -- not on a mapping, and not on
+    a mock.
+    """
+
+    from lh_harness.adapters.claude_code import _AuditorEnvWrapper
+    from lh_harness.environment.local import LocalEnvironment
+
+    monkeypatch.setenv("GH_TOKEN", "fake-executor-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-executor-github-token")
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-auditor-token")
+
+    local = LocalEnvironment(tmp_dir=str(tmp_path))
+    wrapped = _AuditorEnvWrapper(local)
+
+    command = (
+        "python3 -c 'import os, json; print(json.dumps(dict(os.environ)))'"
+    )
+    result = await wrapped.exec(command, timeout=30)
+
+    assert result.exit_code == 0, result.stderr
+    child_env = json.loads(result.stdout.strip().splitlines()[-1])
+
+    # The executor's tokens are NOT in the auditor child's environment.
+    assert "fake-executor-token" not in child_env.values()
+    assert "fake-executor-github-token" not in child_env.values()
+    assert "GITHUB_TOKEN" not in child_env
+    # The auditor's own token is the child's only GH_TOKEN.
+    assert child_env.get("GH_TOKEN") == "fake-auditor-token"
+    # And gh has an empty configuration directory to fall back on.
+    config_dir = child_env.get("GH_CONFIG_DIR")
+    assert config_dir
+    assert Path(config_dir).is_dir()
+    assert list(Path(config_dir).iterdir()) == []

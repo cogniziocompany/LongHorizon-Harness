@@ -100,8 +100,15 @@ class LocalEnvironment:
         timeout: int = 30,
         tee_path: str | None = None,
         no_output_stall_seconds: int | float | None = None,
+        child_env: dict[str, str] | None = None,
     ) -> ExecResult:
         """Run ``command``, enforcing both a total budget and a stall watchdog.
+
+        ``child_env`` REPLACES the child's environment wholesale when given:
+        the child then sees exactly those variables and nothing else, rather
+        than the parent's environment with a few names removed.  This is how
+        the auditor gets an environment built from scratch, so a credential
+        the harness does not know about cannot reach it by omission.
 
         ``no_output_stall_seconds`` is the stalled-episode detector: if the
         child produces NO stdout or stderr bytes for that long, it is killed
@@ -131,8 +138,17 @@ class LocalEnvironment:
             # embedded ``run --dashboard`` executes agent CLIs directly from
             # this process, so relying only on the standalone supervisor's
             # worker sanitisation would expose that credential to the agent.
-            child_env = os.environ.copy()
-            child_env.pop("LH_HARNESS_WEB_TOKEN", None)
+            #
+            # A caller-supplied ``child_env`` REPLACES this mapping wholesale:
+            # the child then sees exactly the variables it was given, so an
+            # environment built from scratch (the auditor's) cannot be
+            # diluted by the parent's.
+            if child_env is None:
+                child_env = os.environ.copy()
+                child_env.pop("LH_HARNESS_WEB_TOKEN", None)
+            else:
+                child_env = dict(child_env)
+                child_env.pop("LH_HARNESS_WEB_TOKEN", None)
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -9,6 +10,7 @@ from typing import Any
 
 from ..agent_logs import visible_output as extract_claude_visible_output
 from ..agent_registry import normalise_reasoning_effort
+from ..auditor_env import build_auditor_subprocess_env
 from ..mcp_profiles import (
     GRAPHIFY_PROFILE,
     gateway_configured,
@@ -294,7 +296,14 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
 
         # Carry per-episode env into the subprocess, removing auditor-unset keys.
         label = _episode_prompt_label(live_trajectory_path)
-        if self._env_unset_keys:
+        if is_auditor_role(self.role):
+            # The auditor's child gets an environment built FROM SCRATCH: no
+            # inherited GH_TOKEN / GITHUB_TOKEN, no inherited gh login, and
+            # GH_TOKEN set only from the auditor's own token variable.  This
+            # supersedes the per-key unsetting below, which the scrubbed
+            # environment already implies.
+            env = _AuditorEnvWrapper(env)
+        elif self._env_unset_keys:
             env = _EnvUnsetWrapper(env, self._env_unset_keys)
         result = await super().run_episode(
             prompt,
@@ -383,6 +392,70 @@ class _EnvUnsetWrapper:
             for key, value in saved.items():
                 if value is not None:
                     _os.environ[key] = value
+
+
+class _AuditorEnvWrapper:
+    """Wrap an Environment so the auditor's child gets a FROM-SCRATCH env.
+
+    The auditor must not inherit the executor's authority.  An inherited
+    ``GH_TOKEN`` / ``GITHUB_TOKEN``, or an inherited ``gh`` login under
+    ``$HOME/.config/gh``, would let a ``gh auth token`` or ``gh config get
+    oauth_token`` print a write-capable credential into the auditor's
+    context.
+
+    So the child environment is not "the parent environment, minus a few
+    names": it is built from scratch by
+    :func:`lh_harness.auditor_env.build_auditor_subprocess_env`, with
+    ``GH_CONFIG_DIR`` pointing at a fresh empty directory and ``GH_TOKEN``
+    set only from the auditor's own token variable.
+
+    Where the environment supports an explicit child env
+    (:meth:`lh_harness.environment.local.LocalEnvironment.exec`), it is
+    passed through directly.  Where it does not, the parent's ``os.environ``
+    is curated in place for the duration of the call, exactly as
+    :class:`_EnvUnsetWrapper` does -- the auditor's local runs are
+    single-threaded and the environment is restored immediately afterwards.
+    """
+
+    def __init__(self, env: Environment) -> None:
+        self._env = env
+        self.child_env: dict[str, str] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate all other Environment attributes (upload, download,
+        # staging_dir, etc.) to the wrapped environment unchanged.
+        return getattr(self._env, name)
+
+    async def exec(
+        self,
+        command: str,
+        timeout: int = 30,
+        tee_path: str | None = None,
+    ) -> Any:
+        import os as _os
+
+        self.child_env = build_auditor_subprocess_env()
+        exec_fn = getattr(self._env, "exec", None)
+        params = inspect.signature(exec_fn).parameters
+        if "child_env" in params:
+            return await exec_fn(
+                command,
+                timeout=timeout,
+                tee_path=tee_path,
+                child_env=self.child_env,
+            )
+
+        # Fallback for an Environment that builds its own child env: curate
+        # the parent's os.environ in place so the child inherits exactly the
+        # scrubbed environment, and restore it immediately afterwards.
+        saved = dict(_os.environ)
+        try:
+            _os.environ.clear()
+            _os.environ.update(self.child_env)
+            return await exec_fn(command, timeout=timeout, tee_path=tee_path)
+        finally:
+            _os.environ.clear()
+            _os.environ.update(saved)
 
 
 def episode_session_id(run_id: str | None, label: str, role: str) -> str:
