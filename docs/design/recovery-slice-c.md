@@ -69,10 +69,13 @@ processes.** Slice C is exactly about those three things.
 
 ### 0.2 Method note
 
-`graphify-query_graph` was not available in this run (no such executable on `PATH`, and no
-graphify resource advertised by any configured MCP server). The coverage map in §6 and every
-reference in this document therefore come from direct reads of the checkout at the base
-commit, not from a graph query.
+`graphify-query_graph` was not available in this run: no `graphify-query_graph`
+executable is on `PATH`, no graphify resource is advertised by any configured MCP server,
+and the `graphify` CLI that is on `~/.local/bin` has no graph built for this checkout
+(`graphify explain` → `error: graph file not found: .../graphify-out/graph.json`; no
+`graphify-out/` directory exists). The coverage map in §6 and every reference in this
+document therefore come from direct reads of the checkout at the base commit, not from a
+graph query. Every file:line cited was re-checked against the tree by script (§9).
 
 ---
 
@@ -100,19 +103,22 @@ round state rather than creating a new run directory:
    tampered checksum aborts the restore and falls back to the current fresh-start
    behaviour.
 2. Rebuild the round list from the ledger (`_recorded_rounds`) and continue at
-   `round_index + 1`, exactly as `manager.run()` already does when `resume` is true
-   (`src/lh_harness/manager.py:280`–`:290`, and the `role_harness_resumed` event at `:316`).
+   `round_index + 1`, exactly as the manager already does when `resume` is true
+   (`src/lh_harness/manager.py:280`–`:290` inside `_run_impl`, `:174`; the
+   `role_harness_resumed` event is at `:319`; the public `run` at `:134` delegates).
 3. Keep G2/G4 ahead of this step: effects are still detected first and the workspace is
    still stashed first; a restore never overwrites uncommitted work.
 4. Keep G3: the successor keeps `retry_of` / `interrupted_run`, and the report records
    `resume_from_round`.
 
 The single missing link today is the wiring: `Launcher._launch`
-(`src/lh_harness/launcher.py:1981`) calls `RunSupervisor.create_run` (`:2106`), which reaches
-`_create_run_once` (`src/lh_harness/supervisor/service.py:2095`) — a function with **no
-`resume` parameter**. `_worker_command` (`:1859`) only appends `--resume` when told to
-(`resume: bool = False` at `:1874`, append at `:1901`), and the only caller that passes
-`resume=True` is `_continue_run_in_place` (`:3236`, argument at `:3319`). So the durable
+(`src/lh_harness/launcher.py:1981`) calls `self.supervisor.create_run(...)` at
+`launcher.py:2106`; `RunSupervisor.create_run` is `supervisor/service.py:1932` and reaches
+`_create_run_once` (`:2095`) — both with **no `resume` parameter** (verified: `resume` does
+not appear anywhere in `create_run`'s or `_create_run_once`'s signatures).
+`RunSupervisor._worker_command` (`:1859`) only appends `--resume` when told to
+(`resume: bool = False` at `:1874`, append at `:1901`), and the only `resume=True` call site
+in the module is `_continue_run_in_place` (`:3236`, argument at `:3319`). So the durable
 round state is written correctly and read correctly, and simply never reaches the successor.
 
 **Proof test.** Build a run directory with two recorded rounds and a valid checkpoint, drive
@@ -164,8 +170,8 @@ operator-declared event.
   (`src/lh_harness/disk_retention/config.py:58`) are pruned by `prune_runs`
   (`src/lh_harness/disk_retention/runs.py:240`), which preserves only the failed-report
   files under `runs/_failed-reports/<id>/`. So even on a *live* host, round state older
-  than 14 days is gone by design, and `LIVE_STATES` (`:62`) is the only protection for an
-  in-flight run.
+  than 14 days is gone by design, and `LIVE_STATES` (`src/lh_harness/disk_retention/runs.py:62`,
+  not `config.py`) is the only protection for an in-flight run.
 
 **Recovery.** The design is a two-part restore, and it must be built in this order:
 
@@ -210,17 +216,25 @@ its constructor **overwrites the epoch**, naming the still-running service as th
 "previous" instance. From then on a worker that died while the service was up matches the
 previous-epoch test and is misclassified as restart-interrupted.
 
-This is not hypothetical. Constructing a launcher over an existing epoch
-`{pid: 1111, previous_pid: null}` rewrote the file to
-`{pid: <new>, previous_pid: 1111, previous_started_at: …}` on the real code, i.e. it
-recorded the live service as the previous instance. `classify_worker_death`
-(`restart_recovery.py:387`) then returns `INTERRUPTED_BY_RESTART` for a same-service death,
+This is not hypothetical. Constructing a real `Launcher` over an existing epoch
+`{"pid": 1111, "previous_pid": null, "previous_started_at": null, "started_at": 1.0}`
+rewrote the file to
+`{"pid": 1415612, "previous_pid": 1111, "previous_started_at": 1.0, "started_at": <now>}`,
+i.e. it recorded the live service as the previous instance. `classify_worker_death`
+(`restart_recovery.py:387`) then returns `interrupted_by_restart` for that worker's death
+(`belonged_to_previous_epoch` → `True` because `owner.supervisor_pid == epoch.previous_pid`),
 and `Launcher._update_launched_entries` creates a real `-r1` successor for an ordinary
 crash. A second, independent defect in the same shape: an `attached_only` supervisor refuses
 `create_run` (`src/lh_harness/supervisor/service.py:2124`, "this API is attached to an
 existing worker and cannot create runs"), and the launcher's `_launch` turns that refusal
-into `mark_failed(..., "launch failed: …")` — so the embedded dashboard can consume a real
-pending queue entry and fail it. Both were reproduced directly against the filesystem.
+into `mark_failed(..., "launch failed: …")` (the exception handler at
+`launcher.py:2127`–`:2129`) — so the embedded dashboard can consume a real pending queue
+entry and fail it. A `Launcher` constructed over an `attached_only` stand-in whose `create_run` raises
+that exact `ValueError` took a clean-workspace `pending` entry to `failed` with reason
+`launch failed: this API is attached to an existing worker and cannot create runs`.
+
+Both defects were reproduced directly against the real modules on a throwaway `runs_root`
+under `/tmp` — not read off the source.
 
 **Detection.** Three structural facts identify a launcher shape that must **not** own the
 epoch:
@@ -231,7 +245,8 @@ epoch:
   pid is alive and is not this process).
 
 `create_app` currently builds a `Launcher` for **any** non-`None` supervisor and queue
-store (`src/lh_harness/webapi/server.py:2039`) with no `attached_only` check, and
+store (`src/lh_harness/webapi/server.py:2038`–`:2041`; the condition at `:2038` is
+`supervisor is not None and queue_store is not None`, with no `attached_only` check), and
 `Launcher.__init__` unconditionally calls `_begin_service_epoch` (`launcher.py:806` →
 `:830` → `restart_recovery.begin_service_epoch`, `:227`).
 
@@ -273,9 +288,12 @@ that overlap in time both see "no successor" and both create one. The result vio
 
 — two `-r1` successors for one original — and, with them, two potential workers.
 
-This is real on the code at the base commit: two concurrent callers against one original
-entry produced **two** successors (`successors for q-orig: 2`), while the same two calls in
-sequence produce one (the existing tests
+This is real on the code at the base commit: two concurrent threads calling
+`reconcile_interrupted_run` — released from a `threading.Barrier` so both read the same
+snapshot — against one failed original entry produced **two** `-r1` successors, both
+`pending`, both carrying `retry_of` to the same original
+(`q-a459347e025844ff` and `q-f863010c69fa45d9`, both `retry_of: q-d4c874adf308487c`), while
+the same two calls in sequence produce one (the existing tests
 `test_reconcile_twice_still_yields_one_successor` and
 `test_reconcile_is_idempotent_when_called_directly_twice`,
 `tests/webapi/test_restart_run_recovery.py:346`, `:376`, cover only the sequential case).
@@ -302,12 +320,24 @@ a **plain partial index**, not a unique constraint, and both stores insert witho
    successor (or `None`, per G1's "already exists ⇒ no-op") and never raises into the
    launcher tick.
 
-For completeness, the *adjacent* reconciler is already idempotent in this sense:
-`queue_reconcile._apply_reconciliation` (`src/lh_harness/queue_reconcile.py:364`) re-reads
-each entry and `continue`s when `status != "launched"`; two overlapping sweeps over one
-zombie produced "A applied 1, B applied 0". It has no lock either — its protection is the
-status re-read, which leaves a stale-snapshot residual but no duplicate-write path. It is
-the model to copy, not a second thing to fix.
+For completeness, the *adjacent* reconciler is **nearly** idempotent, and the difference is
+instructive: `queue_reconcile._apply_reconciliation` (`src/lh_harness/queue_reconcile.py:364`)
+re-reads each entry and `continue`s when `status != "launched"`. Measured on the real code
+against one zombie:
+
+- **staggered** (second sweep 20 ms later): "A applied 1, B applied 0" — the status re-read
+  catches it.
+- **sequential** (the shape the existing tests pin): A 1, B 0.
+- **simultaneous** (both threads released from a barrier, both reading `launched`): **A 1,
+  B 1** — both sweeps append the same zombie to `applied` and both call `mark_failed`.
+
+The terminal state is still correct (`failed`, written twice with the same target status),
+so this is a **reporting** over-count, not a duplicate row — strictly weaker than the
+successor problem, where the duplicate is a real second queue entry with its own worker.
+But it means "the status re-read makes it idempotent" is only true for non-simultaneous
+sweeps; the honest statement is "no duplicate row, but a stale-snapshot double-apply in the
+report". It is the model to copy for the *row* outcome, not proof that re-read alone is
+sufficient.
 
 **Known residuals to state in the design, not to hide.** The file-store launcher lease
 (`queue.py` `.lease`, `_create_lease_excl` `:1384`, `acquire_lease` `:1405`) is O_EXCL and
@@ -323,7 +353,9 @@ close the lease residual, which is out of scope here.
 successor, whichever order they interleave in (this is the missing test; the existing ones
 are sequential). (b) The same test against the PG store asserts `ON CONFLICT` produces one
 row. (c) A third reconcile after the fact remains a no-op and does not raise. (d) Two
-overlapping `queue_reconcile` sweeps stay at one applied row (already true; pin it).
+barrier-released `queue_reconcile` sweeps leave the entry at one terminal status and — once
+this slice's re-read is made atomic — report it in only one sweep's `applied` list (today
+the simultaneous case reports A 1 B 1; see §4).
 
 **Invariant check.** This is G1 made durable: the invariant stops depending on the caller's
 snapshot and starts depending on the store. G2/G3/G4 order is unchanged — the loser of the
@@ -413,19 +445,25 @@ adding `interrupted_run`, `successor`, `needs_review`. 008 is the queue-migratio
 
 | Area | Grade | Evidence | Gap |
 |---|---|---|---|
-| 1. Durable checkpoint restore | **partial** | write: `manager._record_round:2472` → `_round_checkpoint:2456` → `_round_checkpoint_path:2451`; read/validate: `service._validate_latest_round_checkpoint:3357` (fail-closed); restore: `manager.run:280`, `_recorded_rounds:2385` | validator reachable only from `_resume_once:3139` (line `:3187`, `mode="continue"`, via `POST /api/maintenance/resume`, `server.py:2967`). Successors go `launcher._launch:1981` → `create_run:1932` → `_create_run_once:2095`, which has no `resume`; `_worker_command:1859` appends `--resume` only when passed (`:1874`, `:1901`). No test covers `checkpoint.json` at all. |
-| 2. Whole-host / `runs_root` loss | **no-handling** | state: `manager.py:266`, `queue.py:35`/`:1487`, `restart_recovery.epoch_path:167`; outbound only: `fleet/reporter.post_round_content:1022`; retention: `disk_retention/config.py:58`, `runs.py:240`, `LIVE_STATES:62`; PG rows only: `pg_queue.py:143` | no inbound fetch/import/restore anywhere in `src/lh_harness/fleet/`; epoch and round state share the lost disk; PG keeps queue rows but not round state |
+| 1. Durable checkpoint restore | **partial** | write: `manager._record_round:2472` → `_round_checkpoint:2456` → `_round_checkpoint_path:2451`; read/validate: `service._validate_latest_round_checkpoint:3357` (fail-closed); restore: `manager._run_impl:280`, `_recorded_rounds:2385` | validator reachable only from `_resume_once:3139` (line `:3187`, inside `if mode == "continue"`, via `POST /api/maintenance/resume`, `server.py:2967`). Successors go `launcher._launch:1981` → `create_run:1932` → `_create_run_once:2095`, which has no `resume`; `_worker_command:1859` appends `--resume` only when passed (`:1874`, `:1901`). No test covers `checkpoint.json` at all. |
+| 2. Whole-host / `runs_root` loss | **no-handling** | state: `manager.py:266`, `queue.py:35`/`:1487`, `restart_recovery.epoch_path:167`; outbound only: `fleet/reporter.post_round_content:1022`; retention: `disk_retention/config.py:58`, `runs.py:240`, `runs.py:LIVE_STATES:62`; PG rows only: `pg_queue.py:143` | no inbound fetch/import/restore anywhere in `src/lh_harness/fleet/`; epoch and round state share the lost disk; PG keeps queue rows but not round state |
 | 3. Non-web launcher shapes | **partial, defect reproduced** | `Launcher.__init__:806` → `_begin_service_epoch:830` → `begin_service_epoch:227` (unconditional); `server.create_app:2039` builds a Launcher for any supervisor; `cli.py:779` (`--dashboard` default on) + `:2021`–`:2024` (`attached_only`) + `:2039` (`start_web_server`); `service.py:2124` refuses `create_run` | constructing the embedded launcher rewrote `runs_root/queue/service_epoch.json` to `{pid:new, previous_pid:<live service>}`; an `attached_only` launcher marked an unrelated pending entry `failed` ("launch failed: this API is attached to an existing worker and cannot create runs") |
-| 4. Reconciler idempotency | **partial (sequential only)** | `find_restart_successor:447`, `already_restart_retried:463`; tests `test_restart_run_recovery.py:346`, `:376`; `migrations/005:42` plain partial index on `retry_of`; `queue.requeue:1767`, `pg_queue.requeue:763` (insert `:872`, random `q-uuid4`); lease `queue.py:1384`/`:1405`; `launcher._acquire_lease:1040` | two concurrent reconciles produced **2** successors for one original; no unique constraint; PG backend has no file lease. Adjacent `queue_reconcile._apply_reconciliation:364` *is* idempotent (verified: A applied 1, B applied 0) |
+| 4. Reconciler idempotency | **partial (sequential only)** | `find_restart_successor:447`, `already_restart_retried:463`; tests `test_restart_run_recovery.py:346`, `:376`; `migrations/005:42` plain partial index on `retry_of`; `queue.requeue:1767`, `pg_queue.requeue:763` (insert `:872`, random `q-uuid4`); lease `queue.py:1384`/`:1405`; `launcher._acquire_lease:1040` | two barrier-released concurrent reconciles produced **2** successors for one original; no unique constraint; PG backend has no file lease. Adjacent `queue_reconcile._apply_reconciliation:364` re-reads status: staggered/sequential A 1 B 0, simultaneous A 1 B 1 (report over-count only, no duplicate row) |
 | 5. Worker loss without a service stop | **partial (explicit negative policy)** | `classify_worker_death:387`, `worker_belonged_to_previous_epoch:285`; `launcher._is_retryable_cause:2360` → `_classify_failure_cause:350`; `service.py:1645` (reason), `:1676` (memory-kill persistence); `worker_isolation.is_memory_kill_reason` | same-epoch death and bare signal are ordinary failures with no successor; memory kill likewise; no operator action; `needs_review` never set for this case |
 
 ### 6.3 Test baseline (measured, not added)
 
-- `tests/webapi/test_restart_run_recovery.py` — 42 passed
-- `tests/test_resume.py` — 74 passed
-- combined — 116 passed in 1.32s
-- `tests/test_queue_reconcile_precheck.py` — 19 passed
-- checkpoint coverage: **none** (`checkpoint.json` appears in no test)
+Run in the repo's `.venv`, at the base commit + this doc:
+
+- `tests/webapi/test_restart_run_recovery.py` — **42 passed** in 2.31s
+- `tests/test_resume.py` — **74 passed** in 0.30s
+- the two together — **116 passed** in 1.36s
+- `tests/test_queue_reconcile_precheck.py` — **19 passed** in 0.17s
+- checkpoint coverage: **none** — `grep -rn "_validate_latest_round_checkpoint|_round_checkpoint|checkpoint.json" tests/`
+  returns nothing.
+
+These counts are the *baseline this doc is written against*; the doc itself adds no test
+(the checkpoint write/read tests are §8 item 1, the next PR piece).
 
 ---
 
@@ -451,21 +489,28 @@ Perplexity models.
 5. What is a defensible automatic-versus-operator policy for retrying work lost to a
    single worker death, and how do mature systems bound retry storms?
 
-**Refusal, recorded exactly** (no key was printed; only environment variable *names* were
-read):
+**Refusal, recorded exactly** (no key was printed, echoed or logged; only environment
+variable *names* were read, and no key material appears anywhere in this document or the
+commit):
 
 - No `LITELLM_API_KEY` / `LITELLM_KEY` is present in the run environment.
 - `LH_HARNESS_MCP_GATEWAY_KEY` → HTTP 403, `key_model_access_denied`:
   `key not allowed to access model. This key can only access models=['qwen3.8']. Tried to access sonar-pro:perplexity`
 - `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` → HTTP 403, same error type, key limited to
   an Anthropic/OpenRouter/Cloud model allowlist that contains no Perplexity model.
+- `LH_HARNESS_FLEET_KEY` → HTTP 401, `auth_error`: `LiteLLM Virtual Key expected. Received=<redacted>, expected to start with 'sk-'` — it is not a LiteLLM key at all.
 - Also refused: `sonar-reasoning-pro:perplexity`, `sonar:perplexity`, `sonar-pro`.
-- `GET /v1/models`: 51 models for `ANTHROPIC_AUTH_TOKEN`, 1 model for the gateway key,
-  **zero** `sonar`/`perplexity` models under either.
+- `GET /v1/models`: 51 models for `ANTHROPIC_AUTH_TOKEN`, 51 for `ANTHROPIC_API_KEY`, 1
+  model for the gateway key, **zero** `sonar`/`perplexity` models under any of them.
 
-There are therefore no cited URLs to record. Nothing in §1–§5 is derived from an external
-source; the designs are grounded in the code coverage map in §6 and in #182's stated
-invariants.
+The POSTs *were* attempted: each model × key combination above was sent to
+`https://litellm.easybutt0n.ai/v1/chat/completions` and refused before inference, so no
+answer text exists to summarise. This is a credential-scope refusal on the router side, not
+a network failure and not a model refusal of the question.
+
+There are therefore no cited URLs to record, and no answer summary may be invented. Nothing
+in §1–§5 is derived from an external source; the designs are grounded in the code coverage
+map in §6, in #182's stated invariants, and in the reproductions recorded in §3/§4 and §9.
 
 ---
 
@@ -492,3 +537,39 @@ invariants.
    (`needs_review` on repeated loss), add the operator-initiated `operator_recovered_after_worker_loss`
    requeue with the G2/G4 preconditions, and test that it neither consumes the restart
    second chance nor bypasses effect detection.
+
+---
+
+## 9. Verification record (how each claim in this document was checked)
+
+Every code reference above was checked against the tree at the base commit by script, not by
+memory: a Python pass that for each `file:line` asserts the line exists and contains the
+named symbol. Result: **91/91 citations resolve**. Five were wrong in the first draft and are
+corrected here — `manager.py:316`→`:319` (`role_harness_resumed`; `:280` is inside `_run_impl`
+at `:174`, not `run` at `:134`), `disk_retention/config.py:62`→`runs.py:62` (`LIVE_STATES`
+lives in `runs.py`, not `config.py`), `server.py:2039` (the `Launcher` is constructed at
+`:2039` but the *condition* is at `:2038`, which is what the argument turns on),
+`launcher.py:2124`→`:2127`–`:2129` (the `mark_failed` handler; `:2124` is inside the
+`create_run(...)` argument list), and the §1 `manager.run()` reference, which named the
+public delegator instead of the implementation that holds the `resume` branch.
+
+The four load-bearing behavioural claims were **reproduced on the real modules**, each on a
+throwaway `runs_root`/workspace under `/tmp` inside the repo working tree (deleted after
+each run; nothing left behind):
+
+| Claim | Reproduction | Observed |
+|---|---|---|
+| §3 epoch rewrite by a second launcher | construct a real `Launcher` over an existing `service_epoch.json` with `pid: 1111` | file became `{"pid": 1415612, "previous_pid": 1111, …, "started_at": <now>}` — the live service recorded as the predecessor |
+| §3 same-service death misclassified | `classify_worker_death` with that epoch and `owner.supervisor_pid == 1111` | `belonged_to_previous_epoch` → `True`; returns `interrupted_by_restart` |
+| §3 `attached_only` consumes a pending entry | real `Launcher` over a supervisor whose `create_run` raises the `service.py:2124` `ValueError`, clean git workspace | entry went `pending` → `failed`, reason `launch failed: this API is attached to an existing worker and cannot create runs` (written by `launcher.py:2129`) |
+| §4 two concurrent reconciles → two successors | two threads released from a `threading.Barrier` calling `reconcile_interrupted_run` on one failed entry | 2 successors for one original: `q-a459347e025844ff`, `q-f863010c69fa45d9`, both `retry_of: q-d4c874adf308487c`, both `pending` |
+
+One claim was **narrowed by measurement**: the adjacent `queue_reconcile` sweep is not
+idempotent under true simultaneity (A 1, B 1) — see §4. The terminal status stays correct, so
+it remains a weaker residual than the successor race, but the earlier blanket statement
+"already idempotent" was too strong and has been replaced with the measured three cases.
+
+**Not verified, and stated as such:** the Codex review texts (14:24Z / 16:29Z / 00:5xZ) were
+not supplied to this run, so the five areas are derived only from the task's enumeration of
+them, never from their content. The PG backend behaviours (`ON CONFLICT` absent, no file
+lease) are read off `pg_queue.py`, not executed — no Postgres instance was available.
