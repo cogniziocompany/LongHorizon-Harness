@@ -89,8 +89,13 @@ def test_progressing_episode_is_not_stalled() -> None:
     assert result.metadata["runtime_signals"] == []
 
 
-def test_stall_window_derivation() -> None:
+def test_stall_window_derivation(monkeypatch: pytest.MonkeyPatch) -> None:
     """Quarter of the budget, floored at 120 s, capped at 900 s; 0 disables."""
+    # The ops override (LH_HARNESS_STALL_SECONDS) wins over the derived
+    # window, so an ambient value in the operator's environment would change
+    # what this test measures.  These tests are hermetic by contract, so the
+    # override is cleared for the duration of this test.
+    monkeypatch.delenv("LH_HARNESS_STALL_SECONDS", raising=False)
     assert _stall_window(EpisodeBudget(max_duration_seconds=3600)) == DEFAULT_STALL_SECONDS_CAP
     assert _stall_window(EpisodeBudget(max_duration_seconds=1800)) == 450.0
     assert _stall_window(EpisodeBudget(max_duration_seconds=300)) == 120.0
