@@ -503,6 +503,104 @@ def test_the_agent_and_human_paths_produce_identical_record_shapes() -> None:
     assert agent_record.artifact_refs[0].head_sha == human_record.artifact_refs[0].head_sha
 
 
+def _shape(value: object) -> object:
+    """The STRUCTURE of a close-out payload: keys and value types.
+
+    ``to_dict().keys()`` equality proves two records carry the same field
+    names; it does NOT prove they carry the same TYPES, nor that a field
+    nested one level down (an artifact ref) has the same shape.  The
+    contract asks for a byte-identical record shape, so this walks the
+    whole payload and reports the structure, values excluded.
+    """
+
+    if isinstance(value, dict):
+        return {key: _shape(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_shape(item) for item in value]
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    if value is None:
+        return "none"
+    return type(value).__name__
+
+
+def test_the_three_production_routes_produce_a_byte_identical_record_shape(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The agent path, the manager's human path and ``/stop`` agree exactly.
+
+    The contract says both closers produce the SAME record shape, and the
+    human closer has two production routes (the gate-resolution path and
+    the ``/stop`` action).  Comparing only the top-level keys would let a
+    second mechanism hide behind a matching key set with a different
+    nested shape or a different type, so this compares the full STRUCTURE
+    of the three persisted records, including the nested artifact refs.
+    """
+
+    # 1. The agent path: the manager's "done" proposal.
+    agent_logs = tmp_path / "agent" / "lh_harness"
+    agent_logs.mkdir(parents=True)
+    agent_form = _delivered_form(closed_by="agent")
+    agent_form["closed_by_identity"] = "manager"
+    agent_record = _record_close_out(
+        logs_dir=agent_logs,
+        form=agent_form,
+        closed_by="agent",
+        identity="manager",
+        rounds=[],
+    )
+    assert agent_record is not None
+
+    # 2. The manager's HUMAN path: the operator's form off a gate decision.
+    human_logs = tmp_path / "human" / "lh_harness"
+    human_logs.mkdir(parents=True)
+    human_record = _record_close_out(
+        logs_dir=human_logs,
+        form=_delivered_form(),
+        closed_by="human",
+        identity="hydrafleet-gateway",
+        rounds=[],
+    )
+    assert human_record is not None
+
+    # 3. The ``/stop`` production route: the control-plane closer.
+    supervisor, run_id = _supervisor(monkeypatch, tmp_path)
+    stop_logs = tmp_path / "runs" / run_id / "lh_harness"
+    stop_logs.mkdir(parents=True, exist_ok=True)
+    (stop_logs / "report.json").write_text(
+        json.dumps({"status": "cancelled"}), encoding="utf-8"
+    )
+    stop_result = supervisor.stop(
+        run_id,
+        close_out_form=_delivered_form(),
+        closed_by_identity="hydrafleet-gateway",
+    )
+    assert stop_result["close_out"]["recorded"] is True
+    stop_record = load_close_out(stop_logs)
+    assert stop_record is not None
+
+    agent_shape = _shape(agent_record.to_dict())
+    assert _shape(human_record.to_dict()) == agent_shape
+    assert _shape(stop_record.to_dict()) == agent_shape
+
+    # The nested artifact refs agree too, down to the head sha.
+    for record in (agent_record, human_record, stop_record):
+        assert record.artifact_refs[0].to_dict() == {
+            "kind": "pr",
+            "repo": _PR_REPO,
+            "ref": "96",
+            "url": _PR_URL,
+            "head_sha": _PR_HEAD_SHA,
+            "derived": False,
+        }
+
+
 def test_a_delivery_conflicting_with_the_auditor_is_refused_on_the_human_path() -> None:
     """The auditor is the authority on the human path too."""
 
