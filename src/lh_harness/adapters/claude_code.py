@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -9,6 +10,7 @@ from typing import Any
 
 from ..agent_logs import visible_output as extract_claude_visible_output
 from ..agent_registry import normalise_reasoning_effort
+from ..auditor_env import build_auditor_subprocess_env
 from ..mcp_profiles import (
     GRAPHIFY_PROFILE,
     gateway_configured,
@@ -294,7 +296,14 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
 
         # Carry per-episode env into the subprocess, removing auditor-unset keys.
         label = _episode_prompt_label(live_trajectory_path)
-        if self._env_unset_keys:
+        if is_auditor_role(self.role):
+            # The auditor's child gets an environment built FROM SCRATCH: no
+            # inherited GH_TOKEN / GITHUB_TOKEN, no inherited gh login, and
+            # GH_TOKEN set only from the auditor's own token variable.  This
+            # supersedes the per-key unsetting below, which the scrubbed
+            # environment already implies.
+            env = _AuditorEnvWrapper(env)
+        elif self._env_unset_keys:
             env = _EnvUnsetWrapper(env, self._env_unset_keys)
         result = await super().run_episode(
             prompt,
@@ -383,6 +392,87 @@ class _EnvUnsetWrapper:
             for key, value in saved.items():
                 if value is not None:
                     _os.environ[key] = value
+
+
+class AuditorEnvUnsupported(RuntimeError):
+    """An Environment cannot host the auditor's scrubbed child env.
+
+    Raised fail-closed by :class:`_AuditorEnvWrapper` when the wrapped
+    environment's ``exec`` does not accept ``child_env``.  The auditor must
+    never fall back to mutating the parent's process-global ``os.environ``:
+    see :class:`_AuditorEnvWrapper` for why that cannot be safe across an
+    ``await``.
+    """
+
+
+class _AuditorEnvWrapper:
+    """Wrap an Environment so the auditor's child gets a FROM-SCRATCH env.
+
+    The auditor must not inherit the executor's authority.  An inherited
+    ``GH_TOKEN`` / ``GITHUB_TOKEN``, or an inherited ``gh`` login under
+    ``$HOME/.config/gh``, would let a ``gh auth token`` or ``gh config get
+    oauth_token`` print a write-capable credential into the auditor's
+    context.
+
+    So the child environment is not "the parent environment, minus a few
+    names": it is built from scratch by
+    :func:`lh_harness.auditor_env.build_auditor_subprocess_env`, with
+    ``GH_CONFIG_DIR`` pointing at a fresh empty directory and ``GH_TOKEN``
+    set only from the auditor's own token variable.
+
+    Where the environment supports an explicit child env
+    (:meth:`lh_harness.environment.local.LocalEnvironment.exec`), it is
+    passed through directly.  Where it does not, the wrapper FAILS CLOSED:
+    it raises :class:`AuditorEnvUnsupported` rather than mutating the
+    parent's process-global ``os.environ``.  Curating ``os.environ`` in
+    place cannot be made safe across an ``await`` -- any other coroutine in
+    the same process (the executor's git/gh calls, a second auditor exec)
+    would run with the scrubbed environment during that window, and two
+    overlapping auditor execs could each restore the other's snapshot and
+    leave the process permanently without its own credentials.  There is
+    currently exactly one concrete ``Environment`` (``LocalEnvironment``)
+    and it accepts ``child_env``; a new implementation that does not must
+    opt in before it can host an auditor.
+    """
+
+    def __init__(self, env: Environment) -> None:
+        self._env = env
+        self.child_env: dict[str, str] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate all other Environment attributes (upload, download,
+        # staging_dir, etc.) to the wrapped environment unchanged.
+        return getattr(self._env, name)
+
+    async def exec(
+        self,
+        command: str,
+        timeout: int = 30,
+        tee_path: str | None = None,
+    ) -> Any:
+        self.child_env = build_auditor_subprocess_env()
+        exec_fn = getattr(self._env, "exec", None)
+        params = inspect.signature(exec_fn).parameters
+        if "child_env" in params:
+            return await exec_fn(
+                command,
+                timeout=timeout,
+                tee_path=tee_path,
+                child_env=self.child_env,
+            )
+
+        # Fail closed.  The previous fallback curated the parent's
+        # process-global os.environ in place across the awaited exec, which
+        # leaks the scrubbed environment into every concurrent coroutine in
+        # this process and can corrupt the env permanently when two auditor
+        # execs overlap.  The auditor must not run on that path.
+        raise AuditorEnvUnsupported(
+            "the auditor's scrubbed child environment cannot be applied: "
+            f"{type(self._env).__name__}.exec does not accept child_env; "
+            "the environment must opt in to child_env (see "
+            "_AuditorEnvWrapper) -- refusing to mutate the process-global "
+            "os.environ across an await"
+        )
 
 
 def episode_session_id(run_id: str | None, label: str, role: str) -> str:

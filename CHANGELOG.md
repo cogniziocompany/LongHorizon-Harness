@@ -9,6 +9,167 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The auditor can independently verify a pull request, read-only.** The
+  harness is a validation chain: each step validates the last in its process
+  to achieve its tasks, so a step may only claim success if the step before
+  it actually validated the thing being claimed.  The auditor is the last
+  independent verification step, and until now it could not verify anything
+  about the outside world.  Its MCP profile (`audit`) lists only servers
+  whose tools are inherently non-mutating — the gateway cannot scope a
+  server to read-only, so adding the `github` server there would have handed
+  the auditor WRITE-capable tools — and its tool deny-list refused
+  `Bash(gh *)` wholesale, taking out the local `gh` CLI's READ verbs along
+  with the write ones.  (That blanket deny has since been replaced by
+  per-spelling write denies; see below.)
+
+  The consequence was structural.  An auditor with no independent evidence
+  could only RESTATE an executor's claims or refuse them; it could never
+  CONFIRM or REFUTE them.  A run whose auditor could not reach GitHub
+  produced an audit saying "any executor claim about the PR is untrusted in
+  its entirety" — and that run was then recorded with no distinction from
+  one that had been delivered and audited cleanly.
+
+  New module `lh_harness/auditor_verify.py` gives the auditor a read-only
+  reach of its own:
+
+  * `ReadOnlyGitHubClient` reads a pull request's existence, number, state,
+    base branch, head sha and diff stat.  Read-only is a property of the
+    code, not a convention: every request is a `GET`, the write verbs have no
+    code path at all, and the one dynamic entry point
+    (`ReadOnlyGitHubClient.request`) refuses anything that is not a read.
+  * `assert_read_only_command` is the enforcement layer for the `gh` / `git`
+    command surface.  It refuses `gh pr merge`, `gh pr comment`,
+    `gh pr close`, the `gh api` write methods (`--method=POST`, `-X PATCH`,
+    `-X PUT`, `-X DELETE`) and the field-supplying `gh api` bodies (`-f`,
+    `-F`, `--input`) that a bare `Bash(gh *)` deny would leave unmatched,
+    plus the write leaves that hide under read groups (`gh pr review
+    --approve`, `gh secret set`, `gh workflow run`).
+  * `resolve_auditor_credential` resolves the auditor's OWN fine-grained
+    read-only token from `LH_HARNESS_AUDITOR_GITHUB_TOKEN` and refuses to
+    proceed when the resolved value collides with the executor's `GH_TOKEN` /
+    `GITHUB_TOKEN` or with a fleet admin token.  The value is never printed,
+    logged, or committed; the credential's own `repr` renders presence, not
+    value.
+
+  Fail-closed by construction: any read failure — network error, missing PR,
+  permission error, unexpected status — yields an explicit `unverifiable`
+  verification result that BLOCKS a delivered claim.  It never becomes a
+  silent pass and never becomes a confirmed value.
+
+  New CLI command `lh-harness verify-pr --repo <owner/name> --number <n>
+  [--reviewed-sha <sha>]` runs the verification and prints a verdict of
+  `confirmed`, `refuted`, or `unverifiable`.  Exit code 0 means CONFIRMED;
+  a refutation or an unreachable read exits non-zero, because an auditor that
+  could not reach the evidence has no basis to call the claim true.
+
+  **The auditor's reach is now REACHABLE, not merely present.**  The command
+  the auditor's role instructions named — `lh-harness verify-pr` — did not
+  resolve in the agent environment: the console script is only on PATH inside
+  the project virtualenv, and where it did resolve it resolved to the
+  *installed* package, which has no `verify-pr` subcommand at all.  A
+  verification surface the verifier cannot invoke is not a verification
+  surface.  The auditor's instructions now name
+  `python3 scripts/auditor_verify_pr.py --repo <owner/name> --number <n>
+  [--reviewed-sha <sha>]`, a script that resolves THIS checkout's own `src`
+  tree ahead of anything installed in site-packages, so the auditor verifies
+  against the code in the working tree it is auditing.  Exit code 0 means
+  confirmed; any other exit means NOT confirmed.
+
+  **The blanket `Bash(gh *)` deny is replaced by per-spelling write denies.**
+  Denying `gh` wholesale took out the local `gh` CLI's READ verbs along with
+  its write ones.  `AUDITOR_GH_WRITE_DENY` now denies the write spellings one
+  by one — `gh pr merge`, `gh pr comment`, `gh pr close`, `gh pr ready`,
+  `gh pr edit`, `gh issue comment`, the `gh api` write methods
+  (`--method=*`, `-X *`), the field-supplying `gh api` bodies (`-f`, `-F`,
+  `--field`, `--raw-field`, `--input`), `gh secret set`, `gh workflow run`,
+  `git push` and the rest — while a `gh` read is no longer blocked by the
+  same rule that blocks a write.  The in-process enforcement layer
+  (`assert_read_only_command`) is the belt to that deny list's braces: it
+  refuses a write that arrives by any other route, including a direct call
+  into the harness's GitHub client.
+
+  **Every write spelling is refused INDIVIDUALLY and asserted individually.**
+  `tests/test_auditor_read_only_spelling_coverage.py` gives each spelling its
+  own named test rather than one generic parametrized case, so a spelling
+  cannot be lost from a list or moved to the wrong group without a test
+  failing.  Each refusal is asserted to name the attempted operation and to
+  carry no credential value.
+
+  **The read-only enforcement is now proven at BOTH layers, and the
+  permission layer had six real holes.**  The auditor's read-only reach is
+  enforced in two places: the in-process layer
+  (`assert_read_only_command`), which refuses a write by the SHAPE of the
+  invocation, and the permission layer — the `Bash(...)` rules handed to
+  Claude Code as `--disallowedTools` — which stops the auditor shelling out
+  to a write at all.  Only the first was proven.  The permission layer was
+  checked by string MEMBERSHIP: the tests asserted that the literal rule
+  `"Bash(gh pr merge*)"` was IN the deny list, which proves the rule exists
+  and nothing about whether it DENIES the command it is written for.  A rule
+  can sit in the list and match nothing, and the shell-out is then refused
+  by nothing at all.
+
+  Six write spellings were in exactly that state — refused in-process, matched
+  by no deny rule: `gh issue reopen`, `gh issue delete`, `gh release delete`,
+  `gh secret delete`, `gh variable delete`, and the joined
+  `gh api <path> --input=payload.json` body spelling.  All six now have a
+  deny rule, and `uncovered_auditor_write_spellings()` computes the
+  permission layer's coverage instead of assuming it.
+
+  New in `lh_harness/auditor_verify.py`:
+  * `write_intent_reason(argv)` is the SHAPE classifier the whole surface is
+    built on: it decides by program, subcommand and leaf, HTTP method, and
+    the presence of a request body — never by matching one literal command
+    string — so a renamed or parameterised write is refused the same way.
+    `assert_read_only_command` now sits on top of it.
+  * `deny_rule_matches(command, rule)` and
+    `is_denied_by_auditor_policy(command, rules)` are the permission layer's
+    matcher.  They make a refusal at that layer PROVABLE in-repo instead of
+    asserted by string membership.
+  * `AUDITOR_WRITE_SPELLINGS` is the canonical list of write spellings, as
+    argv lists, and is the single source of truth for the per-spelling tests
+    and for the deny list's coverage invariant.
+
+  New `tests/test_auditor_write_spelling_refusal.py` checks every spelling
+  against BOTH layers, with each spelling in its own named test, and adds
+  the HTTP-layer proof that no write request is ever issued: the client's
+  transport records every request and the test asserts that the number of
+  non-GET requests is ZERO.  Fail-closed behaviour is unchanged — an
+  unreachable read still yields an explicit `unverifiable` that blocks a
+  delivered claim, never a silent pass.
+
+  **The auditor can no longer ASK for a credential, and no longer HAS one to
+  ask with.**  Two holes remained after the read-only surface was built, and
+  both were the same hole seen from two sides.  First, `gh auth`, `gh config`
+  and `gh secret` sat on the read allowlist, so `gh auth token`,
+  `gh auth status --show-token` and `gh config get oauth_token` were ALLOWED
+  — and with an inherited `gh` login or the executor's `GH_TOKEN` in reach,
+  those print a WRITE-capable credential into the auditor's context in the
+  clear.  `auth`, `config` and `secret` are now credential groups that are
+  refused as groups, at both enforcement layers; the single exception is a
+  bare `gh auth status`, which reports the account in use and not the token
+  it would use, so it stays allowed and a token-revealing flag under it
+  (`-t` / `--show-token`, in any position) is refused.
+
+  Second, refusing the COMMAND was not enough while the auditor still
+  INHERITED a credential to ask with.  The auditor's subprocess environment
+  is now BUILT FROM SCRATCH (`lh_harness/auditor_env.py`), not the parent's
+  environment with a few names deleted — a filter can only remove what it
+  knows about.  The child's environment carries a small explicit base, no
+  `GH_TOKEN` / `GITHUB_TOKEN` / `GH_ENTERPRISE_TOKEN` /
+  `GITHUB_ENTERPRISE_TOKEN` and no fleet/admin token, a `GH_CONFIG_DIR`
+  pointing at a FRESH EMPTY temp directory so `gh` has no stored credential
+  to fall back on, and `GH_TOKEN` set only from
+  `LH_HARNESS_AUDITOR_GITHUB_TOKEN` inside that scrubbed environment.  The
+  auditor role's subprocess now runs with exactly that environment.
+
+  The auditor's contract header is UNCHANGED: still exactly `Status` /
+  `Integrity` / `Contract audit`.  The `confirmed` / `refuted` /
+  `unverifiable` values are this module's internal verification result, not a
+  contract-header vocabulary.  The close-out outcome vocabulary belongs to the
+  sibling task `yt:easybutt0n-17:harness-closeout-contract` and is neither
+  defined nor renamed here.  PR #147 (auditor isolation) and PR #159 (queue
+  outcomes) are referenced as design references, not re-implemented.
+
 - **The launcher enforces a node-level active-run ceiling.** `[queue] node_max_runs`
   is the maximum number of runs the launcher will let be active on THIS node at
   once — the value the fleet registry advertises as `maxConcurrentRuns`. Until
@@ -122,6 +283,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The auditor's read-only enforcement no longer depends on the ORDER of a
+  `gh api` command's flags.  `gh api` parses its flags with Go's flag
+  package, so the endpoint is not position-locked:
+  `gh api -f body=x repos/o/r/issues/1/comments` is the same write as
+  `gh api repos/o/r/issues/1/comments -f body=x`.  The deny rules for a
+  field-supplying body were anchored on the path coming first, so in the
+  flag-first ordering they matched NOTHING and the permission layer would
+  have let the write through — the in-process classifier refused it, but the
+  shell-out was refused by no rule at all.  Every body flag (`-f`, `-F`,
+  `--field`, `--raw-field`, `--input`, `--input=`, `-i`) now has a rule for
+  both orderings, and each spelling has its own named test asserting BOTH
+  layers refuse it.
+- The auditor's permission layer now covers the write verbs it had missed
+  entirely: `gh pr lock`/`gh pr unlock` and `gh issue lock`/`gh issue
+  unlock` (locking a conversation is a write), `gh gist rename`/`view`/
+  `list`/`clone` (the gist group is a write group, so the permission layer
+  denies all of it and the two layers agree), `gh project create`/`edit`/
+  `close`/`delete`, `gh cache delete`, `gh config set`, `gh gpg-key delete`,
+  and the write-only groups `gh alias`, `gh extension`, `gh org`, `gh team`
+  and `gh sso` — denied as a GROUP, because a verb-by-verb list is a list
+  that goes stale.  The canonical write-spelling list grows from 90 to 125
+  entries, each with its own named test at both layers.
+- Two invariant tests now guard the enforcement instead of asserting it once:
+  one walks every body flag through every position it can take relative to
+  the endpoint and requires both layers to refuse each, and one requires the
+  in-process classifier and the permission layer to AGREE about which
+  commands are writes — a write the classifier refuses but no deny rule
+  matches is a hole in the permission layer, and a command a deny rule
+  matches that the classifier calls a read is a read taken away.
+- The `graphify` code-graph tool's local index (`graphify-out/`) is now
+  ignored, so a local analysis run cannot commit it.
+
+- The auditor's role instruction now names BOTH halves of the invocation an
+  auditor needs: the command that resolves in the agent environment
+  (`python3 scripts/auditor_verify_pr.py --repo <owner/name> --number <n>
+  --reviewed-sha <sha>`) and the credential variable the verifier reads
+  (`LH_HARNESS_AUDITOR_GITHUB_TOKEN`).  The instruction previously said
+  "the auditor's dedicated read-only token" without saying which variable
+  that was, so an auditor could not set it — and an auditor that guessed the
+  name would have picked up the executor's write-capable `GH_TOKEN` instead.
+  The variable NAME is not a secret and is stated in both the `en` and `zh`
+  instructions; the token VALUE appears nowhere.  The executor's variables
+  are named in the instruction only to forbid them.
+- The auditor's read-only enforcement is now proven **per spelling, at both
+  layers**, for the spellings a read allowlist would otherwise let through:
+  `gh pr merge --admin`, `gh pr merge --rebase`, `gh pr merge --auto`,
+  `gh api --method POST|PATCH|PUT|DELETE` (the space-separated long-flag
+  spelling), and `gh api` with a write method AND a field-supplying body.
+  Each has its own named test asserting the in-process layer refuses it AND
+  the permission layer's deny rule MATCHES it.
+- The G4 reachability tests no longer measure the test harness instead of the
+  surface: they ran the verifier with a hard-coded `HOME` pointing at the
+  repository root, which moved the user site-packages directory and made the
+  harness's own dependencies unimportable, so the named invocation failed
+  with `ModuleNotFoundError` before it ever reached the verifier.  The
+  subprocess environment is now derived from the real one with the harness's
+  own runtime variables stripped.
 - Queue launches no longer burn an attempt on an ineligible auditor MCP
   profile (task 234).  An auditor role that would resolve to a non-read-only
   profile is refused on the pre-burn path: the exact supervisor reason

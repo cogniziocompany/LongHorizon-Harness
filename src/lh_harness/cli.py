@@ -923,6 +923,32 @@ def main(argv: list[str] | None = None) -> int:
 
     add_command("check-update", "Check PyPI for a newer LongHorizon-Harness release")
 
+    verify_parser = add_command(
+        "verify-pr",
+        "Independently read a pull request and confirm or refute a reviewed head sha (read-only)",
+    )
+    verify_parser.add_argument(
+        "--repo",
+        required=True,
+        help="Repository slug, e.g. owner/name.",
+    )
+    verify_parser.add_argument(
+        "--number",
+        required=True,
+        type=int,
+        help="Pull request number.",
+    )
+    verify_parser.add_argument(
+        "--reviewed-sha",
+        default="",
+        help="The head sha the auditor reviewed; a mismatch is REFUTED.",
+    )
+    verify_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the verification result as one JSON object on stdout.",
+    )
+
     retention_parser = add_command(
         "retention",
         "Run disk-retention sweeps (dry-run by default; --apply to actually move/delete)",
@@ -1009,6 +1035,8 @@ def main(argv: list[str] | None = None) -> int:
         return _check_update_command()
     if args.command == "retention":
         return _retention_command(args)
+    if args.command == "verify-pr":
+        return _verify_pr_command(args)
 
     parser.print_help()
     return 2
@@ -1511,6 +1539,62 @@ def _check_update_command() -> int:
     result = check_for_update(__version__)
     _report_update_result(result)
     return 1 if result.status == "failed" else 0
+
+
+def _verify_pr_command(args: argparse.Namespace) -> int:
+    """`lh-harness verify-pr`. An independent, read-only PR read.
+
+    This is the auditor's reach into the outside world.  It uses the
+    auditor's OWN fine-grained read-only token, issues GET requests only, and
+    prints a verdict that is one of confirmed / refuted / unverifiable.
+
+    Exit code 0 means CONFIRMED.  Anything else -- a refutation, or an
+    unverifiable read -- exits non-zero, because an auditor that could not
+    reach the evidence has no basis to call the claim true.
+    """
+
+    import json as _json
+
+    from .auditor_verify import (
+        VERDICT_CONFIRMED,
+        AuditorCredentialError,
+        ReadOnlyGitHubClient,
+        verify_pull_request,
+    )
+
+    try:
+        client = ReadOnlyGitHubClient.from_environment()
+    except AuditorCredentialError as exc:
+        # The message names variables only; it never contains a token value.
+        print(f"verifier unusable: {exc}", file=sys.stderr)
+        return 2
+
+    result = verify_pull_request(
+        client,
+        repo=args.repo,
+        number=args.number,
+        reviewed_sha=args.reviewed_sha,
+    )
+
+    if args.json:
+        print(
+            _json.dumps(
+                {
+                    "verdict": result.verdict,
+                    "reason": result.reason,
+                    "reviewed_sha": result.reviewed_sha,
+                    "observed_sha": result.observed_sha or "",
+                    "blocks_delivery": result.blocks_delivery,
+                    "repo": args.repo,
+                    "number": args.number,
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print(result.summary())
+
+    return 0 if result.verdict == VERDICT_CONFIRMED else 1
 
 
 def _report_update_result(result: UpdateCheckResult | None) -> bool:

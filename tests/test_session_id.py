@@ -40,7 +40,12 @@ class FakeEnvironment:
         command: str,
         timeout: int = 30,
         tee_path: str | None = None,
+        child_env: dict[str, str] | None = None,
     ) -> ExecResult:
+        # child_env: the _AuditorEnvWrapper passes the auditor's scrubbed
+        # environment when this double plays the cli_auditor role (easybutt0n-17
+        # re-review 2026-11-05: the wrapper fails closed for an exec without
+        # child_env, mirroring the real Environment protocol).
         self.commands.append(command)
         return ExecResult(
             stdout='{"type": "final"}\n',

@@ -32,7 +32,6 @@ AUDITOR_NETWORK_GIT_DENY: tuple[str, ...] = (
     "Bash(git clone*)",
     "Bash(git submodule*)",
     "Bash(git lfs*)",
-    "Bash(gh *)",
     # Variants that point git at a different directory via -C or --git-dir.
     "Bash(git -C * fetch*)",
     "Bash(git -C * pull*)",
@@ -49,6 +48,193 @@ AUDITOR_NETWORK_GIT_DENY: tuple[str, ...] = (
     "Bash(git --git-dir* submodule*)",
     "Bash(git --git-dir* lfs*)",
 )
+
+# Deny rules for the auditor's `gh` WRITE spellings.
+#
+# The auditor used to be denied `Bash(gh *)` wholesale.  That was the safe
+# choice at the time, but it was a blunt one: it took out the local `gh`
+# CLI's READ verbs along with the write ones, so an auditor that wanted to
+# look at a pull request had to shell out to something else.  The auditor's
+# independent reach is now the harness's own read-only verifier
+# (``scripts/auditor_verify_pr.py``), and this deny list is spelled per
+# WRITE so that a read is not blocked by the same rule that blocks a write.
+#
+# The spellings below are the write paths that a `gh` read allowlist would
+# otherwise let through.  They are the same spellings the in-process
+# enforcement layer refuses (``lh_harness.auditor_verify.assert_read_only_command``),
+# which is the belt to this deny list's braces: the deny list stops the
+# auditor from *shelling out* to a write, and the enforcement layer refuses a
+# write that arrives by any other route (including a direct call into the
+# harness's GitHub client).
+AUDITOR_GH_WRITE_DENY: tuple[str, ...] = (
+    # A write verb on the raw API.
+    "Bash(gh api --method=*)",
+    "Bash(gh api -X *)",
+    "Bash(gh api -X*)",
+    "Bash(gh api --method *)",
+    # A field-supplying API body: a write even without an explicit method.
+    "Bash(gh api * -f *)",
+    "Bash(gh api * -F *)",
+    "Bash(gh api * --field *)",
+    "Bash(gh api * --raw-field *)",
+    "Bash(gh api * --input *)",
+    "Bash(gh api * --input=*)",
+    "Bash(gh api * -i *)",
+    # The same body flags with the flag BEFORE the endpoint.  `gh api`
+    # parses its flags with Go's flag package, so the endpoint is not
+    # position-locked: `gh api -f body=x repos/o/r/issues/1/comments` is
+    # the same write as `gh api repos/o/r/issues/1/comments -f body=x`.
+    # The rules above are anchored on the path coming first, so without
+    # these the flag-first spelling matched NO rule and the permission
+    # layer let a write through.
+    "Bash(gh api -f *)",
+    "Bash(gh api -F *)",
+    "Bash(gh api --field *)",
+    "Bash(gh api --raw-field *)",
+    "Bash(gh api --input *)",
+    "Bash(gh api --input=*)",
+    "Bash(gh api -i *)",
+    # Pull-request and issue writes.
+    "Bash(gh pr merge*)",
+    "Bash(gh pr close*)",
+    "Bash(gh pr reopen*)",
+    "Bash(gh pr ready*)",
+    "Bash(gh pr edit*)",
+    "Bash(gh pr comment*)",
+    "Bash(gh pr create*)",
+    "Bash(gh pr review*)",
+    "Bash(gh issue comment*)",
+    "Bash(gh issue create*)",
+    "Bash(gh issue close*)",
+    "Bash(gh issue reopen*)",
+    "Bash(gh issue delete*)",
+    "Bash(gh issue edit*)",
+    "Bash(gh release create*)",
+    "Bash(gh release edit*)",
+    "Bash(gh release upload*)",
+    "Bash(gh release delete*)",
+    "Bash(gh secret set*)",
+    "Bash(gh secret delete*)",
+    "Bash(gh variable set*)",
+    "Bash(gh variable delete*)",
+    "Bash(gh workflow run*)",
+    "Bash(gh workflow dispatch*)",
+    "Bash(gh workflow enable*)",
+    "Bash(gh run rerun*)",
+    "Bash(gh run cancel*)",
+    "Bash(gh run delete*)",
+    "Bash(gh repo edit*)",
+    "Bash(gh repo create*)",
+    "Bash(gh repo delete*)",
+    # Conversation locking is a write on the pull request, like a comment.
+    "Bash(gh pr lock*)",
+    "Bash(gh pr unlock*)",
+    "Bash(gh gist create*)",
+    "Bash(gh gist delete*)",
+    "Bash(gh gist edit*)",
+    "Bash(gh gist rename*)",
+    # The gist group is a WRITE group for the in-process classifier, so the
+    # permission layer denies the whole of it -- including the verbs that
+    # read (`gh gist view`, `gh gist list`).  The two layers must agree
+    # about what a write is, or one of them is a hole.
+    "Bash(gh gist view*)",
+    "Bash(gh gist list*)",
+    "Bash(gh gist clone*)",
+    "Bash(gh label create*)",
+    "Bash(gh label edit*)",
+    "Bash(gh label delete*)",
+    # Conversation locking is a write on the issue, like on the PR.
+    "Bash(gh issue lock*)",
+    "Bash(gh issue unlock*)",
+    # Project writes, and the local cache / config writes.
+    "Bash(gh project create*)",
+    "Bash(gh project edit*)",
+    "Bash(gh project close*)",
+    "Bash(gh project delete*)",
+    "Bash(gh cache delete*)",
+    "Bash(gh config set*)",
+    # The credential groups are denied as GROUPS, exactly like the write-only
+    # groups below: a leaf-by-leaf list goes stale, and every leaf of
+    # ``gh auth`` / ``gh config`` / ``gh secret`` either PRINTS a credential
+    # or changes one.  ``gh auth token``, ``gh auth status --show-token`` and
+    # ``gh config get oauth_token`` would put a write-capable credential in
+    # the auditor's context in the clear.
+    #
+    # A plain ``gh auth status`` -- which reports the account in use and not
+    # the token it would use -- is the ONE leaf that stays admissible, so the
+    # ``gh auth`` rules below are spelled leaf by leaf and the two
+    # token-revealing flags are matched in ANY position.
+    "Bash(gh auth token*)",
+    "Bash(gh auth login*)",
+    "Bash(gh auth logout*)",
+    "Bash(gh auth refresh*)",
+    "Bash(gh auth setup-git*)",
+    "Bash(gh auth switch*)",
+    "Bash(gh auth status -t*)",
+    # The two token-revealing flags, matched in ANY position: the flag may
+    # sit behind another flag (``gh auth status --hostname github.com -t``),
+    # and a rule anchored on the flag coming first would let that through.
+    "Bash(gh auth * -t*)",
+    "Bash(gh auth * --show-token*)",
+    "Bash(gh config get*)",
+    "Bash(gh config list*)",
+    "Bash(gh secret list*)",
+    "Bash(gh api-write*)",
+    "Bash(gh codespace*)",
+    "Bash(gh ruleset*)",
+    "Bash(gh ssh-key*)",
+    "Bash(gh gpg-key*)",
+    # These groups are write-ONLY: every verb they offer changes state on
+    # GitHub, so they are denied as a GROUP.  A verb-by-verb list is a list
+    # that goes stale -- `gh gist` was denied only for `create`, so `gh gist
+    # delete` and `gh gist edit` matched no rule at all.  Groups that also
+    # offer READ verbs (`gh label list`, `gh gist view`) are spelled per
+    # verb above, so a legitimate read is not taken away with the write.
+    "Bash(gh alias*)",
+    "Bash(gh extension*)",
+    "Bash(gh org*)",
+    "Bash(gh team*)",
+    "Bash(gh sso*)",
+    # A write flag on an otherwise-read verb.
+    "Bash(gh pr * --approve*)",
+    "Bash(gh pr * --request-changes*)",
+    "Bash(gh pr * --comment*)",
+    "Bash(gh pr * --delete-branch*)",
+    "Bash(gh pr * --merge*)",
+    "Bash(gh pr * --squash*)",
+    "Bash(gh pr * --rebase*)",
+    "Bash(gh pr * --ready*)",
+    "Bash(gh pr * --draft*)",
+)
+
+
+def uncovered_auditor_write_spellings() -> tuple[str, ...]:
+    """Return the write spellings NO deny rule refuses.
+
+    The permission layer is one of two defences, and it is the one that
+    stops the auditor from shelling out to a write at all.  A rule that
+    sits in the deny list but matches nothing is not a defence, so the
+    coverage of the deny list is computed rather than assumed.
+
+    The spellings come from
+    :data:`lh_harness.auditor_verify.AUDITOR_WRITE_SPELLINGS` -- the same
+    list the per-spelling tests walk -- so a spelling that gains a
+    classifier but no rule shows up here as uncovered.
+    """
+
+    from lh_harness.auditor_verify import (  # local import: avoids a cycle
+        AUDITOR_WRITE_SPELLINGS,
+        command_string,
+        is_denied_by_auditor_policy,
+    )
+
+    rules = (*AUDITOR_GH_WRITE_DENY, *AUDITOR_NETWORK_GIT_DENY)
+    uncovered = []
+    for spelling in AUDITOR_WRITE_SPELLINGS:
+        command = command_string(spelling)
+        if is_denied_by_auditor_policy(command, rules) is None:
+            uncovered.append(command)
+    return tuple(uncovered)
 
 # Environment variables that make any network git operation fail fast for the
 # auditor role. GIT_CONFIG_COUNT overrides are injected via the env and cause git
@@ -115,6 +301,7 @@ def policy_for_role(role: str) -> ClaudeRolePolicy:
                 *_WRITE_TOOLS,
                 "Agent",
                 *AUDITOR_NETWORK_GIT_DENY,
+                *AUDITOR_GH_WRITE_DENY,
             ),
             load_computer_mcp=True,
             workspace_read_only=True,

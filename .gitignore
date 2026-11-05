@@ -36,6 +36,10 @@ logs/
 results/
 tmp/
 
+# The graphify code-graph tool writes its index here. It is a local
+# analysis artifact, regenerated on demand, and is never committed.
+graphify-out/
+
 # Secrets and local overrides
 .env
 *.env
