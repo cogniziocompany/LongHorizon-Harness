@@ -9,6 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The auditor can independently verify a pull request, read-only.** The
+  harness is a validation chain: each step validates the last in its process
+  to achieve its tasks, so a step may only claim success if the step before
+  it actually validated the thing being claimed.  The auditor is the last
+  independent verification step, and until now it could not verify anything
+  about the outside world.  Its MCP profile (`audit`) lists only servers
+  whose tools are inherently non-mutating — the gateway cannot scope a
+  server to read-only, so adding the `github` server there would have handed
+  the auditor WRITE-capable tools — and its tool deny-list refused
+  `Bash(gh *)` wholesale, taking out the local `gh` CLI's READ verbs along
+  with the write ones.
+
+  The consequence was structural.  An auditor with no independent evidence
+  could only RESTATE an executor's claims or refuse them; it could never
+  CONFIRM or REFUTE them.  A run whose auditor could not reach GitHub
+  produced an audit saying "any executor claim about the PR is untrusted in
+  its entirety" — and that run was then recorded with no distinction from
+  one that had been delivered and audited cleanly.
+
+  New module `lh_harness/auditor_verify.py` gives the auditor a read-only
+  reach of its own:
+
+  * `ReadOnlyGitHubClient` reads a pull request's existence, number, state,
+    base branch, head sha and diff stat.  Read-only is a property of the
+    code, not a convention: every request is a `GET`, the write verbs have no
+    code path at all, and the one dynamic entry point
+    (`ReadOnlyGitHubClient.request`) refuses anything that is not a read.
+  * `assert_read_only_command` is the enforcement layer for the `gh` / `git`
+    command surface.  It refuses `gh pr merge`, `gh pr comment`,
+    `gh pr close`, the `gh api` write methods (`--method=POST`, `-X PATCH`,
+    `-X PUT`, `-X DELETE`) and the field-supplying `gh api` bodies (`-f`,
+    `-F`, `--input`) that a bare `Bash(gh *)` deny would leave unmatched,
+    plus the write leaves that hide under read groups (`gh pr review
+    --approve`, `gh secret set`, `gh workflow run`).
+  * `resolve_auditor_credential` resolves the auditor's OWN fine-grained
+    read-only token from `LH_HARNESS_AUDITOR_GITHUB_TOKEN` and refuses to
+    proceed when the resolved value collides with the executor's `GH_TOKEN` /
+    `GITHUB_TOKEN` or with a fleet admin token.  The value is never printed,
+    logged, or committed; the credential's own `repr` renders presence, not
+    value.
+
+  Fail-closed by construction: any read failure — network error, missing PR,
+  permission error, unexpected status — yields an explicit `unverifiable`
+  verification result that BLOCKS a delivered claim.  It never becomes a
+  silent pass and never becomes a confirmed value.
+
+  New CLI command `lh-harness verify-pr --repo <owner/name> --number <n>
+  [--reviewed-sha <sha>]` runs the verification and prints a verdict of
+  `confirmed`, `refuted`, or `unverifiable`.  Exit code 0 means CONFIRMED;
+  a refutation or an unreachable read exits non-zero, because an auditor that
+  could not reach the evidence has no basis to call the claim true.  The CLI
+  auditor's instructions now name the command, and tell the auditor that an
+  `unverifiable` verdict is NOT a confirmation.
+
+  The auditor's contract header is UNCHANGED: still exactly `Status` /
+  `Integrity` / `Contract audit`.  The `confirmed` / `refuted` /
+  `unverifiable` values are this module's internal verification result, not a
+  contract-header vocabulary.  The close-out outcome vocabulary belongs to the
+  sibling task `yt:easybutt0n-17:harness-closeout-contract` and is neither
+  defined nor renamed here.  PR #147 (auditor isolation) and PR #159 (queue
+  outcomes) are referenced as design references, not re-implemented.
+
 - **The launcher enforces a node-level active-run ceiling.** `[queue] node_max_runs`
   is the maximum number of runs the launcher will let be active on THIS node at
   once — the value the fleet registry advertises as `maxConcurrentRuns`. Until
