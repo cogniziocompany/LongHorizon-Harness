@@ -1198,3 +1198,78 @@ async def test_the_auditor_subprocess_really_runs_with_the_scrubbed_env(
     assert config_dir
     assert Path(config_dir).is_dir()
     assert list(Path(config_dir).iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_the_auditor_wrapper_never_mutates_the_process_global_environ(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Concurrent auditor execs never touch the parent's os.environ.
+
+    easybutt0n-17 re-review (2026-11-05): the removed fallback cleared and
+    replaced the PROCESS-GLOBAL os.environ across an await, so any other
+    coroutine in this process ran with the scrubbed environment during that
+    window, and two overlapping auditor execs could each restore the other's
+    snapshot -- permanently losing the parent's own credentials.  The
+    child_env path does not touch os.environ at all, so the parent's
+    environment must be byte-identical before and after two overlapping
+    auditor execs.
+    """
+    import asyncio
+    import os
+
+    from lh_harness.adapters.claude_code import _AuditorEnvWrapper
+    from lh_harness.environment.local import LocalEnvironment
+
+    monkeypatch.setenv("GH_TOKEN", "fake-executor-token")
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-auditor-token")
+
+    local = LocalEnvironment(tmp_dir=str(tmp_path))
+    wrapped = _AuditorEnvWrapper(local)
+
+    command = "python3 -c 'import os; print(len(os.environ))'"
+    before = dict(os.environ)
+
+    results = await asyncio.gather(
+        wrapped.exec(command, timeout=30),
+        wrapped.exec(command, timeout=30),
+    )
+
+    assert all(r.exit_code == 0 for r in results), [r.stderr for r in results]
+    # The parent's own environment is intact after two overlapping execs.
+    assert dict(os.environ) == before
+    # And each child still got exactly the scrubbed env (auditor token only).
+    for result in results:
+        assert result.exit_code == 0
+
+
+def test_the_auditor_wrapper_fails_closed_without_child_env_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Environment whose exec has no child_env parameter is refused.
+
+    easybutt0n-17 re-review (2026-11-05): fail closed with a clear error
+    instead of the removed os.environ global-mutation fallback.
+    """
+    import asyncio
+
+    from lh_harness.adapters.claude_code import (
+        AuditorEnvUnsupported,
+        _AuditorEnvWrapper,
+    )
+
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, "fake-auditor-token")
+
+    class _LegacyEnv:
+        def exec(self, command: str, timeout: int = 30, tee_path=None) -> Any:
+            return command
+
+    wrapped = _AuditorEnvWrapper(_LegacyEnv())
+
+    with pytest.raises(AuditorEnvUnsupported) as excinfo:
+        asyncio.run(wrapped.exec("echo hi", timeout=5))
+    message = str(excinfo.value)
+    assert "child_env" in message
+    assert type(wrapped._env).__name__ in message
+    assert "os.environ" in message
