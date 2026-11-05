@@ -92,20 +92,22 @@ class _RecordingServer:
 
 class TickNotifyTest(unittest.TestCase):
     def setUp(self) -> None:
-        self._env_backup = {
-            k: os.environ.get(k)
-            for k in (
-                "SEQ_URL", "SEQ_API_KEY", "SEQ_MIN_LEVEL",
-                "MEMORY_URL", "MEMORY_TOKEN", "MEMORY_MCP_URL", "MEMORY_MCP_KEY", "MEMORY_MCP_TOOL",
-            )
-        }
+        # The tick emitter under test reads only the eight SEQ/MEMORY names
+        # listed below, but several tests in this module call
+        # ``os.environ.clear()`` to start from a known blank slate - which
+        # also wipes ``HOME`` (git identity lookup), ``PATH`` (subprocess
+        # resolution), and every other unrelated variable the rest of the
+        # suite depends on.  Snapshot the whole environment so ``tearDown``
+        # can put it back, regardless of what the test body did to it.
+        self._env_backup = dict(os.environ)
 
     def tearDown(self) -> None:
-        for k, v in self._env_backup.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        # Restore every variable that existed when the test started, removing
+        # any the test body added (a previous version only tracked the eight
+        # names above and left ``HOME`` etc. missing for every subsequent
+        # test that relied on git or subprocess resolution).
+        os.environ.clear()
+        os.environ.update(self._env_backup)
 
     # -- redaction ---------------------------------------------------------
     def test_redact_covers_all_brief_patterns(self) -> None:
