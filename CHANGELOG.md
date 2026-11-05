@@ -118,6 +118,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A run now stops at the first clean, complete audit that verifies its
+  deliverable.** Measured on the QT-20261021 runs (2026-10-23): a run finished
+  its deliverable in round 1 and the harness kept auditing anyway, spending 3-4
+  rounds and often ending `max_rounds_exhausted`.  The manager loop now sets
+  `completion_satisfied` and ends with its normal success outcome as soon as
+  `_latest_auditor_is_clean_complete` holds for the just-recorded round — the
+  same predicate the manager's own `Next: done` request is already held to
+  (auditor control header `Status: complete` + `Integrity: clean` + `Contract
+  audit: aligned`, after `parse_audit_report`'s acceptance guard).  The run's
+  report carries that verifying audit.  The stop is narrow: a latest auditor
+  report that is not clean AND complete falls through to the ordinary progress
+  gate, so the finding is fed back and another round runs exactly as before.
+  No auditor prompt, reward term, queue contract or MCP tool signature changed.
 - Web API now embeds a service-side supervisor and launcher when run with `lh-harness web`.
 
 ### Fixed
