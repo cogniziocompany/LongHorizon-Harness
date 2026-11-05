@@ -1048,7 +1048,9 @@ async def _run_impl(
         identity=(
             "manager"
             if gate.close_out_source == "agent"
-            else (gate.close_out_form or {}).get("closed_by_identity") or "operator"
+            else (gate.close_out_form or {}).get("closed_by_identity")
+            or gate.close_out_identity
+            or "operator"
         ),
         rounds=rounds,
         language=config.prompt_language,
@@ -1190,6 +1192,11 @@ class _GateContext:
     # close-out, in which case the run is closed-out incomplete.
     close_out_form: dict[str, Any] | None = None
     close_out_source: str = ""
+    # WHO closed the run, when the close-out itself does not say (a refused
+    # or missing form).  The operator's identity is kept even when their
+    # form was refused, so the recorded close-out names the human who
+    # closed the run rather than an anonymous placeholder.
+    close_out_identity: str = ""
 
 
 async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_state: str, question: str = "", answers: list[str] | None = None) -> bool:
@@ -1276,14 +1283,19 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
             ctx.abort_reason = "human_abort"
         elif not ctx.completion_satisfied:
             ctx.abort_reason = "human_abort"
-        # The HUMAN close path.  When the operator resolved the gate they may
-        # supply their own close-out form; it goes through the SAME validator
-        # as the agent's, so both produce identical record shapes.  When they
-        # supply none, the agent's proposal is used if there is one, and
-        # otherwise the run is closed out incomplete with the reason
-        # recorded.
+        # The HUMAN close path (easybutt0n-17).  Closing a run requires a
+        # structured close-out FORM, and the human closer is one of the two
+        # closers that must supply one.  The operator's form goes through
+        # the SAME validator as the agent's, so both produce identical
+        # record shapes.
+        #
+        # When the operator supplied NO form the run is NOT completed and is
+        # NOT allowed to inherit the agent's proposal: the agent's block is a
+        # PROPOSAL, and a proposal the human never saw is exactly what the
+        # contract forbids being certified.  The run closes close-out
+        # INCOMPLETE with the refusal reason recorded instead.
         human_form = decision.get("close_out_form")
-        if isinstance(human_form, dict):
+        if isinstance(human_form, dict) and human_form:
             # The operator fills in WHAT happened; the harness supplies WHO
             # closed it and WHEN, so the form is complete without asking the
             # operator to stamp a timestamp.
@@ -1296,6 +1308,14 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
                 )
             ctx.close_out_form = normalized
             ctx.close_out_source = "human"
+        else:
+            # No form from the operator: the run closes close-out incomplete,
+            # with the reason recorded by the shared validator.
+            ctx.close_out_form = None
+            ctx.close_out_source = "human"
+        # Keep the operator's identity even when the form was refused, so the
+        # recorded close-out names the human who closed the run.
+        ctx.close_out_identity = str(decision.get("closed_by_identity") or "")
         # The operator can stop on a round the harness did not treat as an ending
         # (an `ask` or repeated-failure gate), which leaves no reply written yet.
         if await _write_final_response(ctx, round_index, task_state, ctx.abort_reason):

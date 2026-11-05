@@ -24,7 +24,8 @@ Closing a run requires a structured form, not a free-text rationale:
 =========================  ==================================================
 ``outcome``                one of the six values in :data:`CLOSE_OUT_OUTCOMES`
 ``outcome_reason``         short, ASCII, at most 200 characters
-``artifact_refs``          list of ``{kind, repo, ref, url}`` artifacts
+``artifact_refs``          list of ``{kind, repo, ref, url, head_sha}``
+                           artifacts
 ``closed_by``              ``agent`` or ``human``
 ``closed_by_identity``     who closed it (a name, a key id, a gateway id)
 ``closed_at``              epoch seconds
@@ -61,7 +62,7 @@ import os
 import re
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -115,9 +116,14 @@ CLOSE_OUT_FILENAME = "closeout.json"
 _LEGACY_DONE_RE = re.compile(r"^done\s*:\s*(?P<body>.+)$", re.IGNORECASE | re.DOTALL)
 
 #: A legacy ``done:`` body naming a PR, e.g.
-#: ``cogniziocompany/cognizioware-hydra#96``.
+#: ``cogniziocompany/cognizioware-hydra#96``.  A legacy rationale MAY also
+#: name the head sha the PR pointed at, e.g.
+#: ``cogniziocompany/cognizioware-hydra#96 773be7e``; when it does, the sha
+#: is recorded as a DERIVED head sha (it was transcribed from free text, not
+#: fetched from the forge).
 _LEGACY_PR_RE = re.compile(
     r"^(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>\d+)"
+    r"(?:\s+(?P<head_sha>[0-9a-fA-F]{7,40}))?"
 )
 
 
@@ -146,6 +152,14 @@ class ArtifactRef:
     repository (empty for a local file), ``ref`` the PR number / commit sha
     / path, and ``url`` the browsable location.
 
+    ``head_sha`` is the artifact's HEAD — the commit the artifact currently
+    points at.  For a ``pr`` it is the PR's head commit, which is what makes
+    the artifact *verifiable*: a PR number alone can be re-pointed at a
+    different commit later, so "we opened PR 96" is not evidence of "we
+    delivered commit 773be7e".  For a ``commit`` artifact the sha IS the
+    ``ref``, and ``head_sha`` mirrors it, so a consumer can read one field
+    regardless of the kind.  A ``file`` artifact has no head sha.
+
     ``derived`` marks an artifact that was TRANSCRIBED (e.g. read out of a
     legacy ``done:`` rationale) rather than verified against the forge.  A
     derived artifact is not a weaker kind of artifact — the close-out is
@@ -157,6 +171,7 @@ class ArtifactRef:
     repo: str
     ref: str
     url: str
+    head_sha: str = ""
     derived: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -165,6 +180,7 @@ class ArtifactRef:
             "repo": self.repo,
             "ref": self.ref,
             "url": self.url,
+            "head_sha": self.head_sha,
             "derived": self.derived,
         }
 
@@ -175,6 +191,7 @@ class ArtifactRef:
             repo=str(payload.get("repo") or ""),
             ref=str(payload.get("ref") or ""),
             url=str(payload.get("url") or ""),
+            head_sha=str(payload.get("head_sha") or ""),
             derived=bool(payload.get("derived")),
         )
 
@@ -332,6 +349,27 @@ def _require_artifacts(value: Any) -> tuple[ArtifactRef, ...]:
             raise CloseOutValidationError("artifact_ref.url is required")
         if not _is_ascii(ref.url):
             raise CloseOutValidationError("artifact_ref.url must be ASCII")
+        if ref.kind == "pr":
+            # A PR artifact must name the repo, the number, the URL and the
+            # HEAD commit the PR points at.  The head sha is what makes the
+            # artifact verifiable rather than a bare pointer that could be
+            # re-pointed at a different commit later.
+            if not ref.repo.strip():
+                raise CloseOutValidationError(
+                    "artifact_ref.repo is required for a pr artifact"
+                )
+            if not ref.head_sha.strip():
+                raise CloseOutValidationError(
+                    "artifact_ref.head_sha is required for a pr artifact; a "
+                    "delivered PR must name the commit it delivered"
+                )
+            if not _is_ascii(ref.head_sha):
+                raise CloseOutValidationError("artifact_ref.head_sha must be ASCII")
+        elif ref.kind == "commit":
+            # For a commit artifact the sha IS the ref; mirror it so a
+            # consumer reads one field regardless of the artifact kind.
+            if not ref.head_sha.strip():
+                ref = replace(ref, head_sha=ref.ref.strip())
         refs.append(ref)
     return tuple(refs)
 
@@ -392,7 +430,10 @@ def validate_close_out(
     3. ``outcome_reason`` must be a non-empty ASCII string of at most 200
        characters;
     4. ``artifact_refs`` must be a list of well-formed
-       ``{kind: pr|commit|file, repo, ref, url}`` objects;
+       ``{kind: pr|commit|file, repo, ref, url, head_sha}`` objects.  A
+       ``pr`` artifact must name its repo, its number, its URL and the
+       HEAD commit it delivered; a ``commit`` artifact's sha is mirrored
+       into ``head_sha``;
     5. ``delivered``/``delivered_partial`` MUST cite at least one artifact —
        there is no artifactless delivery;
     6. ``closed_by`` must be ``agent`` or ``human`` and must match the
@@ -543,6 +584,7 @@ def parse_legacy_rationale(rationale: str | None) -> CloseOutRecord | None:
                 repo=repo,
                 ref=number,
                 url=f"https://github.com/{repo}/pull/{number}",
+                head_sha=(pr_match.group("head_sha") or ""),
                 derived=True,
             ),
         )
@@ -572,8 +614,11 @@ def parse_legacy_rationale(rationale: str | None) -> CloseOutRecord | None:
 #:     ```closeout
 #:     outcome: delivered
 #:     reason: opened hydra#96 and verified the head sha
-#:     artifact: pr cogniziocompany/cognizioware-hydra 96
+#:     artifact: pr cogniziocompany/cognizioware-hydra 96 773be7e
 #:     ```
+#:
+#: A ``pr``/``commit`` artifact names the HEAD sha as a fourth field; a
+#: ``file`` artifact names only the path.
 #:
 #: The agent may PROPOSE a close-out; it may not CERTIFY one.  The proposal
 #: is parsed here and handed to :func:`validate_close_out`, which is the
@@ -583,9 +628,12 @@ _CLOSE_OUT_BLOCK_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-#: ``artifact: <kind> <repo> <ref>`` — the kind is pr / commit / file.
+#: ``artifact: <kind> <repo> <ref> [<head_sha>]`` — the kind is pr / commit /
+#: file.  The optional fourth field is the artifact's HEAD commit, which is
+#: REQUIRED for a ``pr`` artifact (the validator refuses one without it).
 _ARTIFACT_LINE_RE = re.compile(
-    r"^\s*artifact\s*:\s*(?P<kind>pr|commit|file)\s+(?P<repo>\S+)\s+(?P<ref>\S+)\s*$",
+    r"^\s*artifact\s*:\s*(?P<kind>pr|commit|file)\s+(?P<repo>\S+)\s+"
+    r"(?P<ref>\S+)(?:\s+(?P<head_sha>\S+))?\s*$",
     re.IGNORECASE,
 )
 
@@ -617,12 +665,14 @@ def parse_agent_close_out_proposal(plan_text: str | None) -> dict[str, Any] | No
             kind = artifact_match.group("kind").lower()
             repo = artifact_match.group("repo")
             ref = artifact_match.group("ref")
+            head_sha = (artifact_match.group("head_sha") or "").strip()
             artifact_refs.append(
                 {
                     "kind": kind,
                     "repo": repo,
                     "ref": ref,
                     "url": _artifact_url(kind, repo, ref),
+                    "head_sha": head_sha,
                 }
             )
             continue

@@ -430,6 +430,69 @@ def _requester_param() -> dict[str, Any]:
     }
 
 
+def _close_out_form_param() -> dict[str, Any]:
+    """MCP schema for the operator's close-out FORM (easybutt0n-17).
+
+    Closing a run requires a STRUCTURED form, not a free-text rationale.
+    The form's rules live in the ONE validator
+    (``lh_harness.closeout.validate_close_out``); this schema only describes
+    the shape to the client.
+
+    ``outcome`` is constrained to the canonical six-value enum here as well
+    as in the validator, so a chat client cannot offer a synonym.
+    """
+
+    return {
+        "type": "object",
+        "description": (
+            "Structured close-out form. Required to close a run: outcome, a "
+            "short ASCII reason, and the artifacts that back a delivery. A "
+            "delivery MUST cite at least one artifact (a PR with its head "
+            "commit, or a commit sha); a delivery with no artifact is "
+            "refused. Omitting this form leaves the run close-out "
+            "incomplete, never completed."
+        ),
+        "additionalProperties": False,
+        "properties": {
+            "outcome": {
+                "type": "string",
+                "description": "Close-out outcome.",
+                "enum": ["delivered", "delivered_partial", "blocked", "failed", "aborted", "incomplete"],
+            },
+            "outcome_reason": {
+                "type": "string",
+                "description": "Short ASCII reason (<=200 chars) for the outcome.",
+                "maxLength": 200,
+            },
+            "artifact_refs": {
+                "type": "array",
+                "description": "Artifacts backing the close-out.",
+                "maxItems": 64,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["pr", "commit", "file"]},
+                        "repo": {"type": "string", "description": "owner/repo.", "maxLength": 200},
+                        "ref": {"type": "string", "description": "PR number, commit sha, or path.", "maxLength": 200},
+                        "url": {"type": "string", "description": "Browsable URL.", "maxLength": 500},
+                        "head_sha": {
+                            "type": "string",
+                            "description": "HEAD commit the artifact points at. Required for a pr artifact.",
+                            "maxLength": 64,
+                        },
+                    },
+                },
+            },
+            "closed_by_identity": {
+                "type": "string",
+                "description": "Who closed the run (a name or a gateway key id).",
+                "maxLength": 200,
+            },
+        },
+    }
+
+
 def _fields_param() -> dict[str, Any]:
     """Schema for an ask's declared response fields (task A3d)."""
     return {
@@ -582,6 +645,7 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                 "action": _string_param("Action chosen by the operator (continue/stop/etc).", required=True),
                 "user_input": _string_param("ASCII-only operator message or instruction. Non-ASCII is rejected.", required=False),
                 "reason": _string_param("Operator reason for the resolution.", required=False),
+                "close_out_form": _close_out_form_param(),
             },
         ),
         _tool_spec(
@@ -1687,6 +1751,21 @@ def _resolve_gate(arguments: dict[str, Any], *, registry: Any, supervisor: Any) 
     reason = _bounded(arguments.get("reason"), field="reason", max_chars=10_000)
     user_input = _bounded(arguments.get("user_input"), field="user_input", max_chars=50_000)
 
+    # The operator's close-out FORM (easybutt0n-17).  This is the gateway
+    # route an operator (e.g. the hydrafleet gateway) uses to close a run:
+    # the form travels with the decision so the manager can hand it to the
+    # SAME validator the agent's "done" path uses.  It is optional HERE and
+    # required by the CLOSE-OUT contract itself: a missing or invalid form
+    # leaves the run close-out incomplete with the reason recorded, never
+    # "completed".
+    close_out_form = arguments.get("close_out_form")
+    if close_out_form is not None and not isinstance(close_out_form, dict):
+        return {
+            "ok": False,
+            "error": "close_out_form must be an object",
+            "code": 422,
+        }
+
     # ASCII-only enforcement is required for gateway/chat safety.
     if user_input and not _is_ascii_only(user_input):
         return {
@@ -1701,6 +1780,7 @@ def _resolve_gate(arguments: dict[str, Any], *, registry: Any, supervisor: Any) 
             action=action,
             reason=reason,
             user_input=user_input,
+            close_out_form=close_out_form,
         )
     except Exception as exc:
         return {"ok": False, "error": str(exc), "code": 409}

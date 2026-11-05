@@ -181,6 +181,15 @@ def make_human_hook(
             # budget.  Without this the dialog's round input was ignored.
             "extra_rounds": resolved.extra_rounds or default_extra_rounds,
             "reason": resolved.reason,
+            # The HUMAN half of the close-out contract (easybutt0n-17): the
+            # operator's close-out FORM travels with their decision so the
+            # manager can hand it to the SAME validator the agent's "done"
+            # path uses.  It is passed through VERBATIM — this layer does not
+            # validate it, because there is exactly ONE validator and it
+            # lives in the close-out module.  An empty dict means the
+            # operator supplied none; the manager then closes the run
+            # close-out INCOMPLETE with the reason recorded.
+            "close_out_form": dict(resolved.close_out_form or {}),
         }
 
     return _hook

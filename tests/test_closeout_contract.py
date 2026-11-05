@@ -50,12 +50,17 @@ from lh_harness.closeout import (
     validate_close_out,
 )
 
-# A verifiable artifact: a PR URL with a number and a head sha.
+# A verifiable artifact: a PR URL with a number and the HEAD commit it
+# delivered.  The head sha is what makes a PR artifact VERIFIABLE: a PR
+# number alone can be re-pointed at a different commit later, so "we opened
+# PR 96" is not evidence of "we delivered commit 773be7e".
+_PR_HEAD_SHA = "773be7e"
 _PR_ARTIFACT = ArtifactRef(
     kind="pr",
     repo="cogniziocompany/cognizioware-hydra",
     ref="96",
     url="https://github.com/cogniziocompany/cognizioware-hydra/pull/96",
+    head_sha=_PR_HEAD_SHA,
 )
 
 
@@ -106,6 +111,7 @@ def _valid_delivered_payload() -> dict:
                 "repo": "cogniziocompany/cognizioware-hydra",
                 "ref": "96",
                 "url": "https://github.com/cogniziocompany/cognizioware-hydra/pull/96",
+                "head_sha": _PR_HEAD_SHA,
             }
         ],
         "closed_by": "agent",
@@ -624,7 +630,7 @@ Work is done; the PR is open.
 ```closeout
 outcome: delivered
 reason: opened hydra#96 and verified the head sha
-artifact: pr cogniziocompany/cognizioware-hydra 96
+artifact: pr cogniziocompany/cognizioware-hydra 96 773be7e
 ```
 """
 
@@ -638,6 +644,7 @@ def test_the_agent_proposal_is_parsed_into_a_close_out_form() -> None:
     assert form["artifact_refs"][0]["repo"] == "cogniziocompany/cognizioware-hydra"
     assert form["artifact_refs"][0]["ref"] == "96"
     assert form["artifact_refs"][0]["url"].endswith("/pull/96")
+    assert form["artifact_refs"][0]["head_sha"] == "773be7e"
     assert form["closed_by"] == "agent"
 
 
@@ -794,6 +801,7 @@ def test_the_human_path_produces_the_same_record_shape_as_the_agent(tmp_path: Pa
                 "repo": "cogniziocompany/cognizioware-hydra",
                 "ref": "96",
                 "url": "https://github.com/cogniziocompany/cognizioware-hydra/pull/96",
+                "head_sha": _PR_HEAD_SHA,
             }
         ],
         "closed_by": "human",

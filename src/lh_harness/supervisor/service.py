@@ -23,7 +23,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .control_bus import (
     ControlBus,
@@ -50,8 +50,15 @@ from .lifecycle import (
 from ..agent_registry import normalise_reasoning_effort, supports_reasoning_effort
 from .. import worker_isolation
 from ..workspace_park import park_workspace
-from ..run_outcome import OutcomeCache
-from ..closeout import read_close_out
+from ..run_outcome import OutcomeCache, ascii_reason
+from ..closeout import (
+    CloseOutError,
+    CloseOutValidationError,
+    apply_close_out_to_report,
+    persist_close_out,
+    read_close_out,
+    validate_close_out,
+)
 from ..types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
@@ -562,6 +569,36 @@ def _run_component_name(value: str) -> str | None:
 # Memo for the summary list's outcome fields (report.json is parsed once per
 # finished run, not on every poll).
 _OUTCOME_CACHE = OutcomeCache()
+
+
+def _report_auditor_verdict(report: Mapping[str, Any]) -> dict[str, str]:
+    """The independent auditor's verdict, read from a finished run's report.
+
+    The auditor is the AUTHORITY on whether the work landed.  A close-out
+    that claims a delivery must not contradict it.  The verdict lives in
+    the report's ``latest_auditor_report`` text, which is parsed here with
+    the SAME parser the manager uses, so both closers see the same signal.
+
+    An empty verdict means the report carries no auditor report: the
+    caller decides whether that is acceptable.  It never invents one.
+    """
+
+    raw = str(report.get("latest_auditor_report") or "").strip()
+    if not raw:
+        return {}
+    try:
+        from ..auditor_agent import parse_audit_report
+
+        parsed = parse_audit_report(raw, 0)
+    except Exception:
+        # A malformed auditor report must not break the close-out path; the
+        # validator treats an absent verdict as "no verdict reachable".
+        return {}
+    return {
+        "status": str(getattr(parsed, "status", "") or ""),
+        "integrity_status": str(getattr(parsed, "integrity_status", "") or ""),
+        "contract_audit_status": str(getattr(parsed, "contract_audit_status", "") or ""),
+    }
 
 
 def _summary_close_out_fields(logs_dir: Path) -> dict[str, Any]:
@@ -3017,11 +3054,118 @@ class RunSupervisor:
             bus.receipt(command, "accepted", message=f"sent {sig.name}")
             return {"command_id": command["command_id"], "status": "accepted", "signal": sig.name}
 
-    def stop(self, run_id: str) -> dict[str, Any]:
-        return self._signal(run_id, signal.SIGTERM, kind="stop")
+    def stop(
+        self,
+        run_id: str,
+        *,
+        close_out_form: Mapping[str, Any] | None = None,
+        closed_by_identity: str = "",
+    ) -> dict[str, Any]:
+        """Stop a run, closing it with the HUMAN close-out contract.
+
+        The close-out contract (easybutt0n-17) makes the human ``/stop``
+        action a real CLOSER: stopping a run is how an operator says the
+        work ended, so the operator must supply the structured close-out
+        FORM.  It goes through the SAME validator the agent's "done" path
+        uses, so both closers produce identical record shapes.
+
+        A missing or invalid form never leaves the run "completed": the run
+        closes close-out INCOMPLETE with the refusal reason recorded, and
+        the process lifecycle (``status``) is left exactly as it was.
+        """
+
+        result = self._signal(run_id, signal.SIGTERM, kind="stop")
+        close_out = self._record_human_close_out(
+            run_id,
+            close_out_form=close_out_form,
+            closed_by_identity=closed_by_identity,
+        )
+        result["close_out"] = close_out
+        return result
 
     def abort(self, run_id: str) -> dict[str, Any]:
         return self._signal(run_id, signal.SIGKILL, kind="abort")
+
+    def _record_human_close_out(
+        self,
+        run_id: str,
+        *,
+        close_out_form: Mapping[str, Any] | None,
+        closed_by_identity: str = "",
+    ) -> dict[str, Any]:
+        """Validate and persist the operator's close-out for a stopped run.
+
+        The operator fills in WHAT happened; the harness supplies WHO closed
+        it and WHEN, so the form is complete without asking the operator to
+        stamp a timestamp.  The FORM's rules live in the ONE validator, so
+        this method never re-implements them.
+
+        The record is persisted next to ``report.json`` and mirrored into
+        the run's report status fields.  A missing or invalid form is
+        recorded as a close-out ``incomplete`` with the refusal reason, so
+        the run still carries a truthful close-out and is never reported as
+        delivered.
+        """
+
+        identity = str(closed_by_identity or "").strip() or "operator"
+        # A form the operator supplied NOTHING for stays ``None`` so the
+        # shared validator reports the specific reason: "a close-out form is
+        # required to close a run".  An empty dict would instead fail on the
+        # missing ``outcome`` and hide what actually went wrong.
+        supplied = isinstance(close_out_form, Mapping) and bool(close_out_form)
+        form: dict[str, Any] | None = dict(close_out_form) if supplied else None
+        if form is not None:
+            form["closed_by"] = "human"
+            form["closed_by_identity"] = identity
+            form.setdefault("closed_at", time.time())
+
+        report = _read_json(self._run_logs_dir(run_id) / "report.json")
+        if not isinstance(report, dict):
+            report = {}
+
+        try:
+            record = validate_close_out(
+                form,
+                closed_by="human",
+                auditor_verdict=_report_auditor_verdict(report) or None,
+            )
+        except CloseOutValidationError as exc:
+            # The operator's form was refused.  The run is NOT delivered:
+            # it closes close-out INCOMPLETE with the reason recorded.
+            refusal = {
+                "outcome": "incomplete",
+                "outcome_reason": ascii_reason(str(exc)),
+                "artifact_refs": [],
+                "closed_by": "human",
+                "closed_by_identity": identity,
+                "closed_at": time.time(),
+            }
+            try:
+                record = validate_close_out(refusal, closed_by="human")
+            except CloseOutValidationError:
+                return {"recorded": False, "outcome": "", "reason": str(exc)}
+        try:
+            persist_close_out(self._run_logs_dir(run_id), record)
+        except CloseOutError as exc:
+            return {"recorded": False, "outcome": record.outcome, "reason": str(exc)}
+        if report:
+            apply_close_out_to_report(report, record)
+            try:
+                self._write_private_atomic_json(
+                    self._run_logs_dir(run_id) / "report.json", report
+                )
+            except OSError:
+                # The durable closeout.json is the source of truth; the
+                # mirrored report fields are a convenience for readers that
+                # only look at report.json.
+                pass
+        return {
+            "recorded": True,
+            "outcome": record.outcome,
+            "delivered": bool(record.delivered),
+            "reason": record.outcome_reason,
+            "closed_by": record.closed_by,
+        }
 
     def shutdown(self, *, grace_seconds: float = 5.0) -> None:
         """Stop workers launched by this supervisor before its API exits.

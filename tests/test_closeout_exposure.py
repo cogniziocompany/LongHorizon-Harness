@@ -44,11 +44,13 @@ from lh_harness.closeout_aggregates import (
 # Helpers
 # --------------------------------------------------------------------------
 
+_PR_HEAD_SHA = "773be7e"
 _PR_ARTIFACT = ArtifactRef(
     kind="pr",
     repo="cogniziocompany/cognizioware-hydra",
     ref="96",
     url="https://github.com/cogniziocompany/cognizioware-hydra/pull/96",
+    head_sha=_PR_HEAD_SHA,
 )
 
 
@@ -132,6 +134,7 @@ def test_the_projection_carries_the_close_out_fields() -> None:
                 "repo": "cogniziocompany/cognizioware-hydra",
                 "ref": "96",
                 "url": "https://github.com/cogniziocompany/cognizioware-hydra/pull/96",
+                "head_sha": _PR_HEAD_SHA,
                 "derived": False,
             }
         ],
@@ -148,6 +151,9 @@ def test_the_projection_carries_the_close_out_fields() -> None:
     assert row["closed_at"] == 1762310000.0
     assert row["artifact_refs"][0]["url"].endswith("/pull/96")
     assert row["artifact_refs"][0]["ref"] == "96"
+    # The PRIMARY PR's head sha is exposed, so a consumer can verify WHICH
+    # commit the delivery was.
+    assert row["artifact_refs"][0]["head_sha"] == _PR_HEAD_SHA
     assert row["completion_satisfied"] is True
     assert row["report_status"] == "cancelled"
     assert row["exit_code"] == 1
@@ -211,6 +217,7 @@ def test_the_summary_endpoint_carries_the_close_out(tmp_path: Path) -> None:
     assert row["delivered"] is True
     assert row["closed_by"] == "human"
     assert row["artifact_refs"][0]["url"].endswith("/pull/96")
+    assert row["artifact_refs"][0]["head_sha"] == _PR_HEAD_SHA
     assert row["report_status"] == "cancelled"
     assert row["completion_satisfied"] is True
 

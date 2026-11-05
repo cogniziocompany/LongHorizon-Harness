@@ -199,6 +199,7 @@ def test_build_summary_projection_adds_the_close_out_fields() -> None:
                 "repo": "cogniziocompany/cognizioware-hydra",
                 "ref": "96",
                 "url": "https://github.com/cogniziocompany/cognizioware-hydra/pull/96",
+                "head_sha": "773be7e",
                 "derived": False,
             }
         ],
@@ -222,6 +223,8 @@ def test_build_summary_projection_adds_the_close_out_fields() -> None:
     assert row["closed_at"] == 1762310000.0
     assert row["artifact_refs"][0]["url"].endswith("/pull/96")
     assert row["artifact_refs"][0]["ref"] == "96"
+    # The PRIMARY PR's head sha is exposed with the url and the number.
+    assert row["artifact_refs"][0]["head_sha"] == "773be7e"
     assert row["completion_satisfied"] is True
     assert row["report_status"] == "cancelled"
     assert row["exit_code"] == 1
