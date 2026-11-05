@@ -426,6 +426,131 @@ def test_gh_api_with_dash_i_input_flag_is_refused() -> None:
     assert "gh api" in rule
 
 
+# ---------------------------------------------------------------------------
+# 2b. The same body flags with the flag BEFORE the endpoint.
+#
+# `gh api` parses its flags with Go's flag package, so the endpoint is NOT
+# position-locked: `gh api -f body=x repos/o/r/issues/1/comments` is the
+# same write as `gh api repos/o/r/issues/1/comments -f body=x`.  The deny
+# rules for the path-first spelling are anchored on the path coming first,
+# so without a rule for the flag-first ordering the PERMISSION layer
+# matched nothing and the write was let through.  Each ordering gets its
+# own named test at both layers.
+# ---------------------------------------------------------------------------
+
+
+def test_gh_api_with_dash_f_field_before_the_path_is_refused() -> None:
+    """``gh api -f body=... <path>`` -- the body flag first."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "-f", "body=lgtm", f"repos/{REPO}/issues/1/comments"]
+    )
+    assert "body" in message.lower()
+    assert "gh api" in rule
+
+
+def test_gh_api_with_dash_capital_f_field_before_the_path_is_refused() -> None:
+    """``gh api -F body=... <path>`` -- the typed-field spelling, flag first."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "-F", "body=lgtm", f"repos/{REPO}/issues/1/comments"]
+    )
+    assert "body" in message.lower()
+    assert "gh api" in rule
+
+
+def test_gh_api_with_field_flag_before_the_path_is_refused() -> None:
+    """``gh api --field body=... <path>``."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--field", "body=lgtm", f"repos/{REPO}/issues/1/comments"]
+    )
+    assert "body" in message.lower()
+    assert "gh api" in rule
+
+
+def test_gh_api_with_raw_field_flag_before_the_path_is_refused() -> None:
+    """``gh api --raw-field body=... <path>``."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--raw-field", "body=lgtm", f"repos/{REPO}/issues/1/comments"]
+    )
+    assert "body" in message.lower()
+    assert "gh api" in rule
+
+
+def test_gh_api_with_input_flag_before_the_path_is_refused() -> None:
+    """``gh api --input payload.json <path>`` -- a body read from a file."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--input", "payload.json", f"repos/{REPO}/issues/1/comments"]
+    )
+    assert "body" in message.lower()
+    assert "gh api" in rule
+
+
+def test_gh_api_with_input_equals_flag_before_the_path_is_refused() -> None:
+    """``gh api --input=payload.json <path>`` -- the joined spelling, flag first."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--input=payload.json", f"repos/{REPO}/issues/1/comments"]
+    )
+    assert "body" in message.lower()
+    assert "gh api" in rule
+
+
+def test_gh_api_with_dash_i_input_flag_before_the_path_is_refused() -> None:
+    """``gh api -i payload.json <path>`` -- the short body-from-file spelling."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "-i", "payload.json", f"repos/{REPO}/issues/1/comments"]
+    )
+    assert "body" in message.lower()
+    assert "gh api" in rule
+
+
+def test_gh_api_with_a_mutation_field_before_the_graphql_endpoint_is_refused() -> None:
+    """``gh api -f query=mutation{...} graphql`` -- a mutation, flag first."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "-f", "query=mutation{addComment}", "graphql"]
+    )
+    assert "gh api" in rule
+
+
+def test_gh_api_with_x_post_and_a_field_before_the_path_is_refused() -> None:
+    """``gh api -X POST -f body=... <path>`` -- a method AND a body, flag first."""
+
+    message, rule = _refused_at_both_layers(
+        [
+            "gh",
+            "api",
+            "-X",
+            "POST",
+            "-f",
+            "body=lgtm",
+            f"repos/{REPO}/issues/1/comments",
+        ]
+    )
+    assert "gh api" in rule
+
+
+def test_gh_api_with_method_post_and_a_field_before_the_path_is_refused() -> None:
+    """``gh api --method=POST -f body=... <path>`` -- the long-flag spelling."""
+
+    message, rule = _refused_at_both_layers(
+        [
+            "gh",
+            "api",
+            "--method=POST",
+            "-f",
+            "body=lgtm",
+            f"repos/{REPO}/issues/1/comments",
+        ]
+    )
+    assert "gh api" in rule
+
+
 def test_gh_api_with_method_post_and_a_field_is_refused() -> None:
     """A method AND a body: refused, and still named as a write."""
 
@@ -817,6 +942,196 @@ def test_gh_label_delete_is_refused() -> None:
     assert "gh label" in rule
 
 
+def test_gh_gist_delete_is_refused() -> None:
+    """``gh gist delete`` -- the deny list had only ``gh gist create``."""
+
+    message, rule = _refused_at_both_layers(["gh", "gist", "delete", "id"])
+    assert "gist" in message.lower()
+    assert "gh gist" in rule
+
+
+def test_gh_gist_edit_is_refused() -> None:
+    """``gh gist edit`` -- the deny list had only ``gh gist create``."""
+
+    message, rule = _refused_at_both_layers(["gh", "gist", "edit", "id"])
+    assert "gist" in message.lower()
+    assert "gh gist" in rule
+
+
+def test_gh_pr_lock_is_refused() -> None:
+    """``gh pr lock`` -- locking a conversation is a write on the PR."""
+
+    message, rule = _refused_at_both_layers(["gh", "pr", "lock", "181"])
+    assert "lock" in message.lower()
+    assert "gh pr" in rule
+
+
+def test_gh_pr_unlock_is_refused() -> None:
+    """``gh pr unlock`` -- the write leaf, in the PR group."""
+
+    message, rule = _refused_at_both_layers(["gh", "pr", "unlock", "181"])
+    assert "unlock" in message.lower()
+    assert "gh pr" in rule
+
+
+def test_gh_alias_set_is_refused() -> None:
+    """``gh alias set`` -- the alias group is write-only."""
+
+    message, rule = _refused_at_both_layers(["gh", "alias", "set", "x", "y"])
+    assert "gh alias" in rule
+
+
+def test_gh_alias_delete_is_refused() -> None:
+    """``gh alias delete``."""
+
+    message, rule = _refused_at_both_layers(["gh", "alias", "delete", "x"])
+    assert "gh alias" in rule
+
+
+def test_gh_extension_install_is_refused() -> None:
+    """``gh extension install`` -- the extension group is write-only."""
+
+    message, rule = _refused_at_both_layers(["gh", "extension", "install", "x"])
+    assert "gh extension" in rule
+
+
+def test_gh_extension_remove_is_refused() -> None:
+    """``gh extension remove``."""
+
+    message, rule = _refused_at_both_layers(["gh", "extension", "remove", "x"])
+    assert "gh extension" in rule
+
+
+def test_gh_gpg_key_delete_is_refused() -> None:
+    """``gh gpg-key delete`` -- a credential on the account is removed."""
+
+    message, rule = _refused_at_both_layers(["gh", "gpg-key", "delete", "k"])
+    assert "gh gpg-key" in rule
+
+
+def test_gh_org_create_is_refused() -> None:
+    """``gh org create`` -- the org group is write-only."""
+
+    message, rule = _refused_at_both_layers(["gh", "org", "create", "x"])
+    assert "gh org" in rule
+
+
+def test_gh_org_add_member_is_refused() -> None:
+    """``gh org add-member``."""
+
+    message, rule = _refused_at_both_layers(["gh", "org", "add-member", "x"])
+    assert "gh org" in rule
+
+
+def test_gh_team_create_is_refused() -> None:
+    """``gh team create`` -- the team group is write-only."""
+
+    message, rule = _refused_at_both_layers(["gh", "team", "create", "x"])
+    assert "gh team" in rule
+
+
+def test_gh_sso_create_is_refused() -> None:
+    """``gh sso create`` -- the sso group is write-only."""
+
+    message, rule = _refused_at_both_layers(["gh", "sso", "create", "x"])
+    assert "gh sso" in rule
+
+
+def test_gh_gist_rename_is_refused() -> None:
+    """``gh gist rename`` -- renaming a file in a gist is a write."""
+
+    message, rule = _refused_at_both_layers(["gh", "gist", "rename", "id", "new.txt"])
+    assert "gist" in message.lower()
+    assert "gh gist" in rule
+
+
+def test_gh_gist_view_is_refused() -> None:
+    """``gh gist view`` -- the gist group is a WRITE group for both layers.
+
+    The two layers must agree: the in-process classifier refuses the whole
+    gist group, so the permission layer denies it too.  A read the auditor
+    can perform is served by the harness's own verifier, not by ``gh``.
+    """
+
+    message, rule = _refused_at_both_layers(["gh", "gist", "view", "id"])
+    assert "gist" in message.lower()
+    assert "gh gist" in rule
+
+
+def test_gh_gist_list_is_refused() -> None:
+    """``gh gist list`` -- the gist group is a WRITE group for both layers."""
+
+    message, rule = _refused_at_both_layers(["gh", "gist", "list"])
+    assert "gist" in message.lower()
+    assert "gh gist" in rule
+
+
+def test_gh_gist_clone_is_refused() -> None:
+    """``gh gist clone`` -- the gist group is a WRITE group for both layers."""
+
+    message, rule = _refused_at_both_layers(["gh", "gist", "clone", "id"])
+    assert "gist" in message.lower()
+    assert "gh gist" in rule
+
+
+def test_gh_issue_lock_is_refused() -> None:
+    """``gh issue lock`` -- locking a conversation is a write."""
+
+    message, rule = _refused_at_both_layers(["gh", "issue", "lock", "1"])
+    assert "lock" in message.lower()
+    assert "gh issue" in rule
+
+
+def test_gh_issue_unlock_is_refused() -> None:
+    """``gh issue unlock`` -- the write leaf, in the issue group."""
+
+    message, rule = _refused_at_both_layers(["gh", "issue", "unlock", "1"])
+    assert "unlock" in message.lower()
+    assert "gh issue" in rule
+
+
+def test_gh_project_create_is_refused() -> None:
+    """``gh project create``."""
+
+    message, rule = _refused_at_both_layers(["gh", "project", "create", "x"])
+    assert "gh project" in rule
+
+
+def test_gh_project_edit_is_refused() -> None:
+    """``gh project edit``."""
+
+    message, rule = _refused_at_both_layers(["gh", "project", "edit", "1"])
+    assert "gh project" in rule
+
+
+def test_gh_project_close_is_refused() -> None:
+    """``gh project close``."""
+
+    message, rule = _refused_at_both_layers(["gh", "project", "close", "1"])
+    assert "gh project" in rule
+
+
+def test_gh_project_delete_is_refused() -> None:
+    """``gh project delete``."""
+
+    message, rule = _refused_at_both_layers(["gh", "project", "delete", "1"])
+    assert "gh project" in rule
+
+
+def test_gh_cache_delete_is_refused() -> None:
+    """``gh cache delete`` -- removing a cache entry is a write."""
+
+    message, rule = _refused_at_both_layers(["gh", "cache", "delete", "x"])
+    assert "gh cache" in rule
+
+
+def test_gh_config_set_is_refused() -> None:
+    """``gh config set`` -- writing the local gh configuration is a write."""
+
+    message, rule = _refused_at_both_layers(["gh", "config", "set", "x", "y"])
+    assert "gh config" in rule
+
+
 # ---------------------------------------------------------------------------
 # 7. `git` writes.
 # ---------------------------------------------------------------------------
@@ -966,6 +1281,231 @@ def test_the_deny_list_has_no_unmatched_rule() -> None:
         assert any(deny_rule_matches(command, rule) for command in commands), (
             f"deny rule {rule!r} matches no known write spelling"
         )
+
+
+# ---------------------------------------------------------------------------
+# 9c. The permission layer must not depend on FLAG ORDER.
+# ---------------------------------------------------------------------------
+#
+# `gh api` parses its flags with Go's flag package, so the endpoint is not
+# position-locked.  A deny rule anchored on the path coming first therefore
+# covers only ONE of the two orderings, and the other ordering is a shell-out
+# the permission layer would have allowed.  The canonical list carries the
+# path-first spelling; this test walks the flag-first spelling of every one
+# of them and requires that BOTH layers refuse each.
+#
+# This is the invariant that keeps the hole closed: it fails whenever a new
+# body flag is added to the classifier without a matching deny rule, whatever
+# order the flag and the endpoint are given in.
+
+_GH_API_BODY_FLAGS: tuple[tuple[str, ...], ...] = (
+    ("-f", "body=lgtm"),
+    ("-F", "body=lgtm"),
+    ("--field", "body=lgtm"),
+    ("--raw-field", "body=lgtm"),
+    ("--input", "payload.json"),
+    ("--input=payload.json",),
+    ("-i", "payload.json"),
+)
+
+
+def test_every_gh_api_body_flag_is_refused_whatever_its_position() -> None:
+    """The body flag's POSITION must not change whether the write is refused.
+
+    For every body flag, and for every position the flag can take relative
+    to the endpoint, the write must be refused by the in-process layer AND
+    denied by the permission layer.
+    """
+
+    assert is_denied_by_auditor_policy is not None
+    endpoints = (
+        f"repos/{REPO}/issues/1/comments",
+        f"repos/{REPO}/pulls/181/comments",
+        "graphql",
+    )
+
+    uncovered: list[str] = []
+    for flag in _GH_API_BODY_FLAGS:
+        for endpoint in endpoints:
+            # The flag may come before the endpoint, after it, or (for the
+            # two-token flags) split around it.
+            positions = [
+                ["gh", "api", *flag, endpoint],
+                ["gh", "api", endpoint, *flag],
+            ]
+            if len(flag) == 2:
+                positions.append(["gh", "api", flag[0], endpoint, flag[1]])
+
+            for argv in positions:
+                command = command_string(argv)
+                with pytest.raises(ReadOnlyViolation):
+                    assert_read_only_command(argv)
+                if is_denied_by_auditor_policy(command, ALL_DENY_RULES) is None:
+                    uncovered.append(command)
+
+    assert uncovered == [], (
+        "write spellings the permission layer would have allowed because the "
+        f"body flag's position changed: {uncovered}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9d. The two layers must AGREE about what a write is.
+# ---------------------------------------------------------------------------
+#
+# The in-process classifier and the permission layer are separate defences,
+# and each is proven on its own.  The proof is only meaningful if the two
+# layers agree on WHICH commands are writes: a command the classifier
+# refuses but no deny rule matches is a shell-out the permission layer would
+# have allowed, and a command a deny rule matches but the classifier calls a
+# read is a read the auditor can no longer perform.
+#
+# The table below is the `gh`/`git` command surface.  It is walked here so
+# that a write verb added to one layer without the other is a test failure
+# rather than a hole discovered in an audit.
+
+_LAYER_AGREEMENT_COMMANDS: tuple[tuple[str, ...], ...] = (
+    # gh api, by method.
+    ("gh", "api", "--method=POST", "repos/o/r/pulls/1/comments"),
+    ("gh", "api", "-X", "POST", "repos/o/r/pulls/1/comments"),
+    ("gh", "api", "-XPOST", "repos/o/r/pulls/1/comments"),
+    ("gh", "api", "--method", "PATCH", "repos/o/r/pulls/1"),
+    ("gh", "api", "--method=PUT", "repos/o/r/pulls/1"),
+    ("gh", "api", "--method=DELETE", "repos/o/r/pulls/1"),
+    # gh api, by body.
+    ("gh", "api", "repos/o/r/issues/1/comments", "-f", "body=x"),
+    ("gh", "api", "-f", "body=x", "repos/o/r/issues/1/comments"),
+    ("gh", "api", "repos/o/r/issues/1/comments", "--input=payload.json"),
+    ("gh", "api", "--input=payload.json", "repos/o/r/issues/1/comments"),
+    # gh pr.
+    ("gh", "pr", "merge", "181"),
+    ("gh", "pr", "merge", "181", "--squash", "--delete-branch"),
+    ("gh", "pr", "merge", "181", "--admin"),
+    ("gh", "pr", "close", "181"),
+    ("gh", "pr", "reopen", "181"),
+    ("gh", "pr", "ready", "181"),
+    ("gh", "pr", "lock", "181"),
+    ("gh", "pr", "unlock", "181"),
+    ("gh", "pr", "edit", "181", "--title", "x"),
+    ("gh", "pr", "comment", "181", "--body", "x"),
+    ("gh", "pr", "create", "--title", "x"),
+    ("gh", "pr", "review", "181", "--approve"),
+    ("gh", "pr", "review", "181", "--request-changes"),
+    ("gh", "pr", "review", "181", "--comment", "x"),
+    # gh issue.
+    ("gh", "issue", "comment", "1", "--body", "x"),
+    ("gh", "issue", "create", "--title", "x"),
+    ("gh", "issue", "close", "1"),
+    ("gh", "issue", "reopen", "1"),
+    ("gh", "issue", "delete", "1"),
+    ("gh", "issue", "edit", "1", "--title", "x"),
+    # gh release / secret / variable / workflow / run.
+    ("gh", "release", "create", "v1"),
+    ("gh", "release", "edit", "v1"),
+    ("gh", "release", "upload", "v1", "a.tar.gz"),
+    ("gh", "release", "delete", "v1"),
+    ("gh", "secret", "set", "K", "V"),
+    ("gh", "secret", "delete", "K"),
+    ("gh", "variable", "set", "K", "V"),
+    ("gh", "variable", "delete", "K"),
+    ("gh", "workflow", "run", "ci.yml"),
+    ("gh", "workflow", "dispatch", "ci.yml"),
+    ("gh", "workflow", "enable", "ci.yml"),
+    ("gh", "run", "rerun", "1"),
+    ("gh", "run", "cancel", "1"),
+    ("gh", "run", "delete", "1"),
+    # gh repo / gist / label.
+    ("gh", "repo", "edit", "o/r"),
+    ("gh", "repo", "create", "x"),
+    ("gh", "repo", "delete", "o/r"),
+    ("gh", "gist", "create", "notes.txt"),
+    ("gh", "gist", "delete", "id"),
+    ("gh", "gist", "edit", "id"),
+    ("gh", "gist", "rename", "id", "new.txt"),
+    ("gh", "gist", "view", "id"),
+    ("gh", "gist", "list"),
+    ("gh", "gist", "clone", "id"),
+    ("gh", "label", "create", "x"),
+    ("gh", "label", "edit", "x"),
+    ("gh", "label", "delete", "x"),
+    # gh issue locking, gh project, gh cache, gh config.
+    ("gh", "issue", "lock", "1"),
+    ("gh", "issue", "unlock", "1"),
+    ("gh", "project", "create", "x"),
+    ("gh", "project", "edit", "1"),
+    ("gh", "project", "close", "1"),
+    ("gh", "project", "delete", "1"),
+    ("gh", "cache", "delete", "x"),
+    ("gh", "config", "set", "x", "y"),
+    # The write-only groups.
+    ("gh", "codespace", "code"),
+    ("gh", "ruleset", "create"),
+    ("gh", "ssh-key", "add", "k"),
+    ("gh", "gpg-key", "delete", "k"),
+    ("gh", "api-write", "repos/o/r/issues/1/comments"),
+    ("gh", "alias", "set", "x", "y"),
+    ("gh", "alias", "delete", "x"),
+    ("gh", "extension", "install", "x"),
+    ("gh", "extension", "remove", "x"),
+    ("gh", "org", "create", "x"),
+    ("gh", "org", "add-member", "x"),
+    ("gh", "team", "create", "x"),
+    ("gh", "sso", "create", "x"),
+    # git.
+    ("git", "push", "origin", "main"),
+    ("git", "push"),
+    ("git", "push", "--force", "origin", "main"),
+    ("git", "push", "--force-with-lease", "origin", "main"),
+    ("git", "fetch", "origin"),
+    ("git", "pull", "origin", "main"),
+    ("git", "remote", "add", "u", "https://x.invalid/r.git"),
+    ("git", "clone", "https://x.invalid/r.git"),
+    ("git", "submodule", "update", "--init"),
+    ("git", "lfs", "pull"),
+    ("git", "-C", "/tmp/checkout", "push", "origin", "main"),
+    ("git", "-C", "/tmp/checkout", "fetch", "origin"),
+    ("git", "--git-dir=/tmp/checkout/.git", "push", "origin", "main"),
+    ("git", "--git-dir=/tmp/checkout/.git", "fetch", "origin"),
+)
+
+
+def test_the_two_layers_agree_on_every_write_in_the_command_surface() -> None:
+    """A write the classifier refuses must be DENIED by a rule, and vice versa.
+
+    The two layers are separate defences; a disagreement is a hole in one
+    of them, whichever way it points.
+    """
+
+    assert is_denied_by_auditor_policy is not None
+
+    classifier_only: list[str] = []
+    policy_only: list[str] = []
+
+    for argv in _LAYER_AGREEMENT_COMMANDS:
+        argv = list(argv)
+        command = command_string(argv)
+
+        classifier_refuses = False
+        try:
+            assert_read_only_command(argv)
+        except ReadOnlyViolation:
+            classifier_refuses = True
+
+        policy_denies = is_denied_by_auditor_policy(command, ALL_DENY_RULES) is not None
+
+        if classifier_refuses and not policy_denies:
+            classifier_only.append(command)
+        elif policy_denies and not classifier_refuses:
+            policy_only.append(command)
+
+    assert classifier_only == [], (
+        "writes the in-process layer refuses but no deny rule matches: "
+        f"{classifier_only}"
+    )
+    assert policy_only == [], (
+        "commands a deny rule matches that the in-process layer calls a read: "
+        f"{policy_only}"
+    )
 
 
 # ---------------------------------------------------------------------------

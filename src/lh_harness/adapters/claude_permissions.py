@@ -80,6 +80,20 @@ AUDITOR_GH_WRITE_DENY: tuple[str, ...] = (
     "Bash(gh api * --input *)",
     "Bash(gh api * --input=*)",
     "Bash(gh api * -i *)",
+    # The same body flags with the flag BEFORE the endpoint.  `gh api`
+    # parses its flags with Go's flag package, so the endpoint is not
+    # position-locked: `gh api -f body=x repos/o/r/issues/1/comments` is
+    # the same write as `gh api repos/o/r/issues/1/comments -f body=x`.
+    # The rules above are anchored on the path coming first, so without
+    # these the flag-first spelling matched NO rule and the permission
+    # layer let a write through.
+    "Bash(gh api -f *)",
+    "Bash(gh api -F *)",
+    "Bash(gh api --field *)",
+    "Bash(gh api --raw-field *)",
+    "Bash(gh api --input *)",
+    "Bash(gh api --input=*)",
+    "Bash(gh api -i *)",
     # Pull-request and issue writes.
     "Bash(gh pr merge*)",
     "Bash(gh pr close*)",
@@ -112,14 +126,49 @@ AUDITOR_GH_WRITE_DENY: tuple[str, ...] = (
     "Bash(gh repo edit*)",
     "Bash(gh repo create*)",
     "Bash(gh repo delete*)",
+    # Conversation locking is a write on the pull request, like a comment.
+    "Bash(gh pr lock*)",
+    "Bash(gh pr unlock*)",
     "Bash(gh gist create*)",
+    "Bash(gh gist delete*)",
+    "Bash(gh gist edit*)",
+    "Bash(gh gist rename*)",
+    # The gist group is a WRITE group for the in-process classifier, so the
+    # permission layer denies the whole of it -- including the verbs that
+    # read (`gh gist view`, `gh gist list`).  The two layers must agree
+    # about what a write is, or one of them is a hole.
+    "Bash(gh gist view*)",
+    "Bash(gh gist list*)",
+    "Bash(gh gist clone*)",
     "Bash(gh label create*)",
     "Bash(gh label edit*)",
     "Bash(gh label delete*)",
+    # Conversation locking is a write on the issue, like on the PR.
+    "Bash(gh issue lock*)",
+    "Bash(gh issue unlock*)",
+    # Project writes, and the local cache / config writes.
+    "Bash(gh project create*)",
+    "Bash(gh project edit*)",
+    "Bash(gh project close*)",
+    "Bash(gh project delete*)",
+    "Bash(gh cache delete*)",
+    "Bash(gh config set*)",
     "Bash(gh api-write*)",
     "Bash(gh codespace*)",
     "Bash(gh ruleset*)",
     "Bash(gh ssh-key*)",
+    "Bash(gh gpg-key*)",
+    # These groups are write-ONLY: every verb they offer changes state on
+    # GitHub, so they are denied as a GROUP.  A verb-by-verb list is a list
+    # that goes stale -- `gh gist` was denied only for `create`, so `gh gist
+    # delete` and `gh gist edit` matched no rule at all.  Groups that also
+    # offer READ verbs (`gh label list`, `gh gist view`) are spelled per
+    # verb above, so a legitimate read is not taken away with the write.
+    "Bash(gh alias*)",
+    "Bash(gh extension*)",
+    "Bash(gh org*)",
+    "Bash(gh team*)",
+    "Bash(gh sso*)",
     # A write flag on an otherwise-read verb.
     "Bash(gh pr * --approve*)",
     "Bash(gh pr * --request-changes*)",

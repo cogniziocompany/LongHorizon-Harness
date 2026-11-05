@@ -682,6 +682,22 @@ AUDITOR_WRITE_SPELLINGS: tuple[tuple[str, ...], ...] = (
     ("gh", "api", "repos/owner/repo/issues/1/comments", "-i", "payload.json"),
     ("gh", "api", "repos/owner/repo/pulls/181/comments", "--method=POST", "-f", "body=lgtm"),
     ("gh", "api", "graphql", "-f", "query=mutation{addComment}"),
+    # -- gh api: the same body flags with the flag BEFORE the endpoint ----
+    # `gh api` parses flags with Go's flag package, so the endpoint is not
+    # position-locked.  These spellings are the same writes as the ones
+    # above, re-spelled; the in-process classifier refuses them by shape,
+    # and the permission layer has to match them too.
+    ("gh", "api", "-f", "body=lgtm", "repos/owner/repo/issues/1/comments"),
+    ("gh", "api", "-F", "body=lgtm", "repos/owner/repo/issues/1/comments"),
+    ("gh", "api", "--field", "body=lgtm", "repos/owner/repo/issues/1/comments"),
+    ("gh", "api", "--raw-field", "body=lgtm", "repos/owner/repo/issues/1/comments"),
+    ("gh", "api", "--input", "payload.json", "repos/owner/repo/issues/1/comments"),
+    ("gh", "api", "--input=payload.json", "repos/owner/repo/issues/1/comments"),
+    ("gh", "api", "-i", "payload.json", "repos/owner/repo/issues/1/comments"),
+    ("gh", "api", "-f", "query=mutation{addComment}", "graphql"),
+    # -- gh api: a write method AND a body, flag-first -------------------
+    ("gh", "api", "-X", "POST", "-f", "body=lgtm", "repos/owner/repo/issues/1/comments"),
+    ("gh", "api", "--method=POST", "-f", "body=lgtm", "repos/owner/repo/issues/1/comments"),
     # -- gh pr ------------------------------------------------------------
     ("gh", "pr", "merge", "181"),
     ("gh", "pr", "merge", "181", "--squash", "--delete-branch"),
@@ -721,9 +737,38 @@ AUDITOR_WRITE_SPELLINGS: tuple[tuple[str, ...], ...] = (
     ("gh", "repo", "create", "x"),
     ("gh", "repo", "delete", "owner/repo"),
     ("gh", "gist", "create", "notes.txt"),
+    ("gh", "gist", "delete", "id"),
+    ("gh", "gist", "edit", "id"),
+    ("gh", "gist", "rename", "id", "new.txt"),
+    ("gh", "gist", "view", "id"),
+    ("gh", "gist", "list"),
+    ("gh", "gist", "clone", "id"),
     ("gh", "label", "create", "x"),
     ("gh", "label", "edit", "x"),
     ("gh", "label", "delete", "x"),
+    # -- gh issue conversation locking -----------------------------------
+    ("gh", "issue", "lock", "1"),
+    ("gh", "issue", "unlock", "1"),
+    # -- gh project / cache / config --------------------------------------
+    ("gh", "project", "create", "x"),
+    ("gh", "project", "edit", "1"),
+    ("gh", "project", "close", "1"),
+    ("gh", "project", "delete", "1"),
+    ("gh", "cache", "delete", "x"),
+    ("gh", "config", "set", "x", "y"),
+    # -- gh pr conversation locking ---------------------------------------
+    ("gh", "pr", "lock", "181"),
+    ("gh", "pr", "unlock", "181"),
+    # -- the write-only groups --------------------------------------------
+    ("gh", "alias", "set", "x", "y"),
+    ("gh", "alias", "delete", "x"),
+    ("gh", "extension", "install", "x"),
+    ("gh", "extension", "remove", "x"),
+    ("gh", "gpg-key", "delete", "k"),
+    ("gh", "org", "create", "x"),
+    ("gh", "org", "add-member", "x"),
+    ("gh", "team", "create", "x"),
+    ("gh", "sso", "create", "x"),
     # -- git --------------------------------------------------------------
     ("git", "push", "origin", "main"),
     ("git", "push"),

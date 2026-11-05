@@ -258,6 +258,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The auditor's read-only enforcement no longer depends on the ORDER of a
+  `gh api` command's flags.  `gh api` parses its flags with Go's flag
+  package, so the endpoint is not position-locked:
+  `gh api -f body=x repos/o/r/issues/1/comments` is the same write as
+  `gh api repos/o/r/issues/1/comments -f body=x`.  The deny rules for a
+  field-supplying body were anchored on the path coming first, so in the
+  flag-first ordering they matched NOTHING and the permission layer would
+  have let the write through — the in-process classifier refused it, but the
+  shell-out was refused by no rule at all.  Every body flag (`-f`, `-F`,
+  `--field`, `--raw-field`, `--input`, `--input=`, `-i`) now has a rule for
+  both orderings, and each spelling has its own named test asserting BOTH
+  layers refuse it.
+- The auditor's permission layer now covers the write verbs it had missed
+  entirely: `gh pr lock`/`gh pr unlock` and `gh issue lock`/`gh issue
+  unlock` (locking a conversation is a write), `gh gist rename`/`view`/
+  `list`/`clone` (the gist group is a write group, so the permission layer
+  denies all of it and the two layers agree), `gh project create`/`edit`/
+  `close`/`delete`, `gh cache delete`, `gh config set`, `gh gpg-key delete`,
+  and the write-only groups `gh alias`, `gh extension`, `gh org`, `gh team`
+  and `gh sso` — denied as a GROUP, because a verb-by-verb list is a list
+  that goes stale.  The canonical write-spelling list grows from 90 to 125
+  entries, each with its own named test at both layers.
+- Two invariant tests now guard the enforcement instead of asserting it once:
+  one walks every body flag through every position it can take relative to
+  the endpoint and requires both layers to refuse each, and one requires the
+  in-process classifier and the permission layer to AGREE about which
+  commands are writes — a write the classifier refuses but no deny rule
+  matches is a hole in the permission layer, and a command a deny rule
+  matches that the classifier calls a read is a read taken away.
+- The `graphify` code-graph tool's local index (`graphify-out/`) is now
+  ignored, so a local analysis run cannot commit it.
+
 - The auditor's role instruction now names BOTH halves of the invocation an
   auditor needs: the command that resolves in the agent environment
   (`python3 scripts/auditor_verify_pr.py --repo <owner/name> --number <n>
