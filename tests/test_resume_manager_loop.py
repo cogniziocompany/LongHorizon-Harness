@@ -82,6 +82,10 @@ async def _run(
     pending_instructions=None,
 ) -> tuple[dict[str, Any], SequencedAgent]:
     agent = SequencedAgent(replies)
+    # HARNESS-AUDITOR-ISOLATION: the conftest autouse fixture git-inits
+    # any ``workspace`` directory under tmp_path; create it so the
+    # manager's auditor isolation step has a real git repo to clone.
+    (tmp_path / "workspace").mkdir()
     report = await run(
         task="finish the refactor",
         env=LocalEnvironment(str(tmp_path / "tmp")),

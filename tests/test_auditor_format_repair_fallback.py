@@ -3,15 +3,52 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from lh_harness.auditor_launch import AuditorLaunch
 from lh_harness.environment.local import LocalEnvironment
 from lh_harness.manager import (
     _auditor_report_with_format_repair,
     _format_repair_budget,
 )
+from lh_harness.safe_subprocess import (
+    AuditorBoundary,
+    AuditorBoundaryKind,
+    AuditorBoundaryUnavailable,
+)
 from lh_harness.types import EpisodeBudget, EpisodeResult, HarnessConfig
+
+
+_FIXTURE_BOUNDARY = AuditorBoundary(
+    kind=AuditorBoundaryKind.USER_NAMESPACE,
+    launcher="/usr/bin/unshare",
+    probe_uid=1,
+    rationale="fixture boundary for unit tests",
+)
+
+
+def _fixture_launch() -> AuditorLaunch:
+    return AuditorLaunch("/tmp/lh-auditor-launch-fixture", _FIXTURE_BOUNDARY)
+
+
+def _patch_auditor_launch_prepare(monkeypatch) -> AsyncMock:
+    """Patch ``prepare_auditor_launch`` on the manager module so the
+    format-repair gate accepts the fake agents used in this suite.
+
+    Without the patch, ``prepare_auditor_launch`` calls
+    ``auditor_boundary_required`` and the bwrap mount probe, both of
+    which fail on this host. The unit tests here exercise the
+    adapter-level timeout/error handling, not the isolation
+    subsystem; the boundary suite has its own coverage in
+    ``test_auditor_launch_enforcement`` and ``test_auditor_isolation``.
+    """
+    patched = AsyncMock(return_value=_fixture_launch())
+    monkeypatch.setattr(
+        "lh_harness.manager.prepare_auditor_launch", patched
+    )
+    return patched
 
 
 class FakeTimeoutRepairAgent:
@@ -66,7 +103,9 @@ def _auditor_result(status: str, *, raw_report: str = "", duration_ms: int = 100
 
 
 @pytest.mark.asyncio
-async def test_repair_timeout_preserves_successful_auditor_report(tmp_path: Path) -> None:
+async def test_repair_timeout_preserves_successful_auditor_report(
+    tmp_path: Path, monkeypatch
+) -> None:
     """
     When the auditor itself succeeded but the format-repair pass times out,
     the auditor's raw text must survive with an explicit 'unformatted' marker
@@ -87,6 +126,7 @@ async def test_repair_timeout_preserves_successful_auditor_report(tmp_path: Path
 
     calls: list[dict[str, Any]] = []
     agent = FakeTimeoutRepairAgent(calls)
+    patched_prepare = _patch_auditor_launch_prepare(monkeypatch)
 
     report, status = await _auditor_report_with_format_repair(
         env=env,
@@ -128,7 +168,9 @@ async def test_repair_timeout_preserves_successful_auditor_report(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_repair_error_does_not_fallback_to_raw_report(tmp_path: Path) -> None:
+async def test_repair_error_does_not_fallback_to_raw_report(
+    tmp_path: Path, monkeypatch
+) -> None:
     """
     When the repair fails with a non-timeout error, the existing blocked/suspect
     stub must still be emitted so we do not silently hide a backend failure.
@@ -142,6 +184,8 @@ async def test_repair_error_does_not_fallback_to_raw_report(tmp_path: Path) -> N
     harness_dir = tmp_path / "harness"
     config = HarnessConfig(harness_dir=str(harness_dir), prompt_language="en")
     env = LocalEnvironment(tmp_dir=str(tmp_path))
+
+    _patch_auditor_launch_prepare(monkeypatch)
 
     report, status = await _auditor_report_with_format_repair(
         env=env,
@@ -162,3 +206,76 @@ async def test_repair_error_does_not_fallback_to_raw_report(tmp_path: Path) -> N
     assert "Integrity: suspect" in report
     assert "[Unformatted auditor report" not in report
     assert raw_text not in report
+
+
+@pytest.mark.asyncio
+async def test_repair_audit_zero_launches_when_isolation_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """
+    Format-repair goes through the same isolation gate as the primary audit.
+    When the gate refuses the launch (``AuditorBoundaryUnavailable``) the
+    repair subprocess runs ZERO times; the fake agent's ``run_episode`` is
+    never called; the round log surfaces the missing prerequisite; and the
+    primary auditor text is preserved with an explicit unformatted marker
+    so a successful audit is not silently discarded over a missing kernel
+    prerequisite.
+    """
+    raw_text = "Successful primary audit text preserved."
+    primary = _auditor_result("done", raw_report=raw_text)
+
+    round_dir = tmp_path / "round_001"
+    round_dir.mkdir(parents=True)
+    events_path = tmp_path / "events.jsonl"
+    harness_dir = tmp_path / "harness"
+    config = HarnessConfig(harness_dir=str(harness_dir), prompt_language="en")
+    env = LocalEnvironment(tmp_dir=str(tmp_path))
+
+    class CallCounter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run_episode(self, *_args, **_kwargs):
+            self.calls += 1
+            return EpisodeResult(status="done", actions_log=raw_text)
+
+    agent = CallCounter()
+    monkeypatch.setattr(
+        "lh_harness.manager.prepare_auditor_launch",
+        AsyncMock(side_effect=AuditorBoundaryUnavailable(
+            "no separate-UID launcher; the harness must refuse to launch"
+        )),
+    )
+
+    report, status = await _auditor_report_with_format_repair(
+        env=env,
+        config=config,
+        round_dir=round_dir,
+        events_path=events_path,
+        format_repair_agent=agent,
+        auditor_budget=EpisodeBudget(max_duration_seconds=300),
+        primary_result=primary,
+        round_index=1,
+        episode_root=tmp_path,
+    )
+
+    # Zero launches.
+    assert agent.calls == 0
+    # The primary text is preserved (the audit itself succeeded) with an
+    # explicit unformatted marker.
+    assert raw_text in report
+    assert "[Unformatted auditor report" in report
+    assert "Status: blocked" not in report
+    # The round log records the missing prerequisite and zero accepted.
+    assert status["format_repair_attempted"] is True
+    assert status["format_repair_accepted"] is False
+    repair_status = status["format_repair_status"]
+    assert repair_status["status"] == "error"
+    assert repair_status.get("auditor_isolation_failed") is True
+    assert repair_status.get("missing_prerequisite") == (
+        "auditor_uid_boundary"
+    )
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    done_event = next(e for e in events if e["event"] == "auditor_format_repair_done")
+    assert done_event["accepted"] is False
+

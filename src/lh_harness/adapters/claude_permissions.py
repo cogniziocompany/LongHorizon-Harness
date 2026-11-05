@@ -50,6 +50,81 @@ AUDITOR_NETWORK_GIT_DENY: tuple[str, ...] = (
     "Bash(git --git-dir* lfs*)",
 )
 
+# Deny rules for auditor local git operations that can rewrite the executor's
+# branch, refs, or working tree (task: HARNESS-AUDITOR-ISOLATION, incident
+# 20261016T164706Z_5c063e3e).  The executor's HEAD is recorded into a local
+# ref before the auditor launches and the auditor runs on a read-only
+# snapshot, so any of these in the executor workspace are denied outright.
+# The list mirrors the network deny tuple's -C / --git-dir variants so the
+# auditor cannot pivot the operation at another working tree either.
+#
+# ``update-ref`` (and the ``--stdin`` / ``-d`` / ``--no-deref`` variants) are
+# the reference-writing family that the operator correction flagged as
+# missing from the round-001 list.  An auditor that bypasses Write/Edit
+# but still has Bash can otherwise rewrite any ref (HEAD, branch,
+# refs/lh-harness/...) without going through checkout/reset.
+AUDITOR_LOCAL_GIT_DENY: tuple[str, ...] = (
+    "Bash(git checkout*)",
+    "Bash(git reset*)",
+    "Bash(git switch*)",
+    "Bash(git clean*)",
+    "Bash(git stash*)",
+    "Bash(git restore*)",
+    "Bash(git commit*)",
+    "Bash(git rebase*)",
+    "Bash(git merge*)",
+    # Reference-writing family (covers update-ref, update-ref --stdin,
+    # update-ref -d, symbolic-ref, etc.).  ``git symbolic-ref`` is included
+    # because it rewrites HEAD-style refs without going through checkout.
+    "Bash(git update-ref*)",
+    "Bash(git symbolic-ref*)",
+    # Variants that point git at a different directory via -C or --git-dir.
+    "Bash(git -C * checkout*)",
+    "Bash(git -C * reset*)",
+    "Bash(git -C * switch*)",
+    "Bash(git -C * clean*)",
+    "Bash(git -C * stash*)",
+    "Bash(git -C * restore*)",
+    "Bash(git -C * commit*)",
+    "Bash(git -C * rebase*)",
+    "Bash(git -C * merge*)",
+    "Bash(git -C * update-ref*)",
+    "Bash(git -C * symbolic-ref*)",
+    "Bash(git --git-dir* checkout*)",
+    "Bash(git --git-dir* reset*)",
+    "Bash(git --git-dir* switch*)",
+    "Bash(git --git-dir* clean*)",
+    "Bash(git --git-dir* stash*)",
+    "Bash(git --git-dir* restore*)",
+    "Bash(git --git-dir* commit*)",
+    "Bash(git --git-dir* rebase*)",
+    "Bash(git --git-dir* merge*)",
+    "Bash(git --git-dir* update-ref*)",
+    "Bash(git --git-dir* symbolic-ref*)",
+)
+
+# Deny rules for filesystem mutation channels that could reverse the
+# snapshot's chmod a-w protection (the executor workspace must stay
+# untouched even if a Bash subprocess ignores the audit's tool deny layer).
+# These complement ``_WRITE_TOOLS`` (Write/Edit/NotebookEdit) which already
+# blocks Claude's own file-mutation tools.
+AUDITOR_FS_DENY: tuple[str, ...] = (
+    # chmod/chown would let the auditor reverse the read-only chmod applied
+    # to the snapshot by ``auditor_snapshot._chmod_readonly``.
+    "Bash(chmod*)",
+    "Bash(chown*)",
+    # rm -rf / unlink would let the auditor destroy the snapshot, the
+    # pinned ref, or attempt to delete files inside the executor tree
+    # (the executor path is not exposed to the auditor but defense in
+    # depth still applies).  ``Bash(rm*)`` catches rm, rm -rf, etc.
+    "Bash(rm*)",
+    "Bash(unlink*)",
+    # install / cp -r / mv would let it move or copy files into / out of
+    # the snapshot path in ways the deny list does not anticipate.
+    "Bash(install*)",
+    "Bash(mv*)",
+)
+
 # Environment variables that make any network git operation fail fast for the
 # auditor role. GIT_CONFIG_COUNT overrides are injected via the env and cause git
 # to reject credential helpers and redirect helpers, preventing any network op.
@@ -115,6 +190,8 @@ def policy_for_role(role: str) -> ClaudeRolePolicy:
                 *_WRITE_TOOLS,
                 "Agent",
                 *AUDITOR_NETWORK_GIT_DENY,
+                *AUDITOR_LOCAL_GIT_DENY,
+                *AUDITOR_FS_DENY,
             ),
             load_computer_mcp=True,
             workspace_read_only=True,
@@ -151,6 +228,7 @@ def path_deny_rules(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
 class WorkspaceSnapshot:
     records: dict[str, tuple[object, ...]]
     errors: tuple[str, ...] = ()
+    root: Path | None = None
 
 
 # Git metadata that read-only commands rewrite despite GIT_OPTIONAL_LOCKS=0
@@ -171,12 +249,22 @@ def is_git_internal_metadata_path(relative: str) -> bool:
     read-only git command runs inside the linked (audited) workspace.
     Churn here is git bookkeeping, never an auditor working-file write.
     History-bearing paths (``.git/objects``, refs, top-level ``.git/HEAD``)
-    are NOT covered, so a forbidden network git operation still trips the
-    guard.
+    stay fully tracked, so a forbidden network git operation still trips
+    the guard.
+
+    ``refs/lh-harness/<run_id>/round_<n>`` is a harness-owned bookkeeping
+    ref written by ``auditor_snapshot.pin_executor_head`` BEFORE the
+    auditor launches; the auditor is forbidden from touching it via the
+    ``update-ref`` deny list.  Counting it as a workspace mutation would
+    invalidate the audit when no auditor action occurred, so it is
+    excluded alongside the stat-cache noise.  ``refs/heads``, ``refs/tags``,
+    ``refs/remotes``, and any other ref namespace stay tracked.
     """
     if relative in _GIT_METADATA_NOISE:
         return True
     if relative.startswith(".git/") and relative.endswith(".lock"):
+        return True
+    if relative == ".git/refs/lh-harness" or relative.startswith(".git/refs/lh-harness/"):
         return True
     return relative == ".git/worktrees" or relative.startswith(".git/worktrees/")
 
@@ -195,7 +283,7 @@ def snapshot_workspace(
     records: dict[str, tuple[object, ...]] = {}
     errors: list[str] = []
     if not root.exists():
-        return WorkspaceSnapshot(records={}, errors=(f"workspace does not exist: {root}",))
+        return WorkspaceSnapshot(records={}, errors=(f"workspace does not exist: {root}",), root=root)
     stack = [root]
     while stack:
         directory = stack.pop()
@@ -244,7 +332,7 @@ def snapshot_workspace(
                     records[relative] = ("other", stat.st_mode, stat.st_size, stat.st_mtime_ns)
             except OSError as exc:
                 errors.append(f"{path}: {type(exc).__name__}: {exc}")
-    return WorkspaceSnapshot(records=records, errors=tuple(errors[:100]))
+    return WorkspaceSnapshot(records=records, errors=tuple(errors[:100]), root=root)
 
 
 def workspace_snapshot_diff(
@@ -253,19 +341,101 @@ def workspace_snapshot_diff(
 ) -> dict[str, Any]:
     before_paths = set(before.records)
     after_paths = set(after.records)
-    added = sorted(after_paths - before_paths)
-    deleted = sorted(before_paths - after_paths)
-    changed: list[str] = []
-    type_changed: list[str] = []
+    raw_added = sorted(after_paths - before_paths)
+    raw_deleted = sorted(before_paths - after_paths)
+    raw_changed: list[str] = []
+    raw_type_changed: list[str] = []
     for path in sorted(before_paths & after_paths):
         old = before.records[path]
         new = after.records[path]
         if old == new:
             continue
         if old and new and old[0] != new[0]:
-            type_changed.append(path)
+            raw_type_changed.append(path)
         else:
-            changed.append(path)
+            raw_changed.append(path)
+    # ``snapshot_workspace`` records every tracked path but skips
+    # bookkeeping paths (see ``is_git_internal_metadata_path``); when
+    # the harness writes bookkeeping-only content (e.g.
+    # ``auditor_snapshot.pin_executor_head`` pinning
+    # ``refs/lh-harness/<run_id>/round_<n>`` before the auditor
+    # launches) the bookkeeping paths themselves are absent from the
+    # diff.  Parent directories whose only contents are bookkeeping
+    # can still appear in ``raw_changed`` because their mtime advanced.
+    # Resolve the root that was snapshotted (best effort) and stat
+    # those parents directly: if every direct child under them is a
+    # bookkeeping path or a sub-tree of bookkeeping paths, treat the
+    # parent change as bookkeeping-derived too.
+    bookkeeping_in_added = {
+        path for path in raw_added if is_git_internal_metadata_path(path)
+    }
+    bookkeeping_in_deleted = {
+        path for path in raw_deleted if is_git_internal_metadata_path(path)
+    }
+
+    def _dir_changes_are_bookkeeping_only(path: str) -> bool:
+        # Resolve the absolute parent. ``snapshot_workspace`` records
+        # paths relative to the root it was given, so the diff does not
+        # carry the absolute path. We can probe the FS only when the
+        # caller kept the root, which they do via ``WorkspaceSnapshot.root``.
+        root_path: Path | None = getattr(after, "root", None) or getattr(before, "root", None)
+        if root_path is None:
+            return False
+        absolute = (root_path / path).resolve(strict=False)
+        try:
+            entries = list(os.scandir(absolute))
+        except OSError:
+            return False
+        if not entries:
+            return False
+        prefix = path.rstrip("/") + "/"
+        for entry in entries:
+            child_rel = (Path(entry.path).relative_to(root_path)).as_posix()
+            # A bookkeeping child never appears in the diff (the
+            # snapshotter skipped it), so its mere presence under
+            # ``path`` does not make ``path`` bookkeeping-derived. But
+            # any non-bookkeeping child whose diff entry is recorded
+            # *does* mean ``path`` was modified by a real mutation.
+            if child_rel in (bookkeeping_in_added | bookkeeping_in_deleted):
+                # Child bookkeeping path itself appears in the diff
+                # (i.e. was added or removed); treat the parent change
+                # as bookkeeping-derived only if no other diff entries
+                # under the parent are non-bookkeeping.
+                continue
+            if is_git_internal_metadata_path(child_rel):
+                # Child was always bookkeeping (the snapshotter skipped
+                # it from both before and after); it cannot by itself
+                # account for ``path``'s mtime advance. We do not flag
+                # ``path`` based on this child alone.
+                continue
+            # Non-bookkeeping child exists. Check whether that child's
+            # diff entry itself is bookkeeping-derived (in which case
+            # the child was modified only by the harness) or it is a
+            # genuine mutation.
+            if child_rel in raw_added or child_rel in raw_deleted or child_rel in raw_changed or child_rel in raw_type_changed:
+                if _is_bookkeeping_derived(child_rel):
+                    continue
+                return False
+            # The child is present in the dir but did not appear in
+            # the diff; it didn't change, so it's irrelevant to the
+            # bookkeeping derivation of ``path``.
+            continue
+        return True
+
+    def _is_bookkeeping_derived(path: str) -> bool:
+        if is_git_internal_metadata_path(path):
+            return True
+        # Path itself is bookkeeping.
+        if path in (bookkeeping_in_added | bookkeeping_in_deleted):
+            return True
+        # A directory whose mtime changed because bookkeeping-only
+        # children were added or removed.
+        return _dir_changes_are_bookkeeping_only(path)
+
+    added = [p for p in raw_added if not _is_bookkeeping_derived(p)]
+    deleted = [p for p in raw_deleted if not _is_bookkeeping_derived(p)]
+    changed = [p for p in raw_changed if not _is_bookkeeping_derived(p)]
+    type_changed = [p for p in raw_type_changed if not _is_bookkeeping_derived(p)]
     return {
         "verifier_workspace_guard": True,
         "verifier_workspace_restore_on_mutation": True,
@@ -282,6 +452,12 @@ def workspace_snapshot_diff(
             "changed": len(changed),
             "deleted": len(deleted),
             "type_changed": len(type_changed),
+        },
+        "verifier_workspace_raw_mutations": {
+            "added": raw_added,
+            "changed": raw_changed,
+            "deleted": raw_deleted,
+            "type_changed": raw_type_changed,
         },
         "verifier_workspace_snapshot_errors": [*before.errors, *after.errors][:100],
     }

@@ -343,6 +343,13 @@ async def test_auditor_timeout_keeps_executor_result_and_recovers(tmp_path: Path
         async def run_episode(self, _prompt, _env, _budget, live_trajectory_path=None):
             return next(outputs)
 
+    # HARNESS-AUDITOR-ISOLATION: the auditor isolation step is fail-closed
+    # and refuses to launch against a non-existent workspace. The
+    # conftest autouse fixture initialises git on any ``workspace``
+    # directory that exists under tmp_path; create it here so the
+    # isolation snapshot has a real git repo to clone.
+    (tmp_path / "workspace").mkdir()
+
     result = await run(
         task="recover an auditor timeout",
         env=LocalEnvironment(str(tmp_path / "tmp")),
@@ -383,6 +390,9 @@ async def test_late_crash_report_preserves_completed_rounds(tmp_path: Path) -> N
         return {"action": "continue"}
 
     log_dir = tmp_path / "logs"
+    # HARNESS-AUDITOR-ISOLATION: the conftest autouse fixture git-inits
+    # any ``workspace`` directory that exists under tmp_path.
+    (tmp_path / "workspace").mkdir()
     config = HarnessConfig(
         max_total_episodes=2,
         manager_budget=EpisodeBudget(max_duration_seconds=10),
