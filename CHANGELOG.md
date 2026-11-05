@@ -137,6 +137,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unreachable read still yields an explicit `unverifiable` that blocks a
   delivered claim, never a silent pass.
 
+  **The auditor can no longer ASK for a credential, and no longer HAS one to
+  ask with.**  Two holes remained after the read-only surface was built, and
+  both were the same hole seen from two sides.  First, `gh auth`, `gh config`
+  and `gh secret` sat on the read allowlist, so `gh auth token`,
+  `gh auth status --show-token` and `gh config get oauth_token` were ALLOWED
+  — and with an inherited `gh` login or the executor's `GH_TOKEN` in reach,
+  those print a WRITE-capable credential into the auditor's context in the
+  clear.  `auth`, `config` and `secret` are now credential groups that are
+  refused as groups, at both enforcement layers; the single exception is a
+  bare `gh auth status`, which reports the account in use and not the token
+  it would use, so it stays allowed and a token-revealing flag under it
+  (`-t` / `--show-token`, in any position) is refused.
+
+  Second, refusing the COMMAND was not enough while the auditor still
+  INHERITED a credential to ask with.  The auditor's subprocess environment
+  is now BUILT FROM SCRATCH (`lh_harness/auditor_env.py`), not the parent's
+  environment with a few names deleted — a filter can only remove what it
+  knows about.  The child's environment carries a small explicit base, no
+  `GH_TOKEN` / `GITHUB_TOKEN` / `GH_ENTERPRISE_TOKEN` /
+  `GITHUB_ENTERPRISE_TOKEN` and no fleet/admin token, a `GH_CONFIG_DIR`
+  pointing at a FRESH EMPTY temp directory so `gh` has no stored credential
+  to fall back on, and `GH_TOKEN` set only from
+  `LH_HARNESS_AUDITOR_GITHUB_TOKEN` inside that scrubbed environment.  The
+  auditor role's subprocess now runs with exactly that environment.
+
   The auditor's contract header is UNCHANGED: still exactly `Status` /
   `Integrity` / `Contract audit`.  The `confirmed` / `refuted` /
   `unverifiable` values are this module's internal verification result, not a
