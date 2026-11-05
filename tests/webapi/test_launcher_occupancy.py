@@ -14,6 +14,7 @@ Every git behaviour is proven against throwaway repos built under
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -112,10 +113,13 @@ def test_unpushed_probe_false_on_default_branch(tmp_path: Path) -> None:
 
 
 def test_dirty_tree_skip_reason_names_condition(tmp_path: Path) -> None:
+    # Tracked modification: never auto-parked (easybutt0n-17 auto-park covers
+    # ONLY untracked leftovers — the untracked case launches now, see
+    # test_untracked_only_leftovers_are_auto_parked_and_launch below).
     root, store, supervisor = _fixture(tmp_path)
     launcher = _launcher(store, supervisor)
     repo = _make_repo(tmp_path / "env")
-    (repo / "other-task.txt").write_text("another task's work\n", encoding="utf-8")
+    (repo / "README.md").write_text("base\nanother task's edits\n", encoding="utf-8")
 
     entry = _entry(store, repo)
     asyncio.run(launcher.tick())
@@ -217,7 +221,9 @@ def test_occupancy_skip_is_retryable_stays_pending(tmp_path: Path) -> None:
     root, store, supervisor = _fixture(tmp_path)
     launcher = _launcher(store, supervisor)
     repo = _make_repo(tmp_path / "env6")
-    (repo / "other-task.txt").write_text("another task's work\n", encoding="utf-8")
+    # Tracked modification: untracked-only dirt is auto-parked since
+    # easybutt0n-17, so the retryable-skip case needs tracked work.
+    (repo / "README.md").write_text("base\nanother task's edits\n", encoding="utf-8")
 
     entry = _entry(store, repo)
     asyncio.run(launcher.tick())
@@ -253,6 +259,145 @@ def test_occupancy_skip_is_a_shadow_skip_in_observe_mode(tmp_path: Path) -> None
     assert len(lines) == 1
     assert lines[0]["type"] == "queue.shadow_skip"
     assert "dirty tree" in lines[0]["payload"]["reason"]
+
+
+# ----------------------------------------------------------------------
+# Auto-park (easybutt0n-17): untracked-only dirt is stashed, never skipped
+# ----------------------------------------------------------------------
+
+
+def _stash_list(repo: Path) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "stash", "list"],
+        capture_output=True, text=True, env=GIT_ENV,
+    )
+    assert proc.returncode == 0, f"git stash list failed: {proc.stderr}"
+    return proc.stdout
+
+
+def _porcelain(repo: Path) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True, text=True, env=GIT_ENV,
+    )
+    assert proc.returncode == 0, f"git status failed: {proc.stderr}"
+    # Keep the leading status columns (" M" etc.) — only the trailing
+    # newline goes, so an empty tree still reads "".
+    return proc.stdout.rstrip("\n")
+
+
+def test_untracked_only_leftovers_are_auto_parked_and_launch(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The CT110 case: a tree dirty ONLY with untracked run leftovers is
+    auto-parked (``git stash push -u -m "lh-harness auto-park <queue_id> <utc>"``)
+    and the entry launches instead of being skipped forever."""
+
+    root, store, supervisor = _fixture(tmp_path)
+    launcher = _launcher(store, supervisor)
+    repo = _make_repo(tmp_path / "env-autopark")
+    pycache = repo / "__pycache__"
+    pycache.mkdir()
+    (pycache / "launcher.cpython-312.pyc").write_bytes(b"pyc")
+    newer_branch_dir = repo / "tests" / "only-on-newer-branch"
+    newer_branch_dir.mkdir(parents=True)
+    (newer_branch_dir / "test_new.py").write_text("# newer branch test\n", encoding="utf-8")
+    assert _porcelain(repo) != ""
+
+    entry = _entry(store, repo)
+    with caplog.at_level(logging.INFO, logger="lh_harness.launcher"):
+        asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "launched"
+    assert updated.run_id in supervisor._runs
+    # Leftovers are parked, the tree reads clean, and nothing is lost: the
+    # stash names the queue id in the agreed message format.
+    assert _porcelain(repo) == ""
+    assert not (repo / "__pycache__").exists()
+    assert not newer_branch_dir.exists()
+    stash_list = _stash_list(repo)
+    assert f"lh-harness auto-park {entry.queue_id} " in stash_list
+    # One log line naming the queue id and the stashed file count (two
+    # untracked porcelain entries parked here).
+    auto_park_lines = [r for r in caplog.records if "auto-parked" in r.getMessage()]
+    assert len(auto_park_lines) == 1
+    message = auto_park_lines[0].getMessage()
+    assert entry.queue_id in message
+    assert " 2 " in f" {message} "
+
+
+def test_modified_tracked_file_is_never_parked_and_reason_set(tmp_path: Path) -> None:
+    """Modified tracked work keeps the skip behaviour — never stashed, never
+    touched — and the skip_reason is set so it shows in the queue view."""
+
+    root, store, supervisor = _fixture(tmp_path)
+    launcher = _launcher(store, supervisor)
+    repo = _make_repo(tmp_path / "env-modified")
+    (repo / "README.md").write_text("base\nanother task's edits\n", encoding="utf-8")
+
+    entry = _entry(store, repo)
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "pending"
+    assert updated.run_id is None
+    assert supervisor.created == []
+    assert any(
+        "occupied" in reason and "dirty tree" in reason
+        for reason in updated.skip_reasons
+    )
+    # Untouched: no stash, the modification is still on disk.
+    assert _stash_list(repo) == ""
+    assert " M README.md" in _porcelain(repo)
+
+
+def test_staged_tracked_file_is_never_parked_and_reason_set(tmp_path: Path) -> None:
+    """Staged (index) work is tracked dirt too: same skip, same reason."""
+
+    root, store, supervisor = _fixture(tmp_path)
+    launcher = _launcher(store, supervisor)
+    repo = _make_repo(tmp_path / "env-staged")
+    (repo / "staged.txt").write_text("staged work\n", encoding="utf-8")
+    _git(repo, "add", "staged.txt")
+
+    entry = _entry(store, repo)
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "pending"
+    assert supervisor.created == []
+    assert any(
+        "occupied" in reason and "dirty tree" in reason
+        for reason in updated.skip_reasons
+    )
+    assert _stash_list(repo) == ""
+    assert "A  staged.txt" in _porcelain(repo)
+
+
+def test_held_tree_is_never_auto_parked(tmp_path: Path) -> None:
+    """No auto-park while a run holds the tree: the active-run rule fires
+    first and the untracked leftovers stay exactly where they are."""
+
+    root, store, supervisor = _fixture(tmp_path)
+    launcher = _launcher(store, supervisor)
+    repo = _make_repo(tmp_path / "env-held")
+    (repo / "untracked-leftover.txt").write_text("leftover\n", encoding="utf-8")
+    supervisor.add_run("run-live", str(repo), status="running")
+
+    entry = _entry(store, repo)
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "pending"
+    assert supervisor.created == []
+    assert any(f"active run run-live" in reason for reason in updated.skip_reasons)
+    assert (repo / "untracked-leftover.txt").read_text(encoding="utf-8") == "leftover\n"
+    assert _stash_list(repo) == ""
 
 
 # ----------------------------------------------------------------------
