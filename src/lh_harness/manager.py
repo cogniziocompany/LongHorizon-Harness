@@ -1798,6 +1798,13 @@ def _record_close_out(
     persisted record, or ``None`` when the close-out was refused (in which
     case an ``incomplete`` close-out with the refusal reason is persisted
     instead, so the run still carries a truthful close-out).
+
+    The AGENT path is fail-closed on the auditor verdict: a delivery is
+    only as credible as the independent verdict behind it, so with no
+    verdict reachable the agent's ``delivered`` proposal is refused even
+    when its artifact is well formed.  The HUMAN path is exempt -- the
+    operator is the fallback authority by design and may close a run
+    without an auditor verdict.
     """
 
     auditor_verdict = _latest_auditor_verdict(rounds, language=language)
@@ -1807,6 +1814,16 @@ def _record_close_out(
             closed_by=closed_by,
             auditor_verdict=auditor_verdict or None,
         )
+        if record.delivered and closed_by == "agent" and not auditor_verdict:
+            # No round carried a parseable auditor report, so
+            # ``_latest_auditor_verdict`` returned ``{}`` and the shared
+            # validator saw ``auditor_verdict=None`` -- which it treats as
+            # "no opinion", letting the agent certify a delivery with
+            # nothing but its own artifact claim.  The independent auditor
+            # verdict is the AUTHORITY on whether the work landed; with
+            # none reachable the run cannot certify a delivery and is
+            # refused below, recording the standard incomplete close-out.
+            raise CloseOutValidationError("no auditor verdict")
     except CloseOutValidationError as exc:
         # The close-out was refused.  The run is NOT completed: it is
         # close-out incomplete, with the refusal reason recorded.

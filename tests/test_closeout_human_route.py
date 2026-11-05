@@ -42,11 +42,28 @@ from lh_harness.dashboard.gate import make_human_hook
 from lh_harness.dashboard.state import ApprovalOption, DashboardState
 from lh_harness.manager import _record_close_out
 from lh_harness.supervisor.service import RunSupervisor
+from lh_harness.types import ManagedRound
 
 # The worked example's artifact: hydra PR 96 at head 773be7e.
 _PR_HEAD_SHA = "773be7e"
 _PR_REPO = "cogniziocompany/cognizioware-hydra"
 _PR_URL = f"https://github.com/{_PR_REPO}/pull/96"
+
+
+def _round_with_clean_auditor_verdict() -> ManagedRound:
+    """A round carrying a parseable, clean, complete auditor verdict.
+
+    The agent path is fail-closed without one: with no verdict reachable a
+    ``delivered`` close-out is refused, so the agent leg of a delivery test
+    must carry the independent verdict it stands on.
+    """
+
+    return ManagedRound(
+        round_index=1,
+        next_step="cli",
+        plan_text="ship hydra#96",
+        auditor_report="Status: complete\nIntegrity: clean\nContract audit: aligned",
+    )
 
 
 def _delivered_form(*, closed_by: str = "human") -> dict:
@@ -543,7 +560,8 @@ def test_the_three_production_routes_produce_a_byte_identical_record_shape(
     of the three persisted records, including the nested artifact refs.
     """
 
-    # 1. The agent path: the manager's "done" proposal.
+    # 1. The agent path: the manager's "done" proposal, standing on the
+    # independent auditor verdict the fail-closed agent path requires.
     agent_logs = tmp_path / "agent" / "lh_harness"
     agent_logs.mkdir(parents=True)
     agent_form = _delivered_form(closed_by="agent")
@@ -553,7 +571,7 @@ def test_the_three_production_routes_produce_a_byte_identical_record_shape(
         form=agent_form,
         closed_by="agent",
         identity="manager",
-        rounds=[],
+        rounds=[_round_with_clean_auditor_verdict()],
     )
     assert agent_record is not None
 

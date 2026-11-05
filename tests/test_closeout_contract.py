@@ -49,6 +49,7 @@ from lh_harness.closeout import (
     read_close_out,
     validate_close_out,
 )
+from lh_harness.types import ManagedRound
 
 # A verifiable artifact: a PR URL with a number and the HEAD commit it
 # delivered.  The head sha is what makes a PR artifact VERIFIABLE: a PR
@@ -62,6 +63,23 @@ _PR_ARTIFACT = ArtifactRef(
     url="https://github.com/cogniziocompany/cognizioware-hydra/pull/96",
     head_sha=_PR_HEAD_SHA,
 )
+
+# A round whose auditor report parses to a clean, complete, aligned verdict:
+# the independent confirmation an agent-proposed delivery stands on.
+_CLEAN_AUDIT_REPORT = "Status: complete\nIntegrity: clean\nContract audit: aligned"
+
+
+def _round_with_clean_auditor_verdict(**overrides: object) -> ManagedRound:
+    """A round carrying a parseable, clean, complete auditor verdict."""
+
+    fields: dict = {
+        "round_index": 1,
+        "next_step": "cli",
+        "plan_text": "ship hydra#96",
+        "auditor_report": _CLEAN_AUDIT_REPORT,
+    }
+    fields.update(overrides)
+    return ManagedRound(**fields)
 
 
 # --------------------------------------------------------------------------
@@ -771,7 +789,9 @@ def test_the_manager_persists_a_valid_close_out_next_to_report_json(tmp_path: Pa
         form=form,
         closed_by="agent",
         identity="manager",
-        rounds=[],
+        # An agent close-out is accepted only with the independent verdict
+        # behind it; without one the same form is refused (section 12).
+        rounds=[_round_with_clean_auditor_verdict()],
         report=report,
     )
     assert record is not None
@@ -826,3 +846,132 @@ def test_the_human_path_produces_the_same_record_shape_as_the_agent(tmp_path: Pa
     agent_record = validate_close_out(_valid_delivered_payload(), closed_by="agent")
     assert record.to_dict().keys() == agent_record.to_dict().keys()
     assert report["delivered"] is True
+
+
+# --------------------------------------------------------------------------
+# 12. The agent path is FAIL-CLOSED on the auditor verdict.
+#
+#     ``_latest_auditor_verdict`` returns ``{}`` when no round carries a
+#     parseable auditor report (no rounds, or every round skipped as
+#     invalid/empty), and ``_record_close_out`` passes ``auditor_verdict or
+#     None`` -- which the shared validator treats as "no opinion".  Without
+#     the fail-closed refusal, a well-formed ``delivered`` form would be
+#     certified by nothing but the agent's own artifact claim.  The HUMAN
+#     path stays exempt: the operator is the fallback authority by design.
+# --------------------------------------------------------------------------
+
+
+def test_agent_delivery_without_any_auditor_verdict_is_refused(tmp_path: Path) -> None:
+    """Agent + a well-formed delivered form + no auditor verdict -> refused."""
+
+    from lh_harness.manager import _record_close_out
+
+    logs_dir = tmp_path / "lh_harness"
+    logs_dir.mkdir()
+    report = {"status": "cancelled"}
+    record = _record_close_out(
+        logs_dir=logs_dir,
+        form=_valid_delivered_payload(),
+        closed_by="agent",
+        identity="manager",
+        rounds=[],
+        report=report,
+    )
+    assert record is not None
+    assert record.outcome == "incomplete"
+    assert record.outcome_reason == "no auditor verdict"
+    assert record.delivered is False
+    # The run is NOT reported as completed.
+    assert report["status"] == "cancelled"
+    assert report["outcome"] == "incomplete"
+    assert report["delivered"] is False
+
+
+def test_agent_delivery_with_an_empty_auditor_verdict_is_refused(tmp_path: Path) -> None:
+    """Agent + rounds whose reports are all skipped -> verdict {} -> refused."""
+
+    from lh_harness.manager import _latest_auditor_verdict, _record_close_out
+
+    # A round counted as invalid is skipped by the verdict scan, exactly the
+    # "all rounds skipped as invalid/empty" case: the verdict comes back {}.
+    rounds = [
+        _round_with_clean_auditor_verdict(auditor_status={"invalid_completion": True})
+    ]
+    assert _latest_auditor_verdict(rounds) == {}
+
+    logs_dir = tmp_path / "lh_harness"
+    logs_dir.mkdir()
+    report = {"status": "cancelled"}
+    record = _record_close_out(
+        logs_dir=logs_dir,
+        form=_valid_delivered_payload(),
+        closed_by="agent",
+        identity="manager",
+        rounds=rounds,
+        report=report,
+    )
+    assert record is not None
+    assert record.outcome == "incomplete"
+    assert record.outcome_reason == "no auditor verdict"
+    assert record.delivered is False
+
+
+def test_human_delivery_without_an_auditor_verdict_is_accepted(tmp_path: Path) -> None:
+    """The HUMAN path is exempt: the operator may close without a verdict."""
+
+    from lh_harness.manager import _record_close_out
+
+    logs_dir = tmp_path / "lh_harness"
+    logs_dir.mkdir()
+    human_form = _valid_delivered_payload()
+    human_form["closed_by"] = "human"
+    human_form["closed_by_identity"] = "hydrafleet-gateway"
+    report = {"status": "cancelled"}
+    record = _record_close_out(
+        logs_dir=logs_dir,
+        form=human_form,
+        closed_by="human",
+        identity="hydrafleet-gateway",
+        rounds=[],
+        report=report,
+    )
+    assert record is not None
+    assert record.outcome == "delivered"
+    assert record.closed_by == "human"
+    assert record.delivered is True
+    assert report["delivered"] is True
+    assert report["status"] == "cancelled"
+
+
+def test_the_no_verdict_refusal_is_persisted_and_projected(tmp_path: Path) -> None:
+    """The refusal lands in closeout.json AND in the summary projection."""
+
+    from lh_harness.manager import _record_close_out
+
+    logs_dir = tmp_path / "lh_harness"
+    logs_dir.mkdir()
+    report = {"status": "cancelled", "completion_satisfied": False}
+    record = _record_close_out(
+        logs_dir=logs_dir,
+        form=_valid_delivered_payload(),
+        closed_by="agent",
+        identity="manager",
+        rounds=[],
+        report=report,
+    )
+    assert record is not None
+    # Persisted: the durable closeout.json carries the refusal, not a
+    # delivery.
+    assert (logs_dir / "closeout.json").is_file()
+    persisted = load_close_out(logs_dir)
+    assert persisted is not None
+    assert persisted.outcome == "incomplete"
+    assert persisted.outcome_reason == "no auditor verdict"
+    assert persisted.delivered is False
+    # Projected: the summary status fields mirror the same refusal, and the
+    # process lifecycle stays byte-identical.
+    assert report["outcome"] == "incomplete"
+    assert report["outcome_reason"] == "no auditor verdict"
+    assert report["delivered"] is False
+    assert report["status"] == "cancelled"
+    assert report["completion_satisfied"] is False
