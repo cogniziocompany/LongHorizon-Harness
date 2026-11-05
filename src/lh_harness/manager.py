@@ -65,6 +65,13 @@ from .supervisor.control_bus import (
     _open_nofollow,
 )
 from .workspace_guard import WORKSPACE_BASE_MODES
+from .workspace_preflight import (
+    PREREQUISITE_OWNER,
+    PreflightRecord,
+    receipt_from_record,
+    run_preflight,
+    write_receipt,
+)
 from .auditor_agent import (
     VISIBLE_OUTPUT_KEYS,
     compact_auditor_report_text,
@@ -355,6 +362,68 @@ async def _run_impl(
         _run_progress.rounds = rounds
         _run_progress.gate = gate
         _run_progress.started_at = started
+
+    # LHH-WORKSPACE-TEST-PREFLIGHT: the workspace preflight runs *before*
+    # round 1 is dispatched.  A run that discovers a missing pytest (or a
+    # missing httpx2, or an interpreter that does not match the manifest)
+    # inside round 1 burns the whole round budget discovering it.  The
+    # preflight answers the question up front and, when the answer is
+    # "cannot be fixed from the repo's own manifest", stops the run at a
+    # typed owned prerequisite *before* any round is consumed.
+    preflight_record = _run_workspace_preflight(
+        config.workspace_path,
+        role_dir=role_dir,
+        events_path=events_path,
+        log_dir=log_dir,
+        workspace_base_mode=getattr(config, "workspace_base_mode", None),
+        no_tests_applicable=bool(getattr(config, "no_tests_applicable", False)),
+    )
+    if preflight_record is not None and not preflight_record.ok:
+        prerequisite = preflight_record.prerequisite or {}
+        # -- amendment-3: a readiness gap is not an owned dependency
+        # problem.  It says the preflight could not *determine* the
+        # workspace's declared test suite (a missing or unreadable
+        # manifest, an unsupported suite), which is a different fact from
+        # "a dependency is missing and infra onboarding owns it".  The two
+        # are reported with different abort reasons so an overseer reading
+        # the run snapshot can tell them apart -- and so a readiness gap is
+        # never laundered into an owned prerequisite.
+        gap = preflight_record.readiness_gap or {}
+        if gap and not prerequisite:
+            reason = str(gap.get("message") or "workspace preflight could not determine the test suite")
+            gate.abort_reason = "preflight_readiness_gap"
+            gate.completion_satisfied = False
+            gate.failure_reason = reason
+            emit(
+                "preflight_readiness_gap",
+                code=gap.get("code"),
+                kind=gap.get("kind"),
+                reason=reason,
+            )
+        else:
+            reason = str(prerequisite.get("message") or "workspace preflight failed")
+            owner = str(prerequisite.get("owner") or PREREQUISITE_OWNER)
+            gate.abort_reason = "preflight_prerequisite_missing"
+            gate.completion_satisfied = False
+            gate.failure_reason = f"{reason} (owner: {owner})"
+            emit(
+                "preflight_blocked",
+                code=prerequisite.get("code"),
+                owner=owner,
+                reason=reason,
+            )
+        return await _finalize_preflight_blocked_run(
+            task=task,
+            rounds=rounds,
+            gate=gate,
+            role_dir=role_dir,
+            log_dir=log_dir,
+            events_path=events_path,
+            env=env,
+            config=config,
+            started=started,
+            preflight=preflight_record,
+        )
 
     while round_index < gate.round_budget:
         round_index += 1
@@ -2678,6 +2747,186 @@ def _workspace_round_zero_record(
     if workspace_base_mode is not None:
         record["workspace_base_mode"] = str(workspace_base_mode)
     return record
+
+
+# The name of the run-dir receipt file.  It sits beside the role ledger so a
+# reader of the run dir sees the preflight next to the events it produced.
+PREFLIGHT_RECEIPT_NAME = "workspace_preflight.json"
+
+
+def _run_workspace_preflight(
+    workspace_path: str | Path,
+    *,
+    role_dir: Path,
+    events_path: Path,
+    log_dir: Path,
+    workspace_base_mode: str | None = None,
+    no_tests_applicable: bool = False,
+) -> PreflightRecord | None:
+    """Run the workspace preflight and record its receipts.
+
+    Three receipts are written, all carrying the same fields:
+
+    * a run-dir file (``role_orchestration/workspace_preflight.json``),
+    * a ``workspace_preflight`` event on the ledger, and
+    * the ``workspace_preflight`` field of the ``role_harness_start`` event,
+      which is what the run snapshot projects for the overseer.
+
+    The preflight never raises: a preflight that crashes is a preflight that
+    consumed the run, so every failure degrades to a recorded prerequisite.
+
+    ``no_tests_applicable`` is the **explicit** task/profile declaration
+    that this run is a non-code task and therefore has nothing to test.
+    It is the *only* source of that applicability.
+
+    It is deliberately **not** derived from the filesystem or from
+    ``workspace_base_mode``.  A missing ``.git``, a ``not-a-repo`` launch,
+    an exported code tree, and a Node tree without ``.git`` are all facts
+    about the *shape of the directory*, and every one of them is equally
+    what a wrong working directory looks like.  Treating them as "this
+    task has no tests" let a real code workspace skip the readiness check
+    altogether: the preflight reported a healthy environment for a tree it
+    had never actually been able to verify.  So a manifest-less workspace
+    is now a **readiness gap** unless the task/profile said so explicitly.
+
+    ``workspace_base_mode`` is still recorded (it says whether the run was
+    relocated), but it no longer decides applicability.
+    """
+
+    try:
+        record = run_preflight(
+            workspace_path,
+            no_tests_applicable=bool(no_tests_applicable),
+        )
+    except Exception as exc:  # noqa: BLE001 - the gate must not crash the run
+        logger.exception("workspace preflight raised; recording it as failed")
+        record = PreflightRecord(
+            workspace_path=str(workspace_path),
+            prerequisite={
+                "code": "preflight_internal_error",
+                "message": f"the workspace preflight failed unexpectedly: {exc}",
+                "owner": PREREQUISITE_OWNER,
+                "detail": {"error": type(exc).__name__},
+            },
+            ok=False,
+        )
+
+    payload = receipt_from_record(record)
+
+    # Receipt 1: the run-dir file.
+    try:
+        write_receipt(role_dir / PREFLIGHT_RECEIPT_NAME, payload)
+    except OSError:
+        logger.warning("could not write the workspace preflight receipt")
+
+    # Receipt 2: the ledger event.
+    try:
+        _append_event(events_path, "workspace_preflight", payload)
+    except Exception:  # noqa: BLE001 - a receipt must not fail the run
+        logger.warning("could not append the workspace_preflight event")
+
+    # Receipt 3: the snapshot-facing field of role_harness_start.  The event
+    # was already appended above, so the start event is rewritten in place
+    # rather than the preflight being bolted onto a second event type the
+    # snapshot does not read.
+    try:
+        _attach_preflight_to_start_event(events_path, payload)
+    except Exception:  # noqa: BLE001 - a receipt must not fail the run
+        logger.warning("could not attach the preflight to role_harness_start")
+
+    return record
+
+
+def _attach_preflight_to_start_event(events_path: Path, payload: dict[str, Any]) -> None:
+    """Carry the preflight payload inside the ``role_harness_start`` event.
+
+    The web snapshot reads the *newest* ``role_harness_start`` event and
+    projects selected fields from it (see
+    ``lh_harness.webapi.snapshot``).  Putting the preflight there is what
+    makes it visible to the overseer in the run snapshot.
+
+    The ledger record is **flat** -- ``_append_event`` merges the payload
+    into the top level of the record -- so the preflight is written under
+    the record's own ``workspace_preflight`` key.
+
+    The ledger is append-only, so the start event is rewritten in place: the
+    file is read, the newest start record gains a ``workspace_preflight``
+    key, and the file is written back atomically.
+    """
+
+    if not events_path.is_file():
+        return
+    try:
+        raw = events_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    lines = raw.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index].strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("event") != "role_harness_start":
+            continue
+        record["workspace_preflight"] = payload
+        lines[index] = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        _atomic_bytes_write(
+            events_path, ("\n".join(lines) + "\n").encode("utf-8")
+        )
+        return
+
+
+async def _finalize_preflight_blocked_run(
+    *,
+    task: str,
+    rounds: list[ManagedRound],
+    gate: _GateContext,
+    role_dir: Path,
+    log_dir: Path,
+    events_path: Path,
+    env: Environment,
+    config: HarnessConfig,
+    started: float,
+    preflight: PreflightRecord,
+) -> dict[str, Any]:
+    """Finish a run that the preflight stopped before round 1.
+
+    The run is *blocked*, not failed: the work is well-defined, the
+    environment is not.  The report names the prerequisite and its owner so
+    the operator knows exactly who has to act before the run can be retried.
+    """
+
+    final = _final_report(
+        task=task,
+        rounds=rounds,
+        completion_satisfied=False,
+        abort_reason=gate.abort_reason,
+        last_plan="",
+        task_state="",
+        task_contract="",
+        max_rounds=max(1, gate.round_budget),
+        elapsed_seconds=time.monotonic() - started,
+        final_response="",
+        failure_reason=gate.failure_reason,
+    )
+    final["preflight"] = receipt_from_record(preflight)
+    _write_local(role_dir / "report.json", json.dumps(final, ensure_ascii=False, indent=2) + "\n")
+    _write_local(log_dir / "report.json", json.dumps(final, ensure_ascii=False, indent=2) + "\n")
+    await _write_remote_text(env, f"{config.harness_dir.rstrip('/')}/report.json", json.dumps(final, ensure_ascii=False, indent=2))
+    _append_event(events_path, "role_harness_done", final)
+    emit(
+        "run_done",
+        status=final["status"],
+        completion_satisfied=final["completion_satisfied"],
+        abort_reason=final["abort_reason"],
+        rounds_run=final["rounds_run"],
+        elapsed_seconds=final["elapsed_seconds"],
+        report_path=str(log_dir / "report.json"),
+    )
+    return final
 
 
 def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
