@@ -40,6 +40,16 @@ from .queue import (
     queue_config_from_config,
     read_lease,
 )
+from .restart_recovery import (
+    INTERRUPTED_BY_RESTART,
+    ServiceEpoch,
+    begin_service_epoch,
+    classify_worker_death,
+    death_took_a_shutdown_signal,
+    probe_open_pr_gh_strict,
+    reconcile_interrupted_run,
+    workspace_worker_is_alive,
+)
 from .settings_store import SettingsStore, active_runtime, open_from_environment, trio_role_overrides
 from .supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
 from .supervisor.service import auditor_read_only_violation
@@ -582,6 +592,18 @@ def _normalize_workspace(value: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(str(value or ""))))
 
 
+def _owner_pid_for_log(owner: dict[str, Any]) -> Any:
+    """Return the service pid a run's owner record names, for logging."""
+
+    for key in ("supervisor_pid", "service_pid"):
+        value = owner.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 def _read_report_json(path: Path) -> dict[str, Any]:
     """Load a report.json if it exists and is valid JSON."""
 
@@ -774,6 +796,60 @@ class Launcher:
         self._stall_threshold = _stall_threshold_from_env()
         self._stall_cycles = 0
         self._stall_fired = False
+        # Restart-interrupted run recovery (task easybutt0n-17).  The service
+        # epoch records "this service instance started at <t> as pid <p>".
+        # A run whose worker was launched by an EARLIER service instance was
+        # live across a restart, so its "worker disappeared" death is a
+        # restart interruption rather than a spontaneous crash -- and it gets
+        # one fenced second chance (a single ``-r1`` successor) instead of a
+        # silent terminal failure.  See ``restart_recovery``.
+        self._service_epoch: ServiceEpoch | None = self._begin_service_epoch()
+
+    def _restart_probe_pr(self) -> "Callable[[Path, str], str | None] | None":
+        """The open-PR probe the RESTART RECOVERY path uses.
+
+        The launch guard's default probe (``workspace_guard.probe_open_pr_gh``)
+        returns ``None`` both for "no open PR" and for "gh could not answer".
+        That collapse is fine for a launch guard, which must fail open, but
+        it is wrong for effect detection: an undetectable PR would be read
+        as an absent one and the successor would cut a fresh base, silently
+        dropping the interrupted run's published work (review finding 2).
+
+        So the recovery path gets the strict probe, which reports "unknown"
+        separately and leaves the effects undecided (-> ``needs_review``, no
+        successor).  An explicitly injected seam is the caller's own probe
+        and is honoured as-is; ``None`` keeps the probe disabled.
+        """
+
+        if self.probe_open_pr is None:
+            return None
+        if self.probe_open_pr is probe_open_pr_gh:
+            return probe_open_pr_gh_strict
+        return self.probe_open_pr
+
+    def _begin_service_epoch(self) -> ServiceEpoch | None:
+        """Record this service instance's epoch; ``None`` when unavailable.
+
+        A service that cannot persist its epoch still starts and runs
+        normally; it simply cannot recognise a restart-interrupted death
+        afterwards.  A failure here must never abort the launcher.
+        """
+
+        runs_root = getattr(self.supervisor, "runs_root", None)
+        if runs_root is None:
+            return None
+        try:
+            epoch = begin_service_epoch(runs_root)
+        except OSError:
+            logger.warning("could not persist the service epoch; restart recovery is off")
+            return None
+        logger.info(
+            "service epoch started: pid=%s started_at=%.0f previous_pid=%s",
+            epoch.pid,
+            epoch.started_at,
+            epoch.previous_pid,
+        )
+        return epoch
 
     @staticmethod
     def _load_project_queue_config() -> dict[str, Any]:
@@ -1201,9 +1277,33 @@ class Launcher:
                     # Stopped by _enforce_time_limit: the cause is the limit,
                     # whatever the report says about the interrupted round.
                     cause = f"{TIME_LIMIT_CAUSE} | {cause}"
+                # Restart-interrupted run recovery (task easybutt0n-17).  A
+                # worker that vanished because the SERVICE stopped (its
+                # owner proves it belonged to an EARLIER service instance,
+                # so it was live at this instance's start-up) is not an
+                # ordinary crash: it gets ONE fenced second chance -- a
+                # single ``-r1`` successor -- instead of a silent terminal
+                # failure.  A shutdown signal alone is not enough: a single
+                # worker killed out of band dies on the same signal while
+                # the service keeps running, and stays an ordinary failure.
+                # The classification is read from the same supervisor status
+                # the "worker disappeared" reason was written to, and the
+                # retry itself is the ordinary ``requeue`` path with
+                # ``retry_of`` set, so this extends the existing retry
+                # machinery instead of adding a parallel one.
+                interrupted = self._classify_interrupted_by_restart(run_id, status)
+                if interrupted is not None:
+                    cause = interrupted
                 updated = self.queue_store.mark_failed(
                     entry.queue_id, reason=cause[:_MAX_REASON_LEN]
                 )
+                if interrupted is not None and updated is not None:
+                    # Record the interruption as the entry's own failure cause
+                    # so the classification is durable on the queue row (and
+                    # so the reconcile can recognise a restart retry that is
+                    # itself interrupted).
+                    updated.failure_cause = interrupted
+                    updated = self.queue_store.update(updated)
                 self._emit_run_event(
                     run_id,
                     "queue.failed",
@@ -1213,15 +1313,175 @@ class Launcher:
                         "trio": entry.trio,
                         "workspace": entry.workspace,
                         "run_status": run_status,
+                        "interrupted_by_restart": interrupted is not None,
                     },
                 )
+                if interrupted is not None:
+                    # The interrupted run's workspace is cleaned (stashed, and
+                    # the stash kept) BEFORE the successor is created, and the
+                    # successor is created exactly once.
+                    self._recover_interrupted_run(entry, updated, status)
                 # Retry only genuinely retryable backend faults; human stops,
                 # max_rounds and invalid tasks stay failed with no successor.
-                if updated is not None and self._is_retryable_cause(cause):
+                elif updated is not None and self._is_retryable_cause(cause):
                     self._handle_retry(updated, cause)
             if updated is not None:
                 updated.last_checked_at = _now()
                 self.queue_store.update(updated)
+
+    # ------------------------------------------------------------------
+    # Restart-interrupted run recovery (task easybutt0n-17).
+    #
+    # A worker that vanished because the SERVICE stopped (not because it
+    # crashed on its own) used to end in a silent terminal failure: the queue
+    # entry went to ``failed`` with no successor, and the interrupted run's
+    # untracked leftovers made the next pending entry on that workspace skip
+    # as a "dirty tree".  Here the death is classified as
+    # ``interrupted_by_restart`` and the entry gets ONE fenced second chance:
+    # a single ``-r1`` successor whose workspace is stashed (and the stash
+    # kept) before the successor can launch.
+    #
+    # The successor is an ordinary queue entry created through the ordinary
+    # ``requeue`` path, so it carries ``retry_of`` and is launched by the
+    # ordinary launch pass.  There is no parallel retry mechanism here.
+    # ------------------------------------------------------------------
+
+    def _classify_interrupted_by_restart(
+        self,
+        run_id: str,
+        status: dict[str, Any],
+    ) -> str | None:
+        """Return the ``interrupted_by_restart`` cause, or ``None``.
+
+        ``None`` means the death is an ordinary one (a crash, a memory kill,
+        a human stop) and keeps its current behaviour.  The classification
+        needs the run's owner record: a run whose owner names an EARLIER
+        service instance's pid was live across this service's start-up, which
+        is what proves the service stopped.  A shutdown signal on its own is
+        NOT enough -- a worker killed out of band dies on the same signal
+        while the service keeps running.
+        """
+
+        epoch = self._service_epoch
+        if epoch is None:
+            return None
+        owner: dict[str, Any] = {}
+        try:
+            owner = self.supervisor.owner(run_id) or {}
+        except Exception:  # noqa: BLE001 - a missing owner must not break the pass
+            owner = {}
+        failure_reason = status.get("failure_reason")
+        if classify_worker_death(
+            failure_reason=failure_reason,
+            status=status,
+            owner=owner,
+            epoch=epoch,
+        ) != INTERRUPTED_BY_RESTART:
+            return None
+        # The classification is driven by the EPOCH (the worker belonged to an
+        # earlier service instance); a shutdown signal only corroborates it.
+        # Both are logged so the evidence behind a restart successor is
+        # readable.
+        logger.info(
+            "restart interruption for run %s: owner pid %s is not this epoch's "
+            "pid %s (shutdown signal: %s)",
+            run_id,
+            _owner_pid_for_log(owner),
+            epoch.pid,
+            death_took_a_shutdown_signal(status, owner),
+        )
+        return INTERRUPTED_BY_RESTART
+
+    def _recover_interrupted_run(
+        self,
+        entry: QueueEntry,
+        failed_entry: QueueEntry | None,
+        status: dict[str, Any],
+    ) -> QueueEntry | None:
+        """Create the one ``-r1`` successor for a restart-interrupted entry.
+
+        The reconcile is idempotent: it looks the successor up by
+        ``retry_of`` first, so a second pass (or a racing launcher) creates
+        nothing.  The interrupted run's workspace is stashed BEFORE the
+        successor exists, and the stash is kept (never ``git clean``, never
+        ``git reset --hard``).
+        """
+
+        if failed_entry is None:
+            return None
+        runs_root = getattr(self.supervisor, "runs_root", None)
+        if runs_root is None:
+            return None
+        owner: dict[str, Any] = {}
+        try:
+            owner = self.supervisor.owner(str(entry.run_id or "")) or {}
+        except Exception:  # noqa: BLE001 - a missing owner must not break the pass
+            owner = {}
+        try:
+            successor = reconcile_interrupted_run(
+                self.queue_store,
+                failed_entry,
+                runs_root=runs_root,
+                epoch=self._service_epoch,
+                status=status,
+                owner=owner,
+                # The recovery path's OWN open-PR probe (review finding 2):
+                # it distinguishes "gh could not answer" from "there is no
+                # open PR", so an undetectable PR leaves the effects
+                # undecided instead of being read as absent.  The launch
+                # guard's default probe stays fail-open and is NOT reused
+                # here -- the two paths need opposite semantics.  An
+                # explicitly injected seam is honoured as-is (it is the
+                # caller's own probe), and ``probe_open_pr=None`` still
+                # disables the probe entirely.
+                probe_pr=self._restart_probe_pr(),
+            )
+        except ValueError as exc:
+            # The requeue cap refused the successor: log it, never raise it
+            # into the launcher tick (the same discipline as ``_handle_retry``).
+            self._emit_service_event(
+                "queue.requeue_error",
+                {"queue_id": failed_entry.queue_id, "error": str(exc)[:200]},
+            )
+            return None
+        if successor is None:
+            return None
+        self._emit_service_event(
+            "queue.requeued",
+            {
+                "original": failed_entry.queue_id,
+                "successor": successor.queue_id,
+                "cause": INTERRUPTED_BY_RESTART,
+                "attempt": successor.attempt,
+                "run_id": str(entry.run_id or ""),
+                "name": successor.name,
+            },
+        )
+        return successor
+
+    def _interrupted_worker_alive_reason(self, entry: QueueEntry) -> str | None:
+        """Return a skip reason while the interrupted run's worker lives.
+
+        Only a restart successor is gated: it names the interrupted run in
+        ``interrupted_run``, and that run's worker is checked for liveness.
+        Every other entry is untouched, so the ordinary launch path is
+        unchanged.
+
+        The check is by RUN ID (the worker's command line carries
+        ``--run-id=<id>``), not by pid: a recycled pid must not be mistaken
+        for the interrupted run's worker, and a re-parented worker must not
+        be missed.
+        """
+
+        interrupted_run = str(getattr(entry, "interrupted_run", "") or "")
+        if not interrupted_run:
+            return None
+        if workspace_worker_is_alive(entry.workspace, interrupted_run):
+            return (
+                f"interrupted run {interrupted_run} still has a live worker; "
+                "waiting before the restart successor launches"
+            )
+        return None
 
     def _time_limit_minutes(self, entry: QueueEntry) -> int | None:
         """The entry's own limit, else ``[queue] default_time_limit_minutes``."""
@@ -1505,6 +1765,15 @@ class Launcher:
             node_reason = self._node_capacity_reason(node_active)
             if node_reason is not None:
                 return node_reason
+        # Restart second chance (task easybutt0n-17): a successor for a
+        # restart-interrupted run must NOT launch while the interrupted run's
+        # own worker is still alive -- two workers for one task is the thing
+        # this gate exists to prevent.  The successor stays PENDING with the
+        # reason recorded and is re-attempted on the next pass, so it waits
+        # for the stale worker to go away instead of racing it.
+        interrupted_reason = self._interrupted_worker_alive_reason(entry)
+        if interrupted_reason is not None:
+            return interrupted_reason
         entry_workspace = _normalize_workspace(entry.workspace)
         # Use the shared supervisor reservation primitive so queue launches
         # race-safely with POST /api/runs. A reservation takes priority over the

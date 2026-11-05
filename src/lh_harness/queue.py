@@ -341,6 +341,18 @@ class QueueEntry:
     retry_of: str | None = None
     attempt: int = 1
     failure_cause: str | None = None
+    # Restart-recovery lineage (task easybutt0n-17).  ``interrupted_run`` is
+    # the run id whose worker died with the service; it is set on the
+    # successor and names WHAT the successor continues.  ``successor`` is the
+    # reverse link, set on the ORIGINAL entry and naming the one successor
+    # created for it -- so the lineage is readable from either end.
+    interrupted_run: str | None = None
+    successor: str | None = None
+    # Set on an entry whose restart recovery could not decide safely (the
+    # interrupted run's effects could not be determined).  A ``needs_review``
+    # entry gets NO successor: a human looks at it.  This is a field, not a
+    # status, so the queue's status machine is untouched.
+    needs_review: bool = False
     # Provider-quota backoff: a retry of a quota / rate-limit failure is not
     # launchable before ``not_before`` (epoch seconds); ``wait_reason`` names
     # why (``provider_quota`` / ``provider_rate_limit``).  Both optional, both
@@ -408,6 +420,9 @@ class QueueEntry:
             "retry_of",
             "attempt",
             "failure_cause",
+            "interrupted_run",
+            "successor",
+            "needs_review",
             "not_before",
             "wait_reason",
             "time_limit_minutes",
@@ -1756,6 +1771,9 @@ class QueueStore:
         *,
         not_before: float | None = None,
         wait_reason: str | None = None,
+        name_suffix: str = "",
+        interrupted_run: str | None = None,
+        continue_branch: bool | None = None,
     ) -> QueueEntry | None:
         """Create a successor pending entry for a failed entry.
 
@@ -1765,6 +1783,17 @@ class QueueStore:
             not_before: Optional epoch seconds before which the launcher must
                 not launch the successor (provider-quota backoff)
             wait_reason: Optional label for the wait, shown in the skip reason
+            name_suffix: Optional suffix appended to the successor's name, so
+                a retry that must be distinguishable from the original task
+                (the restart second chance's ``-r1``) is visible in the queue
+            interrupted_run: The run id whose worker died with the service, so
+                the successor records the lineage of what it continues (task
+                easybutt0n-17).  ``None`` on every other retry.
+            continue_branch: Force the successor's continuation opt-in on (or
+                leave it carrying the original's).  The restart second chance
+                sets it when the interrupted run left a pushed branch or an
+                open PR behind: the successor must CONTINUE that work rather
+                than start a fresh branch (task easybutt0n-17).
 
         Returns:
             The new successor QueueEntry, or None if the original entry not found
@@ -1804,7 +1833,7 @@ class QueueStore:
         # specific model/roles must not silently fall back to trio defaults.
         successor = QueueEntry(
             queue_id=f"q-{uuid.uuid4().hex[:16]}",
-            name=entry.name,
+            name=f"{entry.name}{name_suffix}" if name_suffix else entry.name,
             task=entry.task,
             workspace=entry.workspace,
             max_rounds=entry.max_rounds,
@@ -1812,7 +1841,10 @@ class QueueStore:
             priority=entry.priority,
             requested_by=entry.requested_by,
             branch=entry.branch,
-            continue_branch=entry.continue_branch,
+            continue_branch=(
+                entry.continue_branch if continue_branch is None else bool(continue_branch)
+            ),
+            interrupted_run=interrupted_run,
             base_check=entry.base_check,
             status="pending",
             retry_of=entry.queue_id,
