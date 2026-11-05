@@ -384,6 +384,17 @@ class QueueEntry:
     # A legacy entry -- an old JSON file written before the field existed, or
     # a Postgres row written before migration 007 -- loads as the default too.
     gtm_manager: str = DEFAULT_GTM_MANAGER
+    # The close-out contract (easybutt0n-17): the entry carries the SAME
+    # close-out outcome as its run, so a queue consumer and a run consumer
+    # never disagree.  ``outcome`` is one of the six canonical values in
+    # ``lh_harness.closeout.CLOSE_OUT_OUTCOMES``; it is ``None`` until the
+    # run has closed out (a pending or launched entry has no outcome yet),
+    # which keeps a legacy entry's shape unchanged.
+    outcome: str | None = None
+    # The EXPLICIT delivery boolean that accompanies the outcome.  True only
+    # for ``delivered``/``delivered_partial``; never inferred downstream.
+    # ``None`` until the run has closed out.
+    delivered: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -429,6 +440,8 @@ class QueueEntry:
             "model",
             "roles",
             "gtm_manager",
+            "outcome",
+            "delivered",
         ):
             if key in data:
                 kwargs[key] = data[key]

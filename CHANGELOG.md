@@ -9,6 +9,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Runs carry a close-out contract: a structured, authoritative record of
+  how the WORK ended, separate from the process lifecycle.** A run's `status`
+  says how the PROCESS ended; it says nothing about whether the WORK was
+  delivered.  The normal way a harness run ends is a "stop" at the
+  end-of-round gate, which the harness records as `status=cancelled` — so a
+  run that delivered everything it was asked to deliver is indistinguishable
+  from a run that was killed mid-flight.  Across the fleet that made
+  `status` useless as an optimisation signal (1390 cancelled vs 1 completed
+  on 2026-11-05), and an RSI loop that tunes on it tunes on noise.
+
+  `status` is therefore left EXACTLY as it is (many consumers depend on it),
+  and a separate close-out outcome is added beside it.  New module
+  `src/lh_harness/closeout.py` holds the single source of truth:
+
+  - a canonical six-value outcome enum — `delivered`, `delivered_partial`,
+    `blocked`, `failed`, `aborted`, `incomplete` — with no synonyms and no
+    second vocabulary;
+  - a structured close-out FORM (`outcome`, `outcome_reason` — short, ASCII,
+    at most 200 characters, `artifact_refs` as `{kind: pr|commit|file, repo,
+    ref, url}`, `closed_by` as `agent|human`, `closed_by_identity`,
+    `closed_at`, and an EXPLICIT `delivered` boolean that is true only for
+    `delivered`/`delivered_partial` and is never inferred downstream);
+  - ONE validator, `validate_close_out`, used by BOTH closers — the agent
+    (manager) "done" path and the human gate-resolution / stop path — so
+    both produce identical record shapes.  An invalid or missing close-out
+    is never reported as completed: the run is closed out `incomplete` with
+    the refusal reason recorded;
+  - a `delivered`/`delivered_partial` close-out MUST cite at least one
+    verifiable artifact.  There is no `delivered_no_artifact` variant: an
+    artifactless delivery is refused and the caller must use
+    `blocked`/`incomplete` with a reason instead;
+  - the independent auditor verdict as the authority: a `delivered`
+    close-out that contradicts the auditor's verdict is rejected and the run
+    is left `incomplete` with a conflict reason.  The manager may PROPOSE a
+    delivery but cannot CERTIFY one, and the auditor's own verdict
+    computation is unmodified;
+  - one close-out per run, persisted durably as `closeout.json` next to
+    `report.json` and mirrored into the run status fields (`outcome`,
+    `outcome_reason`, `artifact_refs`, `closed_by`, `closed_by_identity`,
+    `closed_at`, `delivered`).  The record is immutable; a re-close requires
+    an explicit audited amendment carrying an actor and a reason, and the
+    previous record is kept in `amendment.previous`;
+  - a free-text `done:` rationale parsed ONLY as a legacy migration hint
+    (`parse_legacy_rationale`), always marked `derived=true` with
+    `derived_from="rationale_parse"`.  A derived record is never a valid
+    standalone close-out.
+
+- **The close-out outcome is exposed where consumers actually read it.**
+  `GET /api/runs?fields=summary` is the path Hydra's `list_fleet_runs` reads,
+  and it used to return no outcome at all — so the reporting-sync could not
+  see the truth even though the node had it.  The summary projection now
+  ALSO carries `outcome` (the six-value close-out enum), the explicit
+  `delivered` boolean, `outcome_reason`, `closed_by`, `closed_by_identity`,
+  `closed_at`, `artifact_refs` (kind/repo/ref/url), plus the process-lifecycle
+  fields a consumer needs to see the two side by side:
+  `completion_satisfied`, `report_status`, `exit_code`.
+
+  The change is ADDITIVE ONLY.  Every existing field keeps its name and its
+  value, and a run whose durable state carries no close-out record keeps
+  exactly the row shape it always had — a live row is unchanged, and a
+  terminal run without a close-out still reports the lifecycle-derived
+  `outcome` it always reported.  When a run HAS a close-out record, the
+  close-out enum is the authoritative `outcome` and the lifecycle-derived
+  value is preserved beside it under `lifecycle_outcome`, so the two
+  vocabularies never mix under one name and nothing is lost.
+
+- **The queue entry carries the SAME close-out outcome as its run.**  A queue
+  consumer and a run consumer now read one value, so they cannot disagree.
+  The launcher copies the run's durable close-out onto the entry when the run
+  reaches a terminal state; a run that predates the contract (or whose
+  close-out was refused) leaves the entry without an outcome, which is honest
+  rather than inferred.  Both fields are `None` on a pending or launched
+  entry, so a legacy entry's shape is unchanged.
+
+- **The run layer exposes read-only outcome aggregates for the measurement
+  layer.**  New module `src/lh_harness/closeout_aggregates.py` counts the
+  durable close-out records per outcome, per node and per day, giving
+  `total` plus each of the six canonical outcomes, with an observed-vs-derived
+  split beside each count.  It is a pure function over the run layer's own
+  records — no new service, no new store, no writes — and it reads the
+  vocabulary from `lh_harness.closeout` rather than re-deriving it, so
+  reporting-sync and RSI loops can never disagree about what the six values
+  are.  A record carrying an outcome outside the canonical enum is refused
+  rather than counted, so a second vocabulary cannot appear in an aggregate.
+
+
 - **The launcher enforces a node-level active-run ceiling.** `[queue] node_max_runs`
   is the maximum number of runs the launcher will let be active on THIS node at
   once — the value the fleet registry advertises as `maxConcurrentRuns`. Until

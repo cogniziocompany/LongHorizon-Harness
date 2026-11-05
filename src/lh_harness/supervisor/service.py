@@ -51,6 +51,7 @@ from ..agent_registry import normalise_reasoning_effort, supports_reasoning_effo
 from .. import worker_isolation
 from ..workspace_park import park_workspace
 from ..run_outcome import OutcomeCache
+from ..closeout import read_close_out
 from ..types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
@@ -561,6 +562,61 @@ def _run_component_name(value: str) -> str | None:
 # Memo for the summary list's outcome fields (report.json is parsed once per
 # finished run, not on every poll).
 _OUTCOME_CACHE = OutcomeCache()
+
+
+def _summary_close_out_fields(logs_dir: Path) -> dict[str, Any]:
+    """The close-out fields of one run's summary row, read from disk.
+
+    Reads the durable ``closeout.json`` written next to ``report.json`` and
+    the report's own status fields.  Every failure mode is non-fatal: a
+    missing, malformed or unreadable record simply contributes nothing, so
+    the runs list still renders.
+
+    The close-out fields are only present for a run that carries a
+    close-out record, which keeps the summary row's shape additive.  The
+    report's own status fields (``completion_satisfied``,
+    ``report_status``, ``exit_code``) are present for any run whose report
+    carries them, close-out or not.
+    """
+
+    fields: dict[str, Any] = {}
+    try:
+        record = read_close_out(logs_dir)
+    except Exception:  # never let a bad record break the list
+        record = None
+    if record is not None:
+        fields.update(
+            {
+                "close_out_outcome": record.outcome,
+                "outcome_reason": record.outcome_reason,
+                "delivered": bool(record.delivered),
+                "closed_by": record.closed_by,
+                "closed_by_identity": record.closed_by_identity,
+                "closed_at": record.closed_at,
+                "artifact_refs": [ref.to_dict() for ref in record.artifact_refs],
+            }
+        )
+        if record.derived:
+            fields["derived"] = True
+            fields["derived_from"] = record.derived_from
+    # The report's own status fields, so a consumer can see the close-out
+    # AND the process lifecycle side by side without a second read.
+    try:
+        report = _read_json(logs_dir / "report.json")
+    except Exception:  # never let a bad report break the list
+        report = {}
+    completion_satisfied = report.get("completion_satisfied")
+    if isinstance(completion_satisfied, bool):
+        fields["completion_satisfied"] = completion_satisfied
+    report_status = report.get("report_status")
+    if not report_status:
+        report_status = report.get("status")
+    if isinstance(report_status, str) and report_status:
+        fields["report_status"] = report_status
+    exit_code = report.get("exit_code")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        fields["exit_code"] = exit_code
+    return fields
 
 
 def _summary_logs_dir(run_dir: Path) -> Path:
@@ -1738,16 +1794,29 @@ class RunSupervisor:
             # "Stopped:" line), memoized per report so a poll stays cheap.
             # Live rows keep their old shape.
             outcome: dict[str, str] = {}
-            if canonical_lifecycle_status(status_name) in TERMINAL_STATUSES:
+            terminal = canonical_lifecycle_status(status_name) in TERMINAL_STATUSES
+            if terminal:
                 try:
                     outcome = _OUTCOME_CACHE.get(
                         Path(entry.path), logs_dir, status_name, status, _read_json
                     )
                 except Exception:  # never let a bad report break the list
                     outcome = {}
+            # The close-out contract (easybutt0n-17): the AUTHORITATIVE
+            # close-out signal, read from the durable ``closeout.json`` next
+            # to ``report.json``.  Additive: a run with no close-out record
+            # contributes nothing here and keeps its old row shape.
+            #
+            # Only TERMINAL runs carry it.  A live run has no close-out yet,
+            # and the report's own status fields (report_status, exit_code,
+            # completion_satisfied) describe a run that ENDED -- reading them
+            # on a live row would change that row's shape, which the
+            # ``fields=summary`` contract forbids.
+            close_out = _summary_close_out_fields(logs_dir) if terminal else {}
             items.append(
                 {
                     **outcome,
+                    **close_out,
                     "id": run_id,
                     "status": status_name,
                     "mtime": mtime,

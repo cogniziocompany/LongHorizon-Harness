@@ -1668,6 +1668,23 @@ def _stream_projection_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
 _HEAVY_SNAPSHOT_FIELDS = frozenset({"rounds", "events", "legacy"})
 
 
+#: The close-out fields the summary projection exposes.  They are ADDITIVE:
+#: a row that carries no close-out record keeps exactly the shape it had
+#: before the close-out contract existed.  ``outcome`` is NOT here: it is
+#: resolved above, because it may be either the close-out enum or the
+#: lifecycle-derived value.
+_CLOSE_OUT_SUMMARY_FIELDS = (
+    "delivered",
+    "outcome_reason",
+    "closed_by",
+    "closed_by_identity",
+    "closed_at",
+    "artifact_refs",
+    "derived",
+    "derived_from",
+)
+
+
 def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
     """Project one cheap run item into the ``fields=summary`` response row.
 
@@ -1682,6 +1699,21 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
     can surface the pending decision's ``owner`` + (capped) ``owner_note``
     without loading the full snapshot.  ``runs_root=None`` skips that read;
     the badge simply won't appear (non-blocking).
+
+    The close-out contract (easybutt0n-17) adds the AUTHORITATIVE
+    close-out signal here, because this is the projection consumers actually
+    read: ``outcome`` (the six-value close-out enum), the explicit
+    ``delivered`` boolean, ``outcome_reason``, ``closed_by`` and
+    ``artifact_refs``.  Every one of them is ADDITIVE — a run with no
+    close-out record keeps the row it always had.
+
+    ``outcome`` is deliberately overloaded only when both are present.  A
+    run whose close-out record exists reports the CLOSE-OUT enum there; the
+    lifecycle-derived value it would otherwise carry is preserved under
+    ``lifecycle_outcome`` so nothing is lost and the two vocabularies never
+    mix under one name.  A run with NO close-out record keeps the
+    lifecycle-derived ``outcome`` exactly as before, so existing readers see
+    no change.
     """
 
     row: dict[str, Any] = {
@@ -1695,10 +1727,42 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
             row[field] = item[field]
     # How a finished run ended (terminal runs only; absent on live rows, so
     # older readers see the same shape).  ASCII, at most 200 characters.
-    for field in ("outcome", "abort_reason", "failure_reason"):
+    #
+    # ``outcome`` is the close-out enum when a close-out record exists; the
+    # lifecycle-derived value moves to ``lifecycle_outcome`` in that case.
+    # Without a close-out record the lifecycle value stays in ``outcome``,
+    # byte-for-byte as before.
+    lifecycle_outcome = item.get("outcome")
+    close_out_outcome = item.get("close_out_outcome")
+    if isinstance(close_out_outcome, str) and close_out_outcome:
+        row["outcome"] = close_out_outcome
+        if isinstance(lifecycle_outcome, str) and lifecycle_outcome:
+            row["lifecycle_outcome"] = lifecycle_outcome
+    elif isinstance(lifecycle_outcome, str) and lifecycle_outcome:
+        row["outcome"] = lifecycle_outcome
+    for field in ("abort_reason", "failure_reason"):
         value = item.get(field)
         if isinstance(value, str) and value:
             row[field] = value
+    # The close-out contract's own fields.  Additive: absent when the run
+    # carries no close-out record.
+    for field in _CLOSE_OUT_SUMMARY_FIELDS:
+        if field not in item:
+            continue
+        value = item[field]
+        if value is None:
+            continue
+        row[field] = value
+    # The run's own status fields, so a consumer sees the close-out AND
+    # the process lifecycle side by side.  Additive: absent when the run's
+    # report does not carry them.
+    for field in ("completion_satisfied", "report_status", "exit_code"):
+        if field not in item:
+            continue
+        value = item[field]
+        if value is None:
+            continue
+        row[field] = value
     if isinstance(item.get("round"), int) and not isinstance(item.get("round"), bool):
         row["round"] = item["round"]
     return row

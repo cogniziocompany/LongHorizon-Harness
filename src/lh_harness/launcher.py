@@ -30,6 +30,7 @@ from typing import Any, Callable
 from .safe_subprocess import child_env, git_argv
 from .config import DEFAULT_NODE_MAX_RUNS, PROJECT_CONFIG_PATH, load_run_defaults
 from .contention import ContentionGroup, detect_contention, groups_to_json
+from .closeout import CloseOutRecord, read_close_out
 from .queue import (
     DEFAULT_QUOTA_BACKOFF_MINUTES,
     QueueEntry,
@@ -1261,6 +1262,17 @@ class Launcher:
                 updated = self.queue_store.mark_done(
                     entry.queue_id, reason=reason
                 )
+                # The close-out contract (easybutt0n-17): the queue entry
+                # carries the SAME close-out outcome as its run, so a queue
+                # consumer and a run consumer never disagree.  A run with no
+                # close-out record (one that predates the contract, or one
+                # whose close-out was refused) leaves the entry without an
+                # outcome, which is honest rather than inferred.
+                close_out = self._read_run_close_out(run_id)
+                if close_out is not None and updated is not None:
+                    updated.outcome = close_out.outcome
+                    updated.delivered = bool(close_out.delivered)
+                    updated = self.queue_store.update(updated)
                 self._emit_run_event(
                     run_id,
                     "queue.done",
@@ -1297,6 +1309,15 @@ class Launcher:
                 updated = self.queue_store.mark_failed(
                     entry.queue_id, reason=cause[:_MAX_REASON_LEN]
                 )
+                # The close-out contract (easybutt0n-17): a failed run still
+                # has a close-out outcome (``failed``, ``aborted``,
+                # ``incomplete`` …).  The queue entry carries the SAME value
+                # the run carries, so both consumers agree.
+                close_out = self._read_run_close_out(run_id)
+                if close_out is not None and updated is not None:
+                    updated.outcome = close_out.outcome
+                    updated.delivered = bool(close_out.delivered)
+                    updated = self.queue_store.update(updated)
                 if interrupted is not None and updated is not None:
                     # Record the interruption as the entry's own failure cause
                     # so the classification is durable on the queue row (and
@@ -1543,6 +1564,23 @@ class Launcher:
             return {}
         report_path = Path(runs_root) / run_id / "lh_harness" / "report.json"
         return _read_report_json(report_path)
+
+    def _read_run_close_out(self, run_id: str) -> CloseOutRecord | None:
+        """Read the run's durable close-out record, if it has one.
+
+        The close-out contract (easybutt0n-17) writes ``closeout.json``
+        next to ``report.json``.  A run that predates the contract, or one
+        whose close-out was refused, has no record here, which is not an
+        error: the queue entry simply carries no outcome.
+        """
+
+        runs_root = getattr(self.supervisor, "runs_root", None)
+        if runs_root is None:
+            return None
+        try:
+            return read_close_out(Path(runs_root) / run_id / "lh_harness")
+        except Exception:  # never let a bad record break the launch pass
+            return None
 
     def _maintenance_run_ids(self) -> set[str]:
         """Run ids parked by POST /api/maintenance/suspend for this root."""
