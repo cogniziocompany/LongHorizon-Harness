@@ -28,6 +28,7 @@ surface.  These tests pin the two properties that make it real:
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -46,6 +47,11 @@ try:  # pragma: no cover - the RED state simply does not have it yet
     from lh_harness.adapters.claude_permissions import AUDITOR_GH_WRITE_DENY
 except ImportError:  # pragma: no cover
     AUDITOR_GH_WRITE_DENY = ()
+
+try:  # pragma: no cover - the RED state simply does not have it yet
+    from lh_harness.auditor_verify import AUDITOR_GITHUB_TOKEN_ENV
+except ImportError:  # pragma: no cover
+    AUDITOR_GITHUB_TOKEN_ENV = ""
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "auditor_verify_pr.py"
@@ -86,6 +92,90 @@ def test_the_chinese_role_instruction_names_the_same_invocation() -> None:
     assert "python3 scripts/auditor_verify_pr.py" in instructions
 
 
+def test_the_role_instruction_names_the_auditor_token_variable() -> None:
+    """The instruction names the auditor's OWN credential variable.
+
+    The prose said "the auditor's dedicated read-only token" without saying
+    WHICH variable that is.  An auditor that cannot name the variable
+    cannot set it, and an auditor that guesses the name picks up the
+    executor's credential instead.  The variable NAME is not a secret, so
+    the instruction states it; the VALUE never appears anywhere.
+    """
+
+    instructions = CLI_AUDITOR_INSTRUCTIONS["en"]
+
+    assert AUDITOR_GITHUB_TOKEN_ENV in instructions
+
+
+def test_the_chinese_role_instruction_names_the_auditor_token_variable() -> None:
+    """The zh instruction names the same credential variable."""
+
+    instructions = CLI_AUDITOR_INSTRUCTIONS["zh"]
+
+    assert AUDITOR_GITHUB_TOKEN_ENV in instructions
+
+
+def test_the_role_instruction_names_only_the_auditor_credential() -> None:
+    """The instruction does not point the auditor at the executor's token.
+
+    Naming the auditor's variable is necessary; naming the EXECUTOR's
+    variable as the way to authenticate would hand the auditor a
+    write-capable credential and undo the whole point of the surface.
+    An executor variable may appear ONLY in a prohibition, never in a
+    sentence that tells the auditor to set it.
+    """
+
+    instructions = CLI_AUDITOR_INSTRUCTIONS["en"]
+
+    # The executor's variables are never presented as the way to read.
+    for executor_var in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "LH_HARNESS_FLEET_GITHUB_TOKEN",
+        "LH_HARNESS_FLEET_TOKEN",
+    ):
+        for line in instructions.splitlines():
+            if executor_var not in line:
+                continue
+            # The variable may be mentioned, but only to forbid it.
+            lowered = line.lower()
+            assert any(
+                marker in lowered
+                for marker in ("never", "not ", "refuse", "forbid")
+            ), f"the instruction presents {executor_var} as a way to authenticate: {line!r}"
+
+
+def _minimal_env() -> dict[str, str]:
+    """An environment in which the auditor's verifier actually resolves.
+
+    The auditor runs in a normal shell, so the verifier has to resolve in a
+    NORMAL environment too.  Two things the earlier hard-coded env got
+    wrong made the test measure the test instead of the surface:
+
+    *   ``HOME`` was pointed at the repository root, which moves the user
+        site-packages directory to ``<repo>/.local/...`` and makes the
+        harness's own dependencies unimportable -- the invocation then
+        failed with ``ModuleNotFoundError`` long before it reached the
+        verifier; and
+    *   ``PATH`` was pinned to ``/usr/bin:/bin``, dropping the interpreter
+        and console scripts the auditor would really have.
+
+    So the environment is derived from the real one, with the harness's own
+    runtime variables stripped and the auditor credential deliberately left
+    empty.  The credential is the thing under test; the interpreter's
+    import path is not.
+    """
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("LH_HARNESS_")
+    }
+    env.setdefault("PATH", "/usr/bin:/bin")
+    env.setdefault("HOME", str(Path.home()))
+    return env
+
+
 def test_the_named_invocation_actually_runs() -> None:
     """Run the named invocation and show it reaches the harness's verifier.
 
@@ -95,13 +185,10 @@ def test_the_named_invocation_actually_runs() -> None:
     fail-closed behaviour, not a start-up failure.
     """
 
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": str(REPO_ROOT),
-        # The auditor's own token is not provisioned in this environment, so
-        # the verifier must refuse to confirm anything.
-        "LH_HARNESS_AUDITOR_GITHUB_TOKEN": "",
-    }
+    env = _minimal_env()
+    # The auditor's own token is not provisioned in this environment, so
+    # the verifier must refuse to confirm anything.
+    env["LH_HARNESS_AUDITOR_GITHUB_TOKEN"] = ""
     completed = subprocess.run(
         [sys.executable, "scripts/auditor_verify_pr.py", "--help"],
         cwd=REPO_ROOT,
@@ -151,10 +238,8 @@ def test_the_named_invocation_resolves_this_checkout_not_the_installed_package()
 def test_the_named_invocation_refuses_to_verify_without_the_auditor_credential() -> None:
     """Fail-closed: with no auditor credential the verifier confirms nothing."""
 
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": str(REPO_ROOT),
-    }
+    env = _minimal_env()
+    env["LH_HARNESS_AUDITOR_GITHUB_TOKEN"] = ""
     completed = subprocess.run(
         [
             sys.executable,

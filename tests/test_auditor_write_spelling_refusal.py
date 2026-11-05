@@ -270,6 +270,87 @@ def test_gh_api_with_two_conflicting_methods_is_refused() -> None:
     assert "gh api" in rule
 
 
+def test_gh_api_with_space_separated_method_post_is_refused() -> None:
+    """``gh api --method POST <path>`` -- the long flag with a separate value.
+
+    ``--method=POST`` and ``--method POST`` are the same flag spelled two
+    ways.  The deny list carries a rule for the joined spelling, so the
+    space-separated spelling has to be proven separately rather than
+    assumed to be covered by it.
+    """
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--method", "POST", f"repos/{REPO}/pulls/181/comments"]
+    )
+    assert "POST" in message
+    assert "gh api" in rule
+
+
+def test_gh_api_with_space_separated_method_patch_is_refused() -> None:
+    """``gh api --method PATCH <path>`` -- the space-separated long flag."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--method", "PATCH", f"repos/{REPO}/pulls/181"]
+    )
+    assert "PATCH" in message
+    assert "gh api" in rule
+
+
+def test_gh_api_with_space_separated_method_put_is_refused() -> None:
+    """``gh api --method PUT <path>`` -- the space-separated long flag."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--method", "PUT", f"repos/{REPO}/pulls/181"]
+    )
+    assert "PUT" in message
+    assert "gh api" in rule
+
+
+def test_gh_api_with_space_separated_method_delete_is_refused() -> None:
+    """``gh api --method DELETE <path>`` -- the space-separated long flag."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--method", "DELETE", f"repos/{REPO}/pulls/181"]
+    )
+    assert "DELETE" in message
+    assert "gh api" in rule
+
+
+def test_gh_api_with_method_patch_and_a_field_is_refused() -> None:
+    """A PATCH method AND a body: refused, and still named as a write.
+
+    The two reasons are independent -- a write method is a write on its
+    own, and a body is a write on its own -- so the combination has to be
+    refused for a reason that survives either one being removed.
+    """
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--method=PATCH", f"repos/{REPO}/pulls/181", "-f", "state=closed"]
+    )
+    assert "PATCH" in message
+    assert "gh api" in rule
+
+
+def test_gh_api_with_method_put_and_a_field_is_refused() -> None:
+    """A PUT method AND a body: refused at both layers."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--method=PUT", f"repos/{REPO}/pulls/181", "-F", "title=x"]
+    )
+    assert "PUT" in message
+    assert "gh api" in rule
+
+
+def test_gh_api_with_method_delete_and_a_field_is_refused() -> None:
+    """A DELETE method AND a body: refused at both layers."""
+
+    message, rule = _refused_at_both_layers(
+        ["gh", "api", "--method=DELETE", f"repos/{REPO}/pulls/181", "--field", "x=1"]
+    )
+    assert "DELETE" in message
+    assert "gh api" in rule
+
+
 # ---------------------------------------------------------------------------
 # 2. `gh api` with a field-supplying body -- a write with no explicit method.
 # ---------------------------------------------------------------------------
@@ -384,6 +465,47 @@ def test_gh_pr_merge_with_flags_is_refused() -> None:
     message, rule = _refused_at_both_layers(
         ["gh", "pr", "merge", "181", "--squash", "--delete-branch"]
     )
+    assert "merge" in message.lower()
+    assert "gh pr" in rule
+
+
+def test_gh_pr_merge_with_squash_is_refused() -> None:
+    """``gh pr merge 181 --squash`` -- merge spelled as a squash.
+
+    The combined ``--squash --delete-branch`` spelling is covered by
+    ``test_gh_pr_merge_with_flags_is_refused``; the bare squash flag is
+    proven on its own so that neither spelling leans on the other.
+    """
+
+    message, rule = _refused_at_both_layers(["gh", "pr", "merge", "181", "--squash"])
+    assert "merge" in message.lower()
+    assert "gh pr" in rule
+
+
+def test_gh_pr_merge_with_admin_is_refused() -> None:
+    """``gh pr merge 181 --admin`` -- merge forced through the admin path.
+
+    ``--admin`` is the spelling that bypasses the branch protection rules,
+    so it is the one merge flag that must never be waved through.
+    """
+
+    message, rule = _refused_at_both_layers(["gh", "pr", "merge", "181", "--admin"])
+    assert "merge" in message.lower()
+    assert "gh pr" in rule
+
+
+def test_gh_pr_merge_with_rebase_is_refused() -> None:
+    """``gh pr merge 181 --rebase`` -- merge spelled as a rebase."""
+
+    message, rule = _refused_at_both_layers(["gh", "pr", "merge", "181", "--rebase"])
+    assert "merge" in message.lower()
+    assert "gh pr" in rule
+
+
+def test_gh_pr_merge_with_auto_merge_is_refused() -> None:
+    """``gh pr merge 181 --auto`` -- the auto-merge spelling."""
+
+    message, rule = _refused_at_both_layers(["gh", "pr", "merge", "181", "--auto"])
     assert "merge" in message.lower()
     assert "gh pr" in rule
 

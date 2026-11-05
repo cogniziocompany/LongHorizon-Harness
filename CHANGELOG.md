@@ -258,6 +258,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The auditor's role instruction now names BOTH halves of the invocation an
+  auditor needs: the command that resolves in the agent environment
+  (`python3 scripts/auditor_verify_pr.py --repo <owner/name> --number <n>
+  --reviewed-sha <sha>`) and the credential variable the verifier reads
+  (`LH_HARNESS_AUDITOR_GITHUB_TOKEN`).  The instruction previously said
+  "the auditor's dedicated read-only token" without saying which variable
+  that was, so an auditor could not set it — and an auditor that guessed the
+  name would have picked up the executor's write-capable `GH_TOKEN` instead.
+  The variable NAME is not a secret and is stated in both the `en` and `zh`
+  instructions; the token VALUE appears nowhere.  The executor's variables
+  are named in the instruction only to forbid them.
+- The auditor's read-only enforcement is now proven **per spelling, at both
+  layers**, for the spellings a read allowlist would otherwise let through:
+  `gh pr merge --admin`, `gh pr merge --rebase`, `gh pr merge --auto`,
+  `gh api --method POST|PATCH|PUT|DELETE` (the space-separated long-flag
+  spelling), and `gh api` with a write method AND a field-supplying body.
+  Each has its own named test asserting the in-process layer refuses it AND
+  the permission layer's deny rule MATCHES it.
+- The G4 reachability tests no longer measure the test harness instead of the
+  surface: they ran the verifier with a hard-coded `HOME` pointing at the
+  repository root, which moved the user site-packages directory and made the
+  harness's own dependencies unimportable, so the named invocation failed
+  with `ModuleNotFoundError` before it ever reached the verifier.  The
+  subprocess environment is now derived from the real one with the harness's
+  own runtime variables stripped.
 - Queue launches no longer burn an attempt on an ineligible auditor MCP
   profile (task 234).  An auditor role that would resolve to a non-read-only
   profile is refused on the pre-burn path: the exact supervisor reason
