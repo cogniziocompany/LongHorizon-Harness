@@ -18,35 +18,54 @@
   --amber: #f5c766;
   --red: #ff7890;
   /* Unified status tokens (ship-plane tokens from fleet.easybutt0n.ai).
-     Light values by default; dark scheme overrides below. */
-  --status-running: hsl(142 76% 36%);      /* running / starting / active */
-  --status-waiting: hsl(38 92% 50%);       /* waiting_approval / waiting / pending / reconnecting */
-  --status-failed: hsl(0 72% 51%);         /* failed / error / blocked / closed */
-  --status-completed: hsl(217 91% 60%);    /* completed / done */
-  --status-neutral: hsl(210 8% 56%);       /* cancelled / stopped / skipped / idle / queued */
-  --status-running-soft: hsl(142 76% 36% / .14);
-  --status-waiting-soft: hsl(38 92% 50% / .14);
-  --status-failed-soft: hsl(0 72% 51% / .14);
-  --status-completed-soft: hsl(217 91% 60% / .14);
+     Light values by default; dark scheme overrides below.
+
+     Every foreground below clears WCAG AA 3:1 against BOTH sidebar
+     backgrounds (#fcfcfc light, #171717 dark) — see the contrast table in
+     PR #155 and `STATUS_DOT_CONTRAST` in frontend/core/src/statusDots.ts.
+       running    hsl(142 76% 30%)  #12873d  4.49:1 light /  9.88:1 dark
+       waiting    hsl(32  95% 32%)  #9f5704  5.33:1 light / 10.84:1 dark
+       pending    hsl(210 12% 38%)  #55616d  6.17:1 light /  7.45:1 dark
+       failed     hsl(0   72% 42%)  #b81e1e  6.31:1 light /  4.43:1 dark
+       done       hsl(199 88% 33%)  #0a6f9e  5.41:1 light /  7.00:1 dark
+       cancelled  hsl(210 8%  45%)  #6a737c  4.70:1 light /  6.21:1 dark */
+  --status-running: hsl(142 76% 30%);      /* running / starting / creating / active */
+  --status-waiting: hsl(32 95% 32%);       /* waiting_approval / waiting / paused / reconnecting */
+  --status-pending: hsl(210 12% 38%);      /* pending / queued / suspended / idle / unknown */
+  --status-failed: hsl(0 72% 42%);         /* failed / error / blocked / incomplete / rejected */
+  --status-done: hsl(199 88% 33%);         /* completed / done / success */
+  --status-cancelled: hsl(210 8% 45%);     /* cancelled / stopped / aborted / skipped */
+  --status-completed: var(--status-done);  /* legacy alias */
+  --status-neutral: var(--status-cancelled); /* legacy alias */
+  --status-running-soft: hsl(142 76% 30% / .14);
+  --status-waiting-soft: hsl(32 95% 32% / .14);
+  --status-pending-soft: hsl(210 12% 38% / .14);
+  --status-failed-soft: hsl(0 72% 42% / .14);
+  --status-done-soft: hsl(199 88% 33% / .14);
+  --status-cancelled-soft: hsl(210 8% 45% / .14);
+  --status-completed-soft: var(--status-done-soft);
   --status-amber-text: hsl(32 95% 32%);    /* darker amber for 4.5:1 contrast on light bg */
-  --status-running-pulse: hsl(142 76% 36% / .18);
-  --status-waiting-pulse: hsl(38 92% 50% / .18);
+  --status-running-pulse: hsl(142 76% 30% / .18);
+  --status-waiting-pulse: hsl(32 95% 32% / .18);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --status-running: hsl(142 71% 45%);
-    --status-waiting: hsl(45 93% 47%);
-    --status-failed: hsl(0 70% 55%);
-    --status-completed: hsl(213 94% 68%);
-    --status-neutral: hsl(210 8% 64%);
-    --status-running-soft: hsl(142 71% 45% / .18);
-    --status-waiting-soft: hsl(45 93% 47% / .18);
-    --status-failed-soft: hsl(0 70% 55% / .18);
-    --status-completed-soft: hsl(213 94% 68% / .18);
+    --status-running: hsl(142 71% 52%);
+    --status-waiting: hsl(45 93% 55%);
+    --status-pending: hsl(210 10% 66%);
+    --status-failed: hsl(0 70% 58%);
+    --status-done: hsl(199 88% 52%);
+    --status-cancelled: hsl(210 8% 60%);
+    --status-running-soft: hsl(142 71% 52% / .18);
+    --status-waiting-soft: hsl(45 93% 55% / .18);
+    --status-pending-soft: hsl(210 10% 66% / .18);
+    --status-failed-soft: hsl(0 70% 58% / .18);
+    --status-done-soft: hsl(199 88% 52% / .18);
+    --status-cancelled-soft: hsl(210 8% 60% / .18);
     --status-amber-text: hsl(45 93% 70%);
-    --status-running-pulse: hsl(142 71% 45% / .22);
-    --status-waiting-pulse: hsl(45 93% 47% / .22);
+    --status-running-pulse: hsl(142 71% 52% / .22);
+    --status-waiting-pulse: hsl(45 93% 55% / .22);
   }
 }
 
@@ -288,6 +307,39 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .status-dot { width: 8px; height: 8px; margin-top: 6px; background: var(--status-neutral); }
 /* Status colours come from the unified tokens defined at the top of the file.
    The light codex layer overrides neither the colour palette nor the size. */
+
+/* Status dot tones and shapes.
+   The tone classes come from the shared mapping in
+   frontend/core/src/statusDots.ts, so the sidebar task list, the Run status
+   panel and the queue view all render the same dot for the same status.
+   Each tone also carries a distinct *shape*, so colour is never the only cue:
+     running    green   solid dot inside a ring   (+ slow pulse)
+     waiting    amber   solid dot with a bar
+     pending    grey    hollow outline
+     failed     red     solid dot with a cross
+     done       blue    solid dot
+     cancelled  grey    solid dot with a slash */
+.status-dot.status-running { background: var(--status-running); box-shadow: 0 0 0 3px var(--status-running-soft); }
+.status-dot.status-waiting { background: var(--status-waiting); box-shadow: 0 0 0 3px var(--status-waiting-soft); }
+.status-dot.status-pending { background: transparent; box-shadow: none; border: 2px solid var(--status-pending); }
+.status-dot.status-failed { background: var(--status-failed); box-shadow: 0 0 0 3px var(--status-failed-soft); }
+.status-dot.status-done { background: var(--status-done); box-shadow: 0 0 0 3px var(--status-done-soft); }
+.status-dot.status-cancelled { background: var(--status-cancelled); box-shadow: 0 0 0 3px var(--status-cancelled-soft); }
+
+/* The non-colour cues. */
+.status-dot.status-shape-ring { box-shadow: 0 0 0 3px var(--status-running-soft), 0 0 0 4px var(--status-running); }
+.status-dot.status-shape-bar { position: relative; }
+.status-dot.status-shape-bar::after { content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 2px; margin-top: -1px; border-radius: 1px; background: var(--status-waiting); }
+.status-dot.status-shape-outline { background: transparent; }
+.status-dot.status-shape-cross { position: relative; }
+.status-dot.status-shape-cross::after { content: ''; position: absolute; inset: -3px; border-radius: 50%; background: linear-gradient(45deg, transparent 42%, var(--status-failed) 42%, var(--status-failed) 58%, transparent 58%), linear-gradient(-45deg, transparent 42%, var(--status-failed) 42%, var(--status-failed) 58%, transparent 58%); }
+.status-dot.status-shape-slash { position: relative; }
+.status-dot.status-shape-slash::after { content: ''; position: absolute; left: -2px; right: -2px; top: 50%; height: 2px; margin-top: -1px; border-radius: 1px; background: var(--status-cancelled); transform: rotate(-45deg); }
+/* The running dot breathes slowly so an active run is obvious without colour. */
+.status-dot.status-running { animation: lh-status-pulse 2.4s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .status-dot.status-running { animation: none; }
+}
 .sidebar-footer { padding: 15px 10px 2px; color: #a4a5a7; }.connection-dot { width: 5px; height: 5px; background: var(--status-neutral); }.connection-connected { background: var(--status-running); }.connection-loading, .connection-reconnecting { background: var(--status-waiting); }.connection-error { background: var(--status-failed); }.connection-closed, .connection-idle { background: var(--status-neutral); }
 .codex-main { background: #fff; }.codex-header { min-height: 36px; padding: 0 14px; border-bottom: 1px solid #eeeeee; color: #3c3e40; }
 .header-context { gap: 9px; }.header-folder { color: #3c3e40; font-size: 19px; line-height: 1; }.header-title { max-width: 570px; overflow: hidden; color: #2c2e31; font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }.header-more { color: #767779; letter-spacing: 2px; }.header-actions { gap: 5px; }.header-status { color: #88898b; font-size: 10px; }
@@ -387,6 +439,27 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .status-panel-dot.connection-reconnecting { background: var(--status-waiting); box-shadow: 0 0 0 4px var(--status-waiting-soft); animation: lh-live-pulse 1.35s ease-in-out infinite; }
 .status-panel-dot.connection-closed,
 .status-panel-dot.connection-error { background: var(--status-failed); box-shadow: 0 0 0 4px var(--status-failed-soft); }
+/* The Run status panel dot reads the shared mapping's tone + shape classes
+   (status-running / status-shape-ring and friends), so it renders the same
+   dot as the sidebar task list and the queue view for the same status. */
+.status-panel-dot.status-running { background: var(--status-running); box-shadow: 0 0 0 4px var(--status-running-soft); }
+.status-panel-dot.status-waiting { background: var(--status-waiting); box-shadow: 0 0 0 4px var(--status-waiting-soft); }
+.status-panel-dot.status-pending { background: transparent; box-shadow: none; border: 2px solid var(--status-pending); }
+.status-panel-dot.status-failed { background: var(--status-failed); box-shadow: 0 0 0 4px var(--status-failed-soft); }
+.status-panel-dot.status-done { background: var(--status-done); box-shadow: 0 0 0 4px var(--status-done-soft); }
+.status-panel-dot.status-cancelled { background: var(--status-cancelled); box-shadow: 0 0 0 4px var(--status-cancelled-soft); }
+.status-panel-dot.status-shape-ring { box-shadow: 0 0 0 4px var(--status-running-soft), 0 0 0 5px var(--status-running); }
+.status-panel-dot.status-shape-bar { position: relative; }
+.status-panel-dot.status-shape-bar::after { content: ''; position: absolute; left: -2px; right: -2px; top: 50%; height: 2px; margin-top: -1px; border-radius: 1px; background: var(--status-waiting); }
+.status-panel-dot.status-shape-outline { background: transparent; }
+.status-panel-dot.status-shape-cross { position: relative; }
+.status-panel-dot.status-shape-cross::after { content: ''; position: absolute; inset: -3px; border-radius: 50%; background: linear-gradient(45deg, transparent 42%, var(--status-failed) 42%, var(--status-failed) 58%, transparent 58%), linear-gradient(-45deg, transparent 42%, var(--status-failed) 42%, var(--status-failed) 58%, transparent 58%); }
+.status-panel-dot.status-shape-slash { position: relative; }
+.status-panel-dot.status-shape-slash::after { content: ''; position: absolute; left: -2px; right: -2px; top: 50%; height: 2px; margin-top: -1px; border-radius: 1px; background: var(--status-cancelled); transform: rotate(-45deg); }
+.status-panel-dot.status-running { animation: lh-status-pulse 2.4s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .status-panel-dot.status-running { animation: none; }
+}
 .status-overview { padding: 15px 0 14px; border-bottom: 1px solid #ededee; }
 .status-overview-line, .status-progress-meta, .status-section-title, .status-role-copy > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .status-overview-line strong { color: #242629; font-size: 13px; font-weight: 650; }
@@ -626,6 +699,16 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 
 /* Small source/evidence note shown when the backend has no model catalogue. */
 .drawer-field-note { color: #888b8e; font-size: 10px; line-height: 1.35; }
+/* Queue view. Each entry leads with the shared status dot so a queued,
+   launched or failed task reads at a glance, exactly like the sidebar. */
+.queue-entry-list { display: grid; gap: 8px; margin-top: 12px; }
+.queue-entry { padding: 11px; border: 1px solid #e2e3e4; border-radius: 9px; background: #fafafa; }
+.queue-entry-head { display: flex; align-items: center; gap: 8px; }
+.queue-entry-head > .status-dot { margin-top: 0; }
+.queue-entry-head code { color: #929497; font-size: 10px; }
+.queue-entry-head strong { flex: 1; min-width: 0; color: #35383b; font-size: 12px; }
+.queue-entry-head small { color: #8b8e91; font-size: 10px; }
+.queue-locked { color: #8b8e91; }
 .role-runtime-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 8px; }
 .role-runtime-head > div { display: grid; gap: 2px; }
 .role-runtime-head strong { color: #34373a; font-size: 12px; }

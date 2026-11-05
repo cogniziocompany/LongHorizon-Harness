@@ -5,5 +5,6 @@ export * from './runFeed';
 export * from './commands';
 export * from './panels';
 export * from './statusView';
+export * from './statusDots';
 export * from './trajectoryView';
 export * from './artifactView';
