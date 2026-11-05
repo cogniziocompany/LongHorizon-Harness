@@ -42,10 +42,12 @@ __all__ = [
     "auditor_gh_config_dir",
 ]
 
-#: Every environment variable that can carry a GitHub credential into a child
-#: process.  These are dropped from the auditor's environment unconditionally
-#: -- the auditor's own token is re-introduced separately, under ``GH_TOKEN``,
-#: and only when it resolves to the auditor's OWN fine-grained token.
+#: Every environment variable that can carry a GitHub credential -- or point
+#: ``gh`` at a host the auditor was not meant to talk to -- into a child
+#: process.  These are dropped from the auditor's environment
+#: unconditionally: the auditor's own token is re-introduced separately,
+#: under ``GH_TOKEN``, and only when it resolves to the auditor's OWN
+#: fine-grained token.
 AUDITOR_CREDENTIAL_ENV_NAMES: tuple[str, ...] = (
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -108,10 +110,14 @@ def build_auditor_subprocess_env(
     environment, so a credential the harness does not know about cannot leak
     through it by omission.
 
-    ``source`` defaults to ``os.environ`` and is read ONLY for the variables
-    named in :data:`_AUDITOR_BASE_ENV` and for
-    :data:`AUDITOR_GITHUB_TOKEN_ENV`.  Every credential-named variable in
-    ``source`` is ignored.
+    ``source`` defaults to ``os.environ``.  It is read for the variables named
+    in :data:`_AUDITOR_BASE_ENV`, and for the auditor's own credential
+    (which :func:`lh_harness.auditor_verify.resolve_auditor_credential`
+    resolves from :data:`AUDITOR_GITHUB_TOKEN_ENV`, checking it against the
+    shared credentials in the same mapping).  No other variable in
+    ``source`` is carried over: every credential-named variable in it is
+    ignored, and every variable the harness does not know about is ignored
+    too.
     """
 
     env_source = os.environ if source is None else source
