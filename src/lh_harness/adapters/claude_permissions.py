@@ -153,6 +153,28 @@ AUDITOR_GH_WRITE_DENY: tuple[str, ...] = (
     "Bash(gh project delete*)",
     "Bash(gh cache delete*)",
     "Bash(gh config set*)",
+    # The credential groups are denied as GROUPS, exactly like the write-only
+    # groups below: a leaf-by-leaf list goes stale, and every leaf of
+    # ``gh auth`` / ``gh config`` / ``gh secret`` either PRINTS a credential
+    # or changes one.  ``gh auth token``, ``gh auth status --show-token`` and
+    # ``gh config get oauth_token`` would put a write-capable credential in
+    # the auditor's context in the clear.
+    #
+    # A plain ``gh auth status`` -- which reports the account in use and not
+    # the token it would use -- is the ONE leaf that stays admissible, so the
+    # ``gh auth`` rules below are spelled leaf by leaf and the two
+    # token-revealing flags are matched in ANY position.
+    "Bash(gh auth token*)",
+    "Bash(gh auth login*)",
+    "Bash(gh auth logout*)",
+    "Bash(gh auth refresh*)",
+    "Bash(gh auth setup-git*)",
+    "Bash(gh auth switch*)",
+    "Bash(gh auth status -t*)",
+    "Bash(gh auth * --show-token*)",
+    "Bash(gh config get*)",
+    "Bash(gh config list*)",
+    "Bash(gh secret list*)",
     "Bash(gh api-write*)",
     "Bash(gh codespace*)",
     "Bash(gh ruleset*)",

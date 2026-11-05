@@ -263,13 +263,19 @@ def resolve_auditor_credential(
 # ---------------------------------------------------------------------------
 
 #: ``gh`` subcommands that only ever read.
+#:
+#: ``auth``, ``config`` and ``secret`` are NOT here.  They sit on groups whose
+#: leaves PRINT or CHANGE a credential (``gh auth token``,
+#: ``gh auth status --show-token``, ``gh config get oauth_token``), so an
+#: inherited ``gh`` login or an executor ``GH_TOKEN`` would be written into the
+#: auditor's context in the clear.  ``gh auth status`` is the one leaf of the
+#: ``gh auth`` group that does not reveal a credential, and it is admitted
+#: separately by :func:`_gh_auth_is_a_credential_free_read`.
 _GH_READ_SUBCOMMANDS = frozenset(
     {
         "api",
-        "auth",
         "browse",
         "cache",
-        "config",
         "issue",
         "label",
         "list",
@@ -279,12 +285,22 @@ _GH_READ_SUBCOMMANDS = frozenset(
         "repo",
         "run",
         "search",
-        "secret",
         "status",
         "variable",
         "workflow",
     }
 )
+
+#: ``gh`` subcommand groups that are refused outright because a leaf of them
+#: can reveal or change a credential.
+_GH_CREDENTIAL_SUBCOMMANDS = frozenset({"auth", "config", "secret"})
+
+#: The one ``gh auth`` leaf that is a genuine read: it reports WHICH account
+#: is logged in, not the credential it would use.
+_GH_AUTH_SAFE_LEAF = "status"
+
+#: Flags under ``gh auth status`` that make it PRINT the token.
+_GH_AUTH_TOKEN_REVEALING_FLAGS = frozenset({"-t", "--show-token"})
 
 #: ``gh`` subcommands that always write.  Groups whose read and write leaves
 #: share a name (``gh run view`` reads, ``gh run rerun`` writes) are NOT
@@ -368,6 +384,36 @@ _WRITE_VERBS = frozenset(
 
 #: ``gh api`` flags that supply a request body / fields.
 _GH_API_FIELD_FLAGS = frozenset({"-f", "-F", "--field", "--raw-field", "--input", "-i"})
+
+
+def _gh_auth_is_a_credential_free_read(args: Sequence[str]) -> bool:
+    """True only for a bare ``gh auth status`` that reveals no credential.
+
+    ``gh auth status`` reports which account is logged in and whether its
+    credentials work.  That is a read.  But ``gh auth status --show-token``
+    (and its short form ``-t``) PRINTS the token itself, and every other
+    ``gh auth`` leaf (``token``, ``login``, ``refresh``, ``setup-git``,
+    ``switch`` ...) either reveals or changes a credential.
+
+    So the exception is narrow on purpose: the leaf must be exactly ``status``
+    and no token-revealing flag may be present.  Anything else -- an extra
+    leaf, an unknown flag, a flag spelled ``--show-token=1`` -- is refused.
+    """
+
+    args = [str(token) for token in args if str(token)]
+    if not args:
+        return False
+    if args[0] != _GH_AUTH_SAFE_LEAF:
+        return False
+    for token in args[1:]:
+        if token in _GH_AUTH_TOKEN_REVEALING_FLAGS:
+            return False
+        # ``--show-token=1`` and any other spelling that carries the flag
+        # through an ``=`` is treated as the flag itself.
+        head = token.split("=", 1)[0]
+        if head in _GH_AUTH_TOKEN_REVEALING_FLAGS:
+            return False
+    return True
 
 
 def _gh_api_write_intent(argv: Sequence[str]) -> str | None:
@@ -474,6 +520,19 @@ def write_intent_reason(argv: Sequence[str]) -> str | None:
     sub = rest[0]
     if sub in _GH_WRITE_SUBCOMMANDS:
         return f"'gh {sub}' writes to the outside world"
+    if sub in _GH_CREDENTIAL_SUBCOMMANDS:
+        # ``gh auth`` / ``gh config`` / ``gh secret`` are refused as groups:
+        # every leaf of them either prints a credential or changes one.  The
+        # single exception is a bare ``gh auth status``, which reports the
+        # account in use without revealing the token.
+        if sub == "auth" and _gh_auth_is_a_credential_free_read(rest[1:]):
+            return None
+        # Name the leaf when there is one: the refusal has to say WHAT was
+        # refused, so ``gh secret set`` is reported as ``gh secret set`` and
+        # not as the bare group.
+        leaf = rest[1] if len(rest) >= 2 else ""
+        named = f"'gh {sub} {leaf}'" if leaf else f"'gh {sub}'"
+        return f"{named} can reveal or change a credential"
     if sub not in _GH_READ_SUBCOMMANDS:
         return f"'gh {sub}' is not on the read allowlist"
 
@@ -724,6 +783,22 @@ AUDITOR_WRITE_SPELLINGS: tuple[tuple[str, ...], ...] = (
     ("gh", "release", "delete", "v1"),
     ("gh", "secret", "set", "K", "V"),
     ("gh", "secret", "delete", "K"),
+    # -- the credential-revealing commands -------------------------------
+    # These are not WRITES, but they PRINT a write-capable credential, so
+    # the auditor must refuse them just the same.  They live in the same
+    # canonical spelling list because both enforcement layers have to
+    # refuse the same set of commands.
+    ("gh", "auth", "token"),
+    ("gh", "auth", "status", "--show-token"),
+    ("gh", "auth", "status", "-t"),
+    ("gh", "auth", "login"),
+    ("gh", "auth", "refresh"),
+    ("gh", "auth", "setup-git"),
+    ("gh", "auth", "switch"),
+    ("gh", "auth", "logout"),
+    ("gh", "config", "get", "oauth_token"),
+    ("gh", "config", "list"),
+    ("gh", "secret", "list"),
     ("gh", "variable", "set", "K", "V"),
     ("gh", "variable", "delete", "K"),
     ("gh", "workflow", "run", "ci.yml"),
