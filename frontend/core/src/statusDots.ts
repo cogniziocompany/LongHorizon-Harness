@@ -65,9 +65,13 @@ export interface StatusDotStyle {
  *
  * The list is the union of the supervised-run lifecycle
  * (`src/lh_harness/supervisor/lifecycle.py`), the status words the queue
- * store writes, and the approval/pending words the web API returns.  The
- * unit test in `frontend/core/test/statusDots.test.ts` asserts that this set
- * stays in sync with the backend vocabulary.
+ * store writes (`src/lh_harness/queue.py`), the live-state words the
+ * retention sweep reads (`src/lh_harness/disk_retention/runs.py`), the
+ * park/resume states the workspace manager writes, and the approval words
+ * the web API returns.  The unit test in
+ * `frontend/core/test/statusDots.test.ts` enumerates the backend source and
+ * asserts that this set stays in sync with the backend vocabulary, so a new
+ * backend status cannot land without a dot style.
  */
 export const BACKEND_STATUS_VALUES: readonly string[] = Object.freeze([
   // Supervised-run lifecycle (supervisor/lifecycle.py).
@@ -107,21 +111,42 @@ export const BACKEND_STATUS_VALUES: readonly string[] = Object.freeze([
   'approval',
   'paused',
   'reconnecting',
+  'gated',
   // Not-started vocabulary.
   'pending',
   'queued',
   'suspended',
   'active',
   'unknown',
+  // Queue vocabulary (queue.py `_VALID_STATUS`): a queued entry that has
+  // been handed to the launcher but whose run has not appeared yet.
+  'launched',
+  'launching',
+  // Resume / park vocabulary.
+  'resuming',
+  'parked',
+  // Control-bus and approval receipt vocabulary.
+  'applied',
+  'accepted',
+  'resolved',
+  'deleted',
 ]);
 
 /** Status word → tone. */
 const TONE_BY_STATUS: ReadonlyMap<string, StatusDotTone> = new Map([
-  // Running family.
+  // Running family: the run is live and making progress.
   ['running', 'running'],
   ['starting', 'running'],
   ['creating', 'running'],
   ['active', 'running'],
+  // A queue entry that has been handed to the launcher.  It is in flight,
+  // not waiting, so it reads as live work rather than as "not started yet".
+  ['launched', 'running'],
+  ['launching', 'running'],
+  ['resuming', 'running'],
+  // Teardown: the run is on its way out but has not reached a terminal state.
+  ['stopping', 'cancelled'],
+  ['aborting', 'cancelled'],
   // Waiting family (gated on a human or on a reconnect).
   ['waiting_approval', 'waiting'],
   ['waiting-approval', 'waiting'],
@@ -129,11 +154,13 @@ const TONE_BY_STATUS: ReadonlyMap<string, StatusDotTone> = new Map([
   ['approval', 'waiting'],
   ['paused', 'waiting'],
   ['reconnecting', 'waiting'],
+  ['gated', 'waiting'],
   // Pending family (accepted but not started).
   ['pending', 'pending'],
   ['queued', 'pending'],
   ['suspended', 'pending'],
   ['idle', 'pending'],
+  ['parked', 'pending'],
   ['unknown', 'pending'],
   // Failure family.
   ['failed', 'failed'],
@@ -155,12 +182,16 @@ const TONE_BY_STATUS: ReadonlyMap<string, StatusDotTone> = new Map([
   ['passed', 'done'],
   ['ok', 'done'],
   ['finished', 'done'],
+  ['applied', 'done'],
+  ['accepted', 'done'],
+  ['resolved', 'done'],
   // Cancelled family.
   ['cancelled', 'cancelled'],
   ['canceled', 'cancelled'],
   ['stopped', 'cancelled'],
   ['aborted', 'cancelled'],
   ['skipped', 'cancelled'],
+  ['deleted', 'cancelled'],
 ]);
 
 /**
@@ -282,20 +313,30 @@ export function statusDotAttributes(
  *
  * `ratio` is the WCAG 2.x relative-luminance contrast ratio; every value
  * must be >= 3 (WCAG AA for non-text/UI components) in both themes.
+ *
+ * The hex foregrounds and the ratios are **derived from the shipped CSS**
+ * (`frontend/web/src/style.css`), not written by hand: the unit test in
+ * `frontend/core/test/statusDots.test.ts` re-parses that stylesheet,
+ * recomputes every ratio from the real `--status-*` custom properties and
+ * the real `.codex-sidebar` background, and fails if these numbers drift.
+ * `lightCssValue` / `darkCssValue` record the literal CSS declaration each
+ * hex was converted from, so the table is traceable to the stylesheet.
  */
 export const STATUS_DOT_CONTRAST: readonly {
   tone: StatusDotTone;
   lightForeground: string;
+  lightCssValue: string;
   lightBackground: string;
   lightRatio: number;
   darkForeground: string;
+  darkCssValue: string;
   darkBackground: string;
   darkRatio: number;
 }[] = Object.freeze([
-  { tone: 'running', lightForeground: '#12873d', lightBackground: '#fcfcfc', lightRatio: 4.49, darkForeground: '#2edc6d', darkBackground: '#171717', darkRatio: 9.88 },
-  { tone: 'waiting', lightForeground: '#9f5704', lightBackground: '#fcfcfc', lightRatio: 5.33, darkForeground: '#f7c222', darkBackground: '#171717', darkRatio: 10.84 },
-  { tone: 'pending', lightForeground: '#55616d', lightBackground: '#fcfcfc', lightRatio: 6.17, darkForeground: '#a0a8b1', darkBackground: '#171717', darkRatio: 7.45 },
-  { tone: 'failed', lightForeground: '#b81e1e', lightBackground: '#fcfcfc', lightRatio: 6.31, darkForeground: '#df4949', darkBackground: '#171717', darkRatio: 4.43 },
-  { tone: 'done', lightForeground: '#0a6f9e', lightBackground: '#fcfcfc', lightRatio: 5.41, darkForeground: '#19acf0', darkBackground: '#171717', darkRatio: 7.0 },
-  { tone: 'cancelled', lightForeground: '#6a737c', lightBackground: '#fcfcfc', lightRatio: 4.7, darkForeground: '#9199a1', darkBackground: '#171717', darkRatio: 6.21 },
+  { tone: 'running', lightForeground: '#12873d', lightCssValue: 'hsl(142 76% 30%)', lightBackground: '#fcfcfc', lightRatio: 4.49, darkForeground: '#2edc6d', darkCssValue: 'hsl(142 71% 52%)', darkBackground: '#171717', darkRatio: 9.88 },
+  { tone: 'waiting', lightForeground: '#9f5704', lightCssValue: 'hsl(32 95% 32%)', lightBackground: '#fcfcfc', lightRatio: 5.33, darkForeground: '#f7c222', darkCssValue: 'hsl(45 93% 55%)', darkBackground: '#171717', darkRatio: 10.84 },
+  { tone: 'pending', lightForeground: '#55616d', lightCssValue: 'hsl(210 12% 38%)', lightBackground: '#fcfcfc', lightRatio: 6.17, darkForeground: '#a0a8b1', darkCssValue: 'hsl(210 10% 66%)', darkBackground: '#171717', darkRatio: 7.45 },
+  { tone: 'failed', lightForeground: '#b81e1e', lightCssValue: 'hsl(0 72% 42%)', lightBackground: '#fcfcfc', lightRatio: 6.31, darkForeground: '#df4949', darkCssValue: 'hsl(0 70% 58%)', darkBackground: '#171717', darkRatio: 4.43 },
+  { tone: 'done', lightForeground: '#0a6f9e', lightCssValue: 'hsl(199 88% 33%)', lightBackground: '#fcfcfc', lightRatio: 5.41, darkForeground: '#19acf0', darkCssValue: 'hsl(199 88% 52%)', darkBackground: '#171717', darkRatio: 7.0 },
+  { tone: 'cancelled', lightForeground: '#6a737c', lightCssValue: 'hsl(210 8% 45%)', lightBackground: '#fcfcfc', lightRatio: 4.7, darkForeground: '#9199a1', darkCssValue: 'hsl(210 8% 60%)', darkBackground: '#171717', darkRatio: 6.21 },
 ]);
