@@ -171,6 +171,10 @@ AUDITOR_GH_WRITE_DENY: tuple[str, ...] = (
     "Bash(gh auth setup-git*)",
     "Bash(gh auth switch*)",
     "Bash(gh auth status -t*)",
+    # The two token-revealing flags, matched in ANY position: the flag may
+    # sit behind another flag (``gh auth status --hostname github.com -t``),
+    # and a rule anchored on the flag coming first would let that through.
+    "Bash(gh auth * -t*)",
     "Bash(gh auth * --show-token*)",
     "Bash(gh config get*)",
     "Bash(gh config list*)",

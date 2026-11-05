@@ -830,6 +830,10 @@ CREDENTIAL_REVEALING_ARGV: tuple[tuple[str, ...], ...] = (
     ("gh", "auth", "status", "-t"),
     ("gh", "auth", "status", "--show-token=true"),
     ("gh", "auth", "status", "--hostname", "github.com", "--show-token"),
+    # The token-revealing flag BEHIND another flag: a deny rule anchored on
+    # the flag coming first would let this through.
+    ("gh", "auth", "status", "--hostname", "github.com", "-t"),
+    ("gh", "auth", "status", "--hostname", "github.com", "--show-token"),
     # ``gh auth``: the leaves that change the credential.
     ("gh", "auth", "login"),
     ("gh", "auth", "refresh"),
