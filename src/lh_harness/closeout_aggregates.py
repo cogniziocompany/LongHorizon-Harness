@@ -148,19 +148,36 @@ class OutcomeCounter:
 
 
 def _bucket(
-    buckets: dict[str, dict[str, int]],
+    buckets: dict[str, dict[str, dict[str, int]]],
     key: str,
     record: CloseOutRecord,
 ) -> None:
+    """Count one record into one bucket row, keeping the observed/derived split.
+
+    Every bucket row has the SAME shape as the ``overall`` aggregate: a
+    ``counts`` row, an ``observed`` row and a ``derived`` row.  A consumer
+    therefore never has to ask whether a given split carries the
+    observed/derived distinction -- it is always there, and
+    ``observed[outcome] + derived[outcome] == counts[outcome]`` holds for
+    every bucket, not just for the flat matrix.
+    """
+
     row = buckets.get(key)
     if row is None:
-        row = empty_counts()
+        row = {
+            "counts": empty_counts(),
+            "observed": empty_counts(),
+            "derived": empty_counts(),
+        }
         buckets[key] = row
     outcome = record.outcome
-    if outcome not in row:
+    if outcome not in row["counts"]:
         return
-    row["total"] += 1
-    row[outcome] += 1
+    row["counts"]["total"] += 1
+    row["counts"][outcome] += 1
+    bucket = row["derived"] if record.derived else row["observed"]
+    bucket["total"] += 1
+    bucket[outcome] += 1
 
 
 def aggregate_records(
@@ -179,6 +196,12 @@ def aggregate_records(
     ``by_node``       one aggregate per node
     ``by_day``        one aggregate per UTC day (``YYYY-MM-DD``)
 
+    EVERY row -- ``overall`` and each per-outcome / per-node / per-day row
+    -- carries the SAME shape: a ``counts`` row, an ``observed`` row and a
+    ``derived`` row.  The observed/derived split is therefore never missing
+    from a per-node or per-day view, which is exactly where a measurement
+    layer reads a fleet's history.
+
     The per-node split uses the node the run layer belongs to.  The
     per-day split uses the close-out's ``closed_at`` timestamp, in UTC.
 
@@ -189,9 +212,9 @@ def aggregate_records(
 
     effective_node = node if node is not None else current_node()
     overall = OutcomeCounter()
-    by_outcome: dict[str, dict[str, int]] = {}
-    by_node: dict[str, dict[str, int]] = {}
-    by_day: dict[str, dict[str, int]] = {}
+    by_outcome: dict[str, dict[str, dict[str, int]]] = {}
+    by_node: dict[str, dict[str, dict[str, int]]] = {}
+    by_day: dict[str, dict[str, dict[str, int]]] = {}
 
     for record in records:
         if not overall.add(record):
@@ -199,10 +222,19 @@ def aggregate_records(
         outcome = record.outcome
         outcome_row = by_outcome.get(outcome)
         if outcome_row is None:
-            outcome_row = empty_counts()
+            outcome_row = {
+                "counts": empty_counts(),
+                "observed": empty_counts(),
+                "derived": empty_counts(),
+            }
             by_outcome[outcome] = outcome_row
-        outcome_row["total"] += 1
-        outcome_row[outcome] += 1
+        outcome_row["counts"]["total"] += 1
+        outcome_row["counts"][outcome] += 1
+        outcome_bucket = (
+            outcome_row["derived"] if record.derived else outcome_row["observed"]
+        )
+        outcome_bucket["total"] += 1
+        outcome_bucket[outcome] += 1
 
         _bucket(by_node, effective_node, record)
         _bucket(by_day, _day_key(record.closed_at), record)
@@ -210,9 +242,21 @@ def aggregate_records(
     return {
         "node": effective_node,
         "overall": overall.aggregate().to_dict(),
-        "by_outcome": {key: dict(value) for key, value in sorted(by_outcome.items())},
-        "by_node": {key: dict(value) for key, value in sorted(by_node.items())},
-        "by_day": {key: dict(value) for key, value in sorted(by_day.items())},
+        "by_outcome": {key: _bucket_row(value) for key, value in sorted(by_outcome.items())},
+        "by_node": {key: _bucket_row(value) for key, value in sorted(by_node.items())},
+        "by_day": {key: _bucket_row(value) for key, value in sorted(by_day.items())},
+    }
+
+
+def _bucket_row(row: dict[str, dict[str, int]]) -> dict[str, Any]:
+    """Render one bucket row in the ``overall`` aggregate's shape."""
+
+    counts = dict(row["counts"])
+    return {
+        "total": counts.get("total", 0),
+        "counts": counts,
+        "observed": dict(row["observed"]),
+        "derived": dict(row["derived"]),
     }
 
 

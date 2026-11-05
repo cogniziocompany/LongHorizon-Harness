@@ -416,6 +416,79 @@ def test_the_aggregate_counts_the_delivery_outcomes() -> None:
     assert result["overall"]["counts"]["total"] == 2
 
 
+def test_the_per_node_and_per_day_buckets_split_observed_from_derived() -> None:
+    """Every bucket row carries the observed/derived split, not just the total.
+
+    The flat matrix (``outcome_count_matrix``) had the split, but the
+    per-node and per-day views a measurement layer actually reads did not:
+    a consumer could not tell an OBSERVED delivery from a DERIVED one
+    (a legacy ``done:`` rationale) when it asked "what did node ct111
+    deliver on Tuesday?".  Every row now carries the same shape as the
+    ``overall`` aggregate.
+    """
+
+    records = [
+        _record("delivered", closed_at=1762310000.0, artifacts=(_PR_ARTIFACT,)),
+        _record(
+            "delivered",
+            closed_at=1762310000.0,
+            derived=True,
+            derived_from="rationale_parse",
+            artifacts=(_PR_ARTIFACT,),
+        ),
+        _record("blocked", closed_at=1762400000.0),
+    ]
+    result = aggregate_records(records, node="ct111")
+
+    # The per-node row: one observed delivery, one derived delivery, one
+    # observed block.
+    node_row = result["by_node"]["ct111"]
+    assert node_row["total"] == 3
+    assert node_row["counts"]["delivered"] == 2
+    assert node_row["observed"]["delivered"] == 1
+    assert node_row["derived"]["delivered"] == 1
+    assert node_row["observed"]["blocked"] == 1
+    assert node_row["derived"]["blocked"] == 0
+    # observed + derived == counts, per outcome, in the per-node row.
+    for outcome in CLOSE_OUT_OUTCOMES:
+        assert (
+            node_row["observed"][outcome] + node_row["derived"][outcome]
+            == node_row["counts"][outcome]
+        )
+
+    # The per-day rows carry the same split: the day holding the two
+    # deliveries splits them, the day holding the block does not.
+    day_rows = result["by_day"]
+    delivery_day = next(row for row in day_rows.values() if row["counts"]["delivered"] == 2)
+    assert delivery_day["observed"]["delivered"] == 1
+    assert delivery_day["derived"]["delivered"] == 1
+    block_day = next(row for row in day_rows.values() if row["counts"]["blocked"] == 1)
+    assert block_day["observed"]["blocked"] == 1
+    assert block_day["derived"]["blocked"] == 0
+    for row in day_rows.values():
+        for outcome in CLOSE_OUT_OUTCOMES:
+            assert (
+                row["observed"][outcome] + row["derived"][outcome]
+                == row["counts"][outcome]
+            )
+
+    # The per-outcome rows carry it too.
+    delivered_row = result["by_outcome"]["delivered"]
+    assert delivered_row["counts"]["delivered"] == 2
+    assert delivered_row["observed"]["delivered"] == 1
+    assert delivered_row["derived"]["delivered"] == 1
+
+
+def test_the_per_node_and_per_day_buckets_are_zero_filled_when_empty() -> None:
+    """An empty fleet yields well-formed, all-zero bucket rows."""
+
+    result = aggregate_records([], node="ct111")
+    assert result["overall"]["total"] == 0
+    assert result["by_node"] == {}
+    assert result["by_day"] == {}
+    assert result["by_outcome"] == {}
+
+
 def test_the_aggregate_over_a_runs_root_reads_the_durable_records(tmp_path: Path) -> None:
     """The aggregates come from the run layer's own durable records."""
 
