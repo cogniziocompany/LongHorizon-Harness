@@ -75,6 +75,7 @@ from typing import Any, Callable, Mapping, Sequence
 __all__ = [
     "AUDITOR_GITHUB_TOKEN_ENV",
     "AUDITOR_GITHUB_SCOPE_ENV",
+    "AUDITOR_WRITE_SPELLINGS",
     "VERDICT_CONFIRMED",
     "VERDICT_REFUTED",
     "VERDICT_UNVERIFIABLE",
@@ -85,8 +86,12 @@ __all__ = [
     "ReadOnlyViolation",
     "VerificationResult",
     "assert_read_only_command",
+    "command_string",
+    "deny_rule_matches",
+    "is_denied_by_auditor_policy",
     "resolve_auditor_credential",
     "verify_pull_request",
+    "write_intent_reason",
 ]
 
 
@@ -403,6 +408,96 @@ def _gh_api_write_intent(argv: Sequence[str]) -> str | None:
     return None
 
 
+#: ``git`` subcommands that write to the repository or reach the network.
+_GIT_WRITE_SUBCOMMANDS = frozenset(
+    {
+        "push",
+        "commit",
+        "merge",
+        "rebase",
+        "reset",
+        "checkout",
+        "switch",
+        "add",
+        "rm",
+        "mv",
+        "tag",
+        "branch",
+        "pull",
+        "fetch",
+        "clone",
+        "remote",
+        "submodule",
+        "config",
+        "apply",
+        "stash",
+        "worktree",
+        "notes",
+        "am",
+        "cherry-pick",
+        "revert",
+        "clean",
+    }
+)
+
+
+def write_intent_reason(argv: Sequence[str]) -> str | None:
+    """Return WHY an invocation writes, or ``None`` when it only reads.
+
+    This is the SHAPE classifier the whole read-only surface is built on.
+    It decides by the shape of the invocation -- the program, the subcommand
+    and its leaf, the HTTP method, and whether the invocation supplies a
+    request body -- and never by matching one literal command string.  A
+    renamed, parameterised or reordered write has the same shape and is
+    therefore refused the same way.
+
+    The returned string names the write intent.  It never contains a
+    credential value.
+    """
+
+    args = [str(token) for token in argv if str(token)]
+    if not args:
+        return "an empty command carries no read intent"
+
+    program = os.path.basename(args[0])
+    rest = args[1:]
+
+    if program == "git":
+        return _git_write_intent(rest)
+
+    if program != "gh":
+        return f"command {program!r} is not on the read allowlist"
+
+    if not rest:
+        return "'gh' without a subcommand carries no read intent"
+
+    sub = rest[0]
+    if sub in _GH_WRITE_SUBCOMMANDS:
+        return f"'gh {sub}' writes to the outside world"
+    if sub not in _GH_READ_SUBCOMMANDS:
+        return f"'gh {sub}' is not on the read allowlist"
+
+    if sub == "api":
+        return _gh_api_write_intent(rest[1:])
+
+    # ``gh <group> <leaf>``: a write leaf under a read group is still a write.
+    # ``gh pr view`` reads; ``gh pr review --approve`` and ``gh secret set``
+    # do not, and both live under groups the allowlist admits.
+    if len(rest) >= 2 and rest[1] in _GH_WRITE_LEAF_SUBCOMMANDS:
+        return f"'gh {sub} {rest[1]}' writes to the outside world"
+
+    group_leaves = _GH_WRITE_GROUP_LEAVES.get(sub)
+    if group_leaves and len(rest) >= 2 and rest[1] in group_leaves:
+        return f"'gh {sub} {rest[1]}' writes to the outside world"
+
+    # A write flag is a write intent whatever it is attached to.
+    for token in rest[1:]:
+        if token in _GH_WRITE_FLAGS:
+            return f"'gh {sub}' with {token} writes to the outside world"
+
+    return None
+
+
 def assert_read_only_command(argv: Sequence[str]) -> None:
     """Refuse a write intent on the ``gh`` / ``git`` command surface.
 
@@ -411,106 +506,262 @@ def assert_read_only_command(argv: Sequence[str]) -> None:
     unrecognised subcommand is refused rather than assumed harmless.
     """
 
-    args = [str(token) for token in argv if str(token)]
-    if not args:
-        raise ReadOnlyViolation(
-            "read-only surface: an empty command carries no read intent"
-        )
-
-    program = os.path.basename(args[0])
-    rest = args[1:]
-
-    if program == "git":
-        _assert_read_only_git(rest)
-        return
-
-    if program != "gh":
-        raise ReadOnlyViolation(
-            f"read-only surface: command {program!r} is not on the read allowlist"
-        )
-
-    if not rest:
-        raise ReadOnlyViolation(
-            "read-only surface: 'gh' without a subcommand carries no read intent"
-        )
-
-    sub = rest[0]
-    if sub in _GH_WRITE_SUBCOMMANDS:
-        raise ReadOnlyViolation(
-            f"read-only surface: 'gh {sub}' writes to the outside world"
-        )
-    if sub not in _GH_READ_SUBCOMMANDS:
-        raise ReadOnlyViolation(
-            f"read-only surface: 'gh {sub}' is not on the read allowlist"
-        )
-
-    if sub == "api":
-        reason = _gh_api_write_intent(rest[1:])
-        if reason is not None:
-            raise ReadOnlyViolation(
-                f"read-only surface: 'gh api' with {reason} is refused"
-            )
-        return
-
-    # ``gh <group> <leaf>``: a write leaf under a read group is still a write.
-    # ``gh pr view`` reads; ``gh pr review --approve`` and ``gh secret set``
-    # do not, and both live under groups the allowlist admits.
-    if len(rest) >= 2 and rest[1] in _GH_WRITE_LEAF_SUBCOMMANDS:
-        raise ReadOnlyViolation(
-            f"read-only surface: 'gh {sub} {rest[1]}' writes to the outside world"
-        )
-
-    group_leaves = _GH_WRITE_GROUP_LEAVES.get(sub)
-    if group_leaves and len(rest) >= 2 and rest[1] in group_leaves:
-        raise ReadOnlyViolation(
-            f"read-only surface: 'gh {sub} {rest[1]}' writes to the outside world"
-        )
-
-    # A write flag is a write intent whatever it is attached to.
-    for token in rest[1:]:
-        if token in _GH_WRITE_FLAGS:
-            raise ReadOnlyViolation(
-                f"read-only surface: 'gh {sub}' with {token} writes to the "
-                "outside world"
-            )
+    reason = write_intent_reason(argv)
+    if reason is not None:
+        raise ReadOnlyViolation(f"read-only surface: {reason} is refused")
 
 
-def _assert_read_only_git(args: Sequence[str]) -> None:
-    """Refuse a git invocation that writes or reaches the network."""
+def _git_write_intent(args: Sequence[str]) -> str | None:
+    """Return why a git invocation writes, or ``None`` when it only reads."""
 
     for token in args:
         head = token.split("=", 1)[0]
-        if head in {
-            "push",
-            "commit",
-            "merge",
-            "rebase",
-            "reset",
-            "checkout",
-            "switch",
-            "add",
-            "rm",
-            "mv",
-            "tag",
-            "branch",
-            "pull",
-            "fetch",
-            "clone",
-            "remote",
-            "submodule",
-            "config",
-            "apply",
-            "stash",
-            "worktree",
-            "notes",
-            "am",
-            "cherry-pick",
-            "revert",
-            "clean",
-        }:
-            raise ReadOnlyViolation(
-                f"read-only surface: 'git {head}' writes to the repository"
-            )
+        if head in _GIT_WRITE_SUBCOMMANDS:
+            return f"'git {head}' writes to the repository"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The permission deny-rule layer
+# ---------------------------------------------------------------------------
+#
+# The auditor's read-only reach is enforced in TWO layers, and both have to
+# hold:
+#
+# 1.  the IN-PROCESS layer (:func:`assert_read_only_command`), which refuses
+#     a write by its shape -- program, subcommand and leaf, HTTP method, and
+#     the presence of a request body; and
+# 2.  the PERMISSION layer, the ``Bash(...)`` rules the harness hands to
+#     Claude Code as ``--disallowedTools``.  These stop the auditor from
+#     shelling out to a write at all.
+#
+# Until now only layer 1 was proven.  The permission layer was checked by
+# STRING MEMBERSHIP -- "the rule ``Bash(gh pr merge*)`` is in the deny list"
+# -- which proves the rule EXISTS and nothing about whether it denies the
+# command it is supposed to deny.  A rule can sit in the list and match
+# nothing, and the shell-out is then refused by nothing at all.
+#
+# So the permission layer needs its own matcher, and every write spelling
+# needs to be checked against BOTH layers.  :func:`deny_rule_matches` is
+# that matcher; :func:`is_denied_by_auditor_policy` applies a whole deny
+# list to one command string.
+
+#: The prefix Claude Code uses for a Bash permission rule.
+_DENY_TOOL_PREFIX = "Bash("
+
+
+def deny_rule_matches(command: str, rule: str) -> bool:
+    """Return True when a ``Bash(...)`` deny rule matches a command.
+
+    The rule syntax implemented here is the one the harness's own deny
+    rules are written in:
+
+    *   ``Bash(cmd)``  -- the command exactly; and
+    *   ``Bash(pat)``  -- a glob, where ``*`` matches any run of characters
+        inside the command string.
+
+    ``Bash(gh pr merge*)`` therefore matches ``gh pr merge``, ``gh pr merge
+    181`` and ``gh pr merge --squash`` alike, and a rule with a glob in the
+    middle (``Bash(gh api * -f *)``) matches a body-supplying API call
+    wherever the body flag sits.
+
+    The matcher is deliberately simple and total: an unknown rule shape
+    matches nothing, so a malformed rule can never be read as "everything
+    is denied" nor as "nothing is denied".
+    """
+
+    text = str(rule or "").strip()
+    if not text.startswith(_DENY_TOOL_PREFIX) or not text.endswith(")"):
+        return False
+
+    pattern = text[len(_DENY_TOOL_PREFIX) : -1]
+    if not pattern:
+        return False
+
+    target = str(command or "").strip()
+    if not target:
+        return False
+
+    if "*" not in pattern:
+        return target == pattern
+
+    # Glob semantics: ``*`` matches any run of characters.  The command is
+    # compared as a whole, so a rule cannot match a suffix of a longer
+    # command.
+    return _glob_matches(pattern, target)
+
+
+def _glob_matches(pattern: str, target: str) -> bool:
+    """Match ``target`` against a ``*``-glob, without importing fnmatch.
+
+    ``fnmatch`` is case-normalising and treats ``?`` and ``[]`` specially;
+    the deny rules use only ``*``, so a direct implementation keeps the
+    matching predictable and case-SENSITIVE (a command is spelled exactly).
+    """
+
+    parts = pattern.split("*")
+    if not parts:
+        return target == pattern
+
+    if not target.startswith(parts[0]):
+        return False
+
+    remainder = target[len(parts[0]) :]
+    for part in parts[1:-1]:
+        index = remainder.find(part)
+        if index < 0:
+            return False
+        remainder = remainder[index + len(part) :]
+
+    last = parts[-1]
+    if not last:
+        return True
+    return remainder.endswith(last)
+
+
+def is_denied_by_auditor_policy(
+    command: str,
+    rules: Sequence[str],
+) -> str | None:
+    """Return the deny rule that refuses ``command``, or ``None``.
+
+    This is the permission layer's answer to "is this shell-out refused?".
+    It is deliberately independent of :func:`write_intent_reason`: the two
+    layers are separate defences and each is proven on its own, so a hole in
+    one is visible instead of being papered over by the other.
+    """
+
+    for rule in rules:
+        if deny_rule_matches(command, rule):
+            return rule
+    return None
+
+
+def command_string(argv: Sequence[str]) -> str:
+    """Render an argv list as the command string a deny rule would see."""
+
+    return " ".join(str(token) for token in argv if str(token))
+
+
+# ---------------------------------------------------------------------------
+# The canonical write spellings
+# ---------------------------------------------------------------------------
+#
+# Every write spelling the auditor must never be able to execute, in one
+# place.  This list is the source of truth for two separate obligations:
+#
+# *   the in-process layer must refuse each one (the shape classifier); and
+# *   the permission layer must deny each one (a matching deny rule).
+#
+# It is a list of ARGV LISTS rather than command strings so that the same
+# entry can be handed to the classifier and to the rule matcher without
+# re-parsing, and so that a spelling with a space in an argument cannot be
+# silently re-spelled into a different command.
+
+#: ``gh``/``git`` write spellings, as argv lists.
+AUDITOR_WRITE_SPELLINGS: tuple[tuple[str, ...], ...] = (
+    # -- gh api: an explicit write method ---------------------------------
+    ("gh", "api", "--method=POST", "repos/owner/repo/pulls/181/comments"),
+    ("gh", "api", "-X", "POST", "repos/owner/repo/pulls/181/comments"),
+    ("gh", "api", "-XPOST", "repos/owner/repo/pulls/181/comments"),
+    ("gh", "api", "--method=post", "repos/owner/repo/pulls/181/reviews"),
+    ("gh", "api", "--method", "PATCH", "repos/owner/repo/pulls/181"),
+    ("gh", "api", "--method=PUT", "repos/owner/repo/pulls/181"),
+    ("gh", "api", "--method=DELETE", "repos/owner/repo/pulls/181"),
+    ("gh", "api", "-X", "PATCH", "repos/owner/repo/pulls/181"),
+    ("gh", "api", "-X", "PUT", "repos/owner/repo/pulls/181"),
+    ("gh", "api", "-X", "DELETE", "repos/owner/repo/pulls/181"),
+    ("gh", "api", "--method=POST", "-X", "GET", "repos/owner/repo/pulls/181"),
+    # -- gh api: a field-supplying body, with no explicit method ---------
+    ("gh", "api", "repos/owner/repo/issues/1/comments", "-f", "body=lgtm"),
+    ("gh", "api", "repos/owner/repo/issues/1/comments", "-F", "body=lgtm"),
+    ("gh", "api", "repos/owner/repo/issues/1/comments", "--field", "body=lgtm"),
+    ("gh", "api", "repos/owner/repo/issues/1/comments", "--raw-field", "body=lgtm"),
+    ("gh", "api", "repos/owner/repo/issues/1/comments", "--input", "payload.json"),
+    ("gh", "api", "repos/owner/repo/issues/1/comments", "--input=payload.json"),
+    ("gh", "api", "repos/owner/repo/issues/1/comments", "-i", "payload.json"),
+    ("gh", "api", "repos/owner/repo/pulls/181/comments", "--method=POST", "-f", "body=lgtm"),
+    ("gh", "api", "graphql", "-f", "query=mutation{addComment}"),
+    # -- gh pr ------------------------------------------------------------
+    ("gh", "pr", "merge", "181"),
+    ("gh", "pr", "merge", "181", "--squash", "--delete-branch"),
+    ("gh", "pr", "close", "181"),
+    ("gh", "pr", "reopen", "181"),
+    ("gh", "pr", "ready", "181"),
+    ("gh", "pr", "edit", "181", "--title", "x"),
+    ("gh", "pr", "comment", "181", "--body", "lgtm"),
+    ("gh", "pr", "create", "--title", "x"),
+    ("gh", "pr", "review", "181", "--approve"),
+    ("gh", "pr", "review", "181", "--request-changes"),
+    ("gh", "pr", "review", "181", "--comment", "lgtm"),
+    # -- gh issue ---------------------------------------------------------
+    ("gh", "issue", "comment", "1", "--body", "lgtm"),
+    ("gh", "issue", "create", "--title", "x"),
+    ("gh", "issue", "close", "1"),
+    ("gh", "issue", "reopen", "1"),
+    ("gh", "issue", "delete", "1"),
+    ("gh", "issue", "edit", "1", "--title", "x"),
+    # -- gh release / secret / variable / workflow / run ------------------
+    ("gh", "release", "create", "v1"),
+    ("gh", "release", "edit", "v1"),
+    ("gh", "release", "upload", "v1", "asset.tar.gz"),
+    ("gh", "release", "delete", "v1"),
+    ("gh", "secret", "set", "K", "V"),
+    ("gh", "secret", "delete", "K"),
+    ("gh", "variable", "set", "K", "V"),
+    ("gh", "variable", "delete", "K"),
+    ("gh", "workflow", "run", "ci.yml"),
+    ("gh", "workflow", "dispatch", "ci.yml"),
+    ("gh", "workflow", "enable", "ci.yml"),
+    ("gh", "run", "rerun", "1"),
+    ("gh", "run", "cancel", "1"),
+    ("gh", "run", "delete", "1"),
+    # -- gh repo / gist / label / codespace --------------------------------
+    ("gh", "repo", "edit", "owner/repo"),
+    ("gh", "repo", "create", "x"),
+    ("gh", "repo", "delete", "owner/repo"),
+    ("gh", "gist", "create", "notes.txt"),
+    ("gh", "label", "create", "x"),
+    ("gh", "label", "edit", "x"),
+    ("gh", "label", "delete", "x"),
+    # -- git --------------------------------------------------------------
+    ("git", "push", "origin", "main"),
+    ("git", "push"),
+    ("git", "push", "--force", "origin", "main"),
+    ("git", "push", "--force-with-lease", "origin", "main"),
+    ("git", "-C", "/tmp/checkout", "push", "origin", "main"),
+    ("git", "--git-dir=/tmp/checkout/.git", "push", "origin", "main"),
+    # The network git operations the auditor may not run: they rewrite
+    # .git/ and break the integrity guard.
+    ("git", "fetch", "origin"),
+    ("git", "pull", "origin", "main"),
+    ("git", "remote", "add", "upstream", "https://example.invalid/repo.git"),
+    ("git", "clone", "https://example.invalid/repo.git"),
+    ("git", "submodule", "update", "--init"),
+    ("git", "lfs", "pull"),
+    ("git", "-C", "/tmp/checkout", "fetch", "origin"),
+    ("git", "-C", "/tmp/checkout", "pull", "origin", "main"),
+    ("git", "-C", "/tmp/checkout", "remote", "add", "u", "https://example.invalid/repo.git"),
+    ("git", "-C", "/tmp/checkout", "clone", "https://example.invalid/repo.git"),
+    ("git", "-C", "/tmp/checkout", "submodule", "update", "--init"),
+    ("git", "-C", "/tmp/checkout", "lfs", "pull"),
+    ("git", "--git-dir=/tmp/checkout/.git", "fetch", "origin"),
+    ("git", "--git-dir=/tmp/checkout/.git", "pull", "origin", "main"),
+    ("git", "--git-dir=/tmp/checkout/.git", "remote", "add", "u", "https://example.invalid/repo.git"),
+    ("git", "--git-dir=/tmp/checkout/.git", "clone", "https://example.invalid/repo.git"),
+    ("git", "--git-dir=/tmp/checkout/.git", "submodule", "update", "--init"),
+    ("git", "--git-dir=/tmp/checkout/.git", "lfs", "pull"),
+    # -- the write-only groups the auditor may not shell out to at all ----
+    ("gh", "api-write", "repos/owner/repo/issues/1/comments"),
+    ("gh", "codespace", "code"),
+    ("gh", "ruleset", "create"),
+    ("gh", "ssh-key", "add", "k"),
+    # -- write flags on an otherwise-read verb ----------------------------
+    ("gh", "pr", "view", "181", "--merge"),
+    ("gh", "pr", "view", "181", "--rebase"),
+    ("gh", "pr", "view", "181", "--ready"),
+    ("gh", "pr", "view", "181", "--draft"),
+)
 
 
 # ---------------------------------------------------------------------------

@@ -78,6 +78,7 @@ AUDITOR_GH_WRITE_DENY: tuple[str, ...] = (
     "Bash(gh api * --field *)",
     "Bash(gh api * --raw-field *)",
     "Bash(gh api * --input *)",
+    "Bash(gh api * --input=*)",
     "Bash(gh api * -i *)",
     # Pull-request and issue writes.
     "Bash(gh pr merge*)",
@@ -91,12 +92,17 @@ AUDITOR_GH_WRITE_DENY: tuple[str, ...] = (
     "Bash(gh issue comment*)",
     "Bash(gh issue create*)",
     "Bash(gh issue close*)",
+    "Bash(gh issue reopen*)",
+    "Bash(gh issue delete*)",
     "Bash(gh issue edit*)",
     "Bash(gh release create*)",
     "Bash(gh release edit*)",
     "Bash(gh release upload*)",
+    "Bash(gh release delete*)",
     "Bash(gh secret set*)",
+    "Bash(gh secret delete*)",
     "Bash(gh variable set*)",
+    "Bash(gh variable delete*)",
     "Bash(gh workflow run*)",
     "Bash(gh workflow dispatch*)",
     "Bash(gh workflow enable*)",
@@ -125,6 +131,35 @@ AUDITOR_GH_WRITE_DENY: tuple[str, ...] = (
     "Bash(gh pr * --ready*)",
     "Bash(gh pr * --draft*)",
 )
+
+
+def uncovered_auditor_write_spellings() -> tuple[str, ...]:
+    """Return the write spellings NO deny rule refuses.
+
+    The permission layer is one of two defences, and it is the one that
+    stops the auditor from shelling out to a write at all.  A rule that
+    sits in the deny list but matches nothing is not a defence, so the
+    coverage of the deny list is computed rather than assumed.
+
+    The spellings come from
+    :data:`lh_harness.auditor_verify.AUDITOR_WRITE_SPELLINGS` -- the same
+    list the per-spelling tests walk -- so a spelling that gains a
+    classifier but no rule shows up here as uncovered.
+    """
+
+    from lh_harness.auditor_verify import (  # local import: avoids a cycle
+        AUDITOR_WRITE_SPELLINGS,
+        command_string,
+        is_denied_by_auditor_policy,
+    )
+
+    rules = (*AUDITOR_GH_WRITE_DENY, *AUDITOR_NETWORK_GIT_DENY)
+    uncovered = []
+    for spelling in AUDITOR_WRITE_SPELLINGS:
+        command = command_string(spelling)
+        if is_denied_by_auditor_policy(command, rules) is None:
+            uncovered.append(command)
+    return tuple(uncovered)
 
 # Environment variables that make any network git operation fail fast for the
 # auditor role. GIT_CONFIG_COUNT overrides are injected via the env and cause git

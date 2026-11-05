@@ -95,6 +95,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failing.  Each refusal is asserted to name the attempted operation and to
   carry no credential value.
 
+  **The read-only enforcement is now proven at BOTH layers, and the
+  permission layer had six real holes.**  The auditor's read-only reach is
+  enforced in two places: the in-process layer
+  (`assert_read_only_command`), which refuses a write by the SHAPE of the
+  invocation, and the permission layer — the `Bash(...)` rules handed to
+  Claude Code as `--disallowedTools` — which stops the auditor shelling out
+  to a write at all.  Only the first was proven.  The permission layer was
+  checked by string MEMBERSHIP: the tests asserted that the literal rule
+  `"Bash(gh pr merge*)"` was IN the deny list, which proves the rule exists
+  and nothing about whether it DENIES the command it is written for.  A rule
+  can sit in the list and match nothing, and the shell-out is then refused
+  by nothing at all.
+
+  Six write spellings were in exactly that state — refused in-process, matched
+  by no deny rule: `gh issue reopen`, `gh issue delete`, `gh release delete`,
+  `gh secret delete`, `gh variable delete`, and the joined
+  `gh api <path> --input=payload.json` body spelling.  All six now have a
+  deny rule, and `uncovered_auditor_write_spellings()` computes the
+  permission layer's coverage instead of assuming it.
+
+  New in `lh_harness/auditor_verify.py`:
+  * `write_intent_reason(argv)` is the SHAPE classifier the whole surface is
+    built on: it decides by program, subcommand and leaf, HTTP method, and
+    the presence of a request body — never by matching one literal command
+    string — so a renamed or parameterised write is refused the same way.
+    `assert_read_only_command` now sits on top of it.
+  * `deny_rule_matches(command, rule)` and
+    `is_denied_by_auditor_policy(command, rules)` are the permission layer's
+    matcher.  They make a refusal at that layer PROVABLE in-repo instead of
+    asserted by string membership.
+  * `AUDITOR_WRITE_SPELLINGS` is the canonical list of write spellings, as
+    argv lists, and is the single source of truth for the per-spelling tests
+    and for the deny list's coverage invariant.
+
+  New `tests/test_auditor_write_spelling_refusal.py` checks every spelling
+  against BOTH layers, with each spelling in its own named test, and adds
+  the HTTP-layer proof that no write request is ever issued: the client's
+  transport records every request and the test asserts that the number of
+  non-GET requests is ZERO.  Fail-closed behaviour is unchanged — an
+  unreachable read still yields an explicit `unverifiable` that blocks a
+  delivered claim, never a silent pass.
+
   The auditor's contract header is UNCHANGED: still exactly `Status` /
   `Integrity` / `Contract audit`.  The `confirmed` / `refuted` /
   `unverifiable` values are this module's internal verification result, not a
