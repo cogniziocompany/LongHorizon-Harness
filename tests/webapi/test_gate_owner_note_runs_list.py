@@ -150,3 +150,81 @@ def test_build_summary_projection_keeps_baseline_shape() -> None:
     # ``pending_decision_owner`` is NOT attached by the projection itself;
     # the endpoint handler is responsible for that bounded read.
     assert "pending_decision_owner" not in row
+    # The close-out contract (easybutt0n-17) is ADDITIVE: a run whose
+    # durable state carries no close-out record keeps exactly the baseline
+    # shape.  Every existing field above is unchanged, and none of the new
+    # close-out fields appear on a row that has no close-out.
+    for field in (
+        "outcome",
+        "delivered",
+        "outcome_reason",
+        "closed_by",
+        "closed_by_identity",
+        "closed_at",
+        "artifact_refs",
+        "completion_satisfied",
+        "report_status",
+        "exit_code",
+    ):
+        assert field not in row, f"baseline row must not carry {field!r}"
+    assert set(row) == {
+        "id",
+        "status",
+        "updated_at",
+        "workspace",
+        "agent",
+        "model",
+    }
+
+
+def test_build_summary_projection_adds_the_close_out_fields() -> None:
+    """easybutt0n-17: the close-out fields are ADDED, not substituted."""
+
+    item = {
+        "id": "run-1",
+        "status": "cancelled",
+        "mtime": 1700000000.0,
+        "workspace": "/tmp/r",
+        "agent": "codex",
+        "model": "glm-5.2",
+        "close_out_outcome": "delivered",
+        "delivered": True,
+        "outcome_reason": "opened hydra#96",
+        "closed_by": "human",
+        "closed_by_identity": "hydrafleet-gateway",
+        "closed_at": 1762310000.0,
+        "artifact_refs": [
+            {
+                "kind": "pr",
+                "repo": "cogniziocompany/cognizioware-hydra",
+                "ref": "96",
+                "url": "https://github.com/cogniziocompany/cognizioware-hydra/pull/96",
+                "head_sha": "773be7e",
+                "derived": False,
+            }
+        ],
+        "completion_satisfied": True,
+        "report_status": "cancelled",
+        "exit_code": 1,
+    }
+    row = _build_summary_projection(item)
+    # Every baseline field is still there, unchanged.
+    assert row["id"] == "run-1"
+    assert row["status"] == "cancelled"
+    assert row["workspace"] == "/tmp/r"
+    assert row["agent"] == "codex"
+    assert row["model"] == "glm-5.2"
+    # And the close-out fields are added on top.
+    assert row["outcome"] == "delivered"
+    assert row["delivered"] is True
+    assert row["outcome_reason"] == "opened hydra#96"
+    assert row["closed_by"] == "human"
+    assert row["closed_by_identity"] == "hydrafleet-gateway"
+    assert row["closed_at"] == 1762310000.0
+    assert row["artifact_refs"][0]["url"].endswith("/pull/96")
+    assert row["artifact_refs"][0]["ref"] == "96"
+    # The PRIMARY PR's head sha is exposed with the url and the number.
+    assert row["artifact_refs"][0]["head_sha"] == "773be7e"
+    assert row["completion_satisfied"] is True
+    assert row["report_status"] == "cancelled"
+    assert row["exit_code"] == 1

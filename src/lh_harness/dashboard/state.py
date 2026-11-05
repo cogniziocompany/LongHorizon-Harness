@@ -24,7 +24,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from ..types import DEFAULT_LOG_DIR, MAX_ROUNDS
 from ..supervisor.control_bus import ControlBus, _ensure_dir_fd_nofollow, _open_private_regular_at
@@ -170,6 +170,13 @@ class Approval:
     action: str = ""
     reason: str = ""
     user_input: str = ""
+    # The close-out FORM the operator supplied when they chose to end the
+    # run (easybutt0n-17).  It is the HUMAN half of the close-out contract:
+    # it travels with the operator's decision so the manager can hand it to
+    # the SAME validator the agent's "done" path uses.  An empty dict means
+    # the operator supplied none — the run then closes close-out INCOMPLETE
+    # with the reason recorded, never "completed".
+    close_out_form: dict[str, Any] = field(default_factory=dict)
     extra_rounds: int = 0  # 0 -> use the manager's configured budget
     created_at: float = field(default_factory=time.time)
     resolved_at: float | None = None
@@ -204,6 +211,7 @@ class Approval:
             "action": self.action,
             "reason": self.reason,
             "user_input": self.user_input,
+            "close_out_form": dict(self.close_out_form),
             "extra_rounds": self.extra_rounds,
             "created_at": self.created_at,
             "resolved_at": self.resolved_at,
@@ -961,6 +969,7 @@ class DashboardState:
         action: str,
         reason: str = "",
         user_input: str = "",
+        close_out_form: Mapping[str, Any] | None = None,
         extra_rounds: int | None = None,
         command_id: str | None = None,
         expected_revision: int | None = None,
@@ -972,6 +981,16 @@ class DashboardState:
         normalized_reason = reason.strip()
         normalized_input = user_input.strip()
         normalized_extra = _normalise_extra_rounds(extra_rounds)
+        # The operator's close-out FORM (easybutt0n-17).  It is carried with
+        # the decision so the manager can hand it to the SAME validator the
+        # agent's "done" path uses.  It is stored VERBATIM: this layer does
+        # not validate the form, because the ONE validator lives in the
+        # close-out module and both closers must go through it.  A form that
+        # fails validation there leaves the run close-out incomplete with the
+        # reason recorded — never "completed".
+        normalized_close_out: dict[str, Any] = {}
+        if isinstance(close_out_form, Mapping):
+            normalized_close_out = {str(k): v for k, v in close_out_form.items()}
         # The worker only understands the option values it issued.  Accept a
         # small backwards-compatible default vocabulary when an old approval
         # record omitted options, but never silently turn an arbitrary action
@@ -995,6 +1014,12 @@ class DashboardState:
             "reason": normalized_reason,
             "user_input": normalized_input,
         }
+        if normalized_close_out:
+            # Only present when the operator supplied one: the payload doubles
+            # as the idempotency fingerprint, so an unconditional new key
+            # would make a retry of a pre-upgrade command look like a
+            # different one.
+            payload["close_out_form"] = normalized_close_out
         if normalized_extra:
             # Only present when the operator chose a value: the payload doubles
             # as the idempotency fingerprint, so an unconditional new key would
@@ -1112,6 +1137,11 @@ class DashboardState:
             action=str(record.get("action", "")),
             reason=str(record.get("reason", "")),
             user_input=str(record.get("user_input", "")),
+            close_out_form=(
+                {str(k): v for k, v in record["close_out_form"].items()}
+                if isinstance(record.get("close_out_form"), dict)
+                else {}
+            ),
             extra_rounds=_normalise_extra_rounds(record.get("extra_rounds")),
             created_at=float(record.get("created_at", time.time())),
             resolved_at=float(record["resolved_at"]) if record.get("resolved_at") else None,
@@ -1168,6 +1198,14 @@ class DashboardState:
                 approval.reason = str(payload.get("reason", "")).strip()
                 approval.user_input = user_input
                 approval.extra_rounds = extra_rounds
+                # The operator's close-out FORM travels with the decision so
+                # the manager can validate it through the ONE close-out
+                # validator (easybutt0n-17).
+                close_out_payload = payload.get("close_out_form")
+                if isinstance(close_out_payload, Mapping):
+                    approval.close_out_form = {
+                        str(k): v for k, v in close_out_payload.items()
+                    }
                 approval.status = "resolved"
                 approval.resolved_at = time.time()
                 snapshot = approval.to_dict()
@@ -1325,6 +1363,14 @@ class DashboardState:
             resolved["reason"] = str(payload.get("reason", "")).strip()
             resolved["user_input"] = user_input
             resolved["extra_rounds"] = extra_rounds
+            # Carry the operator's close-out FORM through the durable record
+            # so a reader that only sees approvals.jsonl still learns what
+            # the operator said the run delivered (easybutt0n-17).
+            close_out_payload = payload.get("close_out_form")
+            if isinstance(close_out_payload, Mapping):
+                resolved["close_out_form"] = {
+                    str(k): v for k, v in close_out_payload.items()
+                }
             resolved["resolved_at"] = float(command.get("created_at") or time.time())
             merged[approval_id] = resolved
 

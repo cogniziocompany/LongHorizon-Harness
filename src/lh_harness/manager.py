@@ -58,6 +58,17 @@ from .types import (
     RoleNextStep,
 )
 from .mcp_profiles import GRAPHIFY_PREAMBLE, gateway_configured
+from .run_outcome import ascii_reason
+from .closeout import (
+    CloseOutError,
+    CloseOutRecord,
+    CloseOutValidationError,
+    apply_close_out_to_report,
+    parse_agent_close_out_proposal,
+    parse_legacy_rationale,
+    persist_close_out,
+    validate_close_out,
+)
 from .supervisor.control_bus import (
     _append_jsonl as _append_jsonl_nofollow,
     _atomic_bytes_write,
@@ -541,6 +552,16 @@ async def _run_impl(
         if next_step == MANAGER_NEXT_DONE:
             if _latest_auditor_is_clean_complete(rounds, language=config.prompt_language):
                 gate.completion_satisfied = True
+                # The agent's close-out proposal.  It is a PROPOSAL: it goes
+                # through the SAME validator the human path uses, so a
+                # delivery without a verifiable artifact is refused and a
+                # delivery that contradicts the auditor verdict is refused.
+                agent_form = parse_agent_close_out_proposal(plan_text)
+                if agent_form is not None:
+                    agent_form["closed_at"] = time.time()
+                    agent_form["closed_by_identity"] = "manager"
+                gate.close_out_form = agent_form
+                gate.close_out_source = "agent"
                 rounds.append(
                     ManagedRound(
                         round_index=round_index,
@@ -1013,6 +1034,28 @@ async def _run_impl(
         final_response=gate.final_response,
         failure_reason=gate.failure_reason,
     )
+    # The close-out contract.  The run is closed with a STRUCTURED form, not
+    # a free-text rationale: the agent's proposal and the operator's own
+    # form both go through the SAME validator, so both produce identical
+    # record shapes.  A missing or invalid close-out leaves the run
+    # close-out incomplete with the reason recorded -- it is NEVER reported
+    # as completed.  ``final["status"]`` (the process lifecycle) is NOT
+    # touched by any of this.
+    _record_close_out(
+        logs_dir=log_dir,
+        form=gate.close_out_form,
+        closed_by=gate.close_out_source or "agent",
+        identity=(
+            "manager"
+            if gate.close_out_source == "agent"
+            else (gate.close_out_form or {}).get("closed_by_identity")
+            or gate.close_out_identity
+            or "operator"
+        ),
+        rounds=rounds,
+        language=config.prompt_language,
+        report=final,
+    )
     _write_local(role_dir / "report.json", json.dumps(final, ensure_ascii=False, indent=2) + "\n")
     _write_local(log_dir / "report.json", json.dumps(final, ensure_ascii=False, indent=2) + "\n")
     transcript = format_management_history(rounds, include_empty=True, max_chars=200_000)
@@ -1142,6 +1185,18 @@ class _GateContext:
     # its actionable cause separate from ``abort_reason`` so Supervisor/Web can
     # show the provider's real message instead of a generic round-limit gate.
     failure_reason: str = ""
+    # The close-out FORM proposed for this run, and who proposed it
+    # (``agent`` for the manager's done proposal, ``human`` for the operator's
+    # gate resolution / stop).  Both go through the SAME validator, so both
+    # produce identical record shapes.  ``None`` means nobody proposed a
+    # close-out, in which case the run is closed-out incomplete.
+    close_out_form: dict[str, Any] | None = None
+    close_out_source: str = ""
+    # WHO closed the run, when the close-out itself does not say (a refused
+    # or missing form).  The operator's identity is kept even when their
+    # form was refused, so the recorded close-out names the human who
+    # closed the run rather than an anonymous placeholder.
+    close_out_identity: str = ""
 
 
 async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_state: str, question: str = "", answers: list[str] | None = None) -> bool:
@@ -1206,6 +1261,10 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
             "final_response": ctx.final_response,
             "rounds": [asdict(item) for item in ctx.rounds],
             "log_dir": str(ctx.log_dir),
+            # The agent's close-out proposal, so the operator can confirm,
+            # amend or replace it.  A proposal is never a close-out on its
+            # own: it is validated like any other form.
+            "close_out_form": ctx.close_out_form,
         }
     )
     decision = decision if isinstance(decision, dict) else {}
@@ -1224,6 +1283,39 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
             ctx.abort_reason = "human_abort"
         elif not ctx.completion_satisfied:
             ctx.abort_reason = "human_abort"
+        # The HUMAN close path (easybutt0n-17).  Closing a run requires a
+        # structured close-out FORM, and the human closer is one of the two
+        # closers that must supply one.  The operator's form goes through
+        # the SAME validator as the agent's, so both produce identical
+        # record shapes.
+        #
+        # When the operator supplied NO form the run is NOT completed and is
+        # NOT allowed to inherit the agent's proposal: the agent's block is a
+        # PROPOSAL, and a proposal the human never saw is exactly what the
+        # contract forbids being certified.  The run closes close-out
+        # INCOMPLETE with the refusal reason recorded instead.
+        human_form = decision.get("close_out_form")
+        if isinstance(human_form, dict) and human_form:
+            # The operator fills in WHAT happened; the harness supplies WHO
+            # closed it and WHEN, so the form is complete without asking the
+            # operator to stamp a timestamp.
+            normalized = dict(human_form)
+            normalized["closed_by"] = "human"
+            normalized["closed_at"] = time.time()
+            if not str(normalized.get("closed_by_identity") or "").strip():
+                normalized["closed_by_identity"] = str(
+                    decision.get("closed_by_identity") or "operator"
+                )
+            ctx.close_out_form = normalized
+            ctx.close_out_source = "human"
+        else:
+            # No form from the operator: the run closes close-out incomplete,
+            # with the reason recorded by the shared validator.
+            ctx.close_out_form = None
+            ctx.close_out_source = "human"
+        # Keep the operator's identity even when the form was refused, so the
+        # recorded close-out names the human who closed the run.
+        ctx.close_out_identity = str(decision.get("closed_by_identity") or "")
         # The operator can stop on a round the harness did not treat as an ending
         # (an `ask` or repeated-failure gate), which leaves no reply written yet.
         if await _write_final_response(ctx, round_index, task_state, ctx.abort_reason):
@@ -1634,6 +1726,126 @@ def _latest_auditor_is_clean_complete(rounds: list[ManagedRound], *, language: s
             and report.contract_audit_status == "aligned"
         )
     return False
+
+
+def _latest_auditor_verdict(
+    rounds: list[ManagedRound],
+    *,
+    language: str = "en",
+) -> dict[str, str]:
+    """The independent auditor's verdict on the latest round.
+
+    This is the AUTHORITY on whether the work landed.  The manager may
+    propose a close-out, but it cannot certify one on its own: a
+    ``delivered`` close-out that contradicts this verdict is refused by the
+    shared validator and the run is left close-out incomplete.
+    """
+
+    for item in reversed(rounds):
+        if item.auditor_status.get("invalid_completion") or item.auditor_status.get("invalid_plan"):
+            continue
+        if not item.auditor_report.strip():
+            continue
+        report = parse_audit_report(item.auditor_report, item.round_index, language=language)
+        return {
+            "status": str(report.status or ""),
+            "integrity_status": str(report.integrity_status or ""),
+            "contract_audit_status": str(report.contract_audit_status or ""),
+        }
+    return {}
+
+
+def _build_close_out_form(
+    *,
+    outcome: str,
+    outcome_reason: str,
+    artifact_refs: list[dict[str, Any]] | None,
+    closed_by: str,
+    closed_by_identity: str,
+    closed_at: float,
+) -> dict[str, Any]:
+    """Build the close-out FORM submitted to the shared validator.
+
+    Both closers (the agent's "done" path and the human gate/stop path)
+    build their form here and hand it to the SAME validator, so both
+    produce identical record shapes.
+    """
+
+    return {
+        "outcome": outcome,
+        "outcome_reason": outcome_reason,
+        "artifact_refs": list(artifact_refs or []),
+        "closed_by": closed_by,
+        "closed_by_identity": closed_by_identity,
+        "closed_at": closed_at,
+    }
+
+
+def _record_close_out(
+    *,
+    logs_dir: Path,
+    form: dict[str, Any] | None,
+    closed_by: str,
+    identity: str,
+    rounds: list[ManagedRound],
+    language: str = "en",
+    report: dict[str, Any] | None = None,
+) -> CloseOutRecord | None:
+    """Validate and persist one close-out, or record why it was refused.
+
+    A missing or invalid close-out MUST NOT be reported as completed: the
+    run stays close-out incomplete and the reason is recorded.  Returns the
+    persisted record, or ``None`` when the close-out was refused (in which
+    case an ``incomplete`` close-out with the refusal reason is persisted
+    instead, so the run still carries a truthful close-out).
+
+    The AGENT path is fail-closed on the auditor verdict: a delivery is
+    only as credible as the independent verdict behind it, so with no
+    verdict reachable the agent's ``delivered`` proposal is refused even
+    when its artifact is well formed.  The HUMAN path is exempt -- the
+    operator is the fallback authority by design and may close a run
+    without an auditor verdict.
+    """
+
+    auditor_verdict = _latest_auditor_verdict(rounds, language=language)
+    try:
+        record = validate_close_out(
+            form,
+            closed_by=closed_by,
+            auditor_verdict=auditor_verdict or None,
+        )
+        if record.delivered and closed_by == "agent" and not auditor_verdict:
+            # No round carried a parseable auditor report, so
+            # ``_latest_auditor_verdict`` returned ``{}`` and the shared
+            # validator saw ``auditor_verdict=None`` -- which it treats as
+            # "no opinion", letting the agent certify a delivery with
+            # nothing but its own artifact claim.  The independent auditor
+            # verdict is the AUTHORITY on whether the work landed; with
+            # none reachable the run cannot certify a delivery and is
+            # refused below, recording the standard incomplete close-out.
+            raise CloseOutValidationError("no auditor verdict")
+    except CloseOutValidationError as exc:
+        # The close-out was refused.  The run is NOT completed: it is
+        # close-out incomplete, with the refusal reason recorded.
+        refusal = _build_close_out_form(
+            outcome="incomplete",
+            outcome_reason=ascii_reason(str(exc)),
+            artifact_refs=[],
+            closed_by=closed_by,
+            closed_by_identity=identity,
+            closed_at=time.time(),
+        )
+        try:
+            record = validate_close_out(refusal, closed_by=closed_by)
+        except CloseOutValidationError:
+            return None
+    try:
+        persist_close_out(logs_dir, record)
+    except CloseOutError:
+        return None
+    if report is not None:
+        apply_close_out_to_report(report, record)
+    return record
 
 
 def _final_report(

@@ -80,7 +80,14 @@ def _report_json(tmp_path: Path) -> dict:
 
 
 def _without_timing(report: dict) -> dict:
-    return {key: value for key, value in report.items() if key != "elapsed_seconds"}
+    # ``closed_at`` is wall-clock timing exactly like ``elapsed_seconds``:
+    # the close-out record stamps the moment the run was closed, so two
+    # otherwise-identical runs differ in it.
+    return {
+        key: value
+        for key, value in report.items()
+        if key not in {"elapsed_seconds", "closed_at"}
+    }
 
 
 def _read_experience(tmp_path: Path) -> list[dict]:

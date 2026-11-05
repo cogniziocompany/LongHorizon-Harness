@@ -1242,6 +1242,55 @@ def _body_text(value: Any, *, field: str, required: bool = False, max_chars: int
     return text
 
 
+def _body_close_out_form(value: Any) -> dict[str, Any]:
+    """Read the operator's close-out FORM out of a request body.
+
+    The close-out contract (easybutt0n-17) requires a STRUCTURED form to
+    close a run: a fixed schema with required, enum-constrained fields.
+    This helper only checks the request's SHAPE (it is an object, of
+    bounded size); the FORM's rules live in the ONE validator
+    (``lh_harness.closeout.validate_close_out``), which both the agent and
+    the human path go through.
+
+    A missing form is NOT an error here: the caller decides whether the
+    close-out is REQUIRED for the action it is performing.  A supplied form
+    that fails validation is refused by the shared validator and the run
+    closes close-out INCOMPLETE with the reason recorded — never
+    "completed".
+    """
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=422, detail="close_out_form must be an object")
+    if len(value) > 64:
+        raise HTTPException(status_code=422, detail="close_out_form has too many fields")
+    form: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise HTTPException(status_code=422, detail="close_out_form keys must be strings")
+        if key == "artifact_refs":
+            if not isinstance(item, (list, tuple)):
+                raise HTTPException(
+                    status_code=422, detail="close_out_form.artifact_refs must be a list"
+                )
+            if len(item) > 64:
+                raise HTTPException(
+                    status_code=422, detail="close_out_form.artifact_refs has too many entries"
+                )
+            form[key] = [dict(entry) if isinstance(entry, dict) else entry for entry in item]
+            continue
+        if isinstance(item, (dict, list, tuple)):
+            raise HTTPException(
+                status_code=422,
+                detail=f"close_out_form.{key} must be a scalar value",
+            )
+        if isinstance(item, str) and len(item) > 20_000:
+            raise HTTPException(status_code=413, detail=f"close_out_form.{key} is too large")
+        form[key] = item
+    return form
+
+
 def _state_or_404(registry: StateRegistry, run_id: str) -> DashboardState:
     state = registry.state_for(run_id)
     if state is None:
@@ -1668,6 +1717,55 @@ def _stream_projection_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
 _HEAVY_SNAPSHOT_FIELDS = frozenset({"rounds", "events", "legacy"})
 
 
+#: The close-out fields the summary projection exposes.  They are ADDITIVE:
+#: a row that carries no close-out record keeps exactly the shape it had
+#: before the close-out contract existed.  ``outcome`` is NOT here: it is
+#: resolved above, because it may be either the close-out enum or the
+#: lifecycle-derived value.
+_CLOSE_OUT_SUMMARY_FIELDS = (
+    "delivered",
+    "outcome_reason",
+    "closed_by",
+    "closed_by_identity",
+    "closed_at",
+    "artifact_refs",
+    "derived",
+    "derived_from",
+)
+
+
+def _normalise_artifact_refs(value: Any) -> list[dict[str, Any]]:
+    """Normalise the close-out's ``artifact_refs`` for the summary row.
+
+    The close-out contract makes a delivered PR verifiable by naming the
+    HEAD commit it delivered (``head_sha``) alongside the PR's repo,
+    number and URL.  A consumer reading ``/api/runs?fields=summary`` must
+    be able to rely on those names, so this helper guarantees them per
+    entry while keeping the list's order, length and every existing field.
+
+    It is deliberately forgiving: a malformed or legacy entry is passed
+    through with its known fields rather than dropped, because dropping an
+    artifact would hide the evidence a consumer needs.  Nothing here
+    INVENTS a value — a missing head sha stays missing.
+    """
+
+    if not isinstance(value, (list, tuple)):
+        return []
+    refs: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        for name in ("kind", "repo", "ref", "url", "head_sha", "derived"):
+            entry.setdefault(name, "" if name != "derived" else False)
+        # A ``commit`` artifact's sha IS its ref: expose it under the same
+        # name the PR artifact uses, so a consumer reads one field.
+        if entry["kind"] == "commit" and not str(entry["head_sha"] or "").strip():
+            entry["head_sha"] = str(entry["ref"] or "")
+        refs.append(entry)
+    return refs
+
+
 def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
     """Project one cheap run item into the ``fields=summary`` response row.
 
@@ -1682,6 +1780,21 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
     can surface the pending decision's ``owner`` + (capped) ``owner_note``
     without loading the full snapshot.  ``runs_root=None`` skips that read;
     the badge simply won't appear (non-blocking).
+
+    The close-out contract (easybutt0n-17) adds the AUTHORITATIVE
+    close-out signal here, because this is the projection consumers actually
+    read: ``outcome`` (the six-value close-out enum), the explicit
+    ``delivered`` boolean, ``outcome_reason``, ``closed_by`` and
+    ``artifact_refs``.  Every one of them is ADDITIVE — a run with no
+    close-out record keeps the row it always had.
+
+    ``outcome`` is deliberately overloaded only when both are present.  A
+    run whose close-out record exists reports the CLOSE-OUT enum there; the
+    lifecycle-derived value it would otherwise carry is preserved under
+    ``lifecycle_outcome`` so nothing is lost and the two vocabularies never
+    mix under one name.  A run with NO close-out record keeps the
+    lifecycle-derived ``outcome`` exactly as before, so existing readers see
+    no change.
     """
 
     row: dict[str, Any] = {
@@ -1695,10 +1808,51 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
             row[field] = item[field]
     # How a finished run ended (terminal runs only; absent on live rows, so
     # older readers see the same shape).  ASCII, at most 200 characters.
-    for field in ("outcome", "abort_reason", "failure_reason"):
+    #
+    # ``outcome`` is the close-out enum when a close-out record exists; the
+    # lifecycle-derived value moves to ``lifecycle_outcome`` in that case.
+    # Without a close-out record the lifecycle value stays in ``outcome``,
+    # byte-for-byte as before.
+    lifecycle_outcome = item.get("outcome")
+    close_out_outcome = item.get("close_out_outcome")
+    if isinstance(close_out_outcome, str) and close_out_outcome:
+        row["outcome"] = close_out_outcome
+        if isinstance(lifecycle_outcome, str) and lifecycle_outcome:
+            row["lifecycle_outcome"] = lifecycle_outcome
+    elif isinstance(lifecycle_outcome, str) and lifecycle_outcome:
+        row["outcome"] = lifecycle_outcome
+    for field in ("abort_reason", "failure_reason"):
         value = item.get(field)
         if isinstance(value, str) and value:
             row[field] = value
+    # The close-out contract's own fields.  Additive: absent when the run
+    # carries no close-out record.
+    for field in _CLOSE_OUT_SUMMARY_FIELDS:
+        if field not in item:
+            continue
+        value = item[field]
+        if value is None:
+            continue
+        row[field] = value
+    # ``artifact_refs`` is normalised so a consumer can rely on the PRIMARY
+    # PR's url + number + head sha being present and named the same way
+    # everywhere.  The list keeps its order and its length (additive: no
+    # entry is dropped or reordered), and only the per-entry field NAMES are
+    # guaranteed — a consumer reads ``repo``/``ref``/``url``/``head_sha``.
+    # A row with no close-out record keeps NO ``artifact_refs`` key at all,
+    # so the baseline shape is untouched.
+    if "artifact_refs" in row:
+        row["artifact_refs"] = _normalise_artifact_refs(row["artifact_refs"])
+    # The run's own status fields, so a consumer sees the close-out AND
+    # the process lifecycle side by side.  Additive: absent when the run's
+    # report does not carry them.
+    for field in ("completion_satisfied", "report_status", "exit_code"):
+        if field not in item:
+            continue
+        value = item[field]
+        if value is None:
+            continue
+        row[field] = value
     if isinstance(item.get("round"), int) and not isinstance(item.get("round"), bool):
         row["round"] = item["round"]
     return row
@@ -4058,6 +4212,13 @@ def create_app(
                 action=_body_text(body.get("action", body.get("decision", "continue")), field="action", required=True, max_chars=128),
                 reason=_body_text(body.get("reason", body.get("note", "")), field="reason", max_chars=10_000),
                 user_input=user_input,
+                # The operator's close-out FORM (easybutt0n-17).  It travels
+                # with the decision so the manager can hand it to the SAME
+                # validator the agent's "done" path uses.  It is optional
+                # HERE and required by the CLOSE-OUT contract itself: a
+                # missing or invalid form leaves the run close-out incomplete
+                # with the reason recorded, never "completed".
+                close_out_form=_body_close_out_form(body.get("close_out_form")),
                 extra_rounds=_optional_extra_rounds(body.get("extra_rounds")),
                 command_id=_bounded_command_id(request.headers.get("Idempotency-Key")),
                 expected_revision=expected_revision_int,
@@ -4150,13 +4311,38 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/stop")
-    def stop(run_id: str, request: Request) -> dict[str, Any]:
+    def stop(
+        run_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        """Stop a run, closing it with the HUMAN close-out contract.
+
+        The close-out contract (easybutt0n-17) makes this a real CLOSER:
+        the operator says how the work ended, so the operator supplies the
+        structured close-out FORM.  It goes through the SAME validator the
+        agent's "done" path uses, so both closers produce identical record
+        shapes.
+
+        A missing or invalid form never leaves the run delivered: the run
+        closes close-out INCOMPLETE with the refusal reason recorded.
+        """
+
         _run_control_caller(request)
         _state_or_404(registry, run_id)
         if supervisor is None:
             raise HTTPException(status_code=501, detail="stop requires the standalone Web supervisor")
         try:
-            return {"ok": True, **supervisor.stop(run_id)}
+            return {
+                "ok": True,
+                **supervisor.stop(
+                    run_id,
+                    close_out_form=_body_close_out_form(body.get("close_out_form")),
+                    closed_by_identity=_body_text(
+                        body.get("closed_by_identity"), field="closed_by_identity", max_chars=200
+                    ),
+                ),
+            }
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
