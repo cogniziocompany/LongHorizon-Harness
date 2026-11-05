@@ -11,7 +11,11 @@ non-mutating -- kb, gateway guides/skills, hivemind memory, langfuse -- and
 the gateway cannot scope a server to read-only, so adding the ``github``
 server there would have handed the auditor WRITE-capable tools.  Its tool
 deny-list refused ``Bash(gh *)`` wholesale, which took out the local ``gh``
-CLI's read verbs along with the write ones.
+CLI's read verbs along with the write ones.  That blanket deny has since been
+replaced by per-spelling write denies
+(:data:`lh_harness.adapters.claude_permissions.AUDITOR_GH_WRITE_DENY`), so the
+auditor's reads are no longer collateral damage -- and this module's
+enforcement layer is the belt to that deny list's braces.
 
 The consequence was structural.  An auditor with no independent evidence
 could only RESTATE the executor's claims or refuse them; it could never
@@ -31,7 +35,9 @@ This module gives the auditor a read-only reach of its own:
     (``gh pr merge``, ``gh pr comment``, ``gh pr close``, ...), the
     ``gh api`` write methods (``--method=POST`` / ``-X PATCH`` / ...) and the
     field-supplying ``gh api`` bodies (``-f``/``-F``/``--input``) that a
-    bare ``Bash(gh *)`` deny would leave unmatched.
+    bare ``Bash(gh *)`` deny would leave unmatched.  Every one of those
+    spellings is refused INDIVIDUALLY and asserted individually, in
+    ``tests/test_auditor_read_only_spelling_coverage.py``.
 *   :func:`resolve_auditor_credential` resolves the auditor's OWN
     fine-grained read-only token from a dedicated environment variable and
     REFUSES to proceed when that value collides with the executor's

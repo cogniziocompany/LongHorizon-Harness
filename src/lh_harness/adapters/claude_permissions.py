@@ -32,7 +32,6 @@ AUDITOR_NETWORK_GIT_DENY: tuple[str, ...] = (
     "Bash(git clone*)",
     "Bash(git submodule*)",
     "Bash(git lfs*)",
-    "Bash(gh *)",
     # Variants that point git at a different directory via -C or --git-dir.
     "Bash(git -C * fetch*)",
     "Bash(git -C * pull*)",
@@ -48,6 +47,83 @@ AUDITOR_NETWORK_GIT_DENY: tuple[str, ...] = (
     "Bash(git --git-dir* clone*)",
     "Bash(git --git-dir* submodule*)",
     "Bash(git --git-dir* lfs*)",
+)
+
+# Deny rules for the auditor's `gh` WRITE spellings.
+#
+# The auditor used to be denied `Bash(gh *)` wholesale.  That was the safe
+# choice at the time, but it was a blunt one: it took out the local `gh`
+# CLI's READ verbs along with the write ones, so an auditor that wanted to
+# look at a pull request had to shell out to something else.  The auditor's
+# independent reach is now the harness's own read-only verifier
+# (``scripts/auditor_verify_pr.py``), and this deny list is spelled per
+# WRITE so that a read is not blocked by the same rule that blocks a write.
+#
+# The spellings below are the write paths that a `gh` read allowlist would
+# otherwise let through.  They are the same spellings the in-process
+# enforcement layer refuses (``lh_harness.auditor_verify.assert_read_only_command``),
+# which is the belt to this deny list's braces: the deny list stops the
+# auditor from *shelling out* to a write, and the enforcement layer refuses a
+# write that arrives by any other route (including a direct call into the
+# harness's GitHub client).
+AUDITOR_GH_WRITE_DENY: tuple[str, ...] = (
+    # A write verb on the raw API.
+    "Bash(gh api --method=*)",
+    "Bash(gh api -X *)",
+    "Bash(gh api -X*)",
+    "Bash(gh api --method *)",
+    # A field-supplying API body: a write even without an explicit method.
+    "Bash(gh api * -f *)",
+    "Bash(gh api * -F *)",
+    "Bash(gh api * --field *)",
+    "Bash(gh api * --raw-field *)",
+    "Bash(gh api * --input *)",
+    "Bash(gh api * -i *)",
+    # Pull-request and issue writes.
+    "Bash(gh pr merge*)",
+    "Bash(gh pr close*)",
+    "Bash(gh pr reopen*)",
+    "Bash(gh pr ready*)",
+    "Bash(gh pr edit*)",
+    "Bash(gh pr comment*)",
+    "Bash(gh pr create*)",
+    "Bash(gh pr review*)",
+    "Bash(gh issue comment*)",
+    "Bash(gh issue create*)",
+    "Bash(gh issue close*)",
+    "Bash(gh issue edit*)",
+    "Bash(gh release create*)",
+    "Bash(gh release edit*)",
+    "Bash(gh release upload*)",
+    "Bash(gh secret set*)",
+    "Bash(gh variable set*)",
+    "Bash(gh workflow run*)",
+    "Bash(gh workflow dispatch*)",
+    "Bash(gh workflow enable*)",
+    "Bash(gh run rerun*)",
+    "Bash(gh run cancel*)",
+    "Bash(gh run delete*)",
+    "Bash(gh repo edit*)",
+    "Bash(gh repo create*)",
+    "Bash(gh repo delete*)",
+    "Bash(gh gist create*)",
+    "Bash(gh label create*)",
+    "Bash(gh label edit*)",
+    "Bash(gh label delete*)",
+    "Bash(gh api-write*)",
+    "Bash(gh codespace*)",
+    "Bash(gh ruleset*)",
+    "Bash(gh ssh-key*)",
+    # A write flag on an otherwise-read verb.
+    "Bash(gh pr * --approve*)",
+    "Bash(gh pr * --request-changes*)",
+    "Bash(gh pr * --comment*)",
+    "Bash(gh pr * --delete-branch*)",
+    "Bash(gh pr * --merge*)",
+    "Bash(gh pr * --squash*)",
+    "Bash(gh pr * --rebase*)",
+    "Bash(gh pr * --ready*)",
+    "Bash(gh pr * --draft*)",
 )
 
 # Environment variables that make any network git operation fail fast for the
@@ -115,6 +191,7 @@ def policy_for_role(role: str) -> ClaudeRolePolicy:
                 *_WRITE_TOOLS,
                 "Agent",
                 *AUDITOR_NETWORK_GIT_DENY,
+                *AUDITOR_GH_WRITE_DENY,
             ),
             load_computer_mcp=True,
             workspace_read_only=True,

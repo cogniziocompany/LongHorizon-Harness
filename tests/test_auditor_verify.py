@@ -23,6 +23,12 @@ These tests pin the read-only properties that make the surface usable:
     refused when it collides with the executor's ``GH_TOKEN`` or a fleet
     admin token.
 
+The per-spelling proof that every write spelling is refused INDIVIDUALLY --
+one named test per spelling, so no single generic test can stand in for the
+set -- lives in ``test_auditor_read_only_spelling_coverage.py``.  The proof
+that the auditor can actually INVOKE the surface lives in
+``test_auditor_verification_reach.py``.
+
 No test here reads a real network: the HTTP seam is injected.  No test prints
 a credential value.
 """

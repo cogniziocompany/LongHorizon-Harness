@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server to read-only, so adding the `github` server there would have handed
   the auditor WRITE-capable tools — and its tool deny-list refused
   `Bash(gh *)` wholesale, taking out the local `gh` CLI's READ verbs along
-  with the write ones.
+  with the write ones.  (That blanket deny has since been replaced by
+  per-spelling write denies; see below.)
 
   The consequence was structural.  An auditor with no independent evidence
   could only RESTATE an executor's claims or refuse them; it could never
@@ -59,9 +60,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [--reviewed-sha <sha>]` runs the verification and prints a verdict of
   `confirmed`, `refuted`, or `unverifiable`.  Exit code 0 means CONFIRMED;
   a refutation or an unreachable read exits non-zero, because an auditor that
-  could not reach the evidence has no basis to call the claim true.  The CLI
-  auditor's instructions now name the command, and tell the auditor that an
-  `unverifiable` verdict is NOT a confirmation.
+  could not reach the evidence has no basis to call the claim true.
+
+  **The auditor's reach is now REACHABLE, not merely present.**  The command
+  the auditor's role instructions named — `lh-harness verify-pr` — did not
+  resolve in the agent environment: the console script is only on PATH inside
+  the project virtualenv, and where it did resolve it resolved to the
+  *installed* package, which has no `verify-pr` subcommand at all.  A
+  verification surface the verifier cannot invoke is not a verification
+  surface.  The auditor's instructions now name
+  `python3 scripts/auditor_verify_pr.py --repo <owner/name> --number <n>
+  [--reviewed-sha <sha>]`, a script that resolves THIS checkout's own `src`
+  tree ahead of anything installed in site-packages, so the auditor verifies
+  against the code in the working tree it is auditing.  Exit code 0 means
+  confirmed; any other exit means NOT confirmed.
+
+  **The blanket `Bash(gh *)` deny is replaced by per-spelling write denies.**
+  Denying `gh` wholesale took out the local `gh` CLI's READ verbs along with
+  its write ones.  `AUDITOR_GH_WRITE_DENY` now denies the write spellings one
+  by one — `gh pr merge`, `gh pr comment`, `gh pr close`, `gh pr ready`,
+  `gh pr edit`, `gh issue comment`, the `gh api` write methods
+  (`--method=*`, `-X *`), the field-supplying `gh api` bodies (`-f`, `-F`,
+  `--field`, `--raw-field`, `--input`), `gh secret set`, `gh workflow run`,
+  `git push` and the rest — while a `gh` read is no longer blocked by the
+  same rule that blocks a write.  The in-process enforcement layer
+  (`assert_read_only_command`) is the belt to that deny list's braces: it
+  refuses a write that arrives by any other route, including a direct call
+  into the harness's GitHub client.
+
+  **Every write spelling is refused INDIVIDUALLY and asserted individually.**
+  `tests/test_auditor_read_only_spelling_coverage.py` gives each spelling its
+  own named test rather than one generic parametrized case, so a spelling
+  cannot be lost from a list or moved to the wrong group without a test
+  failing.  Each refusal is asserted to name the attempted operation and to
+  carry no credential value.
 
   The auditor's contract header is UNCHANGED: still exactly `Status` /
   `Integrity` / `Contract audit`.  The `confirmed` / `refuted` /
