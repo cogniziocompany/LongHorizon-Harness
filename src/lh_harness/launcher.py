@@ -60,6 +60,8 @@ from .workspace_guard import (
     resolve_run_base,
 )
 from .workspace_identity import resolve_many
+from .workspace_park import WorkspaceParkError
+from .workspace_park import _git as _park_git
 
 # ``httpx`` is already a transitive dependency of FastAPI/TestClient, but the
 # launcher must not fail to import when it is absent.
@@ -692,6 +694,77 @@ def _unpushed_branch_occupied(workspace: str) -> bool:
         return False
     count = _git_occupancy(repo, "rev-list", "--count", f"refs/remotes/origin/main..{branch}")
     return bool(count and count != "0")
+
+
+def _untracked_only_leftovers(workspace: str) -> list[str] | None:
+    """Porcelain lines when the tree carries ONLY untracked leftovers.
+
+    ``None`` when the workspace is unreadable/clean (the probe fails open,
+    exactly like :func:`_dirty_workspace_occupied`) or when any modified or
+    staged tracked entry exists — porcelain lines not starting with ``??``.
+    The launcher must never auto-park tracked work, only the crumbs runs
+    drop behind them (``__pycache__``, test folders that exist only on
+    newer branches).
+    """
+
+    repo = Path(workspace)
+    if not repo.is_dir():
+        return None
+    status = _git_occupancy(repo, "status", "--porcelain")
+    if not status:
+        return None
+    lines = [line for line in status.splitlines() if line.strip()]
+    if not lines or any(not line.startswith("??") for line in lines):
+        return None
+    return lines
+
+
+def _auto_park_untracked_leftovers(workspace: str, queue_id: str) -> bool:
+    """Stash untracked-only leftovers so the queued entry can launch.
+
+    easybutt0n-17 (CT110, 2026-11-05): workspaces sit on old detached
+    commits and runs leave untracked crumbs, so trees read dirty for days
+    and later queue entries were silently skipped until an operator ran
+    ``lh-harness park`` by hand.  When the whole dirty diff is untracked
+    files — and no run holds the tree, which ``_check_eligibility`` has
+    already proven upstream through the reservation probe and the
+    active-run scan — the launcher parks the crumbs itself, then lets the
+    entry launch.
+
+    The stash runs through ``workspace_park._git`` — the very git wrapper
+    ``lh-harness park`` uses — so the stash commit gets the harness
+    author/committer identity, the crash-safe child env, and the fleet
+    timeout for free.  Modified or staged tracked work is NEVER touched:
+    that keeps the skip behaviour.  Returns True only when the stash
+    landed; any failure leaves the workspace as-is and the caller keeps
+    its dirty-tree skip.
+    """
+
+    lines = _untracked_only_leftovers(workspace)
+    if not lines:
+        return False
+    repo = Path(workspace)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    message = f"lh-harness auto-park {queue_id} {stamp}"
+    try:
+        _park_git(repo, "stash", "push", "-u", "-m", message)
+    except (WorkspaceParkError, subprocess.SubprocessError, OSError):
+        logger.warning(
+            "auto-park of %d untracked leftover file(s) failed in workspace %s for queue %s; "
+            "keeping the dirty-tree skip",
+            len(lines),
+            workspace,
+            queue_id,
+        )
+        return False
+    logger.info(
+        "auto-parked %d untracked leftover file(s) in workspace %s for queue %s: %s",
+        len(lines),
+        workspace,
+        queue_id,
+        message,
+    )
+    return True
 
 
 def _open_settings_store() -> SettingsStore | None:
@@ -1803,10 +1876,23 @@ class Launcher:
             getattr(entry, "branch", "") or getattr(entry, "continue_branch", False)
         ):
             if _dirty_workspace_occupied(entry.workspace):
-                return (
-                    f"workspace {entry.workspace} occupied: dirty tree "
-                    "(git status --porcelain non-empty)"
+                # Auto-park (easybutt0n-17): when the whole dirty diff is
+                # untracked leftovers, stash them (same wrapper ``lh-harness
+                # park`` uses) and let the entry launch.  Reaching this point
+                # means the reservation probe and the active-run scan above
+                # both passed, so NO run holds the tree — the one condition
+                # under which auto-park is allowed.  Never in observe mode:
+                # shadow decisions record, they never touch the workspace.
+                # Modified/staged tracked work keeps the skip below; the
+                # reason is recorded on the entry by the pass loop either way.
+                parked = not self._observe and _auto_park_untracked_leftovers(
+                    entry.workspace, entry.queue_id
                 )
+                if not parked:
+                    return (
+                        f"workspace {entry.workspace} occupied: dirty tree "
+                        "(git status --porcelain non-empty)"
+                    )
             if _unpushed_branch_occupied(entry.workspace):
                 return (
                     f"workspace {entry.workspace} occupied: checked-out branch "
