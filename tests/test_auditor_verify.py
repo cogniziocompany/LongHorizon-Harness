@@ -1244,6 +1244,140 @@ async def test_the_auditor_wrapper_never_mutates_the_process_global_environ(
         assert result.exit_code == 0
 
 
+@pytest.mark.asyncio
+async def test_a_concurrent_non_auditor_coroutine_never_sees_the_scrubbed_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A non-auditor coroutine running alongside auditor execs keeps GH_TOKEN.
+
+    easybutt0n-17 re-review (2026-11-05): the removed fallback cleared and
+    replaced the PROCESS-GLOBAL os.environ across the awaited exec.  Every
+    other coroutine in the process therefore ran with the scrubbed
+    environment for that window -- the executor's own git/gh calls would
+    lose GH_TOKEN and lose the auditor's token to GH_TOKEN as well.
+
+    So a non-auditor coroutine (here: the executor's own credential probe)
+    must observe the ORIGINAL GH_TOKEN at every point while two overlapping
+    auditor execs are in flight, and the parent's os.environ must be
+    byte-identical afterwards.
+
+    The probe samples GH_TOKEN repeatedly and records every distinct value
+    it saw, so a scrub window that opens and closes between two samples
+    still shows up as a foreign value in the recorded set.
+
+    Two environments are exercised, because the two paths are different:
+
+    * ``LocalEnvironment`` accepts ``child_env``, so the wrapper passes the
+      scrubbed env down to the child and never touches ``os.environ``.
+    * A legacy Environment whose ``exec`` has no ``child_env`` parameter is
+      the case the removed fallback used to cover.  There the wrapper must
+      FAIL CLOSED -- and in particular must not scrub ``os.environ`` on the
+      way to refusing.
+    """
+    import asyncio
+    import os
+
+    from lh_harness.adapters.claude_code import (
+        AuditorEnvUnsupported,
+        _AuditorEnvWrapper,
+    )
+    from lh_harness.environment.local import LocalEnvironment
+    from lh_harness.types import ExecResult
+
+    executor_token = "fake-executor-token"
+    auditor_token = "fake-auditor-token"
+
+    monkeypatch.setenv("GH_TOKEN", executor_token)
+    monkeypatch.setenv(AUDITOR_GITHUB_TOKEN_ENV, auditor_token)
+
+    class _LegacyEnv:
+        """An Environment whose exec predates the ``child_env`` parameter."""
+
+        async def exec(
+            self,
+            command: str,
+            timeout: int = 30,
+            tee_path: str | None = None,
+        ) -> Any:
+            # A real await, so the probe can genuinely interleave with the
+            # exec -- this is the window the removed fallback scrubbed.
+            await asyncio.sleep(0.2)
+            return ExecResult(stdout="", stderr="", exit_code=0, duration_ms=0)
+
+    async def _probe_while_auditor_execs(
+        wrapped: Any,
+        *,
+        expect_success: bool,
+    ) -> tuple[list[str | None], list[Any]]:
+        """Run two auditor execs while a non-auditor coroutine samples."""
+        before = dict(os.environ)
+        observed: list[str | None] = []
+        stop = asyncio.Event()
+
+        async def _executor_probe() -> None:
+            """A non-auditor coroutine: the executor's own GH_TOKEN reader.
+
+            It samples on EVERY event-loop turn (no sleep between samples)
+            so it observes the environment at every point in the auditor
+            execs' lifetime, including the window a scrub would occupy.
+            """
+            while not stop.is_set():
+                observed.append(os.environ.get("GH_TOKEN"))
+                await asyncio.sleep(0)
+
+        probe = asyncio.create_task(_executor_probe())
+        try:
+            if expect_success:
+                results = await asyncio.gather(
+                    wrapped.exec("echo hi", timeout=30),
+                    wrapped.exec("echo hi", timeout=30),
+                )
+            else:
+                results = await asyncio.gather(
+                    wrapped.exec("echo hi", timeout=30),
+                    wrapped.exec("echo hi", timeout=30),
+                    return_exceptions=True,
+                )
+        finally:
+            stop.set()
+            await probe
+
+        # The parent's environment is byte-identical afterwards.
+        assert dict(os.environ) == before
+        assert os.environ.get("GH_TOKEN") == executor_token
+        # The probe really did sample DURING the auditor window (otherwise
+        # this test would pass without exercising concurrency at all).
+        assert len(observed) > 1, observed
+        # The non-auditor coroutine ALWAYS saw the executor's own token.  It
+        # never saw the auditor's token, and never saw GH_TOKEN disappear.
+        assert set(observed) == {executor_token}, observed
+        return observed, list(results)
+
+    # --- the child_env path -------------------------------------------------
+    local = LocalEnvironment(tmp_dir=str(tmp_path))
+    observed, results = await _probe_while_auditor_execs(
+        _AuditorEnvWrapper(local),
+        expect_success=True,
+    )
+    assert all(r.exit_code == 0 for r in results), [r.stderr for r in results]
+    assert set(observed) == {executor_token}, observed
+
+    # --- the legacy path: fail closed, and never scrub os.environ ----------
+    #
+    # The wrapper refuses BEFORE calling the environment's exec, so the
+    # legacy exec never runs.  That is the point: the refusal happens
+    # without any window in which os.environ could be scrubbed.
+    observed, results = await _probe_while_auditor_execs(
+        _AuditorEnvWrapper(_LegacyEnv()),
+        expect_success=False,
+    )
+    assert len(results) == 2
+    for result in results:
+        assert isinstance(result, AuditorEnvUnsupported), result
+    assert set(observed) == {executor_token}, observed
+
+
 def test_the_auditor_wrapper_fails_closed_without_child_env_support(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
