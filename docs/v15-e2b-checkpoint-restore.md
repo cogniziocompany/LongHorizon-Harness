@@ -132,7 +132,7 @@ The restore on the second worker must preserve, durably, all of:
   execution, push, PR, gate resolve) is observed once across both workers
   (assertion 3 at large, `:414-611` today plus the `:620` xfail pinning the
   missing piece); on the queue side, reconciling twice and even two launchers
-  racing still yield exactly one successor (`restart_recovery.py:24-26, 45-48`).
+  racing still yield exactly one successor (`restart_recovery.py:24-26, 44-45`).
 * **Queue survives.** Entries live as atomic JSON files under the runs root
   (`queue.py:4, 35`); after the cross-worker restore, the entry chain for the
   task is exactly one of: (a) the original entry still `launched`, bound to
