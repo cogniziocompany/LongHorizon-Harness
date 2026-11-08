@@ -2208,10 +2208,27 @@ def create_app(
         # stalled" rather than aborting the metadata handshake.
         launcher_stalled = False
         launcher_stall_cycles = None
+        launcher_last_pass_at = None
+        launcher_loop_failure = None
+        lease_holder = None
         if launcher is not None:
             try:
                 launcher_stalled = bool(launcher.stall_fired)
                 launcher_stall_cycles = launcher.stall_cycles or None
+                launcher_last_pass_at = launcher.last_pass_at
+                launcher_loop_failure = launcher.loop_failure
+            except Exception:
+                pass
+        # easybutt0n-61: a lease is a cross-process exclusion record, not proof
+        # that the launch loop still completes passes.  Expose both signals;
+        # readers can detect a live service with a stale loop even while the
+        # old lease has not yet crossed its reclaim horizon.
+        runs_root = getattr(queue_store, "runs_root", None) if queue_store is not None else None
+        if runs_root is not None:
+            try:
+                lease = read_lease(runs_root)
+                if lease is not None:
+                    lease_holder = {"pid": lease.get("pid"), "host": lease.get("host")}
             except Exception:
                 pass
         # LHH-CT110-DISK: report disk usage in the same handshake the
@@ -2264,6 +2281,9 @@ def create_app(
             fleet_channel=_fleet_channel_state(),
             launcher_stalled=launcher_stalled,
             launcher_stall_cycles=launcher_stall_cycles,
+            launcher_last_pass_at=launcher_last_pass_at,
+            launcher_loop_failure=launcher_loop_failure,
+            lease_holder=lease_holder,
             capabilities={
                 "approvals": live_control,
                 "injections": live_control,
