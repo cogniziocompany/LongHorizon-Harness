@@ -204,6 +204,11 @@ at `:2385` restoring only completed rounds). Consequences for this row:
 * **Escalation when CT111 is unreachable through an authorised path:** see
   the execution-target section below.
 
+The mid-round restore gap is an approved waiver under ticket `easybutt0n-48`,
+enforced by the strict xfail (`xfail(strict=True)` at
+`tests/test_e2b_mid_round_restore.py:352`). The condition it covers is
+documented at lines 176-177 of this document.
+
 ## 5. Execution target and authorisation boundary
 
 CT111 is the execution target for this row, and it is currently
