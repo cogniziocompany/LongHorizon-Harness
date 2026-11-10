@@ -42,7 +42,6 @@ import conftest  # noqa: F401  (loopback TestClient Host patch)
 
 from fastapi.testclient import TestClient
 
-from lh_harness.dashboard import state as dashboard_state
 from lh_harness.dashboard.state import DashboardState
 from lh_harness.supervisor import control_bus
 from lh_harness.supervisor.service import RunSupervisor
