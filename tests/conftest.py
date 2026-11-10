@@ -127,9 +127,89 @@ def host_independent_worker_isolation(monkeypatch):
     own suites: test_worker_isolation_fallback.py, test_worker_rss_bound.py,
     supervisor/test_memory_kill_reason.py), so make the isolation decision
     deterministic: no systemd scope, no delegated cgroup subtree.
+
+    The session-scope ``_relocate_pytest_into_a_leaf_cgroup`` autouse fixture
+    also lives here: when that fixture ran first (pytest session started
+    inside a host with a delegated subtree) it set ``_RELOCATED = True`` and
+    pointed ``_WORKER_PARENT_CGROUP`` at a real cgroup, which would otherwise
+    mask the "no delegated subtree" branch of the fallback routing these
+    tests exercise.  Reset both flags so the test sees the documented
+    host-independent baseline, and force ``cgroup_plan`` itself to raise so
+    the post-scope retry always lands on the log-only plan (some of these
+    tests specifically exercise the fallback-after-scope-failure path).
     """
 
     from lh_harness import worker_isolation
 
     monkeypatch.setattr(worker_isolation, "probe_systemd_run", lambda: None)
     monkeypatch.setattr(worker_isolation, "cgroup_subtree_writable", lambda *a, **k: False)
+    monkeypatch.setattr(worker_isolation, "_RELOCATED", False, raising=False)
+    monkeypatch.setattr(worker_isolation, "_WORKER_PARENT_CGROUP", None, raising=False)
+
+    def _raise_cgroup_plan(*args, **kwargs):
+        raise OSError("host_independent_worker_isolation: cgroup subtree not delegated")
+
+    monkeypatch.setattr(worker_isolation, "cgroup_plan", _raise_cgroup_plan)
+
+
+@_pytest_task300.fixture(scope="session", autouse=True)
+def _relocate_pytest_into_a_leaf_cgroup():
+    """Move the pytest process into a fresh leaf cgroup on session start.
+
+    The RSS-bound tests (``test_worker_rss_bound``) call
+    ``worker_isolation._prepare_child_cgroup`` which writes
+    ``+memory +pids`` to ``cgroup.subtree_control`` of whatever cgroup the
+    pytest process happens to be in - the precondition for ``+memory +pids``
+    is that the target cgroup has no resident processes.  When pytest is
+    launched inside the lh-harness service unit it lands in a leaf already
+    full of worker processes (or shares one with siblings), the write
+    returns EBUSY, and the cgroup plan fails.  This fixture creates a
+    dedicated ``lh-pytest`` leaf under the service cgroup, moves the pytest
+    process into it, and tells ``worker_isolation`` to use the service
+    cgroup itself (now empty of pytest) as the parent of any
+    ``worker-*`` child cgroups.  The move is best-effort: hosts without a
+    delegated cgroup subtree simply skip it (the subtree-availability check
+    in ``test_worker_rss_bound`` already does its own honest skip), and we
+    never raise here - a misconfigured cgroupfs must not mask the real
+    test failures with an autouse-fixture crash.
+    """
+
+    import os as _os
+
+    from lh_harness import worker_isolation as _wi
+
+    try:
+        current = _wi.own_cgroup_path()
+        if not current or not current.startswith("/"):
+            return
+        root = _wi.CGROUP_ROOT
+        current_path = root / current.strip("/")
+        if not (current_path / "cgroup.procs").exists():
+            return
+        leaf_name = f"lh-pytest-{_os.getpid()}"
+        service_cgroup = current_path
+        while service_cgroup != root:
+            ctrl = service_cgroup / "cgroup.subtree_control"
+            try:
+                if ctrl.exists() and "memory" in ctrl.read_text().split():
+                    break
+            except Exception:
+                pass
+            service_cgroup = service_cgroup.parent
+        if service_cgroup == root:
+            return
+        leaf_path = service_cgroup / leaf_name
+        try:
+            leaf_path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        try:
+            with open(leaf_path / "cgroup.procs", "w", encoding="utf-8") as fh:
+                fh.write(f"{_os.getpid()}\n")
+        except OSError:
+            return
+        parent_cgroup = "/" + str(service_cgroup.relative_to(root)).strip("/")
+        _wi._RELOCATED = True
+        _wi._WORKER_PARENT_CGROUP = parent_cgroup
+    except Exception:
+        return

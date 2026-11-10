@@ -89,8 +89,13 @@ def test_progressing_episode_is_not_stalled() -> None:
     assert result.metadata["runtime_signals"] == []
 
 
-def test_stall_window_derivation() -> None:
+def test_stall_window_derivation(monkeypatch: pytest.MonkeyPatch) -> None:
     """Quarter of the budget, floored at 120 s, capped at 900 s; 0 disables."""
+    # ``_stall_window`` reads ``LH_HARNESS_STALL_SECONDS`` from the environment
+    # as an operator-level override; a CT110 run inheriting the live harness
+    # service's value would mask the derived numbers the test exercises.
+    # Pop the override here so the test sees the documented derived defaults.
+    monkeypatch.delenv("LH_HARNESS_STALL_SECONDS", raising=False)
     assert _stall_window(EpisodeBudget(max_duration_seconds=3600)) == DEFAULT_STALL_SECONDS_CAP
     assert _stall_window(EpisodeBudget(max_duration_seconds=1800)) == 450.0
     assert _stall_window(EpisodeBudget(max_duration_seconds=300)) == 120.0
