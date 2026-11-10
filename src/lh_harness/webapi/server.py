@@ -898,6 +898,17 @@ _SUMMARY_STAMP_FILES = (
     "role_management/report.json",
     "role_orchestration/approvals.jsonl",
     "role_management/approvals.jsonl",
+    # ``build_run_summary``'s status fallback (a row with no status) calls
+    # ``DashboardState.snapshot()``, which derives the lifecycle status from
+    # ``read_events``; ``snapshot()`` also reads ``rounds.jsonl`` and
+    # ``final_response.txt``.  Without these stamps a run whose status lives
+    # only in its event log would serve a stale status forever.
+    "role_orchestration/events.jsonl",
+    "role_management/events.jsonl",
+    "role_orchestration/rounds.jsonl",
+    "role_management/rounds.jsonl",
+    "role_orchestration/final_response.txt",
+    "role_management/final_response.txt",
 )
 
 
