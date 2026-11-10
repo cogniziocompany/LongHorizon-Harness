@@ -37,6 +37,15 @@ stays identical to the measured one and there is no parallel fixture harness.
 Run it with::
 
     PYTHONPATH=src pytest tests/webapi/test_runs_full_projection_bounded.py -v
+
+On a host whose site-packages also carries an installed ``lh_harness`` copy,
+``tests/conftest.py`` deliberately drops that path (it must test this checkout,
+not the installed one), which also hides ``fastapi`` when the two live in the
+same directory and the import fails with ``ModuleNotFoundError: No module named
+'fastapi'``.  Point ``PYTHONPATH`` at a dependency-only directory instead so the
+conftest has nothing to strip::
+
+    PYTHONPATH=/path/to/deps-only:src pytest tests/webapi/test_runs_full_projection_bounded.py -v
 """
 
 from __future__ import annotations
