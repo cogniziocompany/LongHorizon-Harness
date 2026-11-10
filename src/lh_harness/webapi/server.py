@@ -890,9 +890,16 @@ def _queue_entry_summary(item: Any) -> dict[str, Any]:
 # ages exactly like the files it came from.
 
 # Run-relative paths whose contents ``build_run_summary`` projects.
-_SUMMARY_STAMP_FILES = (
+# Control metadata lives directly under the run directory.
+_SUMMARY_STAMP_RUN_FILES = (
     "control/status.json",
     "control/owner.json",
+)
+# Everything else lives under the run's LOG directory (``<run>/lh_harness`` for
+# current runs, the legacy names for older ones) -- the listing row's
+# ``log_dir``.  Stamping these relative to the run directory would stat paths
+# that never exist, so a report/approval/event change would never invalidate.
+_SUMMARY_STAMP_LOG_FILES = (
     "report.json",
     "role_orchestration/report.json",
     "role_management/report.json",
@@ -951,7 +958,9 @@ def _summary_cache_for(runs_root: Any) -> _SummaryCacheHolder | None:
         return holder
 
 
-def _run_summary_stamp(run_dir: Path) -> tuple[tuple[str, int, int], ...] | None:
+def _run_summary_stamp(
+    run_dir: Path, log_dir: Path | None = None
+) -> tuple[tuple[str, int, int], ...] | None:
     """Cheap per-run change stamp: run dir + every metadata file projected.
 
     ``st_mtime_ns`` alone is not enough for the directory: two writes inside one
@@ -959,17 +968,24 @@ def _run_summary_stamp(run_dir: Path) -> tuple[tuple[str, int, int], ...] | None
     ``st_size`` catches a same-timestamp rewrite; the metadata files get the
     same treatment.  A missing file is recorded as ``(0, 0)`` so its later
     appearance changes the stamp.
+
+    ``log_dir`` is the listing row's log directory; the report, approvals,
+    events, rounds and final-response files are stamped there, the control
+    files under ``run_dir``.
     """
 
+    targets: list[tuple[str, Path]] = [(".", run_dir)]
+    targets += [(name, run_dir / name) for name in _SUMMARY_STAMP_RUN_FILES]
+    base = log_dir if log_dir is not None else run_dir
+    targets += [("log/" + name, base / name) for name in _SUMMARY_STAMP_LOG_FILES]
     parts: list[tuple[str, int, int]] = []
-    for relative in ("",) + _SUMMARY_STAMP_FILES:
-        target = run_dir / relative if relative else run_dir
+    for label, target in targets:
         try:
             info = os.stat(target)
         except OSError:
-            parts.append((relative or ".", 0, 0))
+            parts.append((label, 0, 0))
             continue
-        parts.append((relative or ".", info.st_mtime_ns, info.st_size))
+        parts.append((label, info.st_mtime_ns, info.st_size))
     return tuple(parts)
 
 
@@ -3638,8 +3654,13 @@ def create_app(
             recomputed: dict[str, _SummaryEntry] = {}
             for item in items:
                 run_id = str(item.get("id") or "")
-                run_dir = Path(str(item.get("log_dir") or "")).parent
-                stamp = _run_summary_stamp(run_dir) if run_id and run_dir.name else None
+                log_dir = Path(str(item.get("log_dir") or ""))
+                run_dir = log_dir.parent
+                stamp = (
+                    _run_summary_stamp(run_dir, log_dir)
+                    if run_id and run_dir.name
+                    else None
+                )
                 if stamp is not None:
                     cached = recomputed.get(run_id) or holder.entries.get(run_id)
                     if cached is not None and cached.stamp == stamp:

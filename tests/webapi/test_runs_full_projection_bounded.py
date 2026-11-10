@@ -337,3 +337,76 @@ def test_unchanged_warm_listing_does_no_projection_work(listing_app) -> None:
             "projection must be memoized across requests "
             f"(work: {repeat_work})"
         )
+
+
+def test_log_dir_only_change_is_visible(listing_app) -> None:
+    """A change made ONLY under the run's log dir must not be served stale.
+
+    ``report.json`` (and approvals/events/rounds) live under
+    ``<run>/lh_harness/...``, not directly under the run directory.  Rewriting
+    them moves neither the run directory's stamp nor ``control/*.json``, so a
+    stamp that looks for them beside ``control/`` never sees the change (found
+    in the non-author review of this change: the listing kept serving the old
+    row).
+    """
+
+    client, root = listing_app
+    target = root / "bnd0005run"
+    first = client.get("/api/runs")
+    assert first.status_code == 200
+    first_rows = {row["id"]: row for row in first.json()["runs"]}
+    assert first_rows[target.name].get("mcp_profile") is None
+
+    dir_stamp_before = os.stat(target).st_mtime_ns
+    control_before = [
+        os.stat(target / "control" / name).st_mtime_ns
+        for name in ("status.json", "owner.json")
+    ]
+    changed = 0
+    for path in (
+        target / "lh_harness" / "report.json",
+        target / "lh_harness" / "role_orchestration" / "report.json",
+    ):
+        if path.exists():
+            report = _read_json(path)
+            report["mcp_profile"] = "review-probe-profile"
+            _write_json(path, report)
+            changed += 1
+    assert changed, "fixture no longer writes report.json under lh_harness/"
+    assert os.stat(target).st_mtime_ns == dir_stamp_before
+    assert control_before == [
+        os.stat(target / "control" / name).st_mtime_ns
+        for name in ("status.json", "owner.json")
+    ]
+
+    rows = {row["id"]: row for row in client.get("/api/runs").json()["runs"]}
+    assert rows[target.name].get("mcp_profile") == "review-probe-profile", (
+        "the listing served a stale summary after a report.json-only change"
+    )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "report.json",
+        "role_orchestration/report.json",
+        "role_orchestration/approvals.jsonl",
+        "role_orchestration/events.jsonl",
+        "role_orchestration/rounds.jsonl",
+        "role_orchestration/final_response.txt",
+    ],
+)
+def test_summary_stamp_follows_log_dir_files(listing_app, relative: str) -> None:
+    """Every projected log-dir file moves the per-run stamp when it changes."""
+
+    _client, root = listing_app
+    run_dir = root / "bnd0003run"
+    log_dir = run_dir / "lh_harness"
+    before = webapi_server._run_summary_stamp(run_dir, log_dir)
+    path = log_dir / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"probe": true}\n')
+    assert webapi_server._run_summary_stamp(run_dir, log_dir) != before, (
+        f"appending to {relative} under the log dir did not move the stamp"
+    )
