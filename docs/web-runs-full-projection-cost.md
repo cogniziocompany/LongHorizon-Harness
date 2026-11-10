@@ -87,8 +87,8 @@ is memoized across requests:
 
 | N | warm full listing | per run | `list_run_items` | `state_for` | `build_run_summary` |
 | --- | --- | --- | --- | --- | --- |
-| 50 | 110 ms | 2.20 ms | 91.6 ms | 9.8 ms | 3.8 ms |
-| 372 | 804 ms | 2.16 ms | 678.8 ms | 71.5 ms | 31.2 ms |
+| 50 | 107.2 ms | 2.144 ms | 91.6 ms | 9.8 ms | 3.8 ms |
+| 372 | 803.8 ms | 2.161 ms | 678.8 ms | 71.5 ms | 31.2 ms |
 
 `build_run_summary` is called **once per run on every request**
 (`build_summary_calls: 372`), `list_run_items` once per request, and the
@@ -114,8 +114,8 @@ over 60 s" symptom far better than a scan (the scan is cached and measured at
 
 ## Cold vs warm
 
-The first listing after a process start is much worse: **4997 ms at N=372**
-(13.4 ms/run) versus 804 ms warm.  Two effects:
+The first listing after a process start is much worse: **4997.3 ms at N=372**
+(13.4 ms/run) versus 803.8 ms warm.  Two effects:
 
 * `DashboardState.snapshot()`/`_scan_runs()` populate the shared holder on the
   first cold listing; warm listings do `scan_walks: 0`.
