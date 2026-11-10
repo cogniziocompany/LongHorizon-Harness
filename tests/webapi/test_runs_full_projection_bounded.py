@@ -118,33 +118,55 @@ class _ProjectionCounter:
     Every counter wraps the production function and calls through to it, so the
     work is actually performed (an untouched run is fully re-projected and the
     count says so).  Nothing here is stubbed or short-circuited.
+
+    ``read_owner`` counts only the reads made while a run is being projected
+    (inside ``state_for`` or ``build_run_summary``).  The listing's own
+    enumeration (``run_items``) also reads each run's control records, and that
+    cheap per-run O(N) work is explicitly allowed to stay.
     """
 
     def __init__(self) -> None:
         self.build_run_summary = 0
         self.read_report = 0
         self.read_owner = 0
+        self._projecting = 0
         self._patches: list[Any] = []
 
     def __enter__(self) -> "_ProjectionCounter":
         original_build = webapi_server.build_run_summary
+        original_state_for = webapi_server.StateRegistry.state_for
         original_report = DashboardState.read_report
         original_owner = control_bus.ControlBus.read_owner
 
+        def counting_state_for(registry, run_id):
+            # ``state_for`` builds the DashboardState the projection needs, and
+            # that construction reads the run's control records.
+            self._projecting += 1
+            try:
+                return original_state_for(registry, run_id)
+            finally:
+                self._projecting -= 1
+
         def counting_build(item, *, state=None):
             self.build_run_summary += 1
-            return original_build(item, state=state)
+            self._projecting += 1
+            try:
+                return original_build(item, state=state)
+            finally:
+                self._projecting -= 1
 
         def counting_report(dashboard_state):
             self.read_report += 1
             return original_report(dashboard_state)
 
         def counting_owner(bus):
-            self.read_owner += 1
+            if self._projecting:
+                self.read_owner += 1
             return original_owner(bus)
 
         for target, name, replacement in (
             (webapi_server, "build_run_summary", counting_build),
+            (webapi_server.StateRegistry, "state_for", counting_state_for),
             (DashboardState, "read_report", counting_report),
             (control_bus.ControlBus, "read_owner", counting_owner),
         ):
@@ -162,6 +184,7 @@ class _ProjectionCounter:
         self.build_run_summary = 0
         self.read_report = 0
         self.read_owner = 0
+        self._projecting = 0
 
     def snapshot(self) -> dict[str, int]:
         return {
@@ -275,11 +298,11 @@ def test_full_listing_reprojects_only_the_changed_run(listing_app) -> None:
     # --- The change must still be VISIBLE (no cache without invalidation). --
     rows = {row["id"]: row for row in after.json()["runs"]}
     assert len(rows) == RUN_COUNT
-    assert rows[target_id]["youtrack_issue_id"] == "easybutt0n-80", (
+    assert rows[target_id].get("youtrack_issue_id") == "easybutt0n-80", (
         "the listing served a stale summary for the changed run: its "
         "owner.json now carries youtrack_issue_id but the response did not"
     )
-    assert rows[target_id]["status"] == "failed", (
+    assert rows[target_id].get("status") == "failed", (
         "the listing served a stale status for the changed run"
     )
     for index in range(RUN_COUNT):
