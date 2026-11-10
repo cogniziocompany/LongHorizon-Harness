@@ -214,6 +214,46 @@ class Approval:
         }
 
 
+@dataclass
+class _RunsScanHolder:
+    """One runs listing (timestamp + rows) shared across states for a root.
+
+    ``GET /api/runs`` builds a ``DashboardState`` per run, so a per-instance
+    cache never survived long enough to help: every new state began cold and
+    walked the whole runs root again, turning one listing into N walks.  The
+    holder is keyed by the runs root, so the first state to scan populates it
+    and every later state for that root reuses the result within the TTL.
+    """
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    entry: tuple[float, list[dict[str, Any]]] | None = None
+
+
+# The holders are process-wide but keyed by the resolved runs root, so two
+# independent roots never share a listing.  Entries are tiny (one row per run
+# directory) and bounded by the number of distinct roots a process serves.
+_RUNS_SCAN_HOLDERS: dict[str, _RunsScanHolder] = {}
+_RUNS_SCAN_HOLDERS_LOCK = threading.Lock()
+
+
+def _runs_scan_cache_for(runs_root: Path | None) -> _RunsScanHolder:
+    """Return the shared runs-scan holder for ``runs_root``.
+
+    ``None`` (no runs root) gets a private holder: such a state never scans,
+    and it must not share a cache slot with a real root.
+    """
+
+    if runs_root is None:
+        return _RunsScanHolder()
+    key = str(runs_root)
+    with _RUNS_SCAN_HOLDERS_LOCK:
+        holder = _RUNS_SCAN_HOLDERS.get(key)
+        if holder is None:
+            holder = _RunsScanHolder()
+            _RUNS_SCAN_HOLDERS[key] = holder
+        return holder
+
+
 class DashboardState:
     """Thread-safe store bridging the management loop and the web server."""
 
@@ -235,15 +275,17 @@ class DashboardState:
         # concurrent pollers the web process saturated its thread pool on
         # filesystem work instead of serving requests.
         #
-        # ``_runs_scan_cache`` holds the (scan timestamp, run list) pair and
-        # ``_runs_scan_lock`` serialises the rescan so that only one thread
-        # walks the runs root at a time; the others wait for that result and
-        # then reuse it (single-flight).
+        # The (scan timestamp, run list) pair lives in a holder that is SHARED
+        # by every ``DashboardState`` built for the same runs root, not on the
+        # instance itself -- see ``_runs_scan_cache_for``.  A per-instance
+        # cache is useless here because ``GET /api/runs`` builds one state per
+        # run, so every fresh state started cold and walked the whole runs
+        # root once more: N runs meant N full walks per request.
         #
-        # Both are set up before the first ``_scan_runs()`` call below, which
-        # runs during construction to auto-select the newest run.
-        self._runs_scan_cache: tuple[float, list[dict[str, Any]]] | None = None
-        self._runs_scan_lock = threading.Lock()
+        # ``holder.lock`` serialises the rescan so that only one thread walks
+        # the runs root at a time; the others wait for that result and then
+        # reuse it (single-flight).
+        self._runs_scan_holder = _runs_scan_cache_for(self.runs_root)
         resolved = Path(log_dir) if log_dir else None
         if resolved is None and self.runs_root is not None:
             runs = self._scan_runs()
@@ -285,35 +327,53 @@ class DashboardState:
     def _invalidate_runs_scan_cache(self) -> None:
         """Drop the cached runs listing so the next call rescans."""
 
-        with self._runs_scan_lock:
-            self._runs_scan_cache = None
+        with self._runs_scan_holder.lock:
+            self._runs_scan_holder.entry = None
+
+    def _cached_runs_scan(self, ttl: float) -> list[dict[str, Any]] | None:
+        """Return a fresh copy of the cached listing, or ``None`` on a miss.
+
+        The cached entry is shared by every state built for this runs root, so
+        a request that builds one state per run reuses the walk the first one
+        performed instead of re-walking the tree for each run.
+        """
+
+        if ttl <= 0:
+            return None
+        entry = self._runs_scan_holder.entry
+        if entry is None:
+            return None
+        if (time.monotonic() - entry[0]) >= ttl:
+            return None
+        return list(entry[1])
 
     def _scan_runs(self) -> list[dict[str, Any]]:
         """Return the runs listing, reusing a recent scan when possible.
 
-        The cached value is a (timestamp, list) pair held on the instance.
-        While the cache is younger than ``LH_HARNESS_RUNS_SCAN_TTL`` seconds
-        the previous scan is reused.  A rescan happens under a lock, so a
-        burst of concurrent callers produces exactly one walk of the runs
-        root and the remaining threads reuse that result.  The returned list
-        is a shallow copy, so callers cannot mutate the cached list.
+        The cached value is a (timestamp, list) pair held in a holder shared by
+        every state built for the same runs root.  While the cache is younger
+        than ``LH_HARNESS_RUNS_SCAN_TTL`` seconds the previous scan is reused.
+        A rescan happens under the holder's lock, so a burst of concurrent
+        callers produces exactly one walk of the runs root and the remaining
+        threads reuse that result.  The returned list is a shallow copy, so
+        callers cannot mutate the cached list.
         """
 
         ttl = self._runs_scan_ttl()
-        if ttl > 0:
-            cached = self._runs_scan_cache
-            if cached is not None and (time.monotonic() - cached[0]) < ttl:
-                return list(cached[1])
+        cached = self._cached_runs_scan(ttl)
+        if cached is not None:
+            return cached
 
-        with self._runs_scan_lock:
-            # Re-check under the lock: another thread may have completed the
-            # rescan while this one was waiting for it.
-            if ttl > 0:
-                cached = self._runs_scan_cache
-                if cached is not None and (time.monotonic() - cached[0]) < ttl:
-                    return list(cached[1])
+        holder = self._runs_scan_holder
+        with holder.lock:
+            # Re-check under the lock: another thread (possibly on another
+            # state for this runs root) may have completed the rescan while
+            # this one was waiting for it.
+            cached = self._cached_runs_scan(ttl)
+            if cached is not None:
+                return cached
             runs = self._scan_runs_uncached()
-            self._runs_scan_cache = (time.monotonic(), runs)
+            holder.entry = (time.monotonic(), runs)
             return list(runs)
 
     def _scan_runs_uncached(self) -> list[dict[str, Any]]:
