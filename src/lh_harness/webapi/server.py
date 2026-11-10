@@ -19,6 +19,7 @@ import time
 import uuid
 import zlib
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
@@ -859,6 +860,133 @@ def _queue_entry_summary(item: Any) -> dict[str, Any]:
         data["skip_reasons"] = reasons[-_QUEUE_SKIP_REASONS_KEEP:]
         data["skip_reasons_total"] = len(reasons)
     return data
+
+
+# ---------------------------------------------------------------------------
+# Full-projection summary cache
+# ---------------------------------------------------------------------------
+#
+# ``GET /api/runs`` with no ``fields`` parameter returns complete run objects,
+# and building one means ``build_run_summary``: read ``control/owner.json`` and
+# ``report.json`` for provenance/status fallbacks, build a ``DashboardState``
+# (which reads ``status.json`` and ``owner.json`` again through
+# ``can_control``) and project it.  Nothing memoized that projection, so a warm
+# request repeated the whole cold cost: with 372 run dirs the first listing
+# took 23.9 s and consecutive ones exceeded 60 s at 253% CPU.
+#
+# This cache is the same shape as the #193 runs-scan holder in
+# ``dashboard/state.py``: a process-wide dict keyed by the runs root, one lock
+# per holder.  The difference is what it keys on.  An entry is reusable only
+# while the run's *own files* are unchanged, and "unchanged" means the run-dir
+# stamp PLUS the per-run metadata files the projection reads -- rewriting
+# ``control/status.json`` does not move the run directory's mtime, so a
+# run-dir-only key serves stale summaries (the #193 audit finding).
+#
+# The stamps are one ``os.stat`` per file per run, i.e. cheap O(N) work; the
+# expensive per-run projection (JSON parses, snapshot fallback, state
+# construction) is then done only for runs whose stamps moved.  Nothing here
+# memoizes a wall-clock value: every field of the summary derives from the run's
+# own files (``updated_at`` is the run row's file mtime), so a cached summary
+# ages exactly like the files it came from.
+
+# Run-relative paths whose contents ``build_run_summary`` projects.
+# Control metadata lives directly under the run directory.
+_SUMMARY_STAMP_RUN_FILES = (
+    "control/status.json",
+    "control/owner.json",
+)
+# Everything else lives under the run's LOG directory (``<run>/lh_harness`` for
+# current runs, the legacy names for older ones) -- the listing row's
+# ``log_dir``.  Stamping these relative to the run directory would stat paths
+# that never exist, so a report/approval/event change would never invalidate.
+_SUMMARY_STAMP_LOG_FILES = (
+    "report.json",
+    "role_orchestration/report.json",
+    "role_management/report.json",
+    "role_orchestration/approvals.jsonl",
+    "role_management/approvals.jsonl",
+    # ``build_run_summary``'s status fallback (a row with no status) calls
+    # ``DashboardState.snapshot()``, which derives the lifecycle status from
+    # ``read_events``; ``snapshot()`` also reads ``rounds.jsonl`` and
+    # ``final_response.txt``.  Without these stamps a run whose status lives
+    # only in its event log would serve a stale status forever.
+    "role_orchestration/events.jsonl",
+    "role_management/events.jsonl",
+    "role_orchestration/rounds.jsonl",
+    "role_management/rounds.jsonl",
+    "role_orchestration/final_response.txt",
+    "role_management/final_response.txt",
+)
+
+
+@dataclass
+class _SummaryEntry:
+    stamp: tuple[tuple[str, int, int], ...]
+    summary: dict[str, Any]
+
+
+@dataclass
+class _SummaryCacheHolder:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    entries: dict[str, _SummaryEntry] = field(default_factory=dict)
+
+    def prune(self, live_ids: set[str]) -> None:
+        """Drop entries for run dirs that no longer exist."""
+        for run_id in [key for key in self.entries if key not in live_ids]:
+            del self.entries[run_id]
+
+
+_SUMMARY_CACHE_HOLDERS: dict[str, _SummaryCacheHolder] = {}
+_SUMMARY_CACHE_HOLDERS_LOCK = threading.Lock()
+
+
+def _summary_cache_for(runs_root: Any) -> _SummaryCacheHolder | None:
+    """Return the shared summary-cache holder for ``runs_root``.
+
+    ``None`` (no runs root) gets no cache: such a registry serves a single
+    embedded run and must never share a slot with a real root.
+    """
+
+    if runs_root is None:
+        return None
+    key = str(runs_root)
+    with _SUMMARY_CACHE_HOLDERS_LOCK:
+        holder = _SUMMARY_CACHE_HOLDERS.get(key)
+        if holder is None:
+            holder = _SummaryCacheHolder()
+            _SUMMARY_CACHE_HOLDERS[key] = holder
+        return holder
+
+
+def _run_summary_stamp(
+    run_dir: Path, log_dir: Path | None = None
+) -> tuple[tuple[str, int, int], ...] | None:
+    """Cheap per-run change stamp: run dir + every metadata file projected.
+
+    ``st_mtime_ns`` alone is not enough for the directory: two writes inside one
+    coarse filesystem timestamp would look identical.  Pairing it with
+    ``st_size`` catches a same-timestamp rewrite; the metadata files get the
+    same treatment.  A missing file is recorded as ``(0, 0)`` so its later
+    appearance changes the stamp.
+
+    ``log_dir`` is the listing row's log directory; the report, approvals,
+    events, rounds and final-response files are stamped there, the control
+    files under ``run_dir``.
+    """
+
+    targets: list[tuple[str, Path]] = [(".", run_dir)]
+    targets += [(name, run_dir / name) for name in _SUMMARY_STAMP_RUN_FILES]
+    base = log_dir if log_dir is not None else run_dir
+    targets += [("log/" + name, base / name) for name in _SUMMARY_STAMP_LOG_FILES]
+    parts: list[tuple[str, int, int]] = []
+    for label, target in targets:
+        try:
+            info = os.stat(target)
+        except OSError:
+            parts.append((label, 0, 0))
+            continue
+        parts.append((label, info.st_mtime_ns, info.st_size))
+    return tuple(parts)
 
 
 class StateRegistry:
@@ -3493,13 +3621,59 @@ def create_app(
 
         result: list[dict[str, Any]] = []
         contentions = _load_contentions(runs_root)
-        for item in registry.run_items():
-            if status_filter and str(item.get("status") or "") not in status_filter:
-                continue
-            item_run_id = str(item.get("id") or "")
-            summary = build_run_summary(item, state=registry.state_for(item_run_id))
+        items = [
+            item for item in registry.run_items()
+            if not status_filter or str(item.get("status") or "") in status_filter
+        ]
+        for summary in _project_run_summaries(registry, items):
             result.append(_annotate_contention(summary, contentions))
         return {"runs": result}
+
+    def _project_run_summaries(
+        registry_value: StateRegistry, items: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Project listing rows into full summaries, reusing unchanged ones.
+
+        Only rows whose per-run stamp moved (or that have no cached summary) pay
+        the ``state_for`` + ``build_run_summary`` cost; unchanged rows reuse the
+        summary built for an identical stamp tuple.  The returned dicts are
+        copies, so contention annotation cannot mutate a cached summary.
+        """
+
+        holder = _summary_cache_for(registry_value.runs_root)
+        if holder is None:
+            return [
+                build_run_summary(
+                    item, state=registry_value.state_for(str(item.get("id") or ""))
+                )
+                for item in items
+            ]
+        summaries: list[dict[str, Any]] = []
+        live_ids = {str(item.get("id") or "") for item in items}
+        with holder.lock:
+            recomputed: dict[str, _SummaryEntry] = {}
+            for item in items:
+                run_id = str(item.get("id") or "")
+                log_dir = Path(str(item.get("log_dir") or ""))
+                run_dir = log_dir.parent
+                stamp = (
+                    _run_summary_stamp(run_dir, log_dir)
+                    if run_id and run_dir.name
+                    else None
+                )
+                if stamp is not None:
+                    cached = recomputed.get(run_id) or holder.entries.get(run_id)
+                    if cached is not None and cached.stamp == stamp:
+                        summaries.append(dict(cached.summary))
+                        continue
+                state = registry_value.state_for(run_id)
+                summary = build_run_summary(item, state=state)
+                if stamp is not None:
+                    recomputed[run_id] = _SummaryEntry(stamp=stamp, summary=summary)
+                summaries.append(dict(summary))
+            holder.entries.update(recomputed)
+            holder.prune(live_ids)
+        return summaries
 
     def _load_contentions(runs_root_value: Any) -> list[dict[str, Any]]:
         if runs_root_value is None:
