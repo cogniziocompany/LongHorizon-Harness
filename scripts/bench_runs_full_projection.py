@@ -38,6 +38,12 @@ from typing import Any, Iterator
 _TESTS_ROOT = Path(__file__).resolve().parents[1] / "tests"
 if str(_TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_TESTS_ROOT))
+
+# A bare-shell (no pytest) run imports the checkout outside any conftest, so
+# importing src/tests writes __pycache__ caches; the tree is audited
+# read-only and that mutation invalidates the audit.  Turn bytecode writing
+# off before the first import.
+sys.dont_write_bytecode = True
 import conftest  # noqa: F401  (loopback TestClient Host patch)
 
 from fastapi.testclient import TestClient

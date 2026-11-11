@@ -156,6 +156,10 @@ def emit_seq(
 def _tick_version() -> str:
     """Return a version string tied to the package if we can import it."""
     try:
+        # A bare-shell import of the package writes __pycache__ caches, and
+        # the tree is audited read-only: turn bytecode writing off before
+        # the first import in this process.
+        sys.dont_write_bytecode = True
         from lh_harness import __version__  # type: ignore[import-untyped]
         return str(__version__)
     except Exception:  # noqa: BLE001
