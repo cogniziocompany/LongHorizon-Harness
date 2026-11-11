@@ -1814,7 +1814,29 @@ class RunSupervisor:
             if not (role.is_dir() or control.is_dir()):
                 continue
             try:
-                status = self._refresh(run_dir.name)
+                # LHH-FULL-RUNS-TERMINAL-FAST-PATH: a run whose durable status
+                # is already terminal never needs the ``_refresh`` walk.  That
+                # walk takes the supervisor-wide ``_lifecycle_lock`` and, for
+                # every run it refreshes (terminal or not), re-reads the owner
+                # record and may fork ``ps`` for PID-reuse checks.  On a node
+                # with hundreds of finished runs (CT111: 372 of 374 terminal
+                # on 2026-11-10) every full ``GET /api/runs`` held the lock
+                # for minutes, wedging the whole web API (only the
+                # ``fields=summary`` path, which never calls this method,
+                # kept answering).  Terminal lifecycle statuses are monotonic
+                # (``_refresh`` itself preserves an existing terminal status
+                # over a newer observation), and ``build_run_summary`` only
+                # needs the durable status text for a finished run, so the
+                # bounded ``status.json`` read is both cheaper and
+                # sufficient.  Live runs keep the full reconciliation.
+                durable_status = _read_json(control / "status.json")
+                status_name = canonical_lifecycle_status(
+                    durable_status.get("status"), default=""
+                )
+                if status_name in TERMINAL_STATUSES:
+                    status = {**durable_status, "status": status_name, "alive": False}
+                else:
+                    status = self._refresh(run_dir.name)
                 report = _read_json(logs / "report.json")
                 owner = _read_json(run_dir / "control" / "owner.json")
                 mtime = run_dir.stat().st_mtime
