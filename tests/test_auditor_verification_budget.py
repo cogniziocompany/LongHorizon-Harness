@@ -255,14 +255,23 @@ def test_repetitive_auditor_exhaustion_is_unverifiable_never_pass(harness_env) -
         assert len(opener.calls) == DEFAULT_VERIFICATION_STEP_BUDGET
 
 
-def test_budget_exhausted_result_never_satisfies_completion() -> None:
+def test_budget_exhausted_result_never_satisfies_completion(tmp_path) -> None:
     """The canonical exhaustion result can never read as PASS/DONE."""
 
+    # Pass the state dir explicitly: the env mapping on purpose carries
+    # only the episode id, and without an explicit state_dir the counter
+    # would fall through to the system temp directory and leak out of the
+    # test sandbox (it did: real-/tmp counters keyed to this episode id).
     step = consume_verification_step(
         {AUDITOR_EPISODE_ID_ENV: "run-9.round_1.cli_auditor"},
+        state_dir=tmp_path / "budget",
         budget=1,
     )
-    consume_verification_step({AUDITOR_EPISODE_ID_ENV: "run-9.round_1.cli_auditor"}, budget=1)
+    consume_verification_step(
+        {AUDITOR_EPISODE_ID_ENV: "run-9.round_1.cli_auditor"},
+        state_dir=tmp_path / "budget",
+        budget=1,
+    )
     result = verification_budget_exhausted_result(step, reviewed_sha=REVIEWED_SHA)
 
     assert result.verdict == VERDICT_UNVERIFIABLE

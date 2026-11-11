@@ -56,6 +56,21 @@ import os as _os
 for _var in ("LH_HARNESS_FLEET_URL", "LH_HARNESS_FLEET_KEY", "LH_HARNESS_FLEET_NODE", "LH_HARNESS_FLEET_LABELS"):
     _os.environ.pop(_var, None)
 
+# easybutt0n-17: workspace-neutral test execution.  Auditors validate this
+# tree by RUNNING the suite, and a run that writes bytecode caches into
+# src/**/__pycache__ invalidates the read-only audit with its own mutation
+# (it happened twice in a row).  Two layers:
+#   1. ``sys.dont_write_bytecode`` stops THIS interpreter; conftest is
+#      imported before any test module, so no harness module import can
+#      write a cache afterwards, however pytest was launched.
+#   2. ``PYTHONDONTWRITEBYTECODE`` in os.environ reaches every child
+#      interpreter whose env is derived from the parent's (helpers that
+#      build a "clean" env strip only LH_HARNESS_* variables).
+# ``_workspace_neutral_bytecode_scrub`` below is the backstop for the one
+# remaining shape: a child python launched with an env built from scratch.
+sys.dont_write_bytecode = True
+_os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
 import fastapi.testclient as fastapi_testclient
 import starlette.testclient as starlette_testclient
 
@@ -153,3 +168,46 @@ def _auditor_verification_budget_state_isolated(monkeypatch, tmp_path):
         str(tmp_path / "auditor-verification-budget"),
     )
     monkeypatch.delenv("LH_HARNESS_AUDITOR_EPISODE_ID", raising=False)
+
+
+@_pytest_task300.fixture(autouse=True, scope="session")
+def _workspace_neutral_bytecode_scrub():
+    """easybutt0n-17: the suite leaves the checkout exactly as it found it.
+
+    Backstop for the bytecode suppression above: a child interpreter
+    launched with an environment built from scratch misses the propagated
+    ``PYTHONDONTWRITEBYTECODE`` and would still drop ``__pycache__``/``*.pyc``
+    into the checkout, mutating a tree the auditor only has read-only
+    rights to.  Everything the session created that did not pre-exist is
+    removed at teardown; caches that existed before the run are left
+    untouched, and harness-owned/VCS directories are never descended.
+    """
+
+    import shutil as _shutil
+
+    repo = Path(__file__).resolve().parent.parent
+    pruned = {".git", ".lh-harness", ".pytest_cache", "node_modules"}
+
+    def _bytecode_paths() -> tuple[set[Path], set[Path]]:
+        caches: set[Path] = set()
+        loose: set[Path] = set()
+        for root, dirnames, filenames in _os.walk(repo):
+            if "__pycache__" in dirnames:
+                caches.add(Path(root) / "__pycache__")
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if name not in pruned and name != "__pycache__"
+            ]
+            for name in filenames:
+                if name.endswith((".pyc", ".pyo")):
+                    loose.add(Path(root) / name)
+        return caches, loose
+
+    pre_caches, pre_loose = _bytecode_paths()
+    yield
+    post_caches, post_loose = _bytecode_paths()
+    for path in sorted(post_caches - pre_caches, key=lambda p: len(p.parts), reverse=True):
+        _shutil.rmtree(path, ignore_errors=True)
+    for path in post_loose - pre_loose:
+        path.unlink(missing_ok=True)
