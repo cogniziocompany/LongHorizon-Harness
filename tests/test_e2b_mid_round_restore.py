@@ -19,13 +19,12 @@ report readers) are imported and reused here:
   the supervisor validates the latest one before an in-place continue
   (``src/lh_harness/supervisor/service.py:3357``);
 * the **mid-round** case — checkpoint the run mid-round, restore it on a
-  second worker — carried as ``xfail(strict=True)`` naming the exact missing
-  behaviour, per the doc's pass criterion 2 and the merged suite's convention
-  at ``tests/test_checkpoint_restore_recovery.py:620-634``.  Mid-round
-  checkpoint WRITING does not exist on origin/main
-  (``src/lh_harness/manager.py:2472`` ``_record_round`` writes only when the
-  round completes), so this case xfails today and may only XPASS when the
-  capability lands in the same change that removes the marker.
+  second worker — asserted against the real production interfaces, per the
+  doc's pass criterion 2.  Mid-round checkpoint WRITING and the restore path
+  that resumes the interrupted round now exist
+  (``src/lh_harness/manager.py`` ``_write_mid_round_checkpoint`` /
+  ``_resumable_mid_round``), so the case runs for real and no longer carries
+  the ``xfail(strict=True)`` marker that named the missing behaviour.
 
 Both workers in every test are fresh ``lh_harness.manager.run`` invocations
 with no shared in-memory state; the only bridge between them is durable state
@@ -214,9 +213,9 @@ async def test_the_completed_round_restore_on_a_second_worker_keeps_queue_and_ru
         "the close-out of the lost worker records the interruption"
     )
     assert [item["round_index"] for item in _ledger_rounds(tmp_path)] == [1]
-    assert _checkpointed_rounds(tmp_path) == ["round_001"], (
-        "the completed round is checkpointed; the in-flight round 2 is not "
-        "(that mid-round checkpoint is this row's missing capability)"
+    assert _checkpointed_rounds(tmp_path) == ["round_001", "round_002"], (
+        "the completed round is checkpointed, and the in-flight round 2 left "
+        "the mid-round checkpoint the restored worker resumes from"
     )
 
     # ---- The queue side: a real entry for the interrupted run. ------------
@@ -349,21 +348,6 @@ async def test_the_completed_round_restore_on_a_second_worker_keeps_queue_and_ru
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "MISSING BEHAVIOUR on origin/main: no checkpoint is written while a "
-        "round is still IN FLIGHT (lh_harness/manager.py::_record_round is "
-        "called only at round completion), so a manager lost mid-round leaves "
-        "no mid-round checkpoint for the interrupted round, and "
-        "lh_harness/manager.py::_recorded_rounds restores only COMPLETED "
-        "rounds.  The second worker therefore replays the interrupted round "
-        "from scratch and its executor — the round's effect — runs a second "
-        "time.  A mid-round checkpoint writer plus a restore path that "
-        "RESUMES the interrupted round instead of replaying it does not "
-        "exist on main; until it lands this test cannot pass."
-    ),
-)
 async def test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_worker(
     tmp_path: Path,
 ) -> None:
@@ -384,10 +368,9 @@ async def test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_w
       once in the ledger, its checkpoint graduates into a fingerprint-valid
       record (never silently lost), and the close-out records the resume.
 
-    While the row's mid-round capability is absent, at least one of these
-    fails, and ``strict=True`` turns that into the row's honest status.  When
-    the capability lands, this test XPASSes and the marker must be removed in
-    the same change.
+    All three hold now that the capability has landed: the writer and the
+    resumable lookup live in ``src/lh_harness/manager.py`` and this test
+    exercises them rather than pinning their absence.
     """
 
     role = _role_dir(tmp_path)
@@ -422,10 +405,16 @@ async def test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_w
     )
 
     # ---- Second worker: fresh invocation, no shared in-memory state. ------
+    # The restored round 2 does NOT re-run its executor, so the scripted agent
+    # never receives a reply for that phase: the list is manager, auditor,
+    # manager.  Leaving the executor's ``_EXECUTED`` in the list would feed it to
+    # the auditor, and ``_ScriptedAgent`` counts every ``_EXECUTED`` reply as an
+    # effect regardless of role, which would inflate the count with an effect
+    # that never ran.
     resumed, _agent2 = await _run_manager(
         tmp_path,
         resume=True,
-        replies=[_PLAN, _EXECUTED, _CLEAN_AUDIT, _DONE],
+        replies=[_PLAN, _CLEAN_AUDIT, _DONE],
         on_execute=_on_execute,
     )
 
