@@ -71,6 +71,19 @@ _AUDITOR_BASE_ENV: tuple[str, ...] = (
     "TERM",
 )
 
+#: The model-access variables the auditor's agent CLI needs to reach its
+#: model through the LiteLLM gateway.  They are NOT GitHub credentials: a
+#: LiteLLM key cannot read or write a repository.  Without them the auditor's
+#: ``claude`` child answers "Not logged in" and every run fails at its first
+#: audit (build 18e43d6e, 2026-11-11).  They are carried over by exact name
+#: only; anything GitHub-shaped is still dropped below.
+_AUDITOR_MODEL_ENV: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+)
+
 #: Variables that make ``git`` fail fast instead of prompting for a
 #: credential.  The auditor never writes, and never asks.
 _AUDITOR_BASE_OVERRIDES: dict[str, str] = {
@@ -123,7 +136,7 @@ def build_auditor_subprocess_env(
     env_source = os.environ if source is None else source
 
     env: dict[str, str] = {}
-    for name in _AUDITOR_BASE_ENV:
+    for name in (*_AUDITOR_BASE_ENV, *_AUDITOR_MODEL_ENV):
         value = env_source.get(name)
         if value:
             env[name] = value
