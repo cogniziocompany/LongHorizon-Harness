@@ -341,9 +341,8 @@ async def test_the_completed_round_restore_on_a_second_worker_keeps_queue_and_ru
 
 # --------------------------------------------------------------------------
 # Pass criterion 2: the mid-round case.  Written against the real production
-# interfaces so it passes EXACTLY when the capability lands; while the
-# capability is absent it carries xfail(strict=True) with the exact missing
-# behaviour named.
+# interfaces; it passes because the capability has landed, and carries no
+# xfail marker naming a missing behaviour.
 # --------------------------------------------------------------------------
 
 
