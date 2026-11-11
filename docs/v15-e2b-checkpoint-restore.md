@@ -213,11 +213,18 @@ does and does not establish is the matrix in section 4b:
 
 ## 4a. Full-suite status (ACCEPTANCE 2): UNCLOSED, not PASS
 
-`/tmp/venv137/bin/python -m pytest tests -q` at head `0c62540` completes with
-**8 failed, 2553 passed, 44 skipped**
-(`easybutt0n-137-fullsuite-at-0c62540-raw.txt`). None of the 8 is on the E2b
-capability; the failure set is *identical* to the clean detached worktree at
-origin/main `9a01b5e`, which reports the same eight ids
+`/tmp/venv137/bin/python -m pytest tests -q` completes with **7 failed, 2553
+to 2554 passed, 44 skipped** depending on whether the timing-sensitive
+stale-worker test fails. Two captures at this tree:
+
+* `easybutt0n-137-fullsuite-at-0c62540-raw.txt` — `8 failed, 2553 passed, 44 skipped`
+* `easybutt0n-137-fullsuite-final2-raw.txt` — `7 failed, 2554 passed, 44 skipped`
+
+The difference is exactly `tests/webapi/test_restart_run_recovery.py::test_live_stale_worker_makes_the_successor_wait`,
+which fails in the first and passes in the second (and passes in the targeted
+per-node capture, `PASSED [ 74%]`). None of the failures is on the E2b
+capability; the stable seven are the *same ids* the clean detached worktree at
+origin/main `9a01b5e` reports
 (`easybutt0n-137-baseline-main-final-raw.txt`: **8 failed, 2550 passed, 44
 skipped, 1 xfailed**). They are environmental and are reported **UNCLOSED**,
 never waived and never PASS:
@@ -229,23 +236,20 @@ never waived and never PASS:
 * `tests/test_workspace_identity.py::test_repo_id_strips_credentials`
 * `tests/test_workspace_identity.py::test_repo_id_for_scp_remote`
 * `tests/test_workspace_identity.py::test_worktree_common_dir_is_absolute_and_same_as_primary`
+
+Eighth id, flaky and likewise **UNCLOSED**, never PASS:
+
 * `tests/webapi/test_restart_run_recovery.py::test_live_stale_worker_makes_the_successor_wait`
 
-The last of those is timing-sensitive (stale-worker gate): it fails in this
-full-suite capture and in the clean-main baseline, but passes in the targeted
-per-node capture (`easybutt0n-137-matrix-nodes-raw.txt`, `PASSED [ 74%]`) and
-passed in the earlier full-suite capture at `1408d92`
-(`easybutt0n-137-fullsuite-final-raw.txt`, `7 failed, 2554 passed`). Flake or
-not, it is **UNCLOSED** and is not claimed as PASS.
-
-The baseline also reports `1 xfailed` and the branch reports none: that is the
+The baseline also reports `1 xfailed` and this branch reports none: that is the
 target capability's strict xfail, present on main and removed on this branch.
 
 The 44 skips are condition-gated. The `-q` ACCEPTANCE-2 capture does not print
 `SKIPPED` lines, so they are enumerated in the dedicated `-rs` capture
-`easybutt0n-137-final-skipids-raw.txt` (the ten skipping files run with `-rs`
-at `1408d92`; `244 passed, 44 skipped in 8.34s`, the same 44-skip count the
-`0c62540` run reports). Verbatim:
+`easybutt0n-137-final2-skipids-raw.txt` (the ten skipping files run with `-rs`
+at head `80463e6`; `244 passed, 44 skipped in 6.15s`). The same twelve skip
+groups and the same 44-skip total were reported at `1408d92`
+(`easybutt0n-137-final-skipids-raw.txt`). Verbatim:
 
 ```
 SKIPPED [1] tests/webapi/test_pg_migrations.py:31: could not import 'psycopg': No module named 'psycopg'
@@ -282,6 +286,8 @@ capture is a capture of the same test code the `0c62540` captures ran:
 | `easybutt0n-137-matrix-nodes-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py tests/test_checkpoint_restore_recovery.py tests/webapi/test_restart_run_recovery.py -p no:cacheprovider -v` | Per-node-id PASSED lines for every executed offline row (`51 passed in 4.08s`), at `1408d92` |
 | `easybutt0n-137-acc1-at-0c62540-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at `0c62540` (`2 passed in 0.90s`) |
 | `easybutt0n-137-fullsuite-at-0c62540-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at `0c62540` (`8 failed, 2553 passed, 44 skipped`) |
+| `easybutt0n-137-acc1-final2-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at final head `80463e6` (`2 passed in 0.89s`) |
+| `easybutt0n-137-fullsuite-final2-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at final head `80463e6` (`7 failed, 2554 passed, 44 skipped`) |
 | `easybutt0n-137-acceptance1-final-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at `1408d92` (`2 passed in 1.52s`) |
 | `easybutt0n-137-fullsuite-final-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at `1408d92` (`7 failed, 2554 passed, 44 skipped`) |
 | `easybutt0n-137-baseline-main-final-raw.txt` | same command, detached worktree at origin/main `9a01b5e` | Clean-main baseline for failure classification (`8 failed, 2550 passed, 44 skipped, 1 xfailed`) |
@@ -346,6 +352,9 @@ recorded inside the file itself:
 | `easybutt0n-137-matrix-nodes-raw.txt` | `/tmp/venv137/bin/python -m pytest <the three E2b suites> -p no:cacheprovider -v` run in this workspace | header line records `git head 1408d92`; `git diff 1408d92 0c62540 -- tests/ src/` is empty, so it exercises the same `src/` and `tests/` blobs as the `0c62540` captures |
 | `easybutt0n-137-acc1-at-0c62540-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header line records `captured at pushed head 0c6254046104f7ea86b316df07a7101e25c4c5b4` and `exit=0` |
 | `easybutt0n-137-fullsuite-at-0c62540-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same header, same head (`8 failed, 2553 passed, 44 skipped`) |
+| `easybutt0n-137-acc1-final2-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header line records `captured at pushed head 80463e6d8dc1e38f3875e5679eb68bbd3601507d` and `exit=0` |
+| `easybutt0n-137-fullsuite-final2-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same header, same head, plus the tracked-tree status; `7 failed, 2554 passed, 44 skipped`, `# exit=1` |
+| `easybutt0n-137-final2-skipids-raw.txt` | `pytest <the ten skipping files> -q -rs` | header records `captured at pushed head 80463e6…`; `244 passed, 44 skipped in 6.15s` |
 | `easybutt0n-137-acceptance1-final-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header line records `git head 1408d92` and an empty tracked-tree status |
 | `easybutt0n-137-fullsuite-final-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same header, same head |
 | `easybutt0n-137-baseline-main-final-raw.txt` | same command in a detached worktree at `origin/main` `9a01b5e` (`/tmp/e2b-main-baseline`, created read-only from the same object store) | header line names the detached worktree and `9a01b5e` |
