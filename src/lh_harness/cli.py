@@ -1548,33 +1548,77 @@ def _verify_pr_command(args: argparse.Namespace) -> int:
     auditor's OWN fine-grained read-only token, issues GET requests only, and
     prints a verdict that is one of confirmed / refuted / unverifiable.
 
-    Exit code 0 means CONFIRMED.  Anything else -- a refutation, or an
-    unverifiable read -- exits non-zero, because an auditor that could not
-    reach the evidence has no basis to call the claim true.
+    Two deterministic bounds wrap the read, both failing closed:
+
+    *   a presence-only preflight: when the verifier's own token is absent
+        or unsuitable, the result is unverifiable with reason
+        ``pr_verifier_unavailable`` -- no token value is read into output,
+        no credential is probed, and no live PR call is made;
+    *   an episode-scoped verification-step budget (the initial evidence
+        pass plus at most two additional passes): each invocation consumes
+        exactly one structured step, and exhaustion yields unverifiable with
+        reason ``verification_budget_exhausted`` before the episode cap.
+
+    Exit code 0 means CONFIRMED.  Anything else -- a refutation, an
+    unverifiable read, an unavailable verifier, or budget exhaustion --
+    exits non-zero, because an auditor that could not confirm the evidence
+    has no basis to call the claim true.
     """
 
     import json as _json
 
     from .auditor_verify import (
+        AUDITOR_GITHUB_TOKEN_ENV,
         VERDICT_CONFIRMED,
         AuditorCredentialError,
         ReadOnlyGitHubClient,
+        consume_verification_step,
+        pr_verifier_unavailable_result,
+        resolve_auditor_credential,
+        verification_budget_exhausted_result,
         verify_pull_request,
     )
 
+    # Fail-closed preflight (before the episode cap, before any network
+    # read): the task requires PR verification, and this command is the
+    # verifier's only reach -- so if the verifier or its token is absent the
+    # conclusion is the canonical unverifiable / pr_verifier_unavailable.
+    # Presence check only: the token VALUE is never read into output, no
+    # credential is probed, and no live PR call is made.
     try:
-        client = ReadOnlyGitHubClient.from_environment()
+        credential = resolve_auditor_credential()
     except AuditorCredentialError as exc:
         # The message names variables only; it never contains a token value.
-        print(f"verifier unusable: {exc}", file=sys.stderr)
-        return 2
-
-    result = verify_pull_request(
-        client,
-        repo=args.repo,
-        number=args.number,
-        reviewed_sha=args.reviewed_sha,
-    )
+        result = pr_verifier_unavailable_result(
+            reviewed_sha=args.reviewed_sha, detail=str(exc)
+        )
+        exit_code = 2
+    else:
+        if not credential.present:
+            result = pr_verifier_unavailable_result(
+                reviewed_sha=args.reviewed_sha,
+                detail=f"{AUDITOR_GITHUB_TOKEN_ENV} is not set",
+            )
+            exit_code = 2
+        else:
+            # The structured verifier boundary: each invocation consumes
+            # exactly one episode-scoped verification step.  Exhaustion is
+            # unverifiable / verification_budget_exhausted -- never a pass.
+            step = consume_verification_step()
+            if not step.granted:
+                result = verification_budget_exhausted_result(
+                    step, reviewed_sha=args.reviewed_sha
+                )
+                exit_code = 1
+            else:
+                client = ReadOnlyGitHubClient(token=credential.token)
+                result = verify_pull_request(
+                    client,
+                    repo=args.repo,
+                    number=args.number,
+                    reviewed_sha=args.reviewed_sha,
+                )
+                exit_code = 0 if result.verdict == VERDICT_CONFIRMED else 1
 
     if args.json:
         print(
@@ -1594,7 +1638,7 @@ def _verify_pr_command(args: argparse.Namespace) -> int:
     else:
         print(result.summary())
 
-    return 0 if result.verdict == VERDICT_CONFIRMED else 1
+    return exit_code
 
 
 def _report_update_result(result: UpdateCheckResult | None) -> bool:

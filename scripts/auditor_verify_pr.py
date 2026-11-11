@@ -79,6 +79,13 @@ def _activate_checkout() -> Path:
         )
         raise SystemExit(2)
 
+    # Importing the checkout this script activates writes .pyc caches into
+    # src/**/__pycache__ unless bytecode writing is off BEFORE the first
+    # harness import in this process -- a bare-shell run has no pytest
+    # conftest to do it, and the auditor's window over the task workspace
+    # is read-only: an audit that writes the tree invalidates itself.
+    sys.dont_write_bytecode = True
+
     entry = str(src)
     if entry in sys.path:
         sys.path.remove(entry)

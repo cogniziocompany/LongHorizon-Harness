@@ -259,12 +259,12 @@ def test_the_named_invocation_refuses_to_verify_without_the_auditor_credential()
     assert completed.returncode != 0
     combined = completed.stdout + completed.stderr
     assert "LH_HARNESS_AUDITOR_GITHUB_TOKEN" in combined
-    # Not a silent pass: the verifier says the claim is NOT confirmed, and
-    # never reports a confirmed verdict.
-    assert "not confirmed" in combined.lower()
-    assert "verdict" not in combined.lower() or "confirmed" not in combined.lower().replace(
-        "not confirmed", ""
-    )
+    # easybutt0n-17: not a silent pass -- the verifier concludes the
+    # canonical UNVERIFIABLE with reason pr_verifier_unavailable (the claim
+    # is NOT confirmed), and never reports a confirmed verdict.
+    assert "unverifiable" in combined.lower()
+    assert "pr_verifier_unavailable" in combined.lower()
+    assert "confirmed" not in combined.lower()
 
 
 # ---------------------------------------------------------------------------

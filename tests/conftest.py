@@ -52,9 +52,25 @@ else:
 # written, and the suite fails everywhere the service actually runs.  Tests
 # that exercise the fleet reporter set their own environment.
 import os as _os
+import tempfile as _tempfile
 
 for _var in ("LH_HARNESS_FLEET_URL", "LH_HARNESS_FLEET_KEY", "LH_HARNESS_FLEET_NODE", "LH_HARNESS_FLEET_LABELS"):
     _os.environ.pop(_var, None)
+
+# easybutt0n-17: workspace-neutral test execution.  Auditors validate this
+# tree by RUNNING the suite, and a run that writes bytecode caches into
+# src/**/__pycache__ invalidates the read-only audit with its own mutation
+# (it happened twice in a row).  Two layers:
+#   1. ``sys.dont_write_bytecode`` stops THIS interpreter; conftest is
+#      imported before any test module, so no harness module import can
+#      write a cache afterwards, however pytest was launched.
+#   2. ``PYTHONDONTWRITEBYTECODE`` in os.environ reaches every child
+#      interpreter whose env is derived from the parent's (helpers that
+#      build a "clean" env strip only LH_HARNESS_* variables).
+# ``_workspace_neutral_bytecode_scrub`` below is the backstop for the one
+# remaining shape: a child python launched with an env built from scratch.
+sys.dont_write_bytecode = True
+_os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
 import fastapi.testclient as fastapi_testclient
 import starlette.testclient as starlette_testclient
@@ -133,3 +149,105 @@ def host_independent_worker_isolation(monkeypatch):
 
     monkeypatch.setattr(worker_isolation, "probe_systemd_run", lambda: None)
     monkeypatch.setattr(worker_isolation, "cgroup_subtree_writable", lambda *a, **k: False)
+
+
+@_pytest_task300.fixture(autouse=True)
+def _auditor_verification_budget_state_isolated(monkeypatch, tmp_path):
+    """easybutt0n-17: isolate the auditor verifier's step-budget counter.
+
+    The episode-scoped verification-step budget persists its counter in a
+    state directory.  Inside one pytest process there is no auditor episode
+    boundary, so without isolation every test would share the ambient state
+    directory and the ambient episode id, and the budget would leak across
+    tests (and across hosts that have run the verifier before).  Each test
+    gets a fresh state directory and no inherited episode id -- exactly the
+    one-auditor-episode, three-structured-passes world the harness runs.
+    """
+
+    monkeypatch.setenv(
+        "LH_HARNESS_AUDITOR_VERIFY_STATE_DIR",
+        str(tmp_path / "auditor-verification-budget"),
+    )
+    monkeypatch.delenv("LH_HARNESS_AUDITOR_EPISODE_ID", raising=False)
+
+
+@_pytest_task300.fixture(autouse=True)
+def _auditor_gh_config_dir_isolated(monkeypatch, tmp_path):
+    """easybutt0n-17: verifier gh-config scratch dirs stay in the sandbox.
+
+    ``build_auditor_subprocess_env`` points ``gh`` at a fresh, empty config
+    directory (so no stored credential can be found) and creates it in the
+    system temp directory -- one per call, and nothing ever removes it.
+    Every test that builds an auditor child environment therefore dropped
+    an ``lh-auditor-gh-config-*`` dir into the real /tmp (15 per run for
+    the child-environment suite alone, and they accumulate forever).
+    Redirect that fallback to the test's own tmp directory.  Callers that
+    pass ``config_dir`` explicitly, and the subprocess-launched verifier
+    (whose fail-closed preflight means no directory is ever created), are
+    untouched.
+    """
+
+    import lh_harness.auditor_env as _auditor_env
+
+    _original = _auditor_env.auditor_gh_config_dir
+    _target = tmp_path / "auditor-gh-config"
+
+    def _isolated(config_dir=None):
+        return _original(_target if config_dir is None else config_dir)
+
+    monkeypatch.setattr(_auditor_env, "auditor_gh_config_dir", _isolated)
+
+
+@_pytest_task300.fixture(autouse=True, scope="session")
+def _workspace_neutral_bytecode_scrub():
+    """easybutt0n-17: the suite leaves the checkout exactly as it found it.
+
+    Backstop for the bytecode suppression above: a child interpreter
+    launched with an environment built from scratch misses the propagated
+    ``PYTHONDONTWRITEBYTECODE`` and would still drop ``__pycache__``/``*.pyc``
+    into the checkout, mutating a tree the auditor only has read-only
+    rights to.  Everything the session created that did not pre-exist is
+    removed at teardown; caches that existed before the run are left
+    untouched, and harness-owned/VCS directories are never descended.
+    """
+
+    import shutil as _shutil
+
+    repo = Path(__file__).resolve().parent.parent
+    pruned = {".git", ".lh-harness", ".pytest_cache", "node_modules"}
+
+    def _bytecode_paths() -> tuple[set[Path], set[Path]]:
+        caches: set[Path] = set()
+        loose: set[Path] = set()
+        for root, dirnames, filenames in _os.walk(repo):
+            if "__pycache__" in dirnames:
+                caches.add(Path(root) / "__pycache__")
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if name not in pruned and name != "__pycache__"
+            ]
+            for name in filenames:
+                if name.endswith((".pyc", ".pyo")):
+                    loose.add(Path(root) / name)
+        return caches, loose
+
+    # The two /tmp leak families the previous audits actually saw: verifier
+    # gh-config scratch dirs and the shared verification-budget counter
+    # dir.  Only entries the session created are removed at its end --
+    # pre-existing ones (including any real episode's counter) stay.
+    tmp_root = Path(_os.environ.get("TMPDIR") or _tempfile.gettempdir())
+    gh_config_prefix = tmp_root / "lh-auditor-gh-config-"
+
+    pre_caches, pre_loose = _bytecode_paths()
+    pre_gh_dirs = set(gh_config_prefix.parent.glob(gh_config_prefix.name + "*"))
+
+    yield
+
+    post_caches, post_loose = _bytecode_paths()
+    for path in sorted(post_caches - pre_caches, key=lambda p: len(p.parts), reverse=True):
+        _shutil.rmtree(path, ignore_errors=True)
+    for path in post_loose - pre_loose:
+        path.unlink(missing_ok=True)
+    for path in set(gh_config_prefix.parent.glob(gh_config_prefix.name + "*")) - pre_gh_dirs:
+        _shutil.rmtree(path, ignore_errors=True)

@@ -43,6 +43,7 @@ import pytest
 
 from lh_harness.auditor_verify import (
     AUDITOR_GITHUB_TOKEN_ENV,
+    REASON_PR_VERIFIER_UNAVAILABLE,
     VERDICT_CONFIRMED,
     VERDICT_REFUTED,
     VERDICT_UNVERIFIABLE,
@@ -703,8 +704,12 @@ def test_cli_verify_pr_without_the_auditor_credential_refuses(
 
     captured = capsys.readouterr()
     assert exit_code == 2
-    assert AUDITOR_GITHUB_TOKEN_ENV in captured.err
-    assert "unverifiable" in captured.err.lower()
+    # easybutt0n-17: a missing verifier/token is the canonical fail-closed
+    # UNVERIFIABLE conclusion (reason pr_verifier_unavailable), printed like
+    # every other verdict; only the variable NAME appears, never a value.
+    assert VERDICT_UNVERIFIABLE in captured.out
+    assert REASON_PR_VERIFIER_UNAVAILABLE in captured.out
+    assert AUDITOR_GITHUB_TOKEN_ENV in captured.out
 
 
 def test_cli_verify_pr_json_output_carries_the_verdict(

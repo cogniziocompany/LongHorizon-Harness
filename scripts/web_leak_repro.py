@@ -68,6 +68,13 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))
 
+# A bare-shell import of src writes __pycache__ caches, and the child server
+# this script spawns inherits this process's environment: turn bytecode
+# writing off for both before the first import.  The tree is audited
+# read-only and a write invalidates the audit.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 # The child server process needs the same interpreter this script runs under
 # so the measured app and the fixtures share one environment.
 _PYTHON = sys.executable
