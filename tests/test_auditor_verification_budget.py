@@ -398,6 +398,62 @@ def test_episode_caps_are_unchanged() -> None:
     assert "\nauditor = 300\n" in CONFIG_TEMPLATE
 
 
+_GUARDED_TEST_MODULES = (
+    "test_auditor_verification_budget.py",
+    "test_auditor_verification_reach.py",
+    "test_auditor_verify.py",
+    "conftest.py",
+)
+
+
+def _skip_or_xfail_markers(source: str) -> list[str]:
+    """Return every skip/xfail usage in ``source`` (decorators, calls, and
+    module-level ``pytestmark``), found via the AST so comments and strings
+    never count."""
+    import ast
+
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Attribute) and node.attr in {
+            "skip",
+            "skipif",
+            "xfail",
+            "importorskip",
+        }:
+            found.append(f"line {node.lineno}: .{node.attr}")
+        elif isinstance(node, ast.Name) and node.id == "pytestmark":
+            found.append(f"line {node.lineno}: pytestmark")
+    return found
+
+
+def test_skip_marker_detector_catches_each_form() -> None:
+    """Mutation proof: the detector must flag every marker form, or the
+    guard below would pass vacuously."""
+    for snippet in (
+        "import pytest\n@pytest.mark.skip(reason='x')\ndef test_a():\n    pass\n",
+        "import pytest\n@pytest.mark.skipif(True, reason='x')\ndef test_a():\n    pass\n",
+        "import pytest\n@pytest.mark.xfail\ndef test_a():\n    pass\n",
+        "import pytest\ndef test_a():\n    pytest.skip('x')\n",
+        "import pytest\ndef test_a():\n    pytest.xfail('x')\n",
+        "import pytest\nmod = pytest.importorskip('nope')\n",
+        "import pytest\npytestmark = pytest.mark.skip\n",
+    ):
+        assert _skip_or_xfail_markers(snippet), snippet
+    clean = "import pytest\n# pytest.mark.skip in a comment\ndef test_a():\n    assert 'pytest.skip' in 'pytest.skip'\n"
+    assert _skip_or_xfail_markers(clean) == []
+
+
 def test_no_new_skip_or_xfail_markers_in_this_change() -> None:
     """Deterministic guards must be executable everywhere; nothing in this
     change is allowed to duck behind a skip/xfail marker."""
+    from pathlib import Path
+
+    tests_dir = Path(__file__).resolve().parent
+    offenders = {}
+    for name in _GUARDED_TEST_MODULES:
+        path = tests_dir / name
+        assert path.is_file(), f"guarded test module missing: {name}"
+        markers = _skip_or_xfail_markers(path.read_text(encoding="utf-8"))
+        if markers:
+            offenders[name] = markers
+    assert offenders == {}, f"skip/xfail markers found: {offenders}"
