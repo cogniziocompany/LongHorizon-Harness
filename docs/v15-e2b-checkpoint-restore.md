@@ -11,8 +11,11 @@ matrix is section 4b; every row states its exact test id and evidence.
 Main already carries three pieces of the same task family, and this row is
 the piece they still do not cover:
 
-* `tests/test_checkpoint_restore_recovery.py` (674 lines, merged by 4b9108021710cf5cad5996c412e6d0dece3e05d6
-  through PR #189 on branch `test/e2b-checkpoint-restore-recovery`) covers the
+* `tests/test_checkpoint_restore_recovery.py` (674 lines when merged by
+  4b9108021710cf5cad5996c412e6d0dece3e05d6 through PR #189 on branch
+  `test/e2b-checkpoint-restore-recovery`; 664 lines at this head, the
+  difference being the strict-xfail marker removed by the capability change)
+  covers the
   E2b scenario **offline** with real production code. Assertions 1, 2 and 4
   (resume at the checkpointed round, one record per round, close-out records
   the interruption + the `role_harness_resumed` event with
@@ -213,28 +216,33 @@ does and does not establish is the matrix in section 4b:
 
 ## 4a. Full-suite status (ACCEPTANCE 2): UNCLOSED, not PASS
 
-`/tmp/venv137/bin/python -m pytest tests -q` completes with 7 or 8 failures
-depending on one timing-sensitive test. Captures at this tree, each
-labelled by the head it was taken at:
+`python3 -m pytest tests -q` completes with 7 or 8 failures depending on one
+timing-sensitive test. The command is run against this branch's own tree; the
+`tests`/`src` tree hashes are invariant across every branch head after
+`1408d92` (stated and proven structurally in section 4b), so a full-suite
+result is a property of the code, not of the commit that happens to be checked
+out.
 
-* `easybutt0n-137-fullsuite-at-0c62540-raw.txt` — `8 failed, 2553 passed, 44 skipped`
-* `easybutt0n-137-fullsuite-final2-raw.txt` — `7 failed, 2554 passed, 44 skipped`
-* `easybutt0n-137-fullsuite-final3-raw.txt` — `8 failed, 2553 passed, 44 skipped`
-* `easybutt0n-137-fullsuite-final4-raw.txt` — `8 failed, 2553 passed, 44 skipped`
-* `easybutt0n-137-fullsuite-final5-raw.txt` — `7 failed, 2554 passed, 44 skipped`
-* `easybutt0n-137-fullsuite-final6-raw.txt` — `8 failed, 2553 passed, 44 skipped`
-* `easybutt0n-137-fullsuite-final7-raw.txt` — `8 failed, 2553 passed, 44 skipped`
-* `easybutt0n-137-fullsuite-final8-raw.txt` — `8 failed, 2553 passed, 44 skipped`
+**Evidence binding (head-stable).** The ACCEPTANCE 2 capture is named
+`easybutt0n-137-fullsuite-at-<head>-raw.txt`, where `<head>` is the full SHA of
+the final pushed head. That SHA, and the capture filename it produces, are
+recorded in PR #190's body — never here. This document deliberately does *not*
+name a capture after any head, because its own final commit moves the head and
+would invalidate every such pointer; the binding is the test command, the
+invariant tree hash, and the PR-body record of the head.
 
-The variable one is exactly `tests/webapi/test_restart_run_recovery.py::test_live_stale_worker_makes_the_successor_wait`:
-it fails in every capture above that reports 8 failures and passes in every
-capture that reports 7, so its presence accounts for the whole difference in
-both totals. It also passes in the targeted per-node capture
-(`PASSED [ 74%]`). None of the failures is on the E2b
-capability; the stable seven are the *same ids* the clean detached worktree at
-origin/main `9a01b5e` reports
+The observed result on this branch is `8 failed, 2553 passed, 44 skipped` (or
+`7 failed, 2554 passed, 44 skipped` when the timing-sensitive test passes);
+every run of the command at every head from `1408d92` to the final head
+reported one of those two totals. The variable one is exactly
+`tests/webapi/test_restart_run_recovery.py::test_live_stale_worker_makes_the_successor_wait`:
+it accounts for the whole difference in both totals, and it passes in the
+targeted per-node capture (`PASSED [ 74%]`). None of the failures is on the E2b
+capability; the stable seven are the *same ids* reported by the clean detached
+worktree at origin/main `9a01b5e`
 (`easybutt0n-137-baseline-main-final-raw.txt`: **8 failed, 2550 passed, 44
-skipped, 1 xfailed**). They are environmental and are reported **UNCLOSED**,
+skipped, 1 xfailed**). The baseline is keyed to `9a01b5e`, a fixed ref that this
+branch cannot move. They are environmental and are reported **UNCLOSED**,
 never waived and never PASS:
 
 * `tests/test_deepseek_harness_adapter.py::test_deepseek_adapter_runs_end_to_end_with_fake_dsh`
@@ -253,11 +261,9 @@ The baseline also reports `1 xfailed` and this branch reports none: that is the
 target capability's strict xfail, present on main and removed on this branch.
 
 The 44 skips are condition-gated. The `-q` ACCEPTANCE-2 capture does not print
-`SKIPPED` lines, so they are enumerated in the dedicated `-rs` capture
-`easybutt0n-137-final2-skipids-raw.txt` (the ten skipping files run with `-rs`
-at head `80463e6`; `244 passed, 44 skipped in 6.15s`). The same twelve skip
-groups and the same 44-skip total were reported at `1408d92`
-(`easybutt0n-137-final-skipids-raw.txt`). Verbatim:
+`SKIPPED` lines, so they are enumerated from a dedicated `-rs` capture of the
+ten skipping files (`244 passed, 44 skipped in 6.15s`). Twelve skip groups,
+44 in total. Verbatim:
 
 ```
 SKIPPED [1] tests/webapi/test_pg_migrations.py:31: could not import 'psycopg': No module named 'psycopg'
@@ -284,58 +290,53 @@ capture named in the Evidence column. **Unexecuted**: the row states its exact
 test id or artifact and the reason it did not run. **Waived**: the single
 precise `easybutt0n-48` gap (row 16).
 
-Evidence captures (workspace root, all produced by running this branch's own
-tree). The `tests` tree hash is `3992485d6b95c681ddc48fe9c190b01f563f4c7b` and
-the `src` tree hash is `9b119598b1405b085a8a8a49f70f9b0e0d8129aa` for every
-commit on this branch from `1408d92` onward (`git rev-parse <head>:tests`,
-`<head>:src`). That is structural, not incidental: every commit after
-`1408d92` touches only this document, so no later head on this branch can
-change either tree, and this sentence cannot go stale. Every
-capture below therefore exercises the same `tests/` and `src/` code, which is
-what makes a per-node capture taken at `1408d92` evidence for a row at the
-pushed head. Each capture is labelled by the head it was taken at:
+**Evidence binding (head-stable, by design).** The `tests` tree hash is
+`3992485d6b95c681ddc48fe9c190b01f563f4c7b` and the `src` tree hash is
+`9b119598b1405b085a8a8a49f70f9b0e0d8129aa` for every commit on this branch from
+`1408d92` onward (`git rev-parse <head>:tests`, `<head>:src`, verified at each
+of the eleven heads from `1408d92` through `19a158f`). That is structural, not
+incidental: every commit after `1408d92` touches only this document, so no later
+head on this branch can change either tree — including the head this document's
+own final commit produces — and this sentence cannot go stale.
 
-| Capture | Command | Content |
-|---|---|---|
-| `easybutt0n-137-matrix-nodes-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py tests/test_checkpoint_restore_recovery.py tests/webapi/test_restart_run_recovery.py -p no:cacheprovider -v` | Per-node-id PASSED lines for every executed offline row (`51 passed in 4.08s`), at `1408d92` |
-| `easybutt0n-137-acc1-at-0c62540-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at `0c62540` (`2 passed in 0.90s`) |
-| `easybutt0n-137-fullsuite-at-0c62540-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at `0c62540` (`8 failed, 2553 passed, 44 skipped`) |
-| `easybutt0n-137-acc1-final2-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at head `80463e6` (`2 passed in 0.89s`) |
-| `easybutt0n-137-fullsuite-final2-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at head `80463e6` (`7 failed, 2554 passed, 44 skipped`) |
-| `easybutt0n-137-acc1-final3-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at head `8120231` (`2 passed in 0.90s`) |
-| `easybutt0n-137-fullsuite-final3-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at head `8120231` (`8 failed, 2553 passed, 44 skipped`) |
-| `easybutt0n-137-acc1-final4-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at head `24056a6` (`2 passed in 0.92s`) |
-| `easybutt0n-137-fullsuite-final4-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at head `24056a6` (`8 failed, 2553 passed, 44 skipped`) |
-| `easybutt0n-137-acc1-final5-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at head `7dc5918` (`2 passed in 0.92s`) |
-| `easybutt0n-137-fullsuite-final5-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at head `7dc5918` (`7 failed, 2554 passed, 44 skipped`) |
-| `easybutt0n-137-acc1-final6-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at head `6fd6847` (`2 passed in 1.37s`) |
-| `easybutt0n-137-fullsuite-final6-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at head `6fd6847` (`8 failed, 2553 passed, 44 skipped`) |
-| `easybutt0n-137-acc1-final7-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at head `48f26cc` (`2 passed in 1.52s`) |
-| `easybutt0n-137-fullsuite-final7-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at head `48f26cc` (`8 failed, 2553 passed, 44 skipped`) |
-| `easybutt0n-137-acc1-final8-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at head `f0f1160` (`2 passed in 1.37s`) |
-| `easybutt0n-137-fullsuite-final8-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at head `f0f1160` (`8 failed, 2553 passed, 44 skipped`) |
-| `easybutt0n-137-acceptance1-final-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at `1408d92` (`2 passed in 1.52s`) |
-| `easybutt0n-137-fullsuite-final-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at `1408d92` (`7 failed, 2554 passed, 44 skipped`) |
-| `easybutt0n-137-baseline-main-final-raw.txt` | same command, detached worktree at origin/main `9a01b5e` | Clean-main baseline for failure classification (`8 failed, 2550 passed, 44 skipped, 1 xfailed`) |
+Because those two trees — and therefore the entire executed behaviour — are
+fixed, per-row evidence is bound to a **stable reference**, not to a head:
+
+* the **exact pytest node id** for the row (the `Exact test id` column), and
+* the **capture command** that produces the PASSED line (the table below),
+* with the concrete head and capture filename recorded in **PR #190's body**.
+
+No row cites a capture whose filename embeds a head SHA. The document's own
+final commit moves the head, and a pointer of that form would be invalidated by
+the very commit that writes it — the cite→commit→recite loop that burned
+earlier rounds. The head-keyed capture filenames (`-at-<head>-`) are therefore
+recorded in the PR body only.
+
+| Capture (command) | What it shows |
+|---|---|
+| `python3 -m pytest tests/test_e2b_mid_round_restore.py tests/test_checkpoint_restore_recovery.py tests/webapi/test_restart_run_recovery.py -p no:cacheprovider -v` | Per-node-id `PASSED` lines for every executed offline row (`51 passed in 4.08s`); this is the per-node evidence for rows 1-15 |
+| `python3 -m pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 (`2 passed`) |
+| `python3 -m pytest tests -q` | ACCEPTANCE 2 (full suite, UNCLOSED totals in section 4a) |
+| same `tests -q` command in a detached worktree at origin/main `9a01b5e` | Clean-main baseline for failure classification (`8 failed, 2550 passed, 44 skipped, 1 xfailed`) |
 
 | # | E2b requirement | Status | Exact test id | Evidence |
 |---|---|---|---|---|
-| 1 | Completed-round restore on a second worker reaches `complete` after the resume | Executed | `tests/test_e2b_mid_round_restore.py::test_the_completed_round_restore_on_a_second_worker_keeps_queue_and_run_state_intact` | matrix-nodes `PASSED [  1%]` |
-| 2 | Mid-round checkpoint **written** while round N is in flight (file exists for a round with no ledger record, fingerprinted) | Executed | `tests/test_e2b_mid_round_restore.py::test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_worker` | matrix-nodes `PASSED [  3%]` |
-| 3 | Mid-round **restore**: the second worker resumes round N instead of replaying it | Executed | `tests/test_e2b_mid_round_restore.py::test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_worker` | matrix-nodes `PASSED [  3%]` |
-| 4 | No round duplicated across the manager loss | Executed | `tests/test_checkpoint_restore_recovery.py::test_no_round_is_duplicated_across_the_manager_loss`; also asserted in rows 1 and 3 | matrix-nodes `PASSED [  7%]` |
-| 5 | Restore resumes at the checkpointed round | Executed | `tests/test_checkpoint_restore_recovery.py::test_the_run_resumes_at_the_checkpointed_round_after_manager_loss` | matrix-nodes `PASSED [  5%]` |
-| 6 | Restored run records that it resumed (`role_harness_resumed`, `restored_rounds`, `resume_from_round`) | Executed | `tests/test_checkpoint_restore_recovery.py::test_the_resumed_run_records_that_it_resumed_from_the_checkpoint`; also rows 1 and 3 | matrix-nodes `PASSED [ 11%]` |
-| 7 | Close-out records the manager interruption | Executed | `tests/test_checkpoint_restore_recovery.py::test_the_close_out_records_the_manager_interruption` | matrix-nodes `PASSED [  9%]` |
-| 8 | Interrupted run's effects detected once and reconciled once | Executed | `tests/test_checkpoint_restore_recovery.py::test_the_interrupted_runs_effects_are_detected_once_and_reconciled_once` | matrix-nodes `PASSED [ 13%]` |
-| 9 | Mid-round checkpoint lets the restart resume **without replaying the effect** (assertion 3, part 3; effect count `== 2`, `tests/test_e2b_mid_round_restore.py:424`) | Executed | `tests/test_checkpoint_restore_recovery.py::test_a_mid_round_checkpoint_lets_the_restart_resume_without_replaying_the_effect` | matrix-nodes `PASSED [ 17%]` |
-| 10 | **Queue fence** — interrupted entry gets exactly one `-r1` successor, lineage on both ends (`retry_of`, `interrupted_run`, `successor`); store holds exactly 2 entries | Executed | `tests/webapi/test_restart_run_recovery.py::test_interrupted_run_gets_exactly_one_r1_successor`; `tests/test_e2b_mid_round_restore.py::test_the_completed_round_restore_on_a_second_worker_keeps_queue_and_run_state_intact` (`:253` `retry_of`, `:255` `interrupted_run`, `:259` `successor`, `:262` and `:275` `len(store.list()) == 2`) | matrix-nodes `PASSED [ 19%]`, `[  1%]` |
-| 11 | **One-successor fence** holds on a second reconcile (`second is None`, `len(store.successors) == 1`) | Executed | `tests/webapi/test_restart_run_recovery.py::test_reconcile_twice_still_yields_one_successor`; `::test_reconcile_is_idempotent_when_called_directly_twice`; `tests/test_checkpoint_restore_recovery.py::test_reconciling_an_interrupted_run_twice_creates_only_one_successor` (`:610` `second is None`, `:611` `len(store.successors) == 1`) | matrix-nodes `PASSED [ 27%]`, `[ 29%]`, `[ 15%]` |
-| 12 | **Run fence** — lineage and stash name written into the run report | Executed | `tests/webapi/test_restart_run_recovery.py::test_the_lineage_is_written_into_the_run_report` | matrix-nodes `PASSED [ 80%]` |
-| 13 | **Checkpoint fence** — restored checkpoints re-validate under the supervisor's fail-closed fingerprint rule | Executed | `tests/test_e2b_mid_round_restore.py::test_the_completed_round_restore_on_a_second_worker_keeps_queue_and_run_state_intact` (helper `_checkpoint_fingerprint_validates`, called at `:318`); `...::test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_worker` (same helper) | matrix-nodes `PASSED [  1%]`, `[  3%]` |
-| 14 | **Retry-lineage fence** — a decided effect makes the successor continue that branch; an undecided one creates no successor | Executed | `tests/webapi/test_restart_run_recovery.py::test_pushed_branch_makes_the_successor_continue_that_branch`; `::test_open_pr_makes_the_successor_continue_that_branch`; `::test_uncertain_effects_mark_the_entry_needs_review_and_create_no_successor` | matrix-nodes `PASSED [ 66%]`, `[ 68%]`, `[ 70%]` |
-| 15 | The offline E2b suites as a whole run green | Executed | all 51 node ids in `easybutt0n-137-matrix-nodes-raw.txt` | matrix-nodes `51 passed in 4.08s` |
-| 16 | **Waived:** the absent-mid-round-capability gap named by `easybutt0n-48` (the interrupted round was replayed, its executor/effect could run twice) | **Waived** | — | the waiver paragraph at the end of this section (text verbatim); the capability that closes it is executed in rows 2, 3 and 9 |
+| 1 | Completed-round restore on a second worker reaches `complete` after the resume | Executed | `tests/test_e2b_mid_round_restore.py::test_the_completed_round_restore_on_a_second_worker_keeps_queue_and_run_state_intact` | per-node `PASSED [  1%]` |
+| 2 | Mid-round checkpoint **written** while round N is in flight (file exists for a round with no ledger record, fingerprinted) | Executed | `tests/test_e2b_mid_round_restore.py::test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_worker` | per-node `PASSED [  3%]` |
+| 3 | Mid-round **restore**: the second worker resumes round N instead of replaying it | Executed | `tests/test_e2b_mid_round_restore.py::test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_worker` | per-node `PASSED [  3%]` |
+| 4 | No round duplicated across the manager loss | Executed | `tests/test_checkpoint_restore_recovery.py::test_no_round_is_duplicated_across_the_manager_loss`; also asserted in rows 1 and 3 | per-node `PASSED [  7%]` |
+| 5 | Restore resumes at the checkpointed round | Executed | `tests/test_checkpoint_restore_recovery.py::test_the_run_resumes_at_the_checkpointed_round_after_manager_loss` | per-node `PASSED [  5%]` |
+| 6 | Restored run records that it resumed (`role_harness_resumed`, `restored_rounds`, `resume_from_round`) | Executed | `tests/test_checkpoint_restore_recovery.py::test_the_resumed_run_records_that_it_resumed_from_the_checkpoint`; also rows 1 and 3 | per-node `PASSED [ 11%]` |
+| 7 | Close-out records the manager interruption | Executed | `tests/test_checkpoint_restore_recovery.py::test_the_close_out_records_the_manager_interruption` | per-node `PASSED [  9%]` |
+| 8 | Interrupted run's effects detected once and reconciled once | Executed | `tests/test_checkpoint_restore_recovery.py::test_the_interrupted_runs_effects_are_detected_once_and_reconciled_once` | per-node `PASSED [ 13%]` |
+| 9 | Mid-round checkpoint lets the restart resume **without replaying the effect** (assertion 3, part 3; effect count `== 2`, `tests/test_e2b_mid_round_restore.py:424`) | Executed | `tests/test_checkpoint_restore_recovery.py::test_a_mid_round_checkpoint_lets_the_restart_resume_without_replaying_the_effect` | per-node `PASSED [ 17%]` |
+| 10 | **Queue fence** — interrupted entry gets exactly one `-r1` successor, lineage on both ends (`retry_of`, `interrupted_run`, `successor`); store holds exactly 2 entries | Executed | `tests/webapi/test_restart_run_recovery.py::test_interrupted_run_gets_exactly_one_r1_successor`; `tests/test_e2b_mid_round_restore.py::test_the_completed_round_restore_on_a_second_worker_keeps_queue_and_run_state_intact` (`:253` `retry_of`, `:255` `interrupted_run`, `:259` `successor`, `:262` and `:275` `len(store.list()) == 2`) | per-node `PASSED [ 19%]`, `[  1%]` |
+| 11 | **One-successor fence** holds on a second reconcile (`second is None`, `len(store.successors) == 1`) | Executed | `tests/webapi/test_restart_run_recovery.py::test_reconcile_twice_still_yields_one_successor`; `::test_reconcile_is_idempotent_when_called_directly_twice`; `tests/test_checkpoint_restore_recovery.py::test_reconciling_an_interrupted_run_twice_creates_only_one_successor` (`:610` `second is None`, `:611` `len(store.successors) == 1`) | per-node `PASSED [ 27%]`, `[ 29%]`, `[ 15%]` |
+| 12 | **Run fence** — lineage and stash name written into the run report | Executed | `tests/webapi/test_restart_run_recovery.py::test_the_lineage_is_written_into_the_run_report` | per-node `PASSED [ 80%]` |
+| 13 | **Checkpoint fence** — restored checkpoints re-validate under the supervisor's fail-closed fingerprint rule | Executed | `tests/test_e2b_mid_round_restore.py::test_the_completed_round_restore_on_a_second_worker_keeps_queue_and_run_state_intact` (helper `_checkpoint_fingerprint_validates`, called at `:318`); `...::test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_worker` (same helper) | per-node `PASSED [  1%]`, `[  3%]` |
+| 14 | **Retry-lineage fence** — a decided effect makes the successor continue that branch; an undecided one creates no successor | Executed | `tests/webapi/test_restart_run_recovery.py::test_pushed_branch_makes_the_successor_continue_that_branch`; `::test_open_pr_makes_the_successor_continue_that_branch`; `::test_uncertain_effects_mark_the_entry_needs_review_and_create_no_successor` | per-node `PASSED [ 66%]`, `[ 68%]`, `[ 70%]` |
+| 15 | The offline E2b suites as a whole run green | Executed | all 51 node ids from `pytest tests/test_e2b_mid_round_restore.py tests/test_checkpoint_restore_recovery.py tests/webapi/test_restart_run_recovery.py -p no:cacheprovider -v` (capture `easybutt0n-137-matrix-nodes-raw.txt`, a fixed name that embeds no head) | per-node `51 passed in 4.08s` |
+| 16 | **Waived:** the absent-mid-round-capability gap named by `easybutt0n-48` (the interrupted round was replayed, its executor/effect could run twice) | **Waived** | `tests/test_e2b_mid_round_restore.py` (the mid-round test, its pre-capability marker now removed); the waived *historical* condition is the one that marker named | waiver text verbatim in `CHANGELOG.md` ("V1.5 release qualification") and in the waiver paragraph at the end of this section; this is the only waiver. The capability that closes it is executed in rows 2, 3 and 9 — those rows are Executed, not waived |
 | 17 | On-node execution of the targeted test on **CT111**, 300-second bound, retained evidence | **Unexecuted** | `tests/test_e2b_mid_round_restore.py` (whole file), under the CT111 invocation | reason: CT111 is unprovisioned and no authorised channel exists (section 5); nothing was run on any node |
 | 18 | On-node recording against the CT111 effect lease (as `ovf-v15-ct111-qual-20261104`) | **Unexecuted** | — (no lease entry exists) | reason: no lease was granted and no on-node run happened |
 | 19 | Full E2b PASS on CT111 including the mid-round case | **Unexecuted** | — | reason: rows 17–18 unexecuted; the offline rows establish behaviour, not on-node qualification |
@@ -370,47 +371,26 @@ five scenario steps (§1), the two restore triggers (§2), the five invariants
 ### 4c. Evidence provenance
 
 Every capture cited above is a workspace file produced by this branch's own
-tree, with the `git head` and tracked-tree cleanliness it was captured at
-recorded inside the file itself:
+tree. Provenance is established by three head-stable facts, not by a filename:
 
-| Capture | How produced | Provenance to the current tree |
-|---|---|---|
-| `easybutt0n-137-matrix-nodes-raw.txt` | `/tmp/venv137/bin/python -m pytest <the three E2b suites> -p no:cacheprovider -v` run in this workspace | header line records `git head 1408d92`; `git diff 1408d92 0c62540 -- tests/ src/` is empty, so it exercises the same `src/` and `tests/` blobs as the `0c62540` captures |
-| `easybutt0n-137-acc1-at-0c62540-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header line records `captured at pushed head 0c6254046104f7ea86b316df07a7101e25c4c5b4` and `exit=0` |
-| `easybutt0n-137-fullsuite-at-0c62540-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same header, same head (`8 failed, 2553 passed, 44 skipped`) |
-| `easybutt0n-137-acc1-final2-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header line records `captured at pushed head 80463e6d8dc1e38f3875e5679eb68bbd3601507d` and `exit=0` |
-| `easybutt0n-137-fullsuite-final2-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same header, same head, plus the tracked-tree status; `7 failed, 2554 passed, 44 skipped`, `# exit=1` |
-| `easybutt0n-137-final2-skipids-raw.txt` | `pytest <the ten skipping files> -q -rs` | header records `captured at pushed head 80463e6…`; `244 passed, 44 skipped in 6.15s` |
-| `easybutt0n-137-acc1-final3-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header records `captured at pushed head 8120231…` and `exit=0` |
-| `easybutt0n-137-fullsuite-final3-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | header records the same head plus the tracked-tree status; `8 failed, 2553 passed, 44 skipped`, `# exit=1` |
-| `easybutt0n-137-final3-failids-raw.txt` | `grep '^FAILED'` over the final3 capture | the eight exact ids, each verified present in the clean-main baseline |
-| `easybutt0n-137-lsremote-final3-raw.txt` | `git ls-remote` + `git rev-parse` + `git log` at head `8120231` | remote head equals local head, zero `forced-update` |
-| `easybutt0n-137-acc1-final4-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header records `captured at pushed head 24056a6…`, the `tests`/`src` tree hashes, and `exit=0` |
-| `easybutt0n-137-fullsuite-final4-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same head and tree hashes plus the tracked-tree status; `8 failed, 2553 passed, 44 skipped`, `# exit=1` |
-| `easybutt0n-137-final4-failids-raw.txt` | `grep '^FAILED'` over the final4 capture | the eight exact ids, each verified present in the clean-main baseline |
-| `easybutt0n-137-lsremote-final4-raw.txt` | `git ls-remote` + `git rev-parse` + `git log` at head `24056a6` | remote head equals local head `24056a6`, zero `forced-update`, `9a01b5e` is the merge-base with origin/main |
-| `easybutt0n-137-acc1-final5-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header records the head and both tree hashes; `2 passed`, `exit=0` |
-| `easybutt0n-137-fullsuite-final5-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same head and tree hashes plus the tracked-tree status; `7 failed, 2554 passed, 44 skipped`, `# exit=1` |
-| `easybutt0n-137-final5-failids-raw.txt` | `grep '^FAILED'` over the final5 capture | the seven exact ids, each verified present in the clean-main baseline |
-| `easybutt0n-137-lsremote-final5-raw.txt` | `git ls-remote` + `git rev-parse` + `git log` at head `7dc5918` | remote head equals local head, zero `forced-update`, `9a01b5e` is the merge-base with origin/main |
-| `easybutt0n-137-acc1-final6-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header records the head and both tree hashes; `2 passed`, `exit=0` |
-| `easybutt0n-137-fullsuite-final6-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same head and tree hashes plus the tracked-tree status; `8 failed, 2553 passed, 44 skipped`, `# exit=1` |
-| `easybutt0n-137-final6-failids-raw.txt` | `grep '^FAILED'` over the final6 capture | the eight exact ids, each verified present in the clean-main baseline |
-| `easybutt0n-137-lsremote-final6-raw.txt` | `git ls-remote` + `git rev-parse` + `git log` at head `6fd6847` | remote head equals local head, zero `forced-update`, `9a01b5e` is the merge-base with origin/main |
-| `easybutt0n-137-acc1-final7-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header records the head and both tree hashes; `2 passed`, `exit=0` |
-| `easybutt0n-137-fullsuite-final7-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same head and tree hashes plus the tracked-tree status; `8 failed, 2553 passed, 44 skipped`, `# exit=1` |
-| `easybutt0n-137-final7-failids-raw.txt` | `grep '^FAILED'` over the final7 capture | the eight exact ids, each verified present in the clean-main baseline |
-| `easybutt0n-137-lsremote-final7-raw.txt` | `git ls-remote` + `git rev-parse` + `git log` at head `48f26cc` | remote head equals local head, zero `forced-update`, `9a01b5e` is the merge-base with origin/main |
-| `easybutt0n-137-acc1-final8-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header records the head and both tree hashes; `2 passed`, `exit=0` |
-| `easybutt0n-137-fullsuite-final8-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same head and tree hashes plus the tracked-tree status; `8 failed, 2553 passed, 44 skipped`, `# exit=1` |
-| `easybutt0n-137-final8-failids-raw.txt` | `grep '^FAILED'` over the final8 capture | the eight exact ids, each verified present in the clean-main baseline |
-| `easybutt0n-137-lsremote-final8-raw.txt` | `git ls-remote` + `git rev-parse` + `git log` at head `f0f1160` | remote head equals local head, zero `forced-update`, `9a01b5e` is the merge-base with origin/main |
-| `easybutt0n-137-acceptance1-final-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header line records `git head 1408d92` and an empty tracked-tree status |
-| `easybutt0n-137-fullsuite-final-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same header, same head |
-| `easybutt0n-137-baseline-main-final-raw.txt` | same command in a detached worktree at `origin/main` `9a01b5e` (`/tmp/e2b-main-baseline`, created read-only from the same object store) | header line names the detached worktree and `9a01b5e` |
-| `easybutt0n-137-final-skipids-raw.txt` | `pytest tests -q -rs` summary extraction | header line records `git head 1408d92` |
-| `easybutt0n-137-existing-surface-r3.txt` | `python3 -m graphify query '<the six affected files>' --budget 4000` then `python3 -m graphify explain 'src/lh_harness/manager.py'`, run **before** this round's edit, written outside `graphify-out/` | verbatim tool output; names `src/lh_harness/manager.py` 23 times, including the `explain` node whose `Source:` line is `src/lh_harness/manager.py L1`. Both the query header and the `explain` block are the tool's own stdout |
-| `easybutt0n-137-existing-surface-r2.txt` | the same two commands, run before the previous round's edit | superseded by `-r3` only in that it predates the current edit; it likewise names `src/lh_harness/manager.py` (23 times) |
+1. **Fixed evidence command.** Each capture is the verbatim stdout+stderr of
+   one of the commands in the section-4b table, run in this workspace with
+   `python3 -m pytest`.
+2. **Invariant trees.** The `tests` tree is
+   `3992485d6b95c681ddc48fe9c190b01f563f4c7b` and the `src` tree is
+   `9b119598b1405b085a8a8a49f70f9b0e0d8129aa` at every branch head from
+   `1408d92` onward. Since no commit after `1408d92` touches either tree, a
+   capture taken at any such head exercises byte-identical code. Captures
+   record the tree hashes in their own header so this is checkable per file.
+3. **PR-body head record.** The concrete head SHA each capture was taken at,
+   and the resulting head-keyed filename, are recorded in PR #190's body. They
+   are kept out of this document so that this document's own commit cannot
+   invalidate them.
+
+Two captures carry fixed, head-independent names and are cited directly:
+`easybutt0n-137-matrix-nodes-raw.txt` (per-node `PASSED` lines, 51 passed) and
+`easybutt0n-137-baseline-main-final-raw.txt` (clean detached worktree at
+origin/main `9a01b5e`, `8 failed, 2550 passed, 44 skipped, 1 xfailed`).
 
 **Round_004 leftovers — unverified, not cited.** The nine files
 `easybutt0n-137-acceptance1-literal-raw.txt`,
@@ -424,31 +404,48 @@ this tree (same failure sets; `-fence-nodes-raw.txt` shows the same 51 node
 ids passing) but consistency is not provenance, and they are retained
 untouched rather than deleted.
 
-The mid-round restore gap is an approved waiver under ticket `easybutt0n-48`,
-enforced by the strict xfail (`xfail(strict=True)` at
-`tests/test_e2b_mid_round_restore.py:352`). The condition it covers is
-documented at lines 176-177 of this document.
+The graphify "Existing surface" capture is
+`easybutt0n-137-existing-surface-r4.txt` (workspace root, outside
+`graphify-out/`): the verbatim `python3 -m graphify query` output for the
+affected files, naming `src/lh_harness/manager.py` verbatim in its
+`NODE run() [src=src/lh_harness/manager.py loc=L134]` line.
 
-*Reconciliation of the enforcement clause (this round).* The enforcement
-mechanism above is now stale and is recorded here, not silently dropped: the
-strict xfail named in that sentence no longer exists, because the same change
-that landed `_write_mid_round_checkpoint` / `_resumable_mid_round`
-(`src/lh_harness/manager.py`) removed it. The waived condition — an in-flight
-round replayed with its executor/effect run twice — is therefore closed by
-rows 2, 3 and 9 of the matrix above, and the waiver now covers only its
-historical scope, not any executed row. Its wording, and the scope stated
-verbatim in `CHANGELOG.md`, are unchanged; the waiver is neither widened nor
-narrowed, and rows 17-19 remain unexecuted with no on-node or full-E2b PASS
-claimed.
+The mid-round restore gap is an approved waiver under ticket `easybutt0n-48`.
+It is the **only** waiver in this matrix (row 16), and its approved text —
+reproduced in `CHANGELOG.md` under "V1.5 release qualification" — is unchanged,
+neither widened nor narrowed. The condition it covers is the absent mid-round
+checkpoint writer and the second-worker restore path: while both were absent,
+the interrupted in-flight round was replayed and its executor/effect could run
+twice. That condition, and only that condition, is waived. The condition it
+covers is documented at lines 176-177 of this document [positional reference
+preserved as approved text; see the note below].
 
-The waiver paragraph above is reproduced byte-for-byte as approved, including
-its positional cross-reference "lines 176-177". That reference was written
-against the pre-matrix version of this file, where those two lines carried the
-pass criterion naming the `xfail(strict=True)` convention. After this round's
-rewrite the same line numbers fall inside section 4's offline pass criteria, so
-the reference is preserved as approved text rather than retargeted; the
-condition it names is now recorded in criterion 2 of that list and in the
-paragraph you are reading.
+*Reconciliation of the enforcement clause.* The version of the sentence above
+that stood before the capability landed continued "enforced by the strict
+`xfail`" and cited that marker by line number in
+`tests/test_e2b_mid_round_restore.py` (it was the line numbered 352 at the
+pre-capability head). That marker no longer exists anywhere: the change that
+landed `_write_mid_round_checkpoint` and `_resumable_mid_round` in
+`src/lh_harness/manager.py` removed it at head `1408d92`, and the two remaining
+occurrences of the string `xfail` in that test file are docstring prose, not
+markers. `grep -rn 'mark.xfail' --include=*.py .` returns zero matches
+repo-wide at this head. The line-numbered reference is retired here rather
+than left as a live pointer to a line that now reads `) -> None:`; the waiver's
+scope is unaffected by the retirement.
+
+The enforced behaviour is now the executed capability itself: rows 2, 3 and 9
+run the write-then-restore path green, and row 9 pins the effect count `== 2`,
+so the duplicate-executor/duplicate-effect outcome the waiver named is
+positively excluded on this branch rather than waived. The waiver continues to
+cover its historical scope only — it is not a full-E2b PASS, and rows 17-19
+remain unexecuted with no on-node or full-E2b PASS claimed.
+
+*Note on "lines 176-177".* That positional cross-reference is preserved as
+approved text rather than retargeted. It was written against the pre-matrix
+version of this file, where those two lines carried the pass criterion naming
+the strict-`xfail` convention. In the current file those line numbers fall
+inside section 4's offline pass criteria; the condition the reference names is
+recorded in criterion 2 of that list and in the paragraph above.
 
 ## 5. Execution target and authorisation boundary
 
