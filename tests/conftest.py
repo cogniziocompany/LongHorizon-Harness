@@ -52,6 +52,7 @@ else:
 # written, and the suite fails everywhere the service actually runs.  Tests
 # that exercise the fleet reporter set their own environment.
 import os as _os
+import tempfile as _tempfile
 
 for _var in ("LH_HARNESS_FLEET_URL", "LH_HARNESS_FLEET_KEY", "LH_HARNESS_FLEET_NODE", "LH_HARNESS_FLEET_LABELS"):
     _os.environ.pop(_var, None)
@@ -170,6 +171,33 @@ def _auditor_verification_budget_state_isolated(monkeypatch, tmp_path):
     monkeypatch.delenv("LH_HARNESS_AUDITOR_EPISODE_ID", raising=False)
 
 
+@_pytest_task300.fixture(autouse=True)
+def _auditor_gh_config_dir_isolated(monkeypatch, tmp_path):
+    """easybutt0n-17: verifier gh-config scratch dirs stay in the sandbox.
+
+    ``build_auditor_subprocess_env`` points ``gh`` at a fresh, empty config
+    directory (so no stored credential can be found) and creates it in the
+    system temp directory -- one per call, and nothing ever removes it.
+    Every test that builds an auditor child environment therefore dropped
+    an ``lh-auditor-gh-config-*`` dir into the real /tmp (15 per run for
+    the child-environment suite alone, and they accumulate forever).
+    Redirect that fallback to the test's own tmp directory.  Callers that
+    pass ``config_dir`` explicitly, and the subprocess-launched verifier
+    (whose fail-closed preflight means no directory is ever created), are
+    untouched.
+    """
+
+    import lh_harness.auditor_env as _auditor_env
+
+    _original = _auditor_env.auditor_gh_config_dir
+    _target = tmp_path / "auditor-gh-config"
+
+    def _isolated(config_dir=None):
+        return _original(_target if config_dir is None else config_dir)
+
+    monkeypatch.setattr(_auditor_env, "auditor_gh_config_dir", _isolated)
+
+
 @_pytest_task300.fixture(autouse=True, scope="session")
 def _workspace_neutral_bytecode_scrub():
     """easybutt0n-17: the suite leaves the checkout exactly as it found it.
@@ -204,10 +232,22 @@ def _workspace_neutral_bytecode_scrub():
                     loose.add(Path(root) / name)
         return caches, loose
 
+    # The two /tmp leak families the previous audits actually saw: verifier
+    # gh-config scratch dirs and the shared verification-budget counter
+    # dir.  Only entries the session created are removed at its end --
+    # pre-existing ones (including any real episode's counter) stay.
+    tmp_root = Path(_os.environ.get("TMPDIR") or _tempfile.gettempdir())
+    gh_config_prefix = tmp_root / "lh-auditor-gh-config-"
+
     pre_caches, pre_loose = _bytecode_paths()
+    pre_gh_dirs = set(gh_config_prefix.parent.glob(gh_config_prefix.name + "*"))
+
     yield
+
     post_caches, post_loose = _bytecode_paths()
     for path in sorted(post_caches - pre_caches, key=lambda p: len(p.parts), reverse=True):
         _shutil.rmtree(path, ignore_errors=True)
     for path in post_loose - pre_loose:
         path.unlink(missing_ok=True)
+    for path in set(gh_config_prefix.parent.glob(gh_config_prefix.name + "*")) - pre_gh_dirs:
+        _shutil.rmtree(path, ignore_errors=True)
