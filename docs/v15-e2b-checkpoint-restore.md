@@ -214,11 +214,12 @@ does and does not establish is the matrix in section 4b:
 ## 4a. Full-suite status (ACCEPTANCE 2): UNCLOSED, not PASS
 
 `/tmp/venv137/bin/python -m pytest tests -q` completes with 7 or 8 failures
-depending on one timing-sensitive test. Three captures at this tree:
+depending on one timing-sensitive test. Four captures at this tree:
 
 * `easybutt0n-137-fullsuite-at-0c62540-raw.txt` — `8 failed, 2553 passed, 44 skipped`
 * `easybutt0n-137-fullsuite-final2-raw.txt` — `7 failed, 2554 passed, 44 skipped`
 * `easybutt0n-137-fullsuite-final3-raw.txt` — `8 failed, 2553 passed, 44 skipped`
+* `easybutt0n-137-fullsuite-final4-raw.txt` — `8 failed, 2553 passed, 44 skipped`
 
 The variable one is exactly `tests/webapi/test_restart_run_recovery.py::test_live_stale_worker_makes_the_successor_wait`,
 which fails in the first and third captures and passes in the second (and
@@ -278,9 +279,13 @@ test id or artifact and the reason it did not run. **Waived**: the single
 precise `easybutt0n-48` gap (row 16).
 
 Evidence captures (workspace root, all produced by running this branch's own
-tree). `git diff 1408d92 0c62540 -- tests/ src/` is empty, so `tests/` and
-`src/` are byte-identical between the two heads and the `1408d92` per-node
-capture is a capture of the same test code the `0c62540` captures ran:
+tree). The `tests` tree hash is `3992485d6b95c681ddc48fe9c190b01f563f4c7b` and
+the `src` tree hash is `9b119598b1405b085a8a8a49f70f9b0e0d8129aa` at every head
+from `1408d92` through `24056a6` (`git rev-parse <head>:tests`, `<head>:src`),
+and this branch's commits since `1408d92` touch only this document. Every
+capture below therefore exercises the same `tests/` and `src/` code, which is
+what makes a per-node capture taken at `1408d92` evidence for a row at the
+pushed head. Each capture is labelled by the head it was taken at:
 
 | Capture | Command | Content |
 |---|---|---|
@@ -289,8 +294,10 @@ capture is a capture of the same test code the `0c62540` captures ran:
 | `easybutt0n-137-fullsuite-at-0c62540-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at `0c62540` (`8 failed, 2553 passed, 44 skipped`) |
 | `easybutt0n-137-acc1-final2-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at head `80463e6` (`2 passed in 0.89s`) |
 | `easybutt0n-137-fullsuite-final2-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at head `80463e6` (`7 failed, 2554 passed, 44 skipped`) |
-| `easybutt0n-137-acc1-final3-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at final head `8120231` (`2 passed in 0.90s`) |
-| `easybutt0n-137-fullsuite-final3-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at final head `8120231` (`8 failed, 2553 passed, 44 skipped`) |
+| `easybutt0n-137-acc1-final3-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at head `8120231` (`2 passed in 0.90s`) |
+| `easybutt0n-137-fullsuite-final3-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at head `8120231` (`8 failed, 2553 passed, 44 skipped`) |
+| `easybutt0n-137-acc1-final4-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at head `24056a6` (`2 passed in 0.92s`) |
+| `easybutt0n-137-fullsuite-final4-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at head `24056a6` (`8 failed, 2553 passed, 44 skipped`) |
 | `easybutt0n-137-acceptance1-final-raw.txt` | `pytest tests/test_e2b_mid_round_restore.py -q` | ACCEPTANCE 1 at `1408d92` (`2 passed in 1.52s`) |
 | `easybutt0n-137-fullsuite-final-raw.txt` | `pytest tests -q` | ACCEPTANCE 2 at `1408d92` (`7 failed, 2554 passed, 44 skipped`) |
 | `easybutt0n-137-baseline-main-final-raw.txt` | same command, detached worktree at origin/main `9a01b5e` | Clean-main baseline for failure classification (`8 failed, 2550 passed, 44 skipped, 1 xfailed`) |
@@ -361,7 +368,11 @@ recorded inside the file itself:
 | `easybutt0n-137-acc1-final3-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header records `captured at pushed head 8120231…` and `exit=0` |
 | `easybutt0n-137-fullsuite-final3-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | header records the same head plus the tracked-tree status; `8 failed, 2553 passed, 44 skipped`, `# exit=1` |
 | `easybutt0n-137-final3-failids-raw.txt` | `grep '^FAILED'` over the final3 capture | the eight exact ids, each verified present in the clean-main baseline |
-| `easybutt0n-137-lsremote-final3-raw.txt` | `git ls-remote` + `git rev-parse` + `git log` at the final head | remote head equals local head `8120231`, zero `forced-update` |
+| `easybutt0n-137-lsremote-final3-raw.txt` | `git ls-remote` + `git rev-parse` + `git log` at head `8120231` | remote head equals local head, zero `forced-update` |
+| `easybutt0n-137-acc1-final4-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header records `captured at pushed head 24056a6…`, the `tests`/`src` tree hashes, and `exit=0` |
+| `easybutt0n-137-fullsuite-final4-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same head and tree hashes plus the tracked-tree status; `8 failed, 2553 passed, 44 skipped`, `# exit=1` |
+| `easybutt0n-137-final4-failids-raw.txt` | `grep '^FAILED'` over the final4 capture | the eight exact ids, each verified present in the clean-main baseline |
+| `easybutt0n-137-lsremote-final4-raw.txt` | `git ls-remote` + `git rev-parse` + `git log` at head `24056a6` | remote head equals local head `24056a6`, zero `forced-update`, `9a01b5e` is the merge-base with origin/main |
 | `easybutt0n-137-acceptance1-final-raw.txt` | `/tmp/venv137/bin/python -m pytest tests/test_e2b_mid_round_restore.py -q` | header line records `git head 1408d92` and an empty tracked-tree status |
 | `easybutt0n-137-fullsuite-final-raw.txt` | `/tmp/venv137/bin/python -m pytest tests -q` | same header, same head |
 | `easybutt0n-137-baseline-main-final-raw.txt` | same command in a detached worktree at `origin/main` `9a01b5e` (`/tmp/e2b-main-baseline`, created read-only from the same object store) | header line names the detached worktree and `9a01b5e` |
