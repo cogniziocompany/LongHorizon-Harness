@@ -133,3 +133,23 @@ def host_independent_worker_isolation(monkeypatch):
 
     monkeypatch.setattr(worker_isolation, "probe_systemd_run", lambda: None)
     monkeypatch.setattr(worker_isolation, "cgroup_subtree_writable", lambda *a, **k: False)
+
+
+@_pytest_task300.fixture(autouse=True)
+def _auditor_verification_budget_state_isolated(monkeypatch, tmp_path):
+    """easybutt0n-17: isolate the auditor verifier's step-budget counter.
+
+    The episode-scoped verification-step budget persists its counter in a
+    state directory.  Inside one pytest process there is no auditor episode
+    boundary, so without isolation every test would share the ambient state
+    directory and the ambient episode id, and the budget would leak across
+    tests (and across hosts that have run the verifier before).  Each test
+    gets a fresh state directory and no inherited episode id -- exactly the
+    one-auditor-episode, three-structured-passes world the harness runs.
+    """
+
+    monkeypatch.setenv(
+        "LH_HARNESS_AUDITOR_VERIFY_STATE_DIR",
+        str(tmp_path / "auditor-verification-budget"),
+    )
+    monkeypatch.delenv("LH_HARNESS_AUDITOR_EPISODE_ID", raising=False)

@@ -301,8 +301,11 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             # inherited GH_TOKEN / GITHUB_TOKEN, no inherited gh login, and
             # GH_TOKEN set only from the auditor's own token variable.  This
             # supersedes the per-key unsetting below, which the scrubbed
-            # environment already implies.
-            env = _AuditorEnvWrapper(env)
+            # environment already implies.  The episode id ({run}.{round}.
+            # {role}) is stamped on top so the read-only PR verifier's
+            # verification-step budget is keyed to this structured episode
+            # boundary -- one three-pass budget per auditor episode.
+            env = _AuditorEnvWrapper(env, episode_id=self.episode_session_id(label))
         elif self._env_unset_keys:
             env = _EnvUnsetWrapper(env, self._env_unset_keys)
         result = await super().run_episode(
@@ -435,8 +438,9 @@ class _AuditorEnvWrapper:
     opt in before it can host an auditor.
     """
 
-    def __init__(self, env: Environment) -> None:
+    def __init__(self, env: Environment, *, episode_id: str = "") -> None:
         self._env = env
+        self._episode_id = str(episode_id or "")
         self.child_env: dict[str, str] = {}
 
     def __getattr__(self, name: str) -> Any:
@@ -450,7 +454,7 @@ class _AuditorEnvWrapper:
         timeout: int = 30,
         tee_path: str | None = None,
     ) -> Any:
-        self.child_env = build_auditor_subprocess_env()
+        self.child_env = build_auditor_subprocess_env(episode_id=self._episode_id)
         exec_fn = getattr(self._env, "exec", None)
         params = inspect.signature(exec_fn).parameters
         if "child_env" in params:

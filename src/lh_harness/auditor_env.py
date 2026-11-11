@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .auditor_verify import (
+    AUDITOR_EPISODE_ID_ENV,
     SHARED_CREDENTIAL_ENV_VARS,
     resolve_auditor_credential,
 )
@@ -115,6 +116,7 @@ def build_auditor_subprocess_env(
     source: Mapping[str, str] | None = None,
     *,
     config_dir: str | Path | None = None,
+    episode_id: str | None = None,
 ) -> dict[str, str]:
     """Build the auditor's child environment from scratch.
 
@@ -131,6 +133,12 @@ def build_auditor_subprocess_env(
     ``source`` is carried over: every credential-named variable in it is
     ignored, and every variable the harness does not know about is ignored
     too.
+
+    ``episode_id`` is the structured episode boundary the verification-step
+    budget is keyed to (``{run_id}.{round_N}.{role}``).  It carries no
+    credential material -- only non-secret identifiers -- and is stamped as
+    :data:`AUDITOR_EPISODE_ID_ENV` so the read-only verifier counts one
+    three-pass budget per auditor episode.
     """
 
     env_source = os.environ if source is None else source
@@ -141,6 +149,10 @@ def build_auditor_subprocess_env(
         if value:
             env[name] = value
     env.update(_AUDITOR_BASE_OVERRIDES)
+
+    stamped_episode_id = str(episode_id or "").strip()
+    if stamped_episode_id:
+        env[AUDITOR_EPISODE_ID_ENV] = stamped_episode_id
 
     # A fresh, empty gh configuration directory: no hosts.yml, no stored
     # token, no fallback to the harness user's login.

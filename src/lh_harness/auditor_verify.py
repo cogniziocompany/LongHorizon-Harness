@@ -70,12 +70,18 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
+    "AUDITOR_EPISODE_ID_ENV",
     "AUDITOR_GITHUB_TOKEN_ENV",
     "AUDITOR_GITHUB_SCOPE_ENV",
+    "AUDITOR_VERIFY_STATE_DIR_ENV",
     "AUDITOR_WRITE_SPELLINGS",
+    "DEFAULT_VERIFICATION_STEP_BUDGET",
+    "REASON_PR_VERIFIER_UNAVAILABLE",
+    "REASON_VERIFICATION_BUDGET_EXHAUSTED",
     "VERDICT_CONFIRMED",
     "VERDICT_REFUTED",
     "VERDICT_UNVERIFIABLE",
@@ -85,11 +91,15 @@ __all__ = [
     "ReadOnlyGitHubClient",
     "ReadOnlyViolation",
     "VerificationResult",
+    "VerificationStep",
     "assert_read_only_command",
     "command_string",
+    "consume_verification_step",
     "deny_rule_matches",
     "is_denied_by_auditor_policy",
+    "pr_verifier_unavailable_result",
     "resolve_auditor_credential",
+    "verification_budget_exhausted_result",
     "verify_pull_request",
     "write_intent_reason",
 ]
@@ -951,6 +961,198 @@ class VerificationResult:
         if self.reviewed_sha:
             parts.append(f"reviewed_sha={self.reviewed_sha}")
         return "; ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# The episode-scoped verification-step budget
+# ---------------------------------------------------------------------------
+#
+# An auditor episode has a DETERMINISTIC budget of structured verification
+# passes: the initial evidence pass plus at most two additional passes.
+# Without the bound an auditor that cannot confirm a claim can retry "one
+# more / one final" verification indefinitely, burning the whole episode cap
+# (900 s for the auditor role) without ever concluding -- and an audit that
+# never concludes is exactly as unconfirmed as one that refused, it just
+# costs the full cap.
+#
+# The count lives at a STRUCTURED boundary, never in prose: each invocation
+# of the read-only verifier (``lh-harness verify-pr`` /
+# ``scripts/auditor_verify_pr.py``) is exactly one verification step, and the
+# counter is keyed to the episode identifier the harness stamps into the
+# auditor's child environment (:data:`AUDITOR_EPISODE_ID_ENV`).  Nothing here
+# matches keywords in the auditor's natural-language output.
+#
+# Exhaustion fails closed: :func:`verification_budget_exhausted_result`
+# yields the canonical ``unverifiable`` verdict with reason
+# ``verification_budget_exhausted``, which blocks delivery like every other
+# non-confirmed result -- it is never a pass and never satisfies completion.
+#
+# The fail-closed preflight is symmetric: when the selected task requires PR
+# verification but the verifier or its token is absent, the caller emits
+# :func:`pr_verifier_unavailable_result` BEFORE the episode cap -- a presence
+# check only, with no token value read out, no credential probe, and no live
+# PR call.  A task that does not require PR verification never invokes the
+# verifier, so a missing token never fails it.
+
+#: Environment variable carrying the structured auditor episode identifier.
+#: The harness stamps ``{run_id}.{round_N}.{role}`` into the auditor's child
+#: environment at episode start; the budget counter is keyed to it, so each
+#: auditor episode gets its own three passes.
+AUDITOR_EPISODE_ID_ENV = "LH_HARNESS_AUDITOR_EPISODE_ID"
+
+#: Optional redirect for the budget counter directory (deployments, tests).
+#: Only ever a PATH; no credential material is stored there.
+AUDITOR_VERIFY_STATE_DIR_ENV = "LH_HARNESS_AUDITOR_VERIFY_STATE_DIR"
+
+#: Total structured verification passes one auditor episode may run: the
+#: initial evidence pass plus at most two additional passes (3 total).
+DEFAULT_VERIFICATION_STEP_BUDGET = 3
+
+#: Canonical reason strings for the two fail-closed outcomes.
+REASON_VERIFICATION_BUDGET_EXHAUSTED = "verification_budget_exhausted"
+REASON_PR_VERIFIER_UNAVAILABLE = "pr_verifier_unavailable"
+
+#: Key used when no structured episode identifier is available.  All such
+#: invocations share one budget: fail-closed beats unbudgeted.
+_UNSCOPED_EPISODE_ID = "unscoped"
+
+
+@dataclass(frozen=True)
+class VerificationStep:
+    """One structured verification pass within an auditor episode.
+
+    ``number`` is 1-based: step 1 is the initial evidence pass.  A step is
+    granted while it is inside the episode's budget; the first step beyond
+    it (number == budget + 1) and every later step are refused.
+    """
+
+    episode_id: str
+    number: int
+    budget: int
+
+    @property
+    def granted(self) -> bool:
+        """True while the step is inside the episode's budget."""
+        return 1 <= self.number <= self.budget
+
+
+def _sanitized_episode_key(episode_id: str) -> str:
+    key = "".join(
+        char if (char.isalnum() or char in "._-") else "_" for char in episode_id
+    ).strip("._")
+    return key or _UNSCOPED_EPISODE_ID
+
+
+def _verification_state_dir(
+    state_dir: str | Path | None,
+    env: Mapping[str, str],
+) -> Path:
+    import tempfile
+
+    if state_dir is not None:
+        return Path(state_dir)
+    override = (env.get(AUDITOR_VERIFY_STATE_DIR_ENV) or "").strip()
+    if override:
+        return Path(override)
+    return Path(tempfile.gettempdir()) / "lh-auditor-verification-budget"
+
+
+def consume_verification_step(
+    env: Mapping[str, str] | None = None,
+    *,
+    state_dir: str | Path | None = None,
+    budget: int = DEFAULT_VERIFICATION_STEP_BUDGET,
+) -> VerificationStep:
+    """Record one structured verification pass; say whether it is granted.
+
+    The caller invokes this exactly ONCE per verifier invocation -- the
+    structured tool/verifier boundary -- after the fail-closed presence
+    preflight and before any network read.  The counter is persisted under
+    ``state_dir`` (default: a harness-owned directory in the system temp
+    directory, deliberately NOT the task workspace, which the auditor's
+    read-only guard forbids writing) and keyed to the episode id the harness
+    stamps into the auditor's environment.
+    """
+
+    source = os.environ if env is None else env
+    episode_id = (source.get(AUDITOR_EPISODE_ID_ENV) or "").strip() or _UNSCOPED_EPISODE_ID
+    step_budget = int(budget)
+    if step_budget < 1:
+        raise ValueError("budget must be at least 1")
+
+    directory = _verification_state_dir(state_dir, source)
+    directory.mkdir(parents=True, exist_ok=True)
+    key = _sanitized_episode_key(episode_id)
+    counter_path = directory / f"{key}.count"
+    lock_path = directory / f"{key}.lock"
+
+    # Advisory lock keeps the read/increment/write atomic between
+    # sequentially invoked verifier processes on this host.
+    import fcntl
+
+    with lock_path.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            used = int(counter_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            used = 0
+        used += 1
+        counter_path.write_text(f"{used}\n", encoding="utf-8")
+
+    return VerificationStep(episode_id=episode_id, number=used, budget=step_budget)
+
+
+def verification_budget_exhausted_result(
+    step: VerificationStep,
+    *,
+    reviewed_sha: str = "",
+) -> VerificationResult:
+    """The canonical UNVERIFIABLE outcome for an exhausted budget.
+
+    Not a pass, never satisfies completion: ``blocks_delivery`` is True for
+    every verdict but ``confirmed``.  The reason carries the canonical slug
+    ``verification_budget_exhausted`` first so the conclusion is machine-
+    checkable without parsing prose.
+    """
+
+    return VerificationResult(
+        verdict=VERDICT_UNVERIFIABLE,
+        reason=(
+            f"{REASON_VERIFICATION_BUDGET_EXHAUSTED}: the auditor "
+            f"verification-step budget of {step.budget} structured passes "
+            f"(initial evidence pass plus at most {max(step.budget - 1, 0)} "
+            f"additional) is exhausted at attempted step {step.number} for "
+            f"episode {step.episode_id}. The audit must conclude UNVERIFIABLE "
+            "and may not attempt further verification passes."
+        ),
+        reviewed_sha=str(reviewed_sha or ""),
+    )
+
+
+def pr_verifier_unavailable_result(
+    *,
+    reviewed_sha: str = "",
+    detail: str = "",
+) -> VerificationResult:
+    """The canonical UNVERIFIABLE outcome when the verifier cannot run.
+
+    Emitted when the selected task requires PR verification but the
+    read-only PR verifier or its token is absent -- a PRESENCE check only.
+    ``detail`` names variables, never values.
+    """
+
+    suffix = f" ({detail})" if detail else ""
+    return VerificationResult(
+        verdict=VERDICT_UNVERIFIABLE,
+        reason=(
+            f"{REASON_PR_VERIFIER_UNAVAILABLE}: the task requires PR "
+            "verification but the read-only PR verifier or its token is "
+            f"unavailable{suffix}. Failing closed before the episode cap: "
+            "the audit must conclude UNVERIFIABLE rather than restating the "
+            "executor's claim."
+        ),
+        reviewed_sha=str(reviewed_sha or ""),
+    )
 
 
 # ---------------------------------------------------------------------------
