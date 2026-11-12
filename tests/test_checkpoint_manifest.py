@@ -54,10 +54,14 @@ def _base(**overrides) -> CheckpointManifest:
 
 
 def _delta(previous, sequence, *, delta_id=None, changes=None, removals=(), **overrides):
+    # ``base_checkpoint_id`` names the *immediate predecessor's* identity, as
+    # the pinned extract requires (``base_checkpoint_id != previous_id``), so
+    # the default is the delta that comes before this one -- not necessarily
+    # the base checkpoint.
     fields = {
         "delta_id": delta_id or f"d-{sequence}",
         "sequence": sequence,
-        "base_checkpoint_id": "cp-base",
+        "base_checkpoint_id": f"d-{sequence - 1}" if sequence > 1 else "cp-base",
         "predecessor_digest": previous,
         "changes": changes or {},
         "removals": removals,
@@ -421,17 +425,44 @@ def test_missing_intermediate_delta():
 
 
 def test_reordered_tail_is_rejected():
-    """Deltas supplied out of order break contiguity.
+    """A tail whose links were swapped so content no longer matches sequence.
 
-    Naive shortcut defeated: trusting input order and comparing only the
-    last item's identity would accept a swapped tail.  Sequence contiguity
-    and predecessor-digest chaining are checked per link, in arrival order.
+    Naive shortcut defeated: comparing only the terminal identity/sequence and
+    trusting each delta's carried digest would accept a chain in which the
+    tail's *content* was rebound to the wrong sequence number.  Here the two
+    tail deltas are rebuilt with swapped content but the original sequence
+    numbers, so the predecessor digest of the second no longer names the
+    first's content and the chain breaks.
+
+    Note the input *list* order is irrelevant: the pinned extract sorts
+    deltas by ``sequence`` (``sorted(deltas, key=lambda item: item["sequence"])``),
+    so a merely shuffled list is valid.  See
+    ``test_shuffled_input_order_is_valid_because_the_chain_sorts``.
     """
     base = _base()
     d1 = _delta(base.digest, 1, changes={"budget": 2})
     d2 = _delta(d1.digest, 2, changes={"budget": 3})
+    # Swap which content sits at which sequence, keeping the recorded
+    # predecessor digests as the originals: the links no longer line up.
+    swapped_1 = _delta(base.digest, 1, changes={"budget": 3})
+    swapped_2 = _delta(swapped_1.digest, 2, changes={"budget": 2})
+    # The terminal the handoff trusts is the honest d2, so this cannot match.
     with pytest.raises(IncompleteContext):
-        validate_chain(base, [d2, d1], handoff=_handoff(base, d2))
+        validate_chain(base, [swapped_1, swapped_2], handoff=_handoff(base, d2))
+
+
+def test_shuffled_input_order_is_valid_because_the_chain_sorts():
+    """The extract sorts by sequence, so arrival order must not matter.
+
+    This pins the positive side of the sorting rule: an implementation that
+    validated in arrival order would reject a legitimately shuffled list.
+    """
+    base = _base()
+    d1 = _delta(base.digest, 1, changes={"budget": 2})
+    d2 = _delta(d1.digest, 2, changes={"budget": 3})
+    d3 = _delta(d2.digest, 3, changes={"budget": 4})
+    summary = validate_chain(base, [d3, d1, d2], handoff=_handoff(base, d3))
+    assert summary.delta_ids == ("d-1", "d-2", "d-3")
 
 
 def test_wrong_predecessor_digest():
@@ -533,6 +564,99 @@ def test_bool_is_not_accepted_as_number():
 
 
 # --------------------------------------------------------------------------
+# Extract-derived rejections (the three round_003 lead areas, re-proved)
+#
+# Each case below is derived from the pinned extract text in
+# 06-solution-snippets.md section 5 -- not from any audit finding -- and each
+# is written so a naive implementation would pass it.
+# --------------------------------------------------------------------------
+
+
+def test_non_adjacent_duplicate_delta_identity_is_rejected():
+    """A delta identity reused anywhere in the chain is a duplicate.
+
+    Extract basis (section 5): ``seen_delta_ids = set()`` is created once
+    before the loop and every id is added to it, so the duplicate check spans
+    the whole chain.  Naive shortcut defeated: comparing a delta only against
+    its *immediate* predecessor (``delta_id == previous_id``) accepts the same
+    id recurring later, e.g. ``d-1, d-2, d-1`` -- which silently re-applies an
+    already-consumed change set under a new sequence number.
+    """
+    base = _base()
+    d1 = _delta(base.digest, 1, changes={"budget": 2})
+    d2 = _delta(d1.digest, 2, changes={"budget": 3})
+    reused = _delta(d2.digest, 3, delta_id="d-1", changes={"budget": 4})
+    with pytest.raises(IncompleteContext, match="duplicate delta identity"):
+        validate_chain(base, [d1, d2, reused], handoff=_handoff(base, reused))
+
+
+def test_change_through_a_mandatory_scalar_is_rejected():
+    """A change path that traverses a mandatory scalar cannot be applied.
+
+    Extract basis (section 5): ``_set_path`` raises
+    ``"state path traverses a scalar"`` as soon as an intermediate segment is
+    not an object.  Naive shortcut defeated: a validator that only looks at
+    mandatory paths equal to the change path never notices
+    ``instructions.x`` descending through the string ``instructions``, and
+    reports a successful chain for a delta whose change had no effect.
+    """
+    base = _base()
+    d1 = _delta(base.digest, 1, changes={"instructions.x": "nested"})
+    with pytest.raises(IncompleteContext, match="traverses a scalar"):
+        validate_chain(base, [d1], handoff=_handoff(base, d1))
+
+
+def test_removal_through_a_mandatory_scalar_is_rejected():
+    """A removal path that traverses a mandatory scalar cannot be applied.
+
+    Extract basis (section 5): ``_remove_path`` raises
+    ``"removal path traverses a scalar"``.  Naive shortcut defeated: ignoring
+    an unappliable removal leaves the mandatory value in place, so a chain
+    whose delta silently failed to remove anything is still reported as
+    trusted.
+    """
+    base = _base()
+    d1 = _delta(base.digest, 1, removals=["instructions.child"])
+    with pytest.raises(IncompleteContext, match="removal path traverses a scalar"):
+        validate_chain(base, [d1], handoff=_handoff(base, d1))
+
+
+def test_mandatory_scalar_change_inside_an_object_path_is_allowed():
+    """A change under a mandatory *object* is fine: the prefix is an object.
+
+    This is the positive side of the scalar rule.  ``evidence`` is an object,
+    so ``evidence.extra`` is a normal nested change and must not be rejected;
+    ``evidence.receipt`` stays present and valid.
+    """
+    base = _base()
+    d1 = _delta(base.digest, 1, changes={"evidence.extra": 1})
+    summary = validate_chain(base, [d1], handoff=_handoff(base, d1))
+    assert summary.terminal_id == "d-1"
+
+
+def test_delta_claiming_the_base_as_predecessor_after_the_first_link():
+    """``base_checkpoint_id`` names the *predecessor*, not the chain's base.
+
+    Extract basis (section 5): ``if delta["base_checkpoint_id"] != previous_id``.
+    Naive shortcut defeated: an implementation that always compares against
+    the base checkpoint id accepts a delta that skipped a link -- here the
+    second delta claims the base while its sequence says it follows d-1.
+    """
+    base = _base()
+    d1 = _delta(base.digest, 1, changes={"budget": 2})
+    skipped = DeltaManifest(
+        delta_id="d-2",
+        sequence=2,
+        base_checkpoint_id="cp-base",  # wrong: predecessor is d-1
+        predecessor_digest=d1.digest,
+        changes={"budget": 3},
+        scope=dict(SCOPE),
+    ).with_digest()
+    with pytest.raises(IncompleteContext, match="predecessor identity"):
+        validate_chain(base, [d1, skipped], handoff=_handoff(base, skipped))
+
+
+# --------------------------------------------------------------------------
 # NaN/Inf and non-canonical documents
 # --------------------------------------------------------------------------
 
@@ -590,7 +714,7 @@ def _naive_accepts(checkpoint, deltas, handoff) -> bool:
     if base_doc.get("checkpoint_id") != handoff.expected_base.get("checkpoint_id"):
         return False
     previous = base_doc
-    for delta in deltas:
+    for delta in sorted(deltas, key=lambda item: item.as_document()["sequence"]):
         doc = delta.as_document()
         if doc.get("sequence") != previous.get("sequence", 0) + 1:
             return False
@@ -646,6 +770,35 @@ def test_naive_reference_accepts_null_mandatory_value():
     assert _naive_accepts(base, [nulling], handoff) is True
     with pytest.raises(IncompleteContext):
         validate_chain(base, [nulling], handoff=handoff)
+
+
+def test_naive_reference_accepts_non_adjacent_duplicate_delta_id():
+    """The whole-chain duplicate check must be invisible to the naive form.
+
+    The naive validator models the adjacent-only comparison, so ``d-1``
+    recurring two links later slips through it while :func:`validate_chain`
+    rejects it -- which is exactly the extract's ``seen_delta_ids`` set.
+    """
+    base = _base()
+    d1 = _delta(base.digest, 1, changes={"budget": 2})
+    d2 = _delta(d1.digest, 2, changes={"budget": 3})
+    reused = _delta(d2.digest, 3, delta_id="d-1", changes={"budget": 4})
+    handoff = _handoff(base, reused)
+
+    assert _naive_accepts(base, [d1, d2, reused], handoff) is True
+    with pytest.raises(IncompleteContext):
+        validate_chain(base, [d1, d2, reused], handoff=handoff)
+
+
+def test_naive_reference_accepts_scalar_traversal():
+    """The scalar-traversal rule must be invisible to the naive form."""
+    base = _base()
+    nested = _delta(base.digest, 1, changes={"instructions.x": "nested"})
+    handoff = _handoff(base, nested)
+
+    assert _naive_accepts(base, [nested], handoff) is True
+    with pytest.raises(IncompleteContext):
+        validate_chain(base, [nested], handoff=handoff)
 
 
 def test_naive_reference_accepts_wrong_policy_revision():

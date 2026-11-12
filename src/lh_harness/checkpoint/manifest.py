@@ -154,8 +154,11 @@ class DeltaManifest:
 
     ``predecessor_digest`` is the *content* digest of the document this delta
     was built on -- the base checkpoint for the first delta, and the previous
-    delta's content digest afterwards.  ``base_checkpoint_id`` names the base
-    the chain descends from, so a delta cannot be spliced onto another base.
+    delta's content digest afterwards.  ``base_checkpoint_id`` names the
+    *immediate predecessor's* identity (the base checkpoint id for the first
+    delta, the previous delta's id afterwards), exactly as the pinned extract
+    checks it against ``previous_id``; a delta therefore cannot be spliced
+    anywhere except directly after the link it names.
 
     Omitted fields mean unchanged; a removal is only a removal when it is
     listed in ``removals`` (explicit-removal contract from the spec).
@@ -284,6 +287,32 @@ def _get_path(state: Any, path: str) -> Any:
     return current
 
 
+def _require_object_prefix(value: Any, relative_path: str, message: str) -> None:
+    """Walk ``relative_path`` under ``value``; raise if any prefix is a scalar.
+
+    This mirrors the extract's ``_set_path``/``_remove_path``: a path with
+    more than one segment is applied by descending through intermediate
+    objects, and the moment one of them is not an object the operation raises
+    ``IncompleteContext`` instead of silently doing nothing.  A path that
+    reaches its leaf is fine; whether the leaf exists is irrelevant (a removal
+    of an absent leaf is a no-op, as in the extract's ``pop(..., None)``).
+    """
+    current = value
+    parts = _parts(relative_path)
+    for part in parts[:-1]:
+        if not isinstance(current, Mapping):
+            raise IncompleteContext(message)
+        current = current.get(part, _MISSING)
+        if current is _MISSING:
+            # The extract's setdefault/get default creates or skips an absent
+            # intermediate object, so an absent prefix is not a scalar.
+            return
+    # After consuming every intermediate segment the container that would
+    # receive the leaf must itself be an object.
+    if not isinstance(current, Mapping):
+        raise IncompleteContext(message)
+
+
 def _validate_value(value: Any, schema: Mapping[str, Any], path: str) -> None:
     kind = schema.get("type")
     valid = {
@@ -355,22 +384,37 @@ def _apply_delta_to_mandatory(
 ) -> None:
     """Apply one delta's changes/removals to the mandatory projection.
 
-    Only mandatory paths matter here, and removal of one -- directly or by
-    replacing an ancestor with a scalar -- is rejected.  A changed value is
-    re-validated against the pinned schema, so ``null``, a wrong type or a
-    value outside its enum fails immediately after the delta rather than only
-    at the end of a restore (NEG-37, NEG-39).
+    The projection keeps one entry per trusted required path.  Three ways a
+    delta can destroy a mandatory path are rejected here:
+
+    * an explicit removal of the path itself (``equal``),
+    * replacing an ancestor so the path disappears (``parent``), and
+    * a change or removal whose path traverses *through* a mandatory scalar
+      (``child``) -- the extract's ``_set_path``/``_remove_path`` raise
+      "traverses a scalar" because such a path cannot be applied to the
+      restored document at all.  Silently ignoring it would let a delta
+      report a change that never took effect.
+
+    A changed value is re-validated against the pinned schema, so ``null``, a
+    wrong type or a value outside its enum fails immediately after the delta
+    rather than only at the end of a restore (NEG-37, NEG-39).
     """
     changes = document.get("changes") or {}
     removals = document.get("removals") or ()
 
-    for path in removals:
+    for raw_path in removals:
+        path = str(raw_path)
         for mandatory in list(view):
-            relation = _path_relation(str(path), mandatory)
+            relation = _path_relation(path, mandatory)
             if relation in ("equal", "parent"):
                 raise IncompleteContext(
                     f"delta removes mandatory state: {mandatory}"
                 )
+            if relation == "child":
+                # Descends through the mandatory value.  The extract walks the
+                # prefix and raises as soon as a segment is not an object.
+                _require_object_prefix(view[mandatory], path[len(mandatory) + 1:],
+                                       "removal path traverses a scalar")
 
     for raw_path, value in changes.items():
         path = str(raw_path)
@@ -389,6 +433,12 @@ def _apply_delta_to_mandatory(
                     )
                 _validate_value(descended, schemas[mandatory], mandatory)
                 view[mandatory] = descended
+            elif relation == "child":
+                # Descends through the mandatory value: the same scalar rule
+                # as the extract's ``_set_path``.
+                _require_object_prefix(view[mandatory], path[len(mandatory) + 1:],
+                                       "state path traverses a scalar")
+                _validate_value(view[mandatory], schemas[mandatory], mandatory)
 
 
 def _expected_triple(handoff_value: Mapping[str, Any]) -> dict[str, Any]:
@@ -450,7 +500,6 @@ def validate_delta_manifest(
     previous_id: str,
     previous_sequence: int,
     previous_digest: str,
-    base_checkpoint_id: str,
 ) -> str:
     """Validate one delta link; return its recomputed content digest.
 
@@ -459,6 +508,12 @@ def validate_delta_manifest(
     digest does not equal the predecessor's recomputed content digest is
     rejected even if its own self-digest was recomputed to match its tampered
     content.
+
+    ``base_checkpoint_id`` names the *immediate predecessor's identity*, as
+    in the pinned extract (``if delta["base_checkpoint_id"] != previous_id``),
+    so a delta cannot be spliced anywhere but directly after the link it
+    claims.  Duplicate-identity detection is the caller's job because it is a
+    property of the whole chain, not of a single link.
     """
     _require_schema(handoff)
     document = delta.as_document() if isinstance(delta, DeltaManifest) else dict(delta)
@@ -466,10 +521,8 @@ def validate_delta_manifest(
 
     if document.get("sequence") != previous_sequence + 1:
         raise IncompleteContext("noncontiguous delta sequence")
-    if document.get("base_checkpoint_id") != base_checkpoint_id:
-        raise IncompleteContext("delta base identity mismatch")
-    if document.get("delta_id") == previous_id:
-        raise IncompleteContext("duplicate delta identity")
+    if document.get("base_checkpoint_id") != previous_id:
+        raise IncompleteContext("delta predecessor identity mismatch")
     if document.get("predecessor_digest") != previous_digest:
         raise IncompleteContext("delta predecessor content digest mismatch")
 
@@ -503,13 +556,16 @@ def validate_chain(
 ) -> ChainSummary:
     """Validate a trusted baseline followed by an ordered chain of deltas.
 
-    The baseline is validated first.  Deltas must then arrive in contiguous
-    sequence order starting at base sequence + 1; each link is validated
-    against the previous link's *recomputed* digest.  Truncation falls out of
-    the terminal comparison: a chain missing its tail cannot reproduce the
-    trusted terminal triple, so it is visibly incomplete rather than
-    silently short.  Reordering breaks contiguity or the predecessor digest,
-    and a spliced delta breaks the base identity.
+    The baseline is validated first.  Deltas are ordered by ``sequence`` --
+    as the pinned extract does, so arrival order is irrelevant and a shuffled
+    input is not itself a failure -- and must then form a contiguous chain
+    starting at base sequence + 1; each link is validated against the previous
+    link's *recomputed* digest.  Truncation falls out of the terminal
+    comparison: a chain missing its tail cannot reproduce the trusted terminal
+    triple, so it is visibly incomplete rather than silently short.  Reordering
+    is caught by contiguity and the predecessor digest, a spliced delta breaks
+    the predecessor identity, and a delta identity reused anywhere in the
+    chain (not only adjacently) is a duplicate.
 
     The trusted mandatory schemas are applied to the baseline and then kept
     in a mandatory-only projection that each delta's changes/removals are
@@ -532,20 +588,26 @@ def validate_chain(
     previous_sequence = base_sequence
     previous_digest = base_digest
     delta_ids: list[str] = []
+    seen_delta_ids: set[str] = set()
 
     mandatory_view = _mandatory_view(
         base_document["state"], handoff.required_state_schemas
     )
 
-    for delta in deltas:
-        document = delta.as_document() if isinstance(delta, DeltaManifest) else dict(delta)
+    documents = [
+        delta.as_document() if isinstance(delta, DeltaManifest) else dict(delta)
+        for delta in deltas
+    ]
+    for document in sorted(documents, key=lambda item: item["sequence"]):
+        if document.get("delta_id") in seen_delta_ids:
+            raise IncompleteContext("duplicate delta identity")
+        seen_delta_ids.add(document.get("delta_id"))
         previous_digest = validate_delta_manifest(
             document,
             handoff=handoff,
             previous_id=previous_id,
             previous_sequence=previous_sequence,
             previous_digest=previous_digest,
-            base_checkpoint_id=base_id,
         )
         # The trusted schemas are applied again after every delta: a delta
         # that removes or mistypes a mandatory path is rejected at that link,
