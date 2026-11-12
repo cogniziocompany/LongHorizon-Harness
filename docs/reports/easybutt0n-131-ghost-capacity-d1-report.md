@@ -43,7 +43,7 @@ Before this change line 318 read `if status not in TERMINAL_STATUSES:`. This
 loop is what decides which runs are serialized into the heartbeat `runs[]` —
 the list the fleet plane (and the settings_store-facing aggregate) treats as
 the node's active set. `capacity.active` on the heartbeat body
-(`reporter.py:346`) is a separate, supervisor-owned process count; the
+(`reporter.py:357`) is a separate, supervisor-owned process count; the
 aggregate that inflated on CT111 is this non-terminal row count.
 
 **Why it over-counts — the canonicalizer:**
@@ -72,7 +72,7 @@ still `idle` as an active run — forever.
 Reproduced by constructing real run directories under a temp runs root and
 running the production row path (`RunSupervisor.list_run_items` →
 `build_run_summary`, exactly what `webapi/server.py::_heartbeat` feeds the
-reporter). Observed with the pre-fix predicate, 8 rows → 6 counted active:
+reporter). Observed with the pre-fix predicate, 7 rows → 6 counted active:
 
 | row | durable `status.json` | pre-fix canonical | pre-fix counted |
 | --- | --- | --- | --- |
