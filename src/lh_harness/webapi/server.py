@@ -86,7 +86,14 @@ from ..queue import (
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..workspace_guard import WorkspaceBaseError, probe_open_pr_gh, resolve_run_base
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
-from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
+from ..utils.run_boundary import (
+    run_is_servable,
+    safe_run_control,
+    safe_run_dir,
+    safe_run_logs,
+    safe_run_role,
+    safe_run_rounds,
+)
 
 import logging
 
@@ -1055,10 +1062,19 @@ class StateRegistry:
     def _run_paths(self, run_id: str) -> tuple[Path, Path] | None:
         """Validate one run boundary before a state can read from it.
 
-        A control-only reservation is valid before its worker creates
-        ``lh_harness``. Existing result/control children, however, must be
-        real directories belonging to this exact run; a link to a sibling run
-        is rejected even though its target remains below ``runs_root``.
+        A folder is resolvable when it holds a run record — the durable
+        result tree with its role ledger — or when it is a live reservation
+        whose worker the supervisor launched but has not yet written that
+        tree.  A control-only leftover (one whose worker files were pruned or
+        never created) is neither, so ``state_for`` returns ``None`` for it
+        and the ``/api/runs/<id>`` routes answer ``404``.
+
+        This is the same ``run_is_servable`` predicate the run listing uses to
+        skip leftover folders, so a folder can never be listed as a run and
+        then 404 for the same id.  Existing result/control children must
+        additionally be real directories belonging to this exact run; a link
+        to a sibling run is rejected even though its target remains below
+        ``runs_root``.
         """
 
         root = self.runs_root
@@ -1066,6 +1082,8 @@ class StateRegistry:
             return None
         run_dir = safe_run_dir(root, run_id)
         if run_dir is None or not run_dir.is_dir():
+            return None
+        if not run_is_servable(root, run_dir):
             return None
         log_dir = safe_run_logs(root, run_dir, allow_missing=True)
         control_dir = safe_run_control(root, run_dir, allow_missing=True)

@@ -12,6 +12,7 @@ return a normal ``404``/``ValueError`` at their API boundary.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 
@@ -187,6 +188,88 @@ def safe_run_logs(
     if require_role_management and role is None:
         return None
     return logs
+
+
+def run_has_record(runs_root: str | Path, run_dir: str | Path) -> bool:
+    """Does this run folder hold a run record?
+
+    A run record is the durable result tree a worker writes: the canonical
+    ``lh_harness`` directory with its ``role_orchestration`` ledger (or one of
+    the two legacy layouts).  A folder that holds only ``control/`` — a
+    control-only reservation whose worker files were pruned or never created —
+    has no run record.
+
+    The check is the same boundary walk ``safe_run_logs`` performs with
+    ``require_role_management=True``: the log directory must exist as a real
+    directory and must contain a real role ledger directory.
+    """
+
+    logs = safe_run_logs(
+        runs_root,
+        run_dir,
+        require_role_management=True,
+        allow_missing=False,
+    )
+    return logs is not None
+
+
+def _read_control_json(path: Path) -> dict:
+    """Read one small control metadata file, or ``{}`` when unreadable.
+
+    Deliberately plain stdlib: this module must not import the control bus
+    (the control bus imports the fleet reporter, which imports back into this
+    package).
+    """
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return {}
+    if len(raw) > 64 * 1024:
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def run_is_servable(runs_root: str | Path, run_dir: str | Path) -> bool:
+    """Is this run folder one the API can serve?
+
+    A folder qualifies when it holds a run record — the durable result tree a
+    worker wrote, with its role ledger — OR when it has a result-log tree at
+    all (the worker got far enough to create ``lh_harness/``) OR when it is a
+    live reservation, a run whose worker the supervisor launched and that has
+    not written its result tree yet.  A live reservation is recognised by its
+    durable ``control/status.json`` saying the worker is alive.
+
+    Everything else is a control-only leftover: a folder that holds just
+    ``control/`` because its worker files were pruned or never created.  Such
+    a folder is not a run.  Listing it produced an "idle" run with an empty
+    task while ``/api/runs/<id>`` answered ``404`` for the same id, and the
+    fleet aggregate counted every one of them as an active run.
+
+    This is the ONE definition of "this folder is a real run".  The run
+    listing uses it to skip leftover folders, and the ``/api/runs/<id>``
+    boundary uses it to answer ``404`` for one, so a folder can never be
+    listed as a run and then 404 for the same id (or the other way round).
+    """
+
+    if run_has_record(runs_root, run_dir):
+        return True
+    run = Path(run_dir)
+    # A result-log tree exists: the worker created it, so this is a run even
+    # if it has not written its role ledger yet.
+    logs = safe_run_logs(runs_root, run, allow_missing=True)
+    if logs is not None and logs.is_dir():
+        return True
+    status = _read_control_json(run / "control" / "status.json")
+    if not status:
+        return False
+    # A live worker has not written its result tree yet, so it has no run
+    # record — but it IS a run and the API must be able to serve it.
+    return bool(status.get("alive"))
 
 
 def safe_run_role(

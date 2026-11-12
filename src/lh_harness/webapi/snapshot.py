@@ -275,12 +275,26 @@ def build_run_summary(item: dict[str, Any], *, state: DashboardState | None = No
         except (OSError, ValueError, RuntimeError):
             report = {}
         provenance_sources.append(report if isinstance(report, dict) else None)
+    # Liveness of the run's worker, read from the durable
+    # ``control/status.json`` record.  The active-run aggregate needs it: an
+    # ``idle`` status with ``alive`` false is a stopped or never-started
+    # worker, NOT an active run, and counting it as active is what made a
+    # node advertise more active runs than it was allowed to run.
+    alive: bool | None = None
+    if state is not None:
+        try:
+            durable_status = state.control_bus.read_status()
+        except (OSError, ValueError, RuntimeError):
+            durable_status = {}
+        if isinstance(durable_status, dict) and "alive" in durable_status:
+            alive = bool(durable_status.get("alive"))
     summary = {
         "id": run_id,
         "task": task,
         "status": status or "unknown",
         "updated_at": item.get("mtime", 0.0),
         "log_dir": item.get("log_dir", ""),
+        "alive": alive,
     }
     # LHH-GATE-OWNER-NOTE: when the run is ``waiting_approval``, surface the
     # FIRST pending approval's owner + owner_note so the runs list can render
