@@ -14,6 +14,7 @@ import mimetypes
 import os
 import re
 import threading
+import tracemalloc
 from collections import OrderedDict
 import time
 import uuid
@@ -59,6 +60,7 @@ from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token,
 from .. import effect_lease, effect_lease_wire
 from ..overseer_state import resolve_overseer_root
 from . import mcp_jsonrpc as mcp_protocol
+from . import memory_debug
 from ..build_info import build_info
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
@@ -2297,6 +2299,130 @@ def create_app(
     # Read-only MSCE experience levels (L1/L2/L3) for the fleet surfaces.
     # Registration adds no auth surface: the middleware above guards /api/*.
     register_experience_api(app, registry, runs_root=registry.runs_root)
+
+    # ------------------------------------------------------------------
+    # LHH-WEB-LEAK-FIX c3: opt-in live memory measurement (ticket easybutt0n-17).
+    #
+    # The CT110 web process grows from ~0.8 GB RSS at start to >3 GB within
+    # ~70 min.  These routes let an operator measure WHAT grows, live, on
+    # the node where it grows, without restarting the process.
+    #
+    # The whole family is OPT-IN: when ``LH_HARNESS_MEM_DEBUG`` is not ``1``
+    # every route below answers 404 -- the routes are invisible, not merely
+    # forbidden -- so the default deployment exposes no new surface at all.
+    # When the flag IS on, the routes inherit the SAME bearer boundary as
+    # every other /api/ route from the middleware above (401 without a
+    # valid bearer).
+    # ------------------------------------------------------------------
+    memory_snapshots = memory_debug.MemorySnapshotStore()
+
+    def _memory_debug_enabled() -> bool:
+        return memory_debug.memory_debug_enabled()
+
+    def _require_memory_debug() -> None:
+        """404 unless the operator opted in to the memory debug routes.
+
+        404 (not 403) is deliberate: without the flag the routes are not
+        part of the API surface at all, and a scanner should not learn that
+        a diagnostic endpoint exists behind the bearer.
+        """
+
+        if not _memory_debug_enabled():
+            raise HTTPException(status_code=404, detail="not found")
+
+    def _memory_report() -> dict[str, Any]:
+        """The full memory payload: RSS, tracemalloc, gc and cache sizes."""
+
+        tracing = tracemalloc.is_tracing()
+        report: dict[str, Any] = {
+            "enabled": True,
+            "tracemalloc": {
+                "tracing": tracing,
+                "current_bytes": 0,
+                "peak_bytes": 0,
+                "frames": memory_debug.TRACEMALLOC_FRAMES,
+                "top_allocations": [],
+            },
+            "rss_bytes": memory_debug.read_rss_bytes(),
+            "gc": memory_debug._gc_stats(),
+            "caches": memory_debug.cache_sizes(registry, snapshot_cache),
+            "snapshots_held": memory_snapshots.count(),
+            "snapshot_cap": memory_debug.MAX_SNAPSHOTS,
+        }
+        if tracing:
+            current, peak = tracemalloc.get_traced_memory()
+            report["tracemalloc"]["current_bytes"] = current
+            report["tracemalloc"]["peak_bytes"] = peak
+            report["tracemalloc"]["top_allocations"] = memory_debug._allocation_groups(
+                tracemalloc.take_snapshot(),
+                memory_debug.TOP_ALLOCATION_GROUPS,
+            )
+        return report
+
+    @app.get("/api/debug/memory")
+    def debug_memory() -> dict[str, Any]:
+        """LIVE memory report for this web process.
+
+        Returns the process RSS, the tracemalloc current/peak totals, the
+        top 30 allocation groups by size (each with a depth-6 file:line
+        traceback and a count), the GC counters with the tracked-object
+        census bucketed by the top 15 types, and the sizes of the known
+        in-memory caches.
+        """
+
+        _require_memory_debug()
+        return _memory_report()
+
+    @app.post("/api/debug/memory/snapshot")
+    def debug_memory_snapshot() -> dict[str, Any]:
+        """Store a tracemalloc snapshot IN MEMORY (never on disk).
+
+        At most 3 snapshots are retained; the oldest is evicted beyond that.
+        Two calls 10 minutes apart therefore leave two comparable snapshots
+        in the store.
+        """
+
+        _require_memory_debug()
+        if not tracemalloc.is_tracing():
+            raise HTTPException(status_code=409, detail="tracemalloc is not running")
+        snapshot = tracemalloc.take_snapshot()
+        held = memory_snapshots.add(snapshot)
+        current, peak = tracemalloc.get_traced_memory()
+        return {
+            "taken_at": time.time(),
+            "snapshots_held": held,
+            "snapshot_cap": memory_debug.MAX_SNAPSHOTS,
+            "current_bytes": current,
+            "peak_bytes": peak,
+        }
+
+    @app.get("/api/debug/memory/diff")
+    def debug_memory_diff() -> dict[str, Any]:
+        """Compare the LATEST TWO snapshots: what grew between them.
+
+        Returns the top 30 growth entries (positive size differences first).
+        Each entry carries the size difference, the count difference and a
+        depth-6 file:line traceback.
+        """
+
+        _require_memory_debug()
+        pair = memory_snapshots.latest_two()
+        if len(pair) < 2:
+            raise HTTPException(
+                status_code=409,
+                detail="need at least two snapshots; POST /api/debug/memory/snapshot twice",
+            )
+        (older_at, older), (newer_at, newer) = pair
+        return {
+            "older_taken_at": older_at,
+            "newer_taken_at": newer_at,
+            "interval_seconds": newer_at - older_at,
+            "top_growth": memory_debug.diff_snapshots(
+                older,
+                newer,
+                limit=memory_debug.TOP_DIFF_GROUPS,
+            ),
+        }
 
     def _fleet_channel_state() -> dict[str, Any]:
         channel = get_channel()
@@ -4556,6 +4682,17 @@ def run_web_server(
     moved = seal_process_environment()
     if moved:
         logger.info("moved %d secret variable(s) out of the environment: %s", len(moved), ", ".join(moved))
+
+    # LHH-WEB-LEAK-FIX c3 (ticket easybutt0n-17): opt-in live memory
+    # measurement.  When the operator sets ``LH_HARNESS_MEM_DEBUG=1`` the
+    # web process starts ``tracemalloc`` with 25 frames of traceback depth
+    # so the ``/api/debug/memory`` family can report what is growing.  With
+    # the flag unset this is a complete no-op and the process pays nothing.
+    if memory_debug.maybe_start_tracemalloc():
+        logger.info(
+            "memory debug enabled: tracemalloc started with %d frames",
+            memory_debug.TRACEMALLOC_FRAMES,
+        )
 
     run_id = Path(log_dir).expanduser().resolve().parent.name if log_dir else None
     effective_root = None if log_dir else runs_root
