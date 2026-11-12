@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import App from './App';
 import AdminApp from './AdminApp';
 import { UiLanguageProvider } from './i18n';
+import '@fontsource-variable/geist';
 import './style.css';
 
 /** Keep a render failure visible and recoverable instead of a blank page. */
