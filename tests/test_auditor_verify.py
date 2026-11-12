@@ -1046,10 +1046,13 @@ def test_the_auditor_child_gh_config_dir_is_the_fresh_empty_temp_dir(
     assert list(Path(config_dir).iterdir()) == [], "the gh config dir is not empty"
 
 
-def test_the_auditor_token_is_the_only_gh_token_the_child_sees(
+def test_the_auditor_token_is_the_only_github_token_the_child_sees(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The child's only ``GH_TOKEN`` is the auditor's own token."""
+    """The child's only GitHub credential is the auditor's own token, carried
+    under the name the read-only verifier reads -- never as ``GH_TOKEN``,
+    which the verifier refuses as a shared credential (2026-11-11 regression:
+    every in-auditor PR verification failed closed)."""
 
     from lh_harness.auditor_env import build_auditor_subprocess_env
 
@@ -1058,7 +1061,8 @@ def test_the_auditor_token_is_the_only_gh_token_the_child_sees(
 
     child_env = _child_env(build_auditor_subprocess_env())
 
-    assert child_env.get("GH_TOKEN") == "fake-auditor-token"
+    assert child_env.get(AUDITOR_GITHUB_TOKEN_ENV) == "fake-auditor-token"
+    assert "GH_TOKEN" not in child_env
     assert "fake-executor-token" not in child_env.values()
 
 
@@ -1095,7 +1099,7 @@ def test_the_auditor_child_environment_is_built_not_filtered(
         "TMPDIR",
         "SHELL",
         "TERM",
-        "GH_TOKEN",
+        AUDITOR_GITHUB_TOKEN_ENV,
         "GH_CONFIG_DIR",
         "GIT_TERMINAL_PROMPT",
         "GIT_ASKPASS",
@@ -1196,8 +1200,10 @@ async def test_the_auditor_subprocess_really_runs_with_the_scrubbed_env(
     assert "fake-executor-token" not in child_env.values()
     assert "fake-executor-github-token" not in child_env.values()
     assert "GITHUB_TOKEN" not in child_env
-    # The auditor's own token is the child's only GH_TOKEN.
-    assert child_env.get("GH_TOKEN") == "fake-auditor-token"
+    # The auditor's own token is the child's only GitHub credential, under the
+    # name the read-only verifier reads; GH_TOKEN is never set in the child.
+    assert child_env.get(AUDITOR_GITHUB_TOKEN_ENV) == "fake-auditor-token"
+    assert "GH_TOKEN" not in child_env
     # And gh has an empty configuration directory to fall back on.
     config_dir = child_env.get("GH_CONFIG_DIR")
     assert config_dir

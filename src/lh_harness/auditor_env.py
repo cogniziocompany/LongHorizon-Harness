@@ -17,8 +17,9 @@ few names".  It is BUILT FROM SCRATCH:
     ``gh`` configuration directory inherited from the harness user;
 *   ``GH_CONFIG_DIR`` pointing at a FRESH EMPTY temp dir, so ``gh`` has no
     stored credential to fall back on; and
-*   ``GH_TOKEN`` set ONLY from :data:`AUDITOR_GITHUB_TOKEN_ENV`, and only
-    when that variable resolves to a token that is not a shared credential.
+*   the auditor's own token carried ONLY under :data:`AUDITOR_GITHUB_TOKEN_ENV`
+    (the name the read-only verifier reads), and only when it resolves to a
+    token that is not a shared credential; ``GH_TOKEN`` stays unset.
 
 The token VALUE never appears in this module's exceptions, in any log, or in
 any representation of the returned mapping beyond the mapping itself.
@@ -33,6 +34,7 @@ from typing import Mapping
 
 from .auditor_verify import (
     AUDITOR_EPISODE_ID_ENV,
+    AUDITOR_GITHUB_TOKEN_ENV,
     SHARED_CREDENTIAL_ENV_VARS,
     resolve_auditor_credential,
 )
@@ -47,7 +49,7 @@ __all__ = [
 #: ``gh`` at a host the auditor was not meant to talk to -- into a child
 #: process.  These are dropped from the auditor's environment
 #: unconditionally: the auditor's own token is re-introduced separately,
-#: under ``GH_TOKEN``, and only when it resolves to the auditor's OWN
+#: under :data:`AUDITOR_GITHUB_TOKEN_ENV`, and only when it resolves to the auditor's OWN
 #: fine-grained token.
 AUDITOR_CREDENTIAL_ENV_NAMES: tuple[str, ...] = (
     "GH_TOKEN",
@@ -166,12 +168,18 @@ def build_auditor_subprocess_env(
 
     # Belt and braces: no credential-named variable may survive from the
     # source mapping, whatever it happened to carry.  The auditor's own
-    # token is re-added afterwards, under GH_TOKEN, and only when it really
+    # token is re-added afterwards, under its own variable, and only when it really
     # is the auditor's own.
     for name in AUDITOR_CREDENTIAL_ENV_NAMES:
         env.pop(name, None)
 
+    # The token goes in under the ONE name the harness's read-only verifier
+    # (``scripts/auditor_verify_pr.py`` / ``ReadOnlyGitHubClient``) reads.
+    # It is deliberately NOT also exposed as ``GH_TOKEN``: the verifier
+    # treats ``GH_TOKEN`` as a shared/executor credential and refuses to act
+    # when the two are equal, so mirroring it there made every in-auditor PR
+    # verification fail closed as ``pr_verifier_unavailable``.
     if credential.present:
-        env["GH_TOKEN"] = credential.token
+        env[AUDITOR_GITHUB_TOKEN_ENV] = credential.token
 
     return env
