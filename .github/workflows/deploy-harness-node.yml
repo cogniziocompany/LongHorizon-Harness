@@ -1,0 +1,226 @@
+name: Deploy harness node (from a git ref)
+
+# LHH-DEPLOY-CT110-PIPELINE: install a harness node's code STRAIGHT FROM A
+# GIT REF, into the node's existing venv, and leave a deploy RECEIPT on the
+# node so the deployed commit is readable over the API without a shell.
+#
+# This is the sibling of `.github/workflows/deploy-ct110.yml`, not a
+# replacement for it:
+#
+#   * deploy-ct110.yml builds a WHEEL on the runner and pushes it to the node
+#     as BYTES (scripts/deploy/ct110/ct110_deploy.sh).  That path is the
+#     established one and stays as it is.
+#   * THIS workflow installs FROM A REF.  The node clones the repository
+#     itself, resolves the ref to a commit, builds a wheel from that commit
+#     and installs it into the same venv the other path installs into.  It
+#     needs no wheel artifact, so a deploy can be run for any commit in the
+#     repository without a CI build first.
+#
+# It REUSES the deploy path this repository already uses (do not invent a
+# second one):
+#
+#   * the self-hosted runner on CT210 with the label `lan-deploy`;
+#   * the SSH key secret per node (`CT110_PVE_SSH_KEY` / `CT111_PVE_SSH_KEY`);
+#   * the Proxmox host and the container id (`CT110_PVE_HOST` /
+#     `CT111_PVE_HOST`, `CT110_CT_ID` / `CT111_CT_ID`);
+#   * `scripts/deploy/ct110/run_on_ct110.sh`, which moves the payload to the
+#     node as BYTES, sha256-verifies every hop and runs it with
+#     `pct exec <ct>`.
+#
+# The in-node half is `scripts/deploy-node.sh`.  It refuses to touch a node
+# with a live run (it reads `runs/<id>/control/status.json`), backs up the
+# venv package metadata and settings.db with a UTC suffix, installs the ref,
+# restarts `lh-harness.service`, reads the service back (is-active,
+# /api/health, /api/meta) and writes the receipt
+# `/home/harness/.lh-harness/deployed.json`.
+#
+# NEVER auto-triggered: the only trigger is workflow_dispatch, so a push to
+# main ships nothing by itself.
+#
+# Prerequisites owned by a human (the values cannot live in git):
+#   - a self-hosted runner registered FOR THIS REPO with the label
+#     `lan-deploy` (CT210, user `runner`) -- the same registration
+#     deploy-ct110.yml uses;
+#   - GitHub environment `ct110-prod` / `ct111-prod` with the secrets
+#     `CT110_API_TOKEN` / `CT111_API_TOKEN` and `CT110_PVE_SSH_KEY` /
+#     `CT111_PVE_SSH_KEY`, and the variables `CT110_WEB_URL` /
+#     `CT111_WEB_URL`, `CT110_PVE_HOST` / `CT111_PVE_HOST`,
+#     `CT110_PVE_SSH_USER` / `CT111_PVE_SSH_USER`, `CT110_CT_ID` /
+#     `CT111_CT_ID` (see scripts/deploy/nodes.json for the inventory and
+#     scripts/deploy/node/README.md for creating a node).
+#
+# Every secret and variable is referenced BY NAME.  No credential value is
+# written into this file, into the workflow log or onto the node.
+
+on:
+  workflow_dispatch:
+    inputs:
+      node:
+        description: "Node to deploy (scripts/deploy/nodes.json)"
+        required: true
+        default: ct110
+        type: choice
+        options:
+          - ct110
+          - ct111
+      ref:
+        description: "Git ref to install on the node (branch, tag or commit sha)"
+        required: true
+        default: origin/main
+        type: string
+      drain_wait_seconds:
+        description: "Seconds to wait for the live runs to finish before deploying (0 = refuse while a run is alive)"
+        required: true
+        default: "0"
+        type: string
+      dry_run:
+        description: "Preflight only; never touches the target node"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  checks: read
+  statuses: read
+
+# One deploy at a time per node, and never cancel one mid-restart: a
+# cancelled deploy can leave the service down or half-upgraded.
+concurrency:
+  group: deploy-node-${{ inputs.node }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.node }} from ${{ inputs.ref }}
+    runs-on: [self-hosted, lan-deploy]
+    environment: ${{ inputs.node == 'ct111' && 'ct111-prod' || 'ct110-prod' }}
+    timeout-minutes: 60
+    env:
+      TARGET_NODE: ${{ inputs.node }}
+      TARGET_REF: ${{ inputs.ref }}
+      DRAIN_WAIT_SECONDS: ${{ inputs.drain_wait_seconds }}
+      # Secret NAME = <CT110|CT111>_API_TOKEN / _PVE_SSH_KEY.  The name is
+      # built from a literal prefix, so an unset secret resolves to empty and
+      # fails the run instead of falling through to the other node's
+      # credential.
+      CT110_API_TOKEN: ${{ secrets[format('{0}_API_TOKEN', inputs.node == 'ct111' && 'CT111' || 'CT110')] }}
+      CT110_PVE_SSH_KEY: ${{ secrets[format('{0}_PVE_SSH_KEY', inputs.node == 'ct111' && 'CT111' || 'CT110')] }}
+      # The web token reaches the in-node script through `pct exec -- env`,
+      # exactly like CT110_API_TOKEN reaches verify_meta.py in the other
+      # workflow.  The node's secrets file is never opened by the deploy.
+      LH_HARNESS_WEB_TOKEN: ${{ secrets[format('{0}_API_TOKEN', inputs.node == 'ct111' && 'CT111' || 'CT110')] }}
+      CT110_WEB_URL: ${{ vars[format('{0}_WEB_URL', inputs.node == 'ct111' && 'CT111' || 'CT110')] || (inputs.node != 'ct111' && 'http://192.168.21.168:8799' || '') }}
+      PVE_HOST: ${{ vars[format('{0}_PVE_HOST', inputs.node == 'ct111' && 'CT111' || 'CT110')] || (inputs.node == 'ct111' && 'ptait07' || 'corsairai300') }}
+      PVE_USER: ${{ vars[format('{0}_PVE_SSH_USER', inputs.node == 'ct111' && 'CT111' || 'CT110')] || 'root' }}
+      CT_ID: ${{ vars[format('{0}_CT_ID', inputs.node == 'ct111' && 'CT111' || 'CT110')] || (inputs.node == 'ct111' && '111' || '110') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The ref must resolve before anything is pushed to a node: a typo must
+      # fail here, not half way through a deploy.
+      - name: Resolve the ref
+        id: resolve
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin "$TARGET_REF" || git fetch --quiet origin
+          sha="$(git rev-parse --verify --quiet "${TARGET_REF}^{commit}" || true)"
+          if [ -z "$sha" ]; then
+            echo "::error::the ref '$TARGET_REF' does not resolve to a commit"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "resolved $TARGET_REF -> $sha"
+
+      - name: Require target configuration
+        run: |
+          set -euo pipefail
+          missing=0
+          [ -n "$CT110_PVE_SSH_KEY" ] || { echo "::error::secret ${TARGET_NODE^^}_PVE_SSH_KEY is not set in this environment"; missing=1; }
+          if [ "$TARGET_NODE" = "ct111" ]; then
+            [ -n "$CT110_WEB_URL" ] || { echo "::error::variable CT111_WEB_URL is not set (no default: the node's IP is assigned per install)"; missing=1; }
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+          echo "target=$TARGET_NODE ct_id=$CT_ID pve_host=$PVE_HOST"
+
+      - name: Stage SSH key
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/harness_node_pve_key"
+          install -m 600 /dev/null "$key_file"
+          printf '%s\n' "$CT110_PVE_SSH_KEY" > "$key_file"
+          echo "SSH_KEY_FILE=$key_file" >> "$GITHUB_ENV"
+
+      # The script travels as BYTES and is sha256-verified at every hop (the
+      # 2026-09-18 CRLF lesson): run_on_ct110.sh pushes it to the Proxmox
+      # host, then into the container, verifying both hops before it runs.
+      - name: Stage the deploy script
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          mkdir -p stage
+          cp scripts/deploy-node.sh stage/deploy-node.sh
+          chmod +x stage/deploy-node.sh
+          sha="$(sha256sum stage/deploy-node.sh | awk '{print $1}')"
+          echo "deploy-node.sh sha256=$sha"
+
+      - name: Dry run (resolve the ref, touch nothing)
+        id: dry_run
+        if: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --verify --quiet "${TARGET_REF}^{commit}" || true)"
+          echo "dry run: $TARGET_REF resolves to ${sha:-nothing}; the node was not touched"
+
+      # The real deploy.  run_on_ct110.sh pushes the staged script into the
+      # container as BYTES (both hops sha256-verified) and runs it there:
+      #   pct exec <ct> -- bash /root/lh-deploy/deploy-node.sh <args>
+      - name: Deploy the ref on the node
+        id: deploy
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          scripts/deploy/ct110/run_on_ct110.sh script stage/deploy-node.sh \
+            --ref "$TARGET_REF" --drain-wait "$DRAIN_WAIT_SECONDS"
+
+      # The script already read the service back (is-active, /api/health,
+      # /api/meta) and rolled back on a failed read-back.  This step confirms
+      # from the runner that the RECEIPT on the node names the commit that
+      # was asked for -- the receipt is what an operator reads later.
+      - name: Verify the deploy receipt on the node
+        if: ${{ !inputs.dry_run }}
+        env:
+          EXPECTED_SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          receipt="$(scripts/deploy/ct110/run_on_ct110.sh exec cat /home/harness/.lh-harness/deployed.json || true)"
+          if [ -z "$receipt" ]; then
+            echo "::error::no deploy receipt at /home/harness/.lh-harness/deployed.json"
+            exit 1
+          fi
+          echo "deploy receipt:"
+          echo "$receipt"
+          got="$(printf '%s' "$receipt" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("commit",""))')"
+          if [ "$got" != "$EXPECTED_SHA" ]; then
+            echo "::error::the receipt names commit '$got', expected '$EXPECTED_SHA'"
+            exit 1
+          fi
+
+      - name: DEPLOY OK
+        if: ${{ !inputs.dry_run }}
+        run: echo "HARNESS_NODE_DEPLOY_OK node=$TARGET_NODE ref=$TARGET_REF sha=${{ steps.resolve.outputs.sha }}"
+
+      - name: Deployment record
+        if: ${{ always() }}
+        run: |
+          {
+            echo "### Harness node deploy"
+            echo ""
+            echo "- node: $TARGET_NODE"
+            echo "- ref: $TARGET_REF"
+            echo "- resolved: ${{ steps.resolve.outputs.sha || 'not resolved' }}"
+            echo "- drain_wait_seconds: $DRAIN_WAIT_SECONDS"
+            echo "- dry_run: ${{ inputs.dry_run }}"
+            echo "- deploy outcome: ${{ steps.deploy.outcome || 'skipped' }}"
+          } >> "$GITHUB_STEP_SUMMARY"

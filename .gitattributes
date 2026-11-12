@@ -4,6 +4,11 @@
 # but correct line endings in the CHECKOUT are the first line of defence.
 scripts/deploy/**/*.sh text eol=lf
 scripts/deploy/**/*.py text eol=lf
+# scripts/deploy-node.sh is the in-node half of the ref deploy: the runner
+# pushes it into the container and bash runs it there, so it needs the same
+# LF rule as the scripts under scripts/deploy/ (the rules above do NOT match
+# it: it sits at scripts/ root, one level above scripts/deploy/).
+scripts/deploy-node.sh text eol=lf
 .github/workflows/*.yml text eol=lf
 # New-node templates are pushed into a CT and installed as-is (systemd unit,
 # harness config), so they follow the same LF rule as the scripts.
