@@ -1173,3 +1173,166 @@ def test_server_upload_lock_map_bounded():
             assert held in webapi_server._upload_locks.values()
     finally:
         webapi_server._upload_locks.clear()
+
+
+# ---------------------------------------------------------------------------
+# Ghost capacity (easybutt0n-131, defect D1)
+#
+# ``FleetReporter.queue_heartbeat`` decides whether a run is "active" with a
+# single predicate: the canonical lifecycle status is not in
+# ``TERMINAL_STATUSES``.  Two row classes defeat that predicate and inflate
+# the settings_store aggregate far past ``maxConcurrentRuns`` (CT111: 7
+# reported against a cap of 2) while the authoritative run list is empty or
+# stale:
+#
+#   (a) an intact CANCELLED row whose durable cancellation is only in a
+#       non-status field -- the operator's request survives in
+#       ``control/owner.json`` (``state``) or in the role event log, while
+#       ``control/status.json`` was never rewritten to a terminal spelling.
+#       The row canonicalizes to ``idle`` and is counted as active.
+#   (b) a STALE row with NO terminal record at all -- the run directory's
+#       control files are gone, blank, or still say ``idle`` with no live
+#       worker.  ``canonical_lifecycle_status`` maps blank/absent to
+#       ``idle``, which is deliberately non-terminal, so the row is counted.
+#
+# Both classes are built from real supervisor rows (``RunSupervisor`` over a
+# temp runs root, then ``build_run_summary``), not hand-written dicts, so the
+# test fails if the row-production path stops surfacing the evidence the fix
+# keys on.
+# ---------------------------------------------------------------------------
+
+
+def _ghost_runs_root(base):
+    """Create one runs dir per row shape; return it for the supervisor."""
+
+    from pathlib import Path
+
+    root = Path(base) / "runs"
+    root.mkdir()
+
+    def make(run_id, *, status=None, owner=None, report=None, events=None):
+        run_dir = root / run_id
+        (run_dir / "control").mkdir(parents=True)
+        role = run_dir / "lh_harness" / "role_orchestration"
+        role.mkdir(parents=True)
+        if status is not None:
+            (run_dir / "control" / "status.json").write_text(json.dumps(status))
+        if owner is not None:
+            (run_dir / "control" / "owner.json").write_text(json.dumps(owner))
+        if report is not None:
+            (run_dir / "lh_harness" / "report.json").write_text(json.dumps(report))
+        if events is not None:
+            (role / "events.jsonl").write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n"
+            )
+        return run_dir
+
+    # (a) intact cancelled rows: cancellation is durable, but not in the
+    # status spelling the counter reads.
+    make("ghost-cancel-owner-state", owner={"task": "t", "pid": 0, "state": "cancelled"})
+    make(
+        "ghost-cancel-event-only",
+        owner={"task": "t", "pid": 0},
+        events=[{"event": "role_harness_start"}, {"event": "role_harness_cancelled"}],
+    )
+    # (b) stale rows: no terminal record survives at all.
+    make("ghost-stale-no-status", owner={"task": "t", "pid": 0})
+    make("ghost-stale-blank-status", status={"status": ""}, owner={"task": "t", "pid": 0})
+    make("ghost-stale-idle-dead", status={"status": "idle", "alive": False}, owner={"task": "t", "pid": 0})
+    # Live baseline that MUST keep counting.  ``attached`` + this process's own
+    # pid is the supervisor's documented liveness path for an embedded run.
+    make(
+        "live-run",
+        status={"status": "running", "alive": True},
+        owner={"task": "t", "pid": os.getpid(), "attached": True},
+        events=[{"event": "role_harness_start"}],
+    )
+    # An ordinary finished run must stay excluded (no regression).
+    make(
+        "finished-run",
+        status={"status": "completed", "alive": False},
+        owner={"task": "t", "pid": 0},
+        report={"status": "completed", "completion_satisfied": True},
+    )
+    return root
+
+
+def _registry_rows(runs_root):
+    """Build heartbeat rows exactly as ``server._heartbeat`` does.
+
+    That callback calls ``build_run_summary(item, state=registry.state_for(id))``
+    for every supervisor row.  ``build_run_summary`` deliberately projects only
+    ``id``/``task``/``status``/``updated_at``/``log_dir`` plus provenance, so the
+    row carries NO liveness field -- which is precisely why the counter must
+    consult the run's durable control record instead of trusting the row.
+    """
+
+    from lh_harness.supervisor.service import RunSupervisor
+    from lh_harness.webapi.snapshot import build_run_summary
+
+    supervisor = RunSupervisor(runs_root=str(runs_root))
+    rows = []
+    for item in supervisor.list_run_items():
+        rows.append(build_run_summary(item, state=None))
+    return rows
+
+
+def _heartbeat_body(http_server, rows):
+    _setenv(http_server, "ghost-node", "ghost-key", "kind=ct111")
+    reporter = get_reporter(version="1.2.0", capacity=2, reset=True)
+    reporter.queue_heartbeat(rows, active=len(rows), cap=2, queue_len=0)
+    reporter.stop(timeout=30.0)
+    requests = [r for r in _StubHandler.requests if r["path"] == "/harness/heartbeat"]
+    assert len(requests) == 1
+    return requests[0]["body"]
+
+
+def test_heartbeat_excludes_intact_cancelled_rows_from_active(http_server, tmp_path):
+    """Class (a): an intact cancelled row is not an active run.
+
+    The cancellation is durable in ``control/owner.json``/the role event log
+    while ``control/status.json`` never carried a terminal spelling.  The
+    counter must read that evidence instead of counting the row as ``idle``.
+    """
+
+    body = _heartbeat_body(http_server, _registry_rows(_ghost_runs_root(tmp_path)))
+
+    sent_ids = {row["runId"] for row in body["runs"]}
+    assert "ghost-cancel-owner-state" not in sent_ids
+    assert "ghost-cancel-event-only" not in sent_ids
+    # The genuinely active run is still reported.
+    assert sent_ids == {"live-run"}
+
+
+def test_heartbeat_excludes_stale_missing_terminal_record_rows(http_server, tmp_path):
+    """Class (b): a stale row with no terminal record is not an active run.
+
+    ``status.json`` is missing, blank, or says ``idle`` with no live worker.
+    ``canonical_lifecycle_status`` maps all of those to non-terminal ``idle``,
+    so only a liveness/record check keeps them out of the active set.
+    """
+
+    body = _heartbeat_body(http_server, _registry_rows(_ghost_runs_root(tmp_path)))
+
+    sent_ids = {row["runId"] for row in body["runs"]}
+    assert "ghost-stale-no-status" not in sent_ids
+    assert "ghost-stale-blank-status" not in sent_ids
+    assert "ghost-stale-idle-dead" not in sent_ids
+    assert "finished-run" not in sent_ids
+    assert sent_ids == {"live-run"}
+
+
+def test_heartbeat_active_count_matches_serialized_rows(http_server, tmp_path):
+    """The reported active count can never exceed the rows actually active.
+
+    This is the aggregate-vs-authoritative-list invariant behind D1: CT111
+    advertised 7 active runs while the run list held nothing to act on.
+    """
+
+    rows = _registry_rows(_ghost_runs_root(tmp_path))
+    body = _heartbeat_body(http_server, rows)
+
+    assert body["runsTotal"] == 7
+    assert len(body["runs"]) == 1
+    # The serialized row page and the counted-active set must not diverge.
+    assert body["runsTruncated"] is False

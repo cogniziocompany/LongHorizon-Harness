@@ -298,13 +298,24 @@ class FleetReporter:
         # status, but only non-terminal runs are serialized into ``runs[]``.
         # Unknown/blank statuses canonicalize to "idle" (non-terminal), so a
         # malformed record is reported, never silently dropped.
+        #
+        # GHOST CAPACITY (easybutt0n-131, D1): the status predicate alone
+        # over-counts.  ``canonical_lifecycle_status`` maps a blank/absent
+        # status to ``idle``, which is deliberately non-terminal, so a row
+        # whose control record is gone -- or whose cancellation never reached
+        # ``status.json`` -- is counted as an active run.  On CT111 that made
+        # the aggregate report 7 active runs against ``maxConcurrentRuns`` 2
+        # while the authoritative run list held nothing to act on.  A row is
+        # only active when its durable control record also says so; the check
+        # lives here, on the single emission path, so every producer of the
+        # run list is covered.
         runs_total = len(runs)
         runs_by_status: dict[str, int] = {}
         active_runs: list[dict[str, Any]] = []
         for run in runs:
             status = canonical_lifecycle_status(run.get("status"))
             runs_by_status[status] = runs_by_status.get(status, 0) + 1
-            if status not in TERMINAL_STATUSES:
+            if status not in TERMINAL_STATUSES and not _is_ghost_capacity_row(run):
                 active_runs.append(run)
         # Hard cap on the active list itself (most recent first by the
         # summary's ``updated_at``; the raw registry ``mtime`` is the
@@ -703,6 +714,117 @@ def _tail_last_event(run_id: str, log_dir: Any) -> Any | None:
     except Exception:
         return None
     return events[-1] if events else None
+
+
+def _read_control_json(log_dir: Any, name: str) -> dict[str, Any]:
+    """Read one run ``control/<name>`` record, or ``{}`` when unreadable.
+
+    ``log_dir`` is ``<run>/lh_harness``; the control directory is its sibling.
+    The same O_NOFOLLOW/single-link discipline as :func:`_read_report` applies:
+    a run directory is worker-writable, so a symlinked or hard-linked control
+    record is never trusted as evidence.
+    """
+
+    if not isinstance(log_dir, str) or not log_dir:
+        return {}
+    try:
+        target = Path(log_dir).parent / "control" / name
+        fd = os.open(
+            target,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError:
+        return {}
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return {}
+        data = os.read(fd, 64 * 1024)
+        value = json.loads(data.decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return value if isinstance(value, dict) else {}
+
+
+def _is_ghost_capacity_row(run: dict[str, Any]) -> bool:
+    """Is this non-terminal-looking row a ghost that must not count as active?
+
+    Two row classes inflate the aggregate (easybutt0n-131, defect D1):
+
+    Class (a): a CANCELLED row whose cancellation is not in ``status.json``.
+    The operator's cancel survives in ``control/owner.json`` (``state``) or in
+    the role event ledger, while the status file was never rewritten to a
+    terminal spelling.  The row canonicalizes to ``idle`` and used to be
+    counted.
+
+    Class (b): a STALE row whose control record still says ``idle`` with
+    ``alive`` false.  An absent/blank status canonicalizes to non-terminal
+    ``idle``, so the row used to be counted forever.
+
+    The discriminator is the durable control record, which the heartbeat
+    already has a path to (``log_dir`` -> sibling ``control/``):
+
+    * a terminal status in ``status.json`` -> not a ghost (already excluded by
+      the caller's status predicate);
+    * cancellation evidence in ``owner.json``/the event tail -> ghost (class a);
+    * ``alive`` explicitly false and the status not an active one -> ghost
+      (class b).
+
+    Only positive durable evidence excludes a row.  ``alive`` absent from
+    ``status.json`` is NOT treated as dead, and a row with no control record at
+    all keeps the documented "malformed record is reported, never silently
+    dropped" behaviour, so a store written before the liveness field existed
+    keeps its previous result.  ``owner.json`` carrying a positive pid counts
+    as liveness evidence: the supervisor only writes a pid it launched.
+    """
+
+    log_dir = run.get("log_dir")
+    status_record = _read_control_json(log_dir, "status.json")
+    owner_record = _read_control_json(log_dir, "owner.json")
+
+    from ..supervisor.lifecycle import (
+        ACTIVE_STATUSES,
+        TERMINAL_STATUSES as _TERMINAL,
+        canonical_lifecycle_status as _canon,
+    )
+
+    durable = _canon(status_record.get("status"), default="")
+    if durable in _TERMINAL:
+        return False
+
+    # (a) Durable cancellation evidence that never reached ``status.json``.
+    owner_state = _canon(owner_record.get("state"), default="")
+    if owner_state == "cancelled":
+        return True
+    last_event = _tail_last_event(str(run.get("id") or ""), log_dir)
+    if last_event is not None:
+        event_name = str(getattr(last_event, "type", "") or "")
+        if event_name.endswith("_cancelled"):
+            return True
+
+    # A pid the supervisor launched is liveness evidence: it only records one
+    # for a worker it actually started.
+    try:
+        owner_pid = int(owner_record.get("pid", 0) or 0)
+    except (TypeError, ValueError):
+        owner_pid = 0
+    if owner_pid > 0:
+        return False
+
+    # (b) Stale row: the durable record positively says no worker is alive, so
+    # the run cannot be one an operator can act on.  Absent liveness is NOT
+    # treated as dead elsewhere, and an absent control record keeps the
+    # documented "malformed record is reported, never silently dropped"
+    # behaviour: only positive evidence excludes a row.
+    alive = status_record.get("alive")
+    if alive is False and durable not in ACTIVE_STATUSES:
+        return True
+    return False
 
 
 def _heartbeat_run_row(run: dict[str, Any], *, now: float) -> dict[str, Any]:
