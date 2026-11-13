@@ -768,7 +768,15 @@ class Launcher:
             self._config.get("capacity", {}).get("poll_seconds", poll_seconds)
         )
         self._task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         self._stopping = False
+        # Launch-loop liveness (easybutt0n-61): the last COMPLETED pass is
+        # independent of the lease timestamp.  The watchdog only observes and
+        # reports; it never refreshes the lease and never starts a launcher.
+        self._loop_started_at: float | None = None
+        self._last_pass_at: float | None = None
+        self._pass_in_progress = False
+        self._loop_failure: str | None = None
         # Workspace branch guard hook: returns a description of an OPEN PR on
         # the given branch, or None.  DEFAULT-ON: production launches probe
         # origin for a colliding OPEN PR with no flag or config (deliverable 3
@@ -986,22 +994,105 @@ class Launcher:
 
         return self._stall_cycles
 
+    @property
+    def last_pass_at(self) -> float | None:
+        """Wall-clock time of the last completed launch pass, if any."""
+
+        return self._last_pass_at
+
+    @property
+    def loop_failure(self) -> str | None:
+        """First unexpected launch-loop stoppage recorded by the watchdog."""
+
+        return self._loop_failure
+
     async def start(self) -> None:
         if self._task is not None:
             return
         self._stopping = False
+        self._loop_started_at = time.time()
+        self._loop_failure = None
         self._task = asyncio.create_task(self._loop())
+        self._task.add_done_callback(self._loop_done)
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
     async def stop(self) -> None:
         self._stopping = True
-        if self._task is not None:
-            self._task.cancel()
+        for attr in ("_task", "_watchdog_task"):
+            task = getattr(self, attr)
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                # A failed launch loop is already loud in the service event and
+                # log; shutdown must still cancel the watchdog and finish.
+                pass
             finally:
-                self._task = None
+                setattr(self, attr, None)
+
+    def _loop_done(self, task: asyncio.Task) -> None:
+        """Fail loudly as soon as the launch task stops unexpectedly."""
+
+        if self._stopping:
+            return
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            self._fail_loop("launch loop task was cancelled unexpectedly")
+        except Exception as exc:
+            self._fail_loop(f"launch loop task failed: {type(exc).__name__}: {exc}")
+        else:
+            self._fail_loop("launch loop task exited unexpectedly")
+
+    async def _watchdog_loop(self) -> None:
+        """Detect a live service whose launch loop has stopped completing passes."""
+
+        while not self._stopping:
+            await asyncio.sleep(max(self._poll_seconds, 0.001))
+            if self._stopping:
+                return
+            if self._pass_in_progress:
+                # A slow workspace/provider operation is not a dead loop.  Task
+                # exit is caught by _loop_done; only an idle loop that has
+                # stopped scheduling new passes trips the time-based watchdog.
+                continue
+            reference = self._last_pass_at
+            if reference is None:
+                reference = self._loop_started_at
+            if reference is None:
+                continue
+            silent_for = time.time() - reference
+            threshold = 3 * self._lease_interval()
+            if silent_for >= threshold:
+                self._fail_loop(
+                    f"no launch pass completed for {silent_for:.1f}s "
+                    f"(threshold {threshold:.1f}s)"
+                )
+                return
+
+    def _fail_loop(self, reason: str) -> None:
+        """Emit one-shot signals without refreshing the lease or relaunching."""
+
+        if self._stopping or self._loop_failure is not None:
+            return
+        self._loop_failure = reason
+        logger.critical(
+            "launcher loop watchdog: %s; service is still running and no second launcher was started",
+            reason,
+        )
+        self._emit_service_event(
+            "launcher.loop_stopped",
+            {
+                "reason": reason,
+                "last_pass_at": self._last_pass_at,
+                "lease_holder": self._lease,
+                "message": f"launcher loop watchdog: {reason}",
+            },
+        )
 
     async def _loop(self) -> None:
         while not self._stopping:
@@ -1011,7 +1102,12 @@ class Launcher:
     async def tick(self) -> None:
         """Run one poll/launch pass, moving blocking work off the event loop."""
 
-        await asyncio.to_thread(self._tick_sync)
+        self._pass_in_progress = True
+        try:
+            await asyncio.to_thread(self._tick_sync)
+            self._last_pass_at = time.time()
+        finally:
+            self._pass_in_progress = False
 
     def _tick_sync(self) -> None:
         try:
