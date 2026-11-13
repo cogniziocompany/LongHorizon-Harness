@@ -563,6 +563,67 @@ def test_bool_is_not_accepted_as_number():
         validate_chain(base, [d1], handoff=_handoff(base, d1))
 
 
+def test_tuple_is_not_accepted_as_array():
+    """NEG-39: ``"array"`` is a JSON ``list``, exactly as the extract types it.
+
+    Extract basis (section 5, line 361): ``"array": lambda: isinstance(value,
+    list)``.  Naive shortcut defeated: widening the predicate to
+    ``(list, tuple)`` accepts a Python tuple, which no JSON document can
+    produce -- the value cannot round-trip through canonical-json/v1 as an
+    array of the same kind, so a document that only survives because the
+    validator was looser than the pinned schema is not the same document the
+    trusted schema admits.
+    """
+    state = {**json.loads(json.dumps(BASE_STATE)), "budget_list": [1, 2]}
+    base = _base(state=state)
+    d1 = DeltaManifest(
+        delta_id="d-1",
+        sequence=1,
+        base_checkpoint_id="cp-base",
+        predecessor_digest=base.digest,
+        changes={"budget_list": (1, 2)},
+        removals=(),
+        scope=dict(SCOPE),
+    ).with_digest()
+    handoff = TrustedHandoff(
+        scope=dict(SCOPE),
+        required_state_schemas={"budget_list": {"type": "array"}},
+        expected_base={
+            "checkpoint_id": "cp-base",
+            "sequence": 0,
+            "digest": base.digest,
+        },
+        expected_terminal={
+            "delta_id": "d-1",
+            "sequence": 1,
+            "digest": d1.digest,
+        },
+    )
+    with pytest.raises(IncompleteContext, match="wrong type"):
+        validate_chain(base, [d1], handoff=handoff)
+
+
+def test_array_schema_accepts_a_list():
+    """The positive side: a JSON list satisfies ``"array"``."""
+    state = {**json.loads(json.dumps(BASE_STATE)), "budget_list": [1, 2]}
+    listable = _base(state=state)
+    handoff = TrustedHandoff(
+        scope=dict(SCOPE),
+        required_state_schemas={"budget_list": {"type": "array"}},
+        expected_base={
+            "checkpoint_id": "cp-base",
+            "sequence": 0,
+            "digest": listable.digest,
+        },
+        expected_terminal={
+            "delta_id": "cp-base",
+            "sequence": 0,
+            "digest": listable.digest,
+        },
+    )
+    validate_chain(listable, [], handoff=handoff)
+
+
 # --------------------------------------------------------------------------
 # Extract-derived rejections (the three round_003 lead areas, re-proved)
 #

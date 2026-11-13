@@ -315,9 +315,14 @@ def _require_object_prefix(value: Any, relative_path: str, message: str) -> None
 
 def _validate_value(value: Any, schema: Mapping[str, Any], path: str) -> None:
     kind = schema.get("type")
+    # The type predicates are the pinned extract's, literally: "object" is a
+    # ``dict`` and "array" is a ``list`` (06-solution-snippets.md section 5,
+    # lines 360-361).  Widening either one -- accepting any ``Mapping`` or a
+    # ``tuple`` -- would let a document that JSON cannot round-trip into that
+    # shape pass the trusted schema, which the pinned reference rejects.
     valid = {
-        "object": lambda: isinstance(value, Mapping),
-        "array": lambda: isinstance(value, (list, tuple)),
+        "object": lambda: isinstance(value, dict),
+        "array": lambda: isinstance(value, list),
         "string": lambda: isinstance(value, str),
         "number": lambda: isinstance(value, (int, float))
         and not isinstance(value, bool),
