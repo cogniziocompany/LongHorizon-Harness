@@ -221,9 +221,10 @@ class TrustedHandoff:
     ``required_state_schemas`` maps a dotted state path to a schema such as
     ``{"type": "string", "min_length": 1}`` or
     ``{"type": "string", "enum": ["a", "b"]}``.  ``expected_base`` and
-    ``expected_terminal`` are ``{id, sequence, digest}`` triples -- the
-    terminal key is normalized to ``delta_id`` by the spec's wording, but
-    this module accepts either spelling.
+    ``expected_terminal`` are the trusted ``{id, sequence, digest}`` triples.
+    ``expected_terminal`` is compared by whole-dict equality against the
+    recomputed terminal (extract line 337), so it must use the key
+    ``delta_id`` (the base uses ``checkpoint_id``) and carry no extra keys.
     """
 
     scope: Mapping[str, Any]
@@ -446,20 +447,6 @@ def _apply_delta_to_mandatory(
                 _validate_value(view[mandatory], schemas[mandatory], mandatory)
 
 
-def _expected_triple(handoff_value: Mapping[str, Any]) -> dict[str, Any]:
-    terminal_id = handoff_value.get("delta_id", handoff_value.get("id"))
-    try:
-        return {
-            "delta_id": terminal_id,
-            "sequence": handoff_value["sequence"],
-            "digest": handoff_value["digest"],
-        }
-    except KeyError as exc:
-        raise IncompleteContext(
-            f"trusted handoff triple is missing {exc.args[0]}"
-        ) from exc
-
-
 def validate_checkpoint_manifest(
     checkpoint: CheckpointManifest | Mapping[str, Any],
     handoff: TrustedHandoff,
@@ -634,7 +621,15 @@ def validate_chain(
         "sequence": previous_sequence,
         "digest": previous_digest,
     }
-    if actual_terminal != _expected_triple(handoff.expected_terminal):
+    # Whole-dict equality against the trusted terminal, exactly as the pinned
+    # extract writes it (06-solution-snippets.md section 5, line 337:
+    # ``if actual_terminal != expected_terminal``).  No key normalization and
+    # no extra-key tolerance: a handoff that spells the terminal id ``id``
+    # rather than ``delta_id``, or that carries a fourth key, is a different
+    # trusted receipt and must not match.  Normalizing would let a handoff the
+    # operator never signed (a superset document, or one using a different
+    # field name) validate the same chain.
+    if actual_terminal != dict(handoff.expected_terminal):
         raise IncompleteContext("terminal content does not match trusted receipt")
 
     return ChainSummary(

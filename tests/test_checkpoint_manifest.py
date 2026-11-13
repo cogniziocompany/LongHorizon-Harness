@@ -228,7 +228,13 @@ def test_neg37_required_value_becomes_null():
 
 
 def test_neg37_baseline_missing_mandatory_path():
-    """NEG-37/NEG-24: a baseline already missing a mandatory path is incomplete."""
+    """NEG-37/NEG-24: a baseline already missing a mandatory path is incomplete.
+
+    Naive shortcut defeated: a validator that checks only the *deltas* for
+    mandatory paths (or that treats the baseline as already trusted because
+    its digest matches) accepts a base that never carried the evidence, so
+    governed work starts from a context that was never complete.
+    """
     state = json.loads(json.dumps(BASE_STATE))
     del state["evidence"]["receipt"]
     base = _base(state=state)
@@ -371,7 +377,12 @@ def test_neg26_cross_tenant_checkpoint_is_rejected_before_content_use():
 
 
 def test_neg26_cross_tenant_delta_is_rejected():
-    """NEG-26: a delta claiming another tenant cannot extend this chain."""
+    """NEG-26: a delta claiming another tenant cannot extend this chain.
+
+    Naive shortcut defeated: binding the scope only on the baseline accepts a
+    delta from another tenant, splicing foreign content into this task's
+    trusted chain (a cross-tenant content-existence leak, spec line 69).
+    """
     base = _base()
     other_scope = dict(SCOPE)
     other_scope["tenant_id"] = "t-2"
@@ -509,7 +520,12 @@ def test_wrong_schema_id():
 
 
 def test_missing_schema_id():
-    """A handoff with no schema id at all is rejected, not defaulted."""
+    """A handoff with no schema id at all is rejected, not defaulted.
+
+    Naive shortcut defeated: ``document.get("schema") == SCHEMA_ID`` with a
+    ``SCHEMA_ID`` default when absent accepts an unversioned handoff, which
+    cannot be proven to be the v2 contract at all.
+    """
     document = {"scope": dict(SCOPE)}
     with pytest.raises(IncompleteContext, match="unsupported trusted handoff schema"):
         TrustedHandoff.from_document(document)
@@ -543,7 +559,12 @@ def test_wrong_mandatory_value_enum():
 
 
 def test_wrong_mandatory_value_type():
-    """NEG-39: a wrong mandatory value type is rejected after the delta."""
+    """NEG-39: a wrong mandatory value type is rejected after the delta.
+
+    Naive shortcut defeated: checking that a mandatory path is merely
+    *present* -- not that it still satisfies the pinned schema -- lets a
+    delta turn ``budget: 5`` into ``budget: "lots"`` and the chain validates.
+    """
     base = _base()
     d1 = _delta(base.digest, 1, changes={"budget": "lots"})
     with pytest.raises(IncompleteContext, match="wrong type"):
@@ -718,6 +739,66 @@ def test_delta_claiming_the_base_as_predecessor_after_the_first_link():
 
 
 # --------------------------------------------------------------------------
+# Strict trusted-terminal equality (extract line 337)
+# --------------------------------------------------------------------------
+
+
+def _terminal_handoff(base, terminal, expected_terminal):
+    """A handoff whose trusted terminal triple is supplied literally."""
+    return _handoff(base, terminal, expected_terminal=expected_terminal)
+
+
+def test_terminal_id_alias_spelling_is_rejected():
+    """The trusted terminal must spell its identity ``delta_id``, not ``id``.
+
+    Extract basis (section 5, line 332-338): ``actual_terminal`` is built with
+    the key ``delta_id`` and compared with ``!=`` against the handoff's
+    ``expected_terminal``, so a handoff spelling it ``id`` is a different
+    receipt and never matches.  Naive shortcut defeated: normalizing the key
+    (``handoff.get("delta_id", handoff.get("id"))``) makes an unsigned alias
+    document validate the same chain -- the operator's pinned receipt is then
+    no longer the thing being compared.
+    """
+    base = _base()
+    d1 = _delta(base.digest, 1, changes={"budget": 2})
+    aliased = {"id": "d-1", "sequence": 1, "digest": d1.digest}
+    with pytest.raises(IncompleteContext, match="terminal content"):
+        validate_chain(base, [d1], handoff=_terminal_handoff(base, d1, aliased))
+
+
+def test_terminal_with_an_extra_key_is_rejected():
+    """A trusted terminal carrying a fourth key does not equal the triple.
+
+    Extract basis (section 5, line 337): the comparison is whole-dict
+    equality, so ``{"delta_id", "sequence", "digest", "note"}`` is a superset
+    document, not the trusted receipt.  Naive shortcut defeated: comparing the
+    three fields the implementation happens to read accepts any handoff that
+    merely *contains* the triple, so a document the operator never signed can
+    authorize the chain.
+    """
+    base = _base()
+    d1 = _delta(base.digest, 1, changes={"budget": 2})
+    superset = {
+        "delta_id": "d-1",
+        "sequence": 1,
+        "digest": d1.digest,
+        "note": "unsigned",
+    }
+    with pytest.raises(IncompleteContext, match="terminal content"):
+        validate_chain(base, [d1], handoff=_terminal_handoff(base, d1, superset))
+
+
+def test_exact_terminal_triple_still_validates():
+    """The positive side: the exact ``{delta_id, sequence, digest}`` triple passes."""
+    base = _base()
+    d1 = _delta(base.digest, 1, changes={"budget": 2})
+    exact = {"delta_id": "d-1", "sequence": 1, "digest": d1.digest}
+    summary = validate_chain(base, [d1], handoff=_terminal_handoff(base, d1, exact))
+    assert summary.terminal_id == "d-1"
+    assert summary.terminal_digest == d1.digest
+
+
+# --------------------------------------------------------------------------
 # NaN/Inf and non-canonical documents
 # --------------------------------------------------------------------------
 
@@ -734,7 +815,12 @@ def test_nan_in_document_is_incomplete():
 
 
 def test_inf_reaching_a_manifest_is_incomplete():
-    """An infinity inside a delta document surfaces as IncompleteContext."""
+    """An infinity inside a delta document surfaces as IncompleteContext.
+
+    Naive shortcut defeated: default ``json.dumps`` writes ``Infinity`` and a
+    validator computing digests with it produces bytes no other canonical
+    implementation reproduces, so two nodes disagree about the same link.
+    """
     base = _base()
     d1 = DeltaManifest(
         delta_id="d-1",
