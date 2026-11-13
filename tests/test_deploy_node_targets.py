@@ -220,7 +220,10 @@ def test_dispatch_without_target_is_the_original_ct110_deploy(target: str | None
 
 @pytest.mark.parametrize("target", [None, "ct110"])
 def test_overseer_units_job_still_runs_for_ct110_only(target: str | None) -> None:
-    condition = _value("if: ${{ !inputs.dry_run && needs.deploy.result")
+    # The overseer-units condition is the one that ALSO names the target
+    # (ct110-only); the qa-review job added 2026-11-07 shares only the
+    # prefix, so pin the overseer-units line by its full condition.
+    condition = _value("if: ${{ !inputs.dry_run && needs.deploy.result == 'success' && inputs.target !=")
     assert _evaluate(EXPR.search(condition).group(1), target=target) is True
     assert _evaluate(EXPR.search(condition).group(1), target=target, dry_run=True) is False
     assert _evaluate(EXPR.search(condition).group(1), target=target,
@@ -228,6 +231,18 @@ def test_overseer_units_job_still_runs_for_ct110_only(target: str | None) -> Non
     assert _evaluate(EXPR.search(condition).group(1), target="ct111") is False
     # The job itself still names CT110's environment literally.
     assert "environment: ct110-prod" in [line.strip() for line in _workflow_lines()]
+
+
+def test_qa_review_job_gates_on_deploy_success() -> None:
+    # Independent release QA review (lease ovf-release-qa-review-hook-1720):
+    # runs only on real deploys (never dry runs) that succeeded.
+    condition = _value("if: ${{ !inputs.dry_run && needs.deploy.result == 'success' }}")
+    assert _evaluate(EXPR.search(condition).group(1), target=None, dry_run=False,
+                     deploy_result="success") is True
+    assert _evaluate(EXPR.search(condition).group(1), target=None, dry_run=True,
+                     deploy_result="success") is False
+    assert _evaluate(EXPR.search(condition).group(1), target=None, dry_run=False,
+                     deploy_result="failure") is False
 
 
 def test_ct111_only_guard_step_is_skipped_for_ct110() -> None:
