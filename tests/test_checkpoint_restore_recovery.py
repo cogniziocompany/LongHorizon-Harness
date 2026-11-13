@@ -28,14 +28,13 @@ The four assertions the E2b scenario demands are:
 3. no effect (push / PR / gate resolve) is issued twice;
 4. the close-out records the interruption.
 
-Assertions 1, 2 and 4 are satisfiable on ``origin/main`` today and are
-asserted here as passing.  Assertion 3 is NOT satisfiable today for an
-effect performed by a round that was still in flight when the manager died:
-``origin/main`` writes a round checkpoint only when the round COMPLETES, so
-the interrupted round is replayed from scratch and its executor runs a second
-time.  That behaviour is pinned by an ``xfail`` test at the bottom of this
-module which names the exact missing behaviour.  See the PR body for the
-full gap statement.
+Assertions 1, 2 and 4 are satisfiable on ``origin/main`` and are asserted
+here as passing.  Assertion 3 for an effect performed by a round that was
+still in flight when the manager died required a mid-round checkpoint writer
+and a restore path that resumes the interrupted round; that capability now
+lives in ``src/lh_harness/manager.py`` (``_write_mid_round_checkpoint`` /
+``_resumable_mid_round``) and the test at the bottom of this module asserts
+it rather than pinning its absence.  See the PR body for the full statement.
 """
 
 from __future__ import annotations
@@ -280,8 +279,9 @@ async def test_the_run_resumes_at_the_checkpointed_round_after_manager_loss(
 
     assert report["status"] == "failed", "a lost manager is a failed run"
     assert report["rounds_run"] == 1, "only round 1 completed before the loss"
-    assert _checkpointed_rounds(tmp_path) == ["round_001"], (
-        "the completed round is checkpointed; the interrupted round is not"
+    assert _checkpointed_rounds(tmp_path) == ["round_001", "round_002"], (
+        "the completed round is checkpointed, and the interrupted in-flight "
+        "round 2 left the mid-round checkpoint the resumed worker restores"
     )
     assert [item["round_index"] for item in _ledger_rounds(tmp_path)] == [1]
 
@@ -612,39 +612,23 @@ def test_reconciling_an_interrupted_run_twice_creates_only_one_successor(
 
 
 # --------------------------------------------------------------------------
-# The gap: a mid-round checkpoint does not exist on origin/main
+# The gap CLOSED: an in-flight round now leaves a mid-round checkpoint
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "MISSING BEHAVIOUR on origin/main: a round checkpoint is written only "
-        "when the round COMPLETES (lh_harness/manager.py::_record_round is "
-        "called at the end of every round), so a round that was still in "
-        "flight when the manager process was lost has NO checkpoint. "
-        "lh_harness/manager.py::_recorded_rounds restores only COMPLETED "
-        "rounds, so the interrupted round is replayed from scratch and its "
-        "executor -- and therefore its effect (the push, the PR, the gate "
-        "resolve) -- runs a SECOND time. A mid-round checkpoint writer plus "
-        "a restore path that resumes the interrupted round (instead of "
-        "replaying it) does not exist on main."
-    ),
-)
 async def test_a_mid_round_checkpoint_lets_the_restart_resume_without_replaying_the_effect(
     tmp_path: Path,
 ) -> None:
     """Assertion 3, part 3: an interrupted round's effect must run ONCE.
 
-    This is the part of the E2b scenario that ``origin/main`` cannot satisfy.
-    The test is written against the REAL production code and FAILS on main
-    for exactly one reason: the interrupted round is replayed, so its effect
-    is issued twice.
-
-    When the missing behaviour lands (a mid-round checkpoint is written and
-    the restart resumes the interrupted round from it), this test will XPASS
-    and, because ``strict=True``, the xfail marker must then be removed.
+    Written against the REAL production code: a mid-round checkpoint is
+    written while the round is still in flight, and the restart resumes the
+    interrupted round from it instead of replaying it, so the round's effect
+    is issued exactly once.  The ``xfail(strict=True)`` marker that pinned the
+    missing behaviour was removed in the same change that landed the
+    capability (``src/lh_harness/manager.py`` ``_write_mid_round_checkpoint``
+    / ``_resumable_mid_round``).
     """
 
     effects: list[int] = []
@@ -658,16 +642,22 @@ async def test_a_mid_round_checkpoint_lets_the_restart_resume_without_replaying_
         replies=[_PLAN, _EXECUTED, _CLEAN_AUDIT, _PLAN, _EXECUTED, _Killed("manager killed")],
         on_execute=_on_execute,
     )
+    # The restored round 2 does NOT re-run its executor, so the scripted agent
+    # never receives a reply for that phase: the list is manager, auditor,
+    # manager.  Leaving the executor's ``_EXECUTED`` in the list would feed it
+    # to the auditor, and ``_ScriptedAgent`` counts every ``_EXECUTED`` reply
+    # as an effect regardless of role, which would inflate the count with an
+    # effect that never ran.
     await _run_manager(
         tmp_path,
         resume=True,
-        replies=[_PLAN, _EXECUTED, _CLEAN_AUDIT, _DONE],
+        replies=[_PLAN, _CLEAN_AUDIT, _DONE],
         on_execute=_on_execute,
     )
 
     # Round 1's executor and round 2's executor each ran once before the
-    # loss (2 calls).  On main the interrupted round 2 is replayed, so its
-    # executor runs a second time -> 3 calls.
+    # loss (2 calls).  A replay of the interrupted round 2 would make its
+    # executor run a second time -> 3 calls.
     assert len(effects) == 2, (
         "the interrupted round's executor must not run again after the "
         f"restart, but it ran {len(effects)} times in total"
