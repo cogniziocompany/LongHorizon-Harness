@@ -306,6 +306,11 @@ _NON_RETRYABLE_CAUSE_SIGNATURES = (
     "worker_cancelled",
     # per-task wall-clock limit (fc-H2): the run was stopped on purpose
     "time_limit",
+    # pre-spawn agent refusal (easybutt0n-238 B): a role's agent has no
+    # worker installed on this node.  A successor entry would hit the exact
+    # same refusal on the same node, so the entry stays failed instead of
+    # burning attempts on a retry that cannot succeed.
+    "launch_refused:",
 )
 
 # Failure cause recorded on a launched entry whose run the launcher stopped for
@@ -456,6 +461,22 @@ def _format_utc(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _launch_role_keys() -> tuple[str, ...]:
+    """The queue's public role set, read from the supervisor's own constant.
+
+    Genuine reuse: ``supervisor.service._ROLE_KEYS`` is the single place that
+    names the three public queue roles (``manager``, ``executor``,
+    ``auditor``).  The launcher used to spell that tuple out again in three
+    places, so a role added there could silently be missing here -- and a
+    caller-supplied pin for it would be dropped instead of applied.  Reading
+    the constant keeps "which roles exist" one fact.
+    """
+
+    from .supervisor.service import _ROLE_KEYS  # lazy: the supervisor stack is heavy
+
+    return tuple(_ROLE_KEYS)
+
+
 def _trio_role_overrides(trio: dict[str, Any]) -> dict[str, dict[str, str]]:
     """``<role>_agent`` / ``<role>_model`` keys of a trio, grouped per role.
 
@@ -465,7 +486,7 @@ def _trio_role_overrides(trio: dict[str, Any]) -> dict[str, dict[str, str]]:
     """
 
     overrides: dict[str, dict[str, str]] = {}
-    for role in ("manager", "executor", "auditor"):
+    for role in _launch_role_keys():
         spec: dict[str, str] = {}
         for key in ("agent", "model"):
             value = trio.get(f"{role}_{key}")
@@ -498,7 +519,7 @@ def _role_configs(
     del mcp_profile, auditor_mcp_profile
     overrides = role_overrides or {}
     configs: dict[str, dict[str, str]] = {}
-    for role in ("manager", "executor", "auditor"):
+    for role in _launch_role_keys():
         role_override = overrides.get(role, {})
         spec: dict[str, str] = {"agent": role_override.get("agent") or agent}
         role_model = role_override.get("model") or model
@@ -2124,6 +2145,30 @@ class Launcher:
                 trio=entry.trio,
             )
             run_id = str(created.get("id") or "")
+            # Pre-spawn agent refusal (easybutt0n-238 B): the supervisor
+            # resolved every role's agent against the workers installed on
+            # THIS node and refused the launch when one of them has none --
+            # before spawning anything.  The run record already carries the
+            # reason; the queue entry must carry it too, with the same exact
+            # wording, so an operator reading either side learns which agent
+            # is missing instead of finding a run that died with status 2.
+            refusal_reason = str(created.get("failure_reason") or "").strip()
+            if created.get("launch_refused") and refusal_reason:
+                updated = self.queue_store.mark_failed(entry.queue_id, refusal_reason)
+                self.queue_store.record_skip(entry.queue_id, refusal_reason)
+                self._emit_service_event(
+                    "queue.skipped",
+                    {
+                        "queue_id": entry.queue_id,
+                        "trio": entry.trio,
+                        "workspace": entry.workspace,
+                        "reason": refusal_reason,
+                    },
+                )
+                if updated is not None:
+                    updated.last_checked_at = _now()
+                    self.queue_store.update(updated)
+                return False
         except Exception as exc:
             failure_reason = f"launch failed: {exc}"
             updated = self.queue_store.mark_failed(entry.queue_id, failure_reason)
