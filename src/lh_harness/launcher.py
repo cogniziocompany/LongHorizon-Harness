@@ -57,6 +57,7 @@ from .workspace_guard import (
     WorkspaceBaseError,
     prepare_workspace_base,
     probe_open_pr_gh,
+    require_git_checkout,
     resolve_run_base,
 )
 from .workspace_identity import resolve_many
@@ -2123,6 +2124,37 @@ class Launcher:
                 self.queue_store.update(updated)
             return False
         workspace = str(workspace)
+        # Workspace preflight (easybutt0n-238, operator item 2): the resolved
+        # workspace must be a git checkout of the requested repo.  A launch
+        # onto a plain directory used to reach the worker and die there with
+        # no explanation; the guard's OWN resolution already classifies such a
+        # workspace as the "not-a-repo" mode, so this reads that mode instead
+        # of probing ``.git`` a second time.  The refusal is named
+        # ("workspace_not_a_repo") and lands on the queue entry, so an
+        # operator learns WHICH preflight refused the launch.
+        #
+        # The refusal keeps the entry PENDING, exactly like the other guard
+        # refusals above: a plain directory is a configuration the operator
+        # can fix (point the entry at the repo), and the entry must be
+        # re-attempted afterwards.  Nothing is spawned and no capacity slot
+        # is consumed.
+        not_a_repo = require_git_checkout(base, workspace)
+        if not_a_repo is not None:
+            reason = not_a_repo[:_MAX_REASON_LEN]
+            updated = self.queue_store.record_skip(entry.queue_id, reason)
+            self._emit_service_event(
+                "queue.skipped",
+                {
+                    "queue_id": entry.queue_id,
+                    "trio": entry.trio,
+                    "workspace": entry.workspace,
+                    "reason": reason,
+                },
+            )
+            if updated is not None:
+                updated.last_checked_at = _now()
+                self.queue_store.update(updated)
+            return False
         try:
             created = self.supervisor.create_run(
                 task=entry.task,
@@ -2152,10 +2184,21 @@ class Launcher:
             # reason; the queue entry must carry it too, with the same exact
             # wording, so an operator reading either side learns which agent
             # is missing instead of finding a run that died with status 2.
+            #
+            # The entry FAILS rather than staying pending (the other guard
+            # refusals keep the entry pending because a dirty tree or an open
+            # PR is transient): a successor entry would be launched on this
+            # same node and hit the identical refusal, so the entry is not
+            # requeued -- ``launch_refused:`` is in the launcher's
+            # non-retryable signature list for exactly that reason.
             refusal_reason = str(created.get("failure_reason") or "").strip()
             if created.get("launch_refused") and refusal_reason:
-                updated = self.queue_store.mark_failed(entry.queue_id, refusal_reason)
-                self.queue_store.record_skip(entry.queue_id, refusal_reason)
+                self.queue_store.mark_failed(entry.queue_id, refusal_reason)
+                # ``record_skip`` re-reads the entry, so ITS return value is
+                # the freshest one -- it carries both the failure reason and
+                # the appended skip reason.  Writing back an older copy would
+                # drop the skip reason.
+                updated = self.queue_store.record_skip(entry.queue_id, refusal_reason)
                 self._emit_service_event(
                     "queue.skipped",
                     {

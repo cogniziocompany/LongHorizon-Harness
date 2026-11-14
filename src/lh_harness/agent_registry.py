@@ -338,6 +338,12 @@ def agent_has_worker(agent_id: str) -> bool:
     ``--version`` probe: a launch must not run an extra subprocess per role
     before every launch, and a broken-but-present binary is a different
     failure class (it starts and then fails) than a missing one.
+
+    ``resolve_agent_binary`` already honours the deployment's explicit
+    binary overrides (``LH_HARNESS_CODEX_BINARY`` and friends), and those are
+    authoritative: an operator who points the harness at a specific
+    installation has answered the question, so the answer is "installed"
+    even when the override names a path this process cannot stat.
     """
 
     try:

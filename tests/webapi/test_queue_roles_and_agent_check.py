@@ -366,3 +366,342 @@ def test_refusal_is_present_in_both_the_run_record_and_the_queue_entry(
     assert owner["failure_reason"] == reason
     # No worker was spawned: the reservation never got a pid.
     assert int(owner.get("pid", 0) or 0) == 0
+
+
+# ----------------------------------------------------------------------
+# operator addition 1: a refused launch consumes no capacity and leaves
+# no orphan launched entry
+# ----------------------------------------------------------------------
+
+
+def test_refused_launch_consumes_no_capacity_slot_and_leaves_no_orphan_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused launch must not burn a capacity slot.
+
+    The launcher's per-trio capacity is a batch budget: a pass that launches
+    one entry shrinks the remaining slots for the others.  A refusal is NOT
+    a launch, so it must leave the remaining capacity exactly as it was --
+    otherwise one entry whose agent is missing on this node silently starves
+    every other entry in the same trio.
+
+    The assertion is on the launcher's OWN remaining-capacity computation
+    (``_remaining_capacity`` -- the same call the pass makes), read before
+    and after the refused launch, plus the queue's own view: the entry is
+    not ``launched`` and carries no run id, so no orphan launched entry is
+    left behind.
+
+    The REAL supervisor is used (not the recording stand-in): the refusal
+    lives in the supervisor's pre-spawn check, and a stand-in that always
+    creates a run would never exercise it.
+    """
+
+    from lh_harness.supervisor.service import RunSupervisor
+
+    store, _sup, runtime, _launcher_obj = _launcher(tmp_path, monkeypatch)
+    runs_root = tmp_path / "runs"
+    supervisor = RunSupervisor(runs_root=runs_root, workspace_root=tmp_path)
+    config = default_queue_config()
+    config["capacity"]["kimi_max"] = 3
+    launcher = Launcher(supervisor, store, queue_config=config)
+
+    # Nothing is installed on this node, so every role's agent is missing.
+    monkeypatch.setattr(
+        "lh_harness.agent_registry.resolve_agent_binary", lambda binary: None
+    )
+
+    refused_entry = store.create(
+        {**_base_entry(trio="kimi", workspace="./w-refused"), "roles": _PINNED},
+        model_fetch=_fake_model_catalog,
+        settings_runtime=runtime,
+    )
+    before = launcher._remaining_capacity(launcher._active_runs())
+
+    asyncio.run(launcher.tick())
+
+    after = launcher._remaining_capacity(launcher._active_runs())
+    # No slot was consumed by the refusal.
+    assert after == before
+
+    # And no orphan launched entry: the refused entry is failed, has no run
+    # id, and no queue entry anywhere claims to be launched.
+    refused = store.get(refused_entry.queue_id)
+    assert refused is not None
+    assert refused.status == "failed"
+    assert refused.run_id is None
+    assert [entry for entry in store.list() if entry.status == "launched"] == []
+
+
+def test_a_refused_entry_does_not_starve_the_next_eligible_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal falls through to the next entry instead of blocking it.
+
+    The refusal is the FIRST entry in the pass; the second entry names an
+    agent that IS installed on this node, so it must still launch.  This is
+    the observable consequence of "a refusal consumes no capacity": the pass
+    does not stop at the refused head entry.
+
+    The REAL supervisor is used (the refusal lives in its pre-spawn check).
+    """
+
+    from lh_harness.supervisor.service import RunSupervisor
+
+    store, _sup, runtime, _launcher_obj = _launcher(tmp_path, monkeypatch)
+    runs_root = tmp_path / "runs"
+    supervisor = RunSupervisor(runs_root=runs_root, workspace_root=tmp_path)
+    config = default_queue_config()
+    config["capacity"]["kimi_max"] = 3
+    launcher = Launcher(supervisor, store, queue_config=config)
+
+    real_resolve = agent_registry.resolve_agent_binary
+
+    def _resolve(binary: str) -> str | None:
+        # The pinned agent (``claude_code``) resolves to the ``claude`` CLI;
+        # that CLI is missing on this node, while every other agent's is not.
+        if binary == agent_registry.agent_spec("claude_code").binary:
+            return None
+        return real_resolve(binary)
+
+    monkeypatch.setattr("lh_harness.agent_registry.resolve_agent_binary", _resolve)
+
+    refused_entry = store.create(
+        {**_base_entry(trio="kimi", workspace="./w-refused"), "roles": _PINNED},
+        model_fetch=_fake_model_catalog,
+        settings_runtime=runtime,
+    )
+    # The second entry names an agent that IS installed on this node, so it
+    # must still launch: the refusal must not block the rest of the pass.
+    ok_entry = store.create(
+        {
+            **_base_entry(trio="kimi", workspace="./w-ok"),
+            "roles": {
+                role: {"agent": "codex", "model": spec["model"]}
+                for role, spec in _PINNED.items()
+            },
+        },
+        model_fetch=_fake_model_catalog,
+        settings_runtime=runtime,
+    )
+
+    asyncio.run(launcher.tick())
+
+    refused = store.get(refused_entry.queue_id)
+    ok = store.get(ok_entry.queue_id)
+    assert refused is not None and refused.status == "failed"
+    assert refused.reason == "launch_refused: agent claude_code has no worker on this node"
+    assert ok is not None and ok.status == "launched", (ok.status, ok.skip_reasons)
+
+
+# ----------------------------------------------------------------------
+# operator addition 2: the workspace preflight
+# ----------------------------------------------------------------------
+
+
+def test_launch_is_refused_when_the_workspace_is_not_a_git_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that exists but is not a checkout refuses the launch.
+
+    The preflight names the refusal ``workspace_not_a_repo`` so an operator
+    learns WHICH preflight refused the launch instead of finding a run that
+    died somewhere else.  The entry stays PENDING (the workspace is a
+    configuration the operator can fix, so it must be re-attempted), the
+    reason lands on the entry, and nothing is spawned.
+    """
+
+    plain = tmp_path / "plain-workspace"
+    plain.mkdir()
+
+    store, supervisor, runtime, launcher = _launcher(tmp_path, monkeypatch)
+    entry = store.create(
+        {**_base_entry(trio="kimi", workspace=str(plain)), "roles": _PINNED},
+        model_fetch=_fake_model_catalog,
+        settings_runtime=runtime,
+    )
+
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "pending", updated.status
+    assert updated.run_id is None
+    # The named reason is on the entry, verbatim.
+    assert any(
+        "workspace_not_a_repo" in reason for reason in updated.skip_reasons
+    ), updated.skip_reasons
+    # Nothing was launched.
+    assert supervisor.created == []
+
+
+def test_workspace_preflight_names_the_reason_in_one_place() -> None:
+    """One builder, one wording -- the same pattern as the agent refusal."""
+
+    from lh_harness.workspace_guard import (
+        WORKSPACE_NOT_A_REPO,
+        workspace_not_a_repo_reason,
+    )
+
+    assert WORKSPACE_NOT_A_REPO == "workspace_not_a_repo"
+    reason = workspace_not_a_repo_reason("/tmp/plain")
+    assert reason.startswith("workspace_not_a_repo: ")
+    assert "/tmp/plain" in reason
+
+
+def test_workspace_preflight_lets_a_real_checkout_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preflight does not refuse a workspace that IS a git checkout.
+
+    A guard that refused everything would be useless; this pins that the
+    preflight is narrow: a real checkout launches exactly as before.
+
+    The fixture is a real repository with a real ``origin`` (the branch
+    guard needs one to resolve the default branch), so the launch reaches
+    ``create_run`` for real.
+    """
+
+    import subprocess
+
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": str(tmp_path),
+    }
+    origin = tmp_path / "checkout.origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True, env=env,
+    )
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True, capture_output=True, env=env,
+    )
+    subprocess.run(["git", "remote", "add", "origin", str(origin)], cwd=repo, check=True, env=env)
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "push", "-q", "-u", "origin", "main"], cwd=repo, check=True, env=env)
+
+    store, supervisor, runtime, launcher = _launcher(tmp_path, monkeypatch)
+    entry = store.create(
+        {**_base_entry(trio="kimi", workspace=str(repo)), "roles": _PINNED},
+        model_fetch=_fake_model_catalog,
+        settings_runtime=runtime,
+    )
+
+    asyncio.run(launcher.tick())
+
+    updated = store.get(entry.queue_id)
+    assert updated is not None
+    assert updated.status == "launched", (updated.status, updated.skip_reasons)
+
+
+# ----------------------------------------------------------------------
+# operator addition 3: role propagation does not move identity
+# ----------------------------------------------------------------------
+
+
+def test_role_propagation_leaves_the_requester_block_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Enqueuing pinned roles must not change the requester/tenant scoping.
+
+    The role pins are a per-role configuration; the requester block is the
+    identity proof of WHO asked.  Carrying the pins through the queue must
+    leave the identity exactly as the caller supplied it -- same kind, name,
+    host, agent and session id -- and must not invent or drop one.
+    """
+
+    requester = {
+        "kind": "ai",
+        "name": "continuity1-op",
+        "host": "ci",
+        "cwd": "/tmp",
+        "agent": "claude",
+        "session_id": "b5038555-9e10-4bb3-a81e-aa03a602d445",
+    }
+
+    store, supervisor, runtime, launcher = _launcher(tmp_path, monkeypatch)
+    entry = store.create(
+        {
+            **_base_entry(trio="kimi", workspace="./w-identity"),
+            "roles": _PINNED,
+            "requester": dict(requester),
+        },
+        model_fetch=_fake_model_catalog,
+        settings_runtime=runtime,
+    )
+
+    # The block survives the enqueue: every field the caller supplied is
+    # still there, unchanged.  (The store's own normaliser may ADD fields it
+    # defaults -- address/notify/session_ref -- but it must not change or
+    # drop one the caller supplied.)
+    assert entry.requester is not None
+    for key, value in requester.items():
+        assert entry.requester[key] == value, key
+
+    asyncio.run(launcher.tick())
+
+    launched = store.get(entry.queue_id)
+    assert launched is not None and launched.status == "launched"
+    # ... and after the launch that carried the role pins.
+    assert launched.requester is not None
+    for key, value in requester.items():
+        assert launched.requester[key] == value, key
+    # The caller's own stamp is untouched too.
+    assert launched.requested_by == "ci"
+    # The roles are the caller's pins -- the propagation did not rewrite them.
+    assert launched.roles == _PINNED
+    # The run record carries the resolved role configs, not the identity.
+    owner = supervisor._owners[launched.run_id]
+    for role, spec in _PINNED.items():
+        assert owner["role_configs"][role] == {"agent": spec["agent"], "model": spec["model"]}
+
+
+def test_role_propagation_does_not_leak_the_requester_into_the_role_specs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The role specs carry agent and model -- nothing from the identity.
+
+    The identity block and the role pins are independent: a role spec must
+    never pick up a requester field, and the requester must never pick up a
+    role pin.
+    """
+
+    requester = {
+        "kind": "ai",
+        "name": "continuity1-op",
+        "host": "ci",
+        "cwd": "/tmp",
+        "agent": "claude",
+        "session_id": "b5038555-9e10-4bb3-a81e-aa03a602d445",
+    }
+
+    store, supervisor, runtime, launcher = _launcher(tmp_path, monkeypatch)
+    entry = store.create(
+        {
+            **_base_entry(trio="kimi", workspace="./w-identity-2"),
+            "roles": _PINNED,
+            "requester": dict(requester),
+        },
+        model_fetch=_fake_model_catalog,
+        settings_runtime=runtime,
+    )
+
+    asyncio.run(launcher.tick())
+    launched = store.get(entry.queue_id)
+    assert launched is not None and launched.status == "launched"
+
+    owner = supervisor._owners[launched.run_id]
+    for role, spec in _PINNED.items():
+        resolved = owner["role_configs"][role]
+        assert set(resolved) <= {"agent", "model"}
+        assert resolved["model"] == spec["model"]
+        assert resolved["model"] != requester["agent"]
+        assert resolved["model"] != requester["session_id"]
