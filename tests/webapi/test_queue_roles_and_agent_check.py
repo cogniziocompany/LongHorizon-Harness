@@ -23,15 +23,11 @@ This module covers two independently testable behaviours:
     reads ``supervisor.service._ROLE_KEYS`` through
     ``launcher._launch_role_keys``, so "which roles exist" is one fact.
 
-    The easybutt0n-238 ROLE LOSS is NOT in the harness.  The reported
-    symptom (manager/auditor falling back to the trio default) comes from
-    the gateway ``enqueue_task`` TOOL, in the separate
-    ``cogniziocompany/cognizioware-hydra`` repository
-    (``orchestrator/src/mcp.js``): that tool neither declares nor forwards
-    a ``roles`` field, so the per-role pins never reach the harness at all.
-    Fixing that is a gateway change and is out of scope for this harness
-    repository; these tests pin the harness-side behaviour so that when the
-    gateway does forward ``roles``, the harness honours it.
+    The easybutt0n-238 ROLE LOSS is NOT in the harness: the role loss was
+    in the gateway `enqueue_task` tool (hydra `orchestrator/src/mcp.js`),
+    which did not forward a `roles` field; that is fixed separately in
+    hydra PR #104 (merged 2026-11-14 08:37Z). These tests pin the
+    harness-side behaviour so the forwarded roles are honoured.
 
 (B) A launch naming an agent with no worker installed on this node used to
     spawn the worker anyway; the worker could not spawn the agent and died
