@@ -126,6 +126,12 @@ def launch_refused_reason(agent: str) -> str:
     One builder, one wording: the run record's ``failure_reason``, the queue
     entry's reason and the launcher's skip reason must all read the same, so
     an operator (or a test) can match on the exact string.
+
+    What the refusal MEANS for the operator: the launch was refused, so
+    nothing was started and no capacity was reserved -- but the refusal is
+    detected inside ``create_run``, so a run record and a run directory
+    already exist and are then FAILED.  The failed run directory is
+    reclaimed by the disk-retention sweep like any other terminal run.
     """
 
     return f"{LAUNCH_REFUSED_PREFIX}: agent {agent} has no worker on this node"
@@ -2343,10 +2349,21 @@ class RunSupervisor:
         # Pre-spawn agent check (easybutt0n-238 B): a role whose agent has no
         # worker installed on THIS node cannot be driven here at all.  The
         # worker used to start anyway, fail to spawn the agent, and die with a
-        # bare "worker exited with status 2" that named nothing.  The refusal
-        # happens HERE -- after the run record exists, before any process is
-        # spawned -- so the run record carries the reason and no worker is
-        # ever started.
+        # bare "worker exited with status 2" that named nothing.
+        #
+        # WHERE the refusal happens, stated plainly for the operator: it is
+        # detected INSIDE ``create_run``, which means a run record and a run
+        # directory ALREADY EXIST by the time the refusal is decided.  The
+        # run directory (``runs/<id>/``) holds the run's own ``control/owner.json``
+        # and ``control/status.json`` and the ``lh_harness/crash_report.json``
+        # diagnostic; the refusal then FAILS that run record (status
+        # ``failed``, ``failure_reason`` set).  NOTHING is launched: no
+        # worker process is spawned, no agent CLI is invoked, and no capacity
+        # slot is reserved.  The run directory is left behind on purpose --
+        # the refusal must be visible in the run record, not only on the
+        # queue entry -- and the disk-retention sweep reclaims it like any
+        # other terminal (``failed``) run once it is older than the
+        # configured run_max_age_days.
         refusal = self._refuse_launch_without_worker(
             run_id=run_id,
             run_dir=run_dir,
@@ -2379,11 +2396,20 @@ class RunSupervisor:
 
         Returns ``None`` when every role's agent is installed here (the launch
         proceeds), or the created run dict carrying the refusal when it is
-        not.  The run record is written exactly as a real launch's would be --
-        owner plus a terminal status -- so the refusal is visible in the run
-        record instead of leaving a directory with no explanation.  NOTHING is
-        spawned: the whole point is to replace a worker that dies with status
-        2 and no explanation by a named refusal.
+        not.
+
+        The refusal is detected INSIDE ``create_run``, so a run record and a
+        run directory ALREADY EXIST when it is decided: the run directory
+        ``runs/<id>/`` was created by ``create_run`` before this check runs.
+        The refusal then FAILS that run -- the owner record and the terminal
+        status are written exactly as a real launch's would be, plus the
+        ``lh_harness/crash_report.json`` diagnostic -- so the refusal is
+        visible in the run record instead of leaving a directory with no
+        explanation.  NOTHING is launched: no worker process is spawned, no
+        agent CLI is invoked, and no capacity slot is reserved.  The run
+        directory is left behind deliberately, and the disk-retention sweep
+        reclaims it like any other terminal (``failed``) run once it is older
+        than the configured ``run_max_age_days``.
 
         The agent resolution reuses the harness's own registry
         (``agent_registry.agent_spec`` -> ``resolve_agent_binary``), the same

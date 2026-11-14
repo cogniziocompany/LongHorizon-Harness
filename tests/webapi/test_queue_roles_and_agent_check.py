@@ -1,15 +1,37 @@
-"""easybutt0n-238: queue-launched role pins survive, and a missing worker refuses.
+"""easybutt0n-238: per-role pins are guarded, and a missing worker refuses.
 
-Two independent launch defects, one test module, two independently testable
-behaviours:
+This module covers two independently testable behaviours:
 
-(A) The queue path dropped the caller's per-role configuration.  A task
-    enqueued through ``harness_enqueue_task`` with a per-role ``roles`` dict
-    (each role pinned to its own agent AND model) must reach the launched run
-    with those pins intact -- the SAME values a direct ``POST /api/runs``
-    create honours.  The pin set wins over the trio default for EVERY role,
-    not only the executor, and no role name or model id is special-cased:
-    the test pins three different models and asserts equality role by role.
+(A) A REGRESSION GUARD around the per-role pins that ALREADY WORKED, plus
+    the role-key de-duplication refactor.  A task enqueued through the queue
+    with a per-role ``roles`` dict (each role pinned to its own agent AND
+    model) must reach the launched run with those pins intact -- the SAME
+    values a direct ``POST /api/runs`` create honours.  The pin set wins
+    over the trio default for EVERY role, not only the executor, and no role
+    name or model id is special-cased: the test pins three different models
+    and asserts equality role by role.
+
+    These tests are a GUARD, not a fix for a broken queue path.  The
+    per-role pin behaviour was already correct before this work: the
+    function that merges the caller's pins onto the trio specs
+    (``launcher._launch_role_configs``) is byte-identical between the base
+    commit and this branch, and the three role-pin tests below pass
+    UNMODIFIED on the base commit (only this module's newer-API import
+    removed).  What this change adds on the role-handling side is the
+    role-key de-duplication refactor: the launcher no longer spells the
+    ``("manager", "executor", "auditor")`` tuple out in three places, it
+    reads ``supervisor.service._ROLE_KEYS`` through
+    ``launcher._launch_role_keys``, so "which roles exist" is one fact.
+
+    The easybutt0n-238 ROLE LOSS is NOT in the harness.  The reported
+    symptom (manager/auditor falling back to the trio default) comes from
+    the gateway ``enqueue_task`` TOOL, in the separate
+    ``cogniziocompany/cognizioware-hydra`` repository
+    (``orchestrator/src/mcp.js``): that tool neither declares nor forwards
+    a ``roles`` field, so the per-role pins never reach the harness at all.
+    Fixing that is a gateway change and is out of scope for this harness
+    repository; these tests pin the harness-side behaviour so that when the
+    gateway does forward ``roles``, the harness honours it.
 
 (B) A launch naming an agent with no worker installed on this node used to
     spawn the worker anyway; the worker could not spawn the agent and died
@@ -17,6 +39,11 @@ behaviours:
     launch is now refused BEFORE any process is spawned, with the named
     reason ``launch_refused: agent <name> has no worker on this node`` --
     present in the run record AND in the queue entry.
+
+    The refusal is detected INSIDE ``supervisor.create_run``, so a run
+    record and a run directory already exist when it is decided, and the
+    refusal FAILS that run record.  Nothing is launched (no worker process,
+    no agent CLI) and no capacity slot is reserved.
 
 The agent resolution reuses the harness's own registry
 (``agent_registry.agent_spec`` -> ``resolve_agent_binary``), so "installed on
@@ -128,7 +155,14 @@ def _launcher(
 
 
 # ----------------------------------------------------------------------
-# (A) the caller's per-role pins reach the launched run
+# (A) REGRESSION GUARD: the caller's per-role pins reach the launched run
+#
+# These behaviours already worked before this branch (the pin-merge
+# function is byte-identical to the base commit and these tests pass
+# unmodified on it).  They are guarded here so they keep working, and so
+# that the gateway's ``enqueue_task`` tool -- the actual source of the
+# reported role loss -- can forward ``roles`` and have the harness honour
+# them.
 # ----------------------------------------------------------------------
 
 
@@ -207,9 +241,10 @@ def test_a_role_pin_overrides_the_trio_default_per_role(
 ) -> None:
     """A single pinned role wins, and the unpinned roles keep the trio default.
 
-    This is the mixed case the measured defect produced in reverse: the
-    defect let the trio default win over a pin, so the pinned role must win
-    while its UNPINNED siblings still inherit the trio's own values.
+    The mixed case: the pinned role must win while its UNPINNED siblings
+    still inherit the trio's own values.  (This is the shape the reported
+    defect took in reverse -- the gateway dropped the ``roles`` field
+    entirely, so every role fell back to the trio default.)
     """
 
     store, supervisor, runtime, launcher = _launcher(tmp_path, monkeypatch)
@@ -256,6 +291,104 @@ def test_agent_without_worker_on_this_node_is_reported_missing(
     monkeypatch.setattr(agent_registry, "resolve_agent_binary", lambda binary: f"/usr/bin/{binary}")
     assert agent_registry.agent_has_worker("codex") is True
     assert agent_registry.agents_without_worker(["codex", "claude_code"]) == []
+
+
+def test_real_agent_binary_resolution_against_a_synthetic_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The REAL ``resolve_agent_binary`` answers the question on a real PATH.
+
+    Every other test in this module stubs the registry's PATH lookup, so
+    nothing in the suite exercises the actual resolution against an actual
+    ``PATH``.  This test does, and it is the one that closes that gap: it
+    opts out of the suite-wide autouse stub (``tests/conftest.py`` stubs
+    ``resolve_agent_binary`` to "every agent has a worker" for every test in
+    the repository), restores the REAL function, and points ``PATH`` at a
+    synthetic directory that either contains an executable stub named like
+    the agent's CLI or does not.
+
+    With the stub present the agent HAS a worker; with it absent the agent
+    has none, and the launch is refused with the named reason.
+
+    The stub is a real executable file, not a mock: the resolution is
+    ``shutil.which`` over ``PATH``, so only a real file on ``PATH`` can
+    satisfy it.
+    """
+
+    from lh_harness.supervisor.service import RunSupervisor
+    from lh_harness.utils.agent_cli import resolve_agent_binary as real_resolve
+
+    # Opt out of the suite-wide autouse stub for THIS test only: put the
+    # real resolution back on the registry.  (The autouse fixture patched
+    # the same attribute with the same function-scoped monkeypatch, so this
+    # setattr is undone with the test like any other.)
+    monkeypatch.setattr(agent_registry, "resolve_agent_binary", real_resolve)
+
+    binary = agent_registry.agent_spec("claude_code").binary
+    assert binary == "claude"
+
+    # The synthetic PATH: a temp dir that holds ONLY what this test puts
+    # in it, so the host's own installation of the CLI cannot answer.
+    synthetic_path = tmp_path / "synthetic-bin"
+    synthetic_path.mkdir()
+    monkeypatch.setenv("PATH", str(synthetic_path))
+
+    # --- the agent is NOT installed on this node ------------------------
+    assert agent_registry.agent_has_worker("claude_code") is False
+
+    root = tmp_path / "case"
+    root.mkdir()
+    store, _sup, runtime, _launcher_obj = _launcher(root, monkeypatch)
+    runs_root = root / "runs"
+    supervisor = RunSupervisor(runs_root=runs_root, workspace_root=root)
+    config = default_queue_config()
+    config["capacity"]["kimi_max"] = 3
+    launcher = Launcher(supervisor, store, queue_config=config)
+
+    entry = store.create(
+        {**_base_entry(trio="kimi", workspace="./w-missing"), "roles": _PINNED},
+        model_fetch=_fake_model_catalog,
+        settings_runtime=runtime,
+    )
+    asyncio.run(launcher.tick())
+    refused = store.get(entry.queue_id)
+    assert refused is not None
+    # The launch is refused with the NAMED reason.
+    assert refused.status == "failed"
+    assert refused.reason == (
+        "launch_refused: agent claude_code has no worker on this node"
+    )
+    assert refused.run_id is None
+
+    # --- the agent IS installed on this node ----------------------------
+    stub = synthetic_path / binary
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+
+    assert agent_registry.agent_has_worker("claude_code") is True
+
+    present_root = tmp_path / "case-present"
+    present_root.mkdir()
+    present_store, present_sup, present_runtime, _present_launcher_obj = _launcher(
+        present_root, monkeypatch
+    )
+    present_runs_root = present_root / "runs"
+    present_supervisor = RunSupervisor(
+        runs_root=present_runs_root, workspace_root=present_root
+    )
+    present_launcher = Launcher(
+        present_supervisor, present_store, queue_config=config
+    )
+    present_entry = present_store.create(
+        {**_base_entry(trio="kimi", workspace="./w-present"), "roles": _PINNED},
+        model_fetch=_fake_model_catalog,
+        settings_runtime=present_runtime,
+    )
+    asyncio.run(present_launcher.tick())
+    launched = present_store.get(present_entry.queue_id)
+    assert launched is not None
+    # The same code path now launches: the agent has a worker.
+    assert launched.status == "launched", (launched.status, launched.skip_reasons)
 
 
 def test_launch_refusal_reason_names_the_agent_and_the_node() -> None:
@@ -366,6 +499,76 @@ def test_refusal_is_present_in_both_the_run_record_and_the_queue_entry(
     assert owner["failure_reason"] == reason
     # No worker was spawned: the reservation never got a pid.
     assert int(owner.get("pid", 0) or 0) == 0
+
+
+def test_the_retention_sweep_reclaims_a_refused_run_directory(
+    tmp_path: Path,
+) -> None:
+    """The refused run directory is reclaimed by the retention sweep.
+
+    The agent refusal is detected inside ``create_run``, so the run record
+    and the run directory exist and are then FAILED.  The run directory is
+    left behind on purpose (the refusal must be visible in the run record),
+    so the operator-facing question is whether that directory is reclaimed.
+
+    It is: the refusal's terminal status is ``failed``, and the retention
+    sweep's ``LIVE_STATES`` -- the only states it refuses to prune -- does
+    NOT include ``failed``.  A refused run directory older than the
+    configured ``run_max_age_days`` is therefore pruned like any other
+    terminal run.
+
+    This test PROVES the existing behaviour; it does not change it.  It
+    refuses a real launch, then runs the real sweep over the real run
+    directory.
+    """
+
+    import os
+    import time
+
+    from lh_harness.disk_retention import RetainMode, prune_runs
+    from lh_harness.disk_retention.config import DEFAULT_RUN_MAX_AGE_DAYS
+    from lh_harness.disk_retention.runs import LIVE_STATES
+    from lh_harness.supervisor.service import RunSupervisor
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True)
+    supervisor = RunSupervisor(runs_root=runs_root, workspace_root=tmp_path)
+
+    # No worker for this agent on this node -> the refusal path.
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(
+        "lh_harness.agent_registry.resolve_agent_binary", lambda binary: None
+    )
+    try:
+        created = supervisor.create_run(
+            task="do something",
+            agent="codex",
+            role_configs={"manager": {"agent": "codex", "model": "m"}},
+            workspace=str(tmp_path),
+        )
+    finally:
+        monkey.undo()
+
+    run_id = str(created["id"])
+    run_dir = runs_root / run_id
+    # The refusal left a run directory behind, and the run is TERMINAL.
+    assert created["status"] == "failed"
+    assert run_dir.is_dir()
+    # The sweep's live states never include a terminal state, so the refused
+    # run is never protected as "live".
+    assert "failed" not in LIVE_STATES
+
+    # A fresh refused run is inside the age gate: it is kept, not pruned.
+    fresh = {r.run_id: r for r in prune_runs(runs_root, mode=RetainMode.live())}
+    assert fresh[run_id].state == "skipped_recent"
+    assert run_dir.is_dir()
+
+    # Older than the threshold, the refused run directory is reclaimed.
+    aged = time.time() - (DEFAULT_RUN_MAX_AGE_DAYS + 1) * 86400
+    os.utime(run_dir, (aged, aged))
+    pruned = {r.run_id: r for r in prune_runs(runs_root, mode=RetainMode.live())}
+    assert pruned[run_id].state == "pruned"
+    assert not run_dir.exists()
 
 
 # ----------------------------------------------------------------------
@@ -532,6 +735,89 @@ def test_launch_is_refused_when_the_workspace_is_not_a_git_checkout(
     ), updated.skip_reasons
     # Nothing was launched.
     assert supervisor.created == []
+
+
+def test_both_refusals_record_the_named_reason_in_the_same_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two refusals agree on WHERE the named reason lands.
+
+    An operator reading the queue entry's ``reason`` field must see BOTH
+    refusals.  The agent refusal puts the text in ``entry.reason`` AND in
+    ``entry.skip_reasons``; the workspace refusal used to put it only in
+    ``entry.skip_reasons``, so it was invisible to anyone who reads just
+    ``reason``.  This pins that both land in ``entry.reason`` with the SAME
+    text as their ``skip_reasons`` entry.
+
+    The STATUSES are deliberately different and are pinned here too: the
+    agent refusal is terminal (the same node would refuse identically, so
+    the entry is not requeued) while the workspace refusal is re-attemptable
+    (a plain directory is a configuration the operator can fix).
+    """
+
+    from lh_harness.supervisor.service import RunSupervisor
+
+    # --- the AGENT refusal ---------------------------------------------
+    agent_root = tmp_path / "agent-case"
+    agent_root.mkdir()
+    agent_store, _agent_sup, agent_runtime, _agent_launcher = _launcher(
+        agent_root, monkeypatch
+    )
+    agent_runs_root = agent_root / "runs"
+    agent_supervisor = RunSupervisor(
+        runs_root=agent_runs_root, workspace_root=agent_root
+    )
+    agent_config = default_queue_config()
+    agent_config["capacity"]["kimi_max"] = 3
+    agent_launcher = Launcher(
+        agent_supervisor, agent_store, queue_config=agent_config
+    )
+    # No agent CLI is installed on this node.
+    monkeypatch.setattr(
+        "lh_harness.agent_registry.resolve_agent_binary", lambda binary: None
+    )
+    agent_entry = agent_store.create(
+        {**_base_entry(trio="kimi", workspace="./w-agent"), "roles": _PINNED},
+        model_fetch=_fake_model_catalog,
+        settings_runtime=agent_runtime,
+    )
+    asyncio.run(agent_launcher.tick())
+    agent_refused = agent_store.get(agent_entry.queue_id)
+    assert agent_refused is not None
+    # The named reason is in ``reason``...
+    assert agent_refused.reason == (
+        "launch_refused: agent claude_code has no worker on this node"
+    )
+    # ... and in ``skip_reasons``, with the SAME text.
+    assert agent_refused.reason in agent_refused.skip_reasons
+    # The agent refusal is terminal.
+    assert agent_refused.status == "failed"
+
+    # --- the WORKSPACE refusal ----------------------------------------
+    monkeypatch.undo()
+    ws_root = tmp_path / "workspace-case"
+    ws_root.mkdir()
+    plain = ws_root / "plain-workspace"
+    plain.mkdir()
+    ws_store, ws_sup, ws_runtime, ws_launcher = _launcher(ws_root, monkeypatch)
+    ws_entry = ws_store.create(
+        {**_base_entry(trio="kimi", workspace=str(plain)), "roles": _PINNED},
+        model_fetch=_fake_model_catalog,
+        settings_runtime=ws_runtime,
+    )
+    asyncio.run(ws_launcher.tick())
+    ws_refused = ws_store.get(ws_entry.queue_id)
+    assert ws_refused is not None
+    # The named reason is in ``reason`` too...
+    assert ws_refused.reason is not None
+    assert ws_refused.reason.startswith("workspace_not_a_repo: ")
+    # ... and in ``skip_reasons``, with the SAME text.
+    assert ws_refused.reason in ws_refused.skip_reasons
+    # The workspace refusal stays re-attemptable: the status is unchanged.
+    assert ws_refused.status == "pending"
+    assert ws_refused.run_id is None
+    # Nothing was launched for it either.
+    assert ws_sup.created == []
 
 
 def test_workspace_preflight_names_the_reason_in_one_place() -> None:

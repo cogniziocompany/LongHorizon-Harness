@@ -52,7 +52,7 @@ from .restart_recovery import (
 )
 from .settings_store import SettingsStore, active_runtime, open_from_environment, trio_role_overrides
 from .supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
-from .supervisor.service import auditor_read_only_violation
+from .supervisor.service import _ROLE_KEYS, auditor_read_only_violation
 from .workspace_guard import (
     WorkspaceBaseError,
     prepare_workspace_base,
@@ -471,9 +471,15 @@ def _launch_role_keys() -> tuple[str, ...]:
     places, so a role added there could silently be missing here -- and a
     caller-supplied pin for it would be dropped instead of applied.  Reading
     the constant keeps "which roles exist" one fact.
-    """
 
-    from .supervisor.service import _ROLE_KEYS  # lazy: the supervisor stack is heavy
+    The import is at module level, not inside this function: the launcher
+    already imports ``supervisor.service`` at module level (for
+    ``auditor_read_only_violation``), and the supervisor stack does not import
+    the launcher, so there is no import cycle to dodge.  A function-local
+    "lazy" import would only defer a name lookup the interpreter caches
+    anyway, while making the reader believe the cost is avoided when it is
+    not.
+    """
 
     return tuple(_ROLE_KEYS)
 
@@ -2138,6 +2144,14 @@ class Launcher:
         # can fix (point the entry at the repo), and the entry must be
         # re-attempted afterwards.  Nothing is spawned and no capacity slot
         # is consumed.
+        #
+        # The named reason lands in BOTH places the agent refusal puts it:
+        # ``entry.reason`` and ``entry.skip_reasons``, with the SAME text.
+        # An operator reading the queue entry's ``reason`` field must see
+        # this refusal too -- otherwise the two refusals disagree about
+        # where the reason lives and the workspace one is invisible to
+        # anyone who reads only ``reason``.  The STATUS is untouched: the
+        # entry stays PENDING (re-attemptable), exactly as before.
         not_a_repo = require_git_checkout(base, workspace)
         if not_a_repo is not None:
             reason = not_a_repo[:_MAX_REASON_LEN]
@@ -2152,6 +2166,10 @@ class Launcher:
                 },
             )
             if updated is not None:
+                # ``record_skip`` returns the freshest entry; writing the
+                # reason onto it (and saving) is what puts the same text in
+                # ``entry.reason`` as in ``entry.skip_reasons``.
+                updated.reason = reason
                 updated.last_checked_at = _now()
                 self.queue_store.update(updated)
             return False
@@ -2184,6 +2202,16 @@ class Launcher:
             # reason; the queue entry must carry it too, with the same exact
             # wording, so an operator reading either side learns which agent
             # is missing instead of finding a run that died with status 2.
+            #
+            # The refusal is detected INSIDE ``supervisor.create_run``, so a
+            # run record AND a run directory already exist by the time it is
+            # decided; the refusal FAILS that run record (status ``failed``,
+            # ``failure_reason`` set) and leaves the run directory behind on
+            # purpose, so the refusal is visible there too.  NOTHING is
+            # launched (no worker process, no agent CLI) and no capacity slot
+            # is reserved.  The disk-retention sweep reclaims the refused run
+            # directory like any other terminal (``failed``) run once it is
+            # older than the configured ``run_max_age_days``.
             #
             # The entry FAILS rather than staying pending (the other guard
             # refusals keep the entry pending because a dirty tree or an open
