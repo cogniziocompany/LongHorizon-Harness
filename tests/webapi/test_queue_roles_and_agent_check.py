@@ -470,20 +470,21 @@ def test_refusal_is_present_in_both_the_run_record_and_the_queue_entry(
     runs_root = tmp_path / "runs"
     runs_root.mkdir(parents=True)
     supervisor = RunSupervisor(runs_root=runs_root, workspace_root=tmp_path)
-    # No worker for this agent on this node.
-    monkey = pytest.MonkeyPatch()
-    monkey.setattr(
-        "lh_harness.agent_registry.resolve_agent_binary", lambda binary: None
-    )
-    try:
+    # No worker for this agent on this node.  The override is scoped to this
+    # block: ``monkeypatch.context()`` patches through a SEPARATE undo
+    # registry, so leaving the block restores the value the attribute had on
+    # entry (the suite-wide autouse stub) and leaves every other patch --
+    # including the ones the autouse fixture made -- in place.
+    with pytest.MonkeyPatch.context() as scoped:
+        scoped.setattr(
+            "lh_harness.agent_registry.resolve_agent_binary", lambda binary: None
+        )
         created = supervisor.create_run(
             task="do something",
             agent="codex",
             role_configs={"manager": {"agent": "codex", "model": "m"}},
             workspace=str(tmp_path),
         )
-    finally:
-        monkey.undo()
 
     reason = "launch_refused: agent codex has no worker on this node"
     assert created["status"] == "failed"
@@ -534,20 +535,19 @@ def test_the_retention_sweep_reclaims_a_refused_run_directory(
     runs_root.mkdir(parents=True)
     supervisor = RunSupervisor(runs_root=runs_root, workspace_root=tmp_path)
 
-    # No worker for this agent on this node -> the refusal path.
-    monkey = pytest.MonkeyPatch()
-    monkey.setattr(
-        "lh_harness.agent_registry.resolve_agent_binary", lambda binary: None
-    )
-    try:
+    # No worker for this agent on this node -> the refusal path.  The
+    # override is scoped to this block, so the suite-wide autouse stub is
+    # back in place the moment the block ends.
+    with pytest.MonkeyPatch.context() as scoped:
+        scoped.setattr(
+            "lh_harness.agent_registry.resolve_agent_binary", lambda binary: None
+        )
         created = supervisor.create_run(
             task="do something",
             agent="codex",
             role_configs={"manager": {"agent": "codex", "model": "m"}},
             workspace=str(tmp_path),
         )
-    finally:
-        monkey.undo()
 
     run_id = str(created["id"])
     run_dir = runs_root / run_id
@@ -772,17 +772,26 @@ def test_both_refusals_record_the_named_reason_in_the_same_place(
     agent_launcher = Launcher(
         agent_supervisor, agent_store, queue_config=agent_config
     )
-    # No agent CLI is installed on this node.
-    monkeypatch.setattr(
-        "lh_harness.agent_registry.resolve_agent_binary", lambda binary: None
-    )
-    agent_entry = agent_store.create(
-        {**_base_entry(trio="kimi", workspace="./w-agent"), "roles": _PINNED},
-        model_fetch=_fake_model_catalog,
-        settings_runtime=agent_runtime,
-    )
-    asyncio.run(agent_launcher.tick())
-    agent_refused = agent_store.get(agent_entry.queue_id)
+    # No agent CLI is installed on this node.  The override is scoped with
+    # ``monkeypatch.context()``: that context manager patches through a
+    # SEPARATE undo registry, so leaving it restores the value the attribute
+    # had on entry -- here, the suite-wide autouse stub from
+    # ``tests/conftest.py`` -- without consuming the SHARED fixture's undo
+    # stack.  A blanket ``monkeypatch.undo()`` would do the opposite: it
+    # unwinds every patch the autouse fixture made (the stub disappears for
+    # the rest of the test) and empties the shared registry, so the fixture
+    # can no longer restore anything at teardown.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            "lh_harness.agent_registry.resolve_agent_binary", lambda binary: None
+        )
+        agent_entry = agent_store.create(
+            {**_base_entry(trio="kimi", workspace="./w-agent"), "roles": _PINNED},
+            model_fetch=_fake_model_catalog,
+            settings_runtime=agent_runtime,
+        )
+        asyncio.run(agent_launcher.tick())
+        agent_refused = agent_store.get(agent_entry.queue_id)
     assert agent_refused is not None
     # The named reason is in ``reason``...
     assert agent_refused.reason == (
@@ -793,8 +802,12 @@ def test_both_refusals_record_the_named_reason_in_the_same_place(
     # The agent refusal is terminal.
     assert agent_refused.status == "failed"
 
+    # The scoped context restored the suite-wide stub exactly: the registry
+    # answer is the autouse stub's again, NOT the real PATH lookup and NOT
+    # this test's "no worker" override.
+    assert agent_registry.resolve_agent_binary("codex") == "/usr/bin/codex"
+
     # --- the WORKSPACE refusal ----------------------------------------
-    monkeypatch.undo()
     ws_root = tmp_path / "workspace-case"
     ws_root.mkdir()
     plain = ws_root / "plain-workspace"
