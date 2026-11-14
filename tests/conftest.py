@@ -152,6 +152,29 @@ def host_independent_worker_isolation(monkeypatch):
 
 
 @_pytest_task300.fixture(autouse=True)
+def _agent_availability_is_host_independent(monkeypatch):
+    """Make the pre-spawn agent check independent of what this host installed.
+
+    The supervisor refuses a launch whose role names an agent with no worker
+    on this node (easybutt0n-238).  That question is answered by resolving
+    the agent's CLI on PATH, so it is a HOST question -- exactly like the
+    systemd probe above.  A developer box or CI runner that never installed
+    the Codex/DSH/OpenCode CLIs would otherwise refuse every run that names
+    one of them, and the tests that stub ``subprocess.Popen`` (they assert the
+    worker's COMMAND, never the agent's CLI) would fail for a reason that has
+    nothing to do with what they test.
+
+    The default here is "every known agent has a worker": the check is
+    exercised on purpose by the tests that care about it, which stub the
+    registry's resolution to report a missing binary.
+    """
+
+    from lh_harness import agent_registry
+
+    monkeypatch.setattr(agent_registry, "resolve_agent_binary", lambda binary: f"/usr/bin/{binary}")
+
+
+@_pytest_task300.fixture(autouse=True)
 def _auditor_verification_budget_state_isolated(monkeypatch, tmp_path):
     """easybutt0n-17: isolate the auditor verifier's step-budget counter.
 

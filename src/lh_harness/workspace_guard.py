@@ -66,6 +66,55 @@ class WorkspaceBaseError(RuntimeError):
     """No clean default-branch base could be resolved; the launch must fail."""
 
 
+# The named refusal for a workspace that is not a git checkout of the
+# requested repo (easybutt0n-238, operator item 2).  The wording is a stable,
+# greppable marker: the queue entry, the run record and the launcher all
+# carry it verbatim, so an operator reading either side learns WHICH preflight
+# refused the launch instead of finding a run that died for another reason.
+WORKSPACE_NOT_A_REPO = "workspace_not_a_repo"
+
+
+def workspace_not_a_repo_reason(workspace: str | Path) -> str:
+    """The refusal text for a workspace that is not a git checkout.
+
+    One builder, one wording: the queue entry's reason, the launcher's skip
+    reason and the run record's ``failure_reason`` must all read the same so
+    a test can match on the exact string.
+    """
+
+    return f"{WORKSPACE_NOT_A_REPO}: workspace {workspace} is not a git checkout"
+
+
+def require_git_checkout(base: WorkspaceBase | None, workspace: str | Path) -> str | None:
+    """Return the refusal reason when the resolved workspace is not a repo.
+
+    Reuses the guard's OWN resolution: ``prepare_workspace_base`` already
+    classifies a workspace that has no ``.git`` as the ``not-a-repo`` mode,
+    so this check reads that mode instead of re-implementing the lookup (no
+    second ``.git`` probe, no second subprocess, no second answer to the
+    same question).
+
+    Two cases are deliberately NOT this refusal:
+
+    * ``base`` is ``None`` -- the caller asked for no explicit workspace, so
+      the supervisor uses its configured workspace root, which the operator
+      owns.
+    * the resolved workspace does not exist on disk yet.  A path the operator
+      named but has not created is not "a workspace that is not a repo"; the
+      worker creates it.  Only an EXISTING directory that is not a checkout
+      is the defect this preflight names.
+    """
+
+    if base is None:
+        return None
+    if base.mode != "not-a-repo":
+        return None
+    if not Path(base.workspace).is_dir():
+        # Not created yet: not this refusal.
+        return None
+    return workspace_not_a_repo_reason(workspace)
+
+
 @dataclass
 class WorkspaceBase:
     """A resolved launch base for one workspace."""

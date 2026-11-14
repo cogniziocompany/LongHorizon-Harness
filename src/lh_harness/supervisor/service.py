@@ -113,6 +113,29 @@ def _config_worker_memory_max() -> str | None:
 _ROLE_KEYS = ("manager", "executor", "auditor")
 _AGENT_CHOICES = frozenset({"codex", "claude_code", "deepseek_harness", "opencode"})
 
+# The pre-spawn agent check names a worker that is not installed on THIS node.
+# The wording is a stable, greppable marker: the launcher's non-retryable
+# signature list matches it (so a refusal never spawns a retry successor) and
+# the refusal text is what the run record and the queue entry both carry.
+LAUNCH_REFUSED_PREFIX = "launch_refused"
+
+
+def launch_refused_reason(agent: str) -> str:
+    """The refusal text for a role whose agent has no worker on this node.
+
+    One builder, one wording: the run record's ``failure_reason``, the queue
+    entry's reason and the launcher's skip reason must all read the same, so
+    an operator (or a test) can match on the exact string.
+
+    What the refusal MEANS for the operator: the launch was refused, so
+    nothing was started and no capacity was reserved -- but the refusal is
+    detected inside ``create_run``, so a run record and a run directory
+    already exist and are then FAILED.  The failed run directory is
+    reclaimed by the disk-retention sweep like any other terminal run.
+    """
+
+    return f"{LAUNCH_REFUSED_PREFIX}: agent {agent} has no worker on this node"
+
 
 def _default_model_for_agent(agent: str) -> str:
     if agent == "claude_code":
@@ -2323,6 +2346,33 @@ class RunSupervisor:
             reservation["queue_id"] = str(queue_id)[:100]
         if trio:
             reservation["trio"] = str(trio)[:100]
+        # Pre-spawn agent check (easybutt0n-238 B): a role whose agent has no
+        # worker installed on THIS node cannot be driven here at all.  The
+        # worker used to start anyway, fail to spawn the agent, and die with a
+        # bare "worker exited with status 2" that named nothing.
+        #
+        # WHERE the refusal happens, stated plainly for the operator: it is
+        # detected INSIDE ``create_run``, which means a run record and a run
+        # directory ALREADY EXIST by the time the refusal is decided.  The
+        # run directory (``runs/<id>/``) holds the run's own ``control/owner.json``
+        # and ``control/status.json`` and the ``lh_harness/crash_report.json``
+        # diagnostic; the refusal then FAILS that run record (status
+        # ``failed``, ``failure_reason`` set).  NOTHING is launched: no
+        # worker process is spawned, no agent CLI is invoked, and no capacity
+        # slot is reserved.  The run directory is left behind on purpose --
+        # the refusal must be visible in the run record, not only on the
+        # queue entry -- and the disk-retention sweep reclaims it like any
+        # other terminal (``failed``) run once it is older than the
+        # configured run_max_age_days.
+        refusal = self._refuse_launch_without_worker(
+            run_id=run_id,
+            run_dir=run_dir,
+            bus=bus,
+            reservation=reservation,
+            role_configs=resolved_role_configs,
+        )
+        if refusal is not None:
+            return refusal
         return self._launch_worker(
             run_id=run_id,
             run_dir=run_dir,
@@ -2332,6 +2382,87 @@ class RunSupervisor:
             workspace_path=workspace_path,
             task=task,
         )
+
+    def _refuse_launch_without_worker(
+        self,
+        *,
+        run_id: str,
+        run_dir: Path,
+        bus: ControlBus,
+        reservation: dict[str, Any],
+        role_configs: dict[str, dict[str, str]] | None,
+    ) -> dict[str, Any] | None:
+        """Refuse a launch whose agent has no worker on this node.
+
+        Returns ``None`` when every role's agent is installed here (the launch
+        proceeds), or the created run dict carrying the refusal when it is
+        not.
+
+        The refusal is detected INSIDE ``create_run``, so a run record and a
+        run directory ALREADY EXIST when it is decided: the run directory
+        ``runs/<id>/`` was created by ``create_run`` before this check runs.
+        The refusal then FAILS that run -- the owner record and the terminal
+        status are written exactly as a real launch's would be, plus the
+        ``lh_harness/crash_report.json`` diagnostic -- so the refusal is
+        visible in the run record instead of leaving a directory with no
+        explanation.  NOTHING is launched: no worker process is spawned, no
+        agent CLI is invoked, and no capacity slot is reserved.  The run
+        directory is left behind deliberately, and the disk-retention sweep
+        reclaims it like any other terminal (``failed``) run once it is older
+        than the configured ``run_max_age_days``.
+
+        The agent resolution reuses the harness's own registry
+        (``agent_registry.agent_spec`` -> ``resolve_agent_binary``), the same
+        PATH lookup the adapters and ``lh-harness doctor`` use, so "installed
+        on this node" means one thing everywhere.
+        """
+
+        from ..agent_registry import agents_without_worker
+
+        agents = [
+            str(spec.get("agent") or "").strip()
+            for spec in (role_configs or {}).values()
+            if isinstance(spec, dict)
+        ]
+        missing = agents_without_worker(agents)
+        if not missing:
+            return None
+        reason = launch_refused_reason(missing[0])
+        # The owner record is the run's provenance; it stays, and it names the
+        # refusal so a reader of the run directory sees WHY there is no worker.
+        refused_owner = {**reservation, "state": "failed", "failure_reason": reason}
+        try:
+            bus.write_owner(refused_owner)
+            bus.write_status(
+                {
+                    "run_id": run_id,
+                    "status": "failed",
+                    "alive": False,
+                    "started_at": float(reservation.get("started_at") or time.time()),
+                    "finished_at": time.time(),
+                    "failure_reason": reason,
+                }
+            )
+        except Exception:  # noqa: BLE001 - the refusal must still be reported
+            logger.exception("could not persist the refused launch record for run %s", run_id)
+        # A durable diagnostic next to the run, matching the shape
+        # ``_persist_failure_report`` writes for a worker that died.
+        self._persist_failure_report(
+            run_id,
+            status={"status": "failed", "failure_reason": reason},
+            returncode=None,
+            reason=reason,
+            report={},
+        )
+        logger.warning("launch refused for run %s: %s", run_id, reason)
+        return {
+            "id": run_id,
+            "task": str(reservation.get("task") or ""),
+            "status": "failed",
+            "failure_reason": reason,
+            "owner": refused_owner,
+            "launch_refused": True,
+        }
 
     def _launch_worker(
         self,

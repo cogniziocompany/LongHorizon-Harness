@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Lock
-from typing import Literal
+from typing import Iterable, Literal
 
 from .types import (
     DEFAULT_CLAUDE_MODEL,
@@ -323,3 +323,50 @@ def _cli_help_text(binary: str) -> str:
 
 def resolve_agent_binary_for(agent_id: str) -> str | None:
     return resolve_agent_binary(agent_spec(agent_id).binary)
+
+
+def agent_has_worker(agent_id: str) -> bool:
+    """True when this node has an installed worker for ``agent_id``.
+
+    "Installed" means the agent's CLI executable resolves on THIS node -- the
+    same resolution every adapter and the doctor command already use
+    (``agent_spec`` -> ``resolve_agent_binary``).  A node that never installed
+    the CLI cannot drive that backend at all: the worker would start, fail to
+    spawn the agent, and exit with a bare status 2 that names nothing.
+
+    This is deliberately the cheap PATH-resolution question, not the
+    ``--version`` probe: a launch must not run an extra subprocess per role
+    before every launch, and a broken-but-present binary is a different
+    failure class (it starts and then fails) than a missing one.
+
+    ``resolve_agent_binary`` already honours the deployment's explicit
+    binary overrides (``LH_HARNESS_CODEX_BINARY`` and friends), and those are
+    authoritative: an operator who points the harness at a specific
+    installation has answered the question, so the answer is "installed"
+    even when the override names a path this process cannot stat.
+    """
+
+    try:
+        spec = agent_spec(agent_id)
+    except ValueError:
+        # An unknown agent id is not a missing worker; the caller's own
+        # validation rejects it with a better message.
+        return True
+    return bool(resolve_agent_binary(spec.binary))
+
+
+def agents_without_worker(agent_ids: Iterable[str]) -> list[str]:
+    """The distinct agents of ``agent_ids`` that have no worker on this node.
+
+    Order follows the input's first appearance so the refusal names the same
+    role order every other launch-time message uses.
+    """
+
+    missing: list[str] = []
+    for agent_id in agent_ids:
+        name = str(agent_id or "").strip()
+        if not name or name in missing:
+            continue
+        if not agent_has_worker(name):
+            missing.append(name)
+    return missing

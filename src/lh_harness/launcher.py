@@ -52,11 +52,12 @@ from .restart_recovery import (
 )
 from .settings_store import SettingsStore, active_runtime, open_from_environment, trio_role_overrides
 from .supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
-from .supervisor.service import auditor_read_only_violation
+from .supervisor.service import _ROLE_KEYS, auditor_read_only_violation
 from .workspace_guard import (
     WorkspaceBaseError,
     prepare_workspace_base,
     probe_open_pr_gh,
+    require_git_checkout,
     resolve_run_base,
 )
 from .workspace_identity import resolve_many
@@ -306,6 +307,11 @@ _NON_RETRYABLE_CAUSE_SIGNATURES = (
     "worker_cancelled",
     # per-task wall-clock limit (fc-H2): the run was stopped on purpose
     "time_limit",
+    # pre-spawn agent refusal (easybutt0n-238 B): a role's agent has no
+    # worker installed on this node.  A successor entry would hit the exact
+    # same refusal on the same node, so the entry stays failed instead of
+    # burning attempts on a retry that cannot succeed.
+    "launch_refused:",
 )
 
 # Failure cause recorded on a launched entry whose run the launcher stopped for
@@ -456,6 +462,28 @@ def _format_utc(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _launch_role_keys() -> tuple[str, ...]:
+    """The queue's public role set, read from the supervisor's own constant.
+
+    Genuine reuse: ``supervisor.service._ROLE_KEYS`` is the single place that
+    names the three public queue roles (``manager``, ``executor``,
+    ``auditor``).  The launcher used to spell that tuple out again in three
+    places, so a role added there could silently be missing here -- and a
+    caller-supplied pin for it would be dropped instead of applied.  Reading
+    the constant keeps "which roles exist" one fact.
+
+    The import is at module level, not inside this function: the launcher
+    already imports ``supervisor.service`` at module level (for
+    ``auditor_read_only_violation``), and the supervisor stack does not import
+    the launcher, so there is no import cycle to dodge.  A function-local
+    "lazy" import would only defer a name lookup the interpreter caches
+    anyway, while making the reader believe the cost is avoided when it is
+    not.
+    """
+
+    return tuple(_ROLE_KEYS)
+
+
 def _trio_role_overrides(trio: dict[str, Any]) -> dict[str, dict[str, str]]:
     """``<role>_agent`` / ``<role>_model`` keys of a trio, grouped per role.
 
@@ -465,7 +493,7 @@ def _trio_role_overrides(trio: dict[str, Any]) -> dict[str, dict[str, str]]:
     """
 
     overrides: dict[str, dict[str, str]] = {}
-    for role in ("manager", "executor", "auditor"):
+    for role in _launch_role_keys():
         spec: dict[str, str] = {}
         for key in ("agent", "model"):
             value = trio.get(f"{role}_{key}")
@@ -498,7 +526,7 @@ def _role_configs(
     del mcp_profile, auditor_mcp_profile
     overrides = role_overrides or {}
     configs: dict[str, dict[str, str]] = {}
-    for role in ("manager", "executor", "auditor"):
+    for role in _launch_role_keys():
         role_override = overrides.get(role, {})
         spec: dict[str, str] = {"agent": role_override.get("agent") or agent}
         role_model = role_override.get("model") or model
@@ -2102,6 +2130,49 @@ class Launcher:
                 self.queue_store.update(updated)
             return False
         workspace = str(workspace)
+        # Workspace preflight (easybutt0n-238, operator item 2): the resolved
+        # workspace must be a git checkout of the requested repo.  A launch
+        # onto a plain directory used to reach the worker and die there with
+        # no explanation; the guard's OWN resolution already classifies such a
+        # workspace as the "not-a-repo" mode, so this reads that mode instead
+        # of probing ``.git`` a second time.  The refusal is named
+        # ("workspace_not_a_repo") and lands on the queue entry, so an
+        # operator learns WHICH preflight refused the launch.
+        #
+        # The refusal keeps the entry PENDING, exactly like the other guard
+        # refusals above: a plain directory is a configuration the operator
+        # can fix (point the entry at the repo), and the entry must be
+        # re-attempted afterwards.  Nothing is spawned and no capacity slot
+        # is consumed.
+        #
+        # The named reason lands in BOTH places the agent refusal puts it:
+        # ``entry.reason`` and ``entry.skip_reasons``, with the SAME text.
+        # An operator reading the queue entry's ``reason`` field must see
+        # this refusal too -- otherwise the two refusals disagree about
+        # where the reason lives and the workspace one is invisible to
+        # anyone who reads only ``reason``.  The STATUS is untouched: the
+        # entry stays PENDING (re-attemptable), exactly as before.
+        not_a_repo = require_git_checkout(base, workspace)
+        if not_a_repo is not None:
+            reason = not_a_repo[:_MAX_REASON_LEN]
+            updated = self.queue_store.record_skip(entry.queue_id, reason)
+            self._emit_service_event(
+                "queue.skipped",
+                {
+                    "queue_id": entry.queue_id,
+                    "trio": entry.trio,
+                    "workspace": entry.workspace,
+                    "reason": reason,
+                },
+            )
+            if updated is not None:
+                # ``record_skip`` returns the freshest entry; writing the
+                # reason onto it (and saving) is what puts the same text in
+                # ``entry.reason`` as in ``entry.skip_reasons``.
+                updated.reason = reason
+                updated.last_checked_at = _now()
+                self.queue_store.update(updated)
+            return False
         try:
             created = self.supervisor.create_run(
                 task=entry.task,
@@ -2124,6 +2195,51 @@ class Launcher:
                 trio=entry.trio,
             )
             run_id = str(created.get("id") or "")
+            # Pre-spawn agent refusal (easybutt0n-238 B): the supervisor
+            # resolved every role's agent against the workers installed on
+            # THIS node and refused the launch when one of them has none --
+            # before spawning anything.  The run record already carries the
+            # reason; the queue entry must carry it too, with the same exact
+            # wording, so an operator reading either side learns which agent
+            # is missing instead of finding a run that died with status 2.
+            #
+            # The refusal is detected INSIDE ``supervisor.create_run``, so a
+            # run record AND a run directory already exist by the time it is
+            # decided; the refusal FAILS that run record (status ``failed``,
+            # ``failure_reason`` set) and leaves the run directory behind on
+            # purpose, so the refusal is visible there too.  NOTHING is
+            # launched (no worker process, no agent CLI) and no capacity slot
+            # is reserved.  The disk-retention sweep reclaims the refused run
+            # directory like any other terminal (``failed``) run once it is
+            # older than the configured ``run_max_age_days``.
+            #
+            # The entry FAILS rather than staying pending (the other guard
+            # refusals keep the entry pending because a dirty tree or an open
+            # PR is transient): a successor entry would be launched on this
+            # same node and hit the identical refusal, so the entry is not
+            # requeued -- ``launch_refused:`` is in the launcher's
+            # non-retryable signature list for exactly that reason.
+            refusal_reason = str(created.get("failure_reason") or "").strip()
+            if created.get("launch_refused") and refusal_reason:
+                self.queue_store.mark_failed(entry.queue_id, refusal_reason)
+                # ``record_skip`` re-reads the entry, so ITS return value is
+                # the freshest one -- it carries both the failure reason and
+                # the appended skip reason.  Writing back an older copy would
+                # drop the skip reason.
+                updated = self.queue_store.record_skip(entry.queue_id, refusal_reason)
+                self._emit_service_event(
+                    "queue.skipped",
+                    {
+                        "queue_id": entry.queue_id,
+                        "trio": entry.trio,
+                        "workspace": entry.workspace,
+                        "reason": refusal_reason,
+                    },
+                )
+                if updated is not None:
+                    updated.last_checked_at = _now()
+                    self.queue_store.update(updated)
+                return False
         except Exception as exc:
             failure_reason = f"launch failed: {exc}"
             updated = self.queue_store.mark_failed(entry.queue_id, failure_reason)
