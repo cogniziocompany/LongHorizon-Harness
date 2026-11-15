@@ -21,10 +21,47 @@ _PROVENANCE_FIELDS = (
     "prompt_language",
     "mcp_profile",
     "mcp_profile_resolution",
+    "work_origin",
 )
 _MAX_FINAL_RESPONSE_CHARS = 512 * 1024
 # Mirrors agent_registry's rule; owner records are untrusted input here.
 _REASONING_EFFORT_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+# The record-only work-origin block (task easybutt0n-17).  Its three kinds
+# and its two bounded id fields; the projection drops anything malformed so
+# an agent-written owner record cannot inflate a summary response.
+_WORK_ORIGIN_KINDS = frozenset({"ticket", "goal", "ops"})
+_WORK_ORIGIN_MAX_ID_CHARS = 128
+
+
+def _safe_work_origin(value: object) -> dict[str, Any]:
+    """Sanitize the record-only work-origin block for projection.
+
+    The block is RECORD-ONLY -- it says where the work came from and nothing
+    more.  The projection keeps the same three keys it was stored with, with
+    the same value types, and drops a malformed block entirely (so the
+    summary carries no ``work_origin`` at all rather than a half-trusted
+    one).
+    """
+
+    if not isinstance(value, dict):
+        return {}
+    kind = value.get("kind")
+    if kind not in _WORK_ORIGIN_KINDS:
+        return {}
+    result: dict[str, Any] = {"kind": kind}
+    for key in ("ticket", "goal_ref"):
+        raw = value.get(key)
+        if raw is None:
+            result[key] = None
+            continue
+        if not isinstance(raw, str):
+            return {}
+        text = raw.strip()
+        if len(text) > _WORK_ORIGIN_MAX_ID_CHARS or "\x00" in text:
+            return {}
+        result[key] = text or None
+    return result
 
 
 def _final_response(
@@ -71,6 +108,15 @@ def _provenance(*sources: dict[str, Any] | None) -> dict[str, Any]:
                 continue
             if field == "mcp_profile_resolution":
                 cleaned = _safe_mcp_profile_resolution(value)
+                if cleaned:
+                    result[field] = cleaned
+                    break
+                continue
+            if field == "work_origin":
+                # The record-only work-origin block: projected when it is
+                # present and well-formed, omitted otherwise.  A run with no
+                # recorded origin simply carries no ``work_origin``.
+                cleaned = _safe_work_origin(value)
                 if cleaned:
                     result[field] = cleaned
                     break

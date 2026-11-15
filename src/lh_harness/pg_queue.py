@@ -13,6 +13,7 @@ exactly like a missing connection: every method raises ``OperationalError``.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import socket
@@ -78,6 +79,12 @@ _COLUMN_GTM_MANAGER = "gtm_manager"
 _COLUMN_INTERRUPTED_RUN = "interrupted_run"
 _COLUMN_SUCCESSOR = "successor"
 _COLUMN_NEEDS_REVIEW = "needs_review"
+# The record-only work-origin block (task easybutt0n-17, migration 010): where
+# the work came from -- a YouTrack ticket, a goal-board item, or an ops chore.
+# Stored as JSONB so the file store's JSON and this column hold the SAME
+# shape; a row written before the column reads back NULL, exactly how the
+# file store loads an entry written before the field existed.
+_COLUMN_WORK_ORIGIN = "work_origin"
 # ``requester`` (task 300) still has no column; see ``create``.
 _QUEUE_COLUMNS = (
     _COLUMN_QUEUE_ID,
@@ -112,6 +119,7 @@ _QUEUE_COLUMNS = (
     _COLUMN_INTERRUPTED_RUN,
     _COLUMN_SUCCESSOR,
     _COLUMN_NEEDS_REVIEW,
+    _COLUMN_WORK_ORIGIN,
 )
 
 # LHH-QUEUE-HOTRELOAD R9: the two per-task override columns, applied in-code
@@ -149,6 +157,20 @@ ALTER TABLE harness.queue
     ADD COLUMN IF NOT EXISTS interrupted_run VARCHAR(128),
     ADD COLUMN IF NOT EXISTS successor VARCHAR(64),
     ADD COLUMN IF NOT EXISTS needs_review BOOLEAN NOT NULL DEFAULT FALSE;
+"""
+
+# easybutt0n-17 (migration 010): the record-only work-origin block on the
+# Postgres queue backend, mirroring the file store's persistence of
+# QueueEntry.work_origin (queue.py).  JSONB, so the column holds the SAME
+# shape as the file store's JSON: {"kind": ..., "ticket": ..., "goal_ref": ...}.
+# A no-op once the column exists; a row written before it reads back NULL,
+# exactly how the file store loads an entry written before the field existed.
+_MIGRATION_WORK_ORIGIN_SQL = """\
+-- easybutt0n-17 (migration 010): the optional, record-only work-origin
+-- block on the Postgres queue backend, mirroring the file store's
+-- persistence of QueueEntry.work_origin (queue.py).
+ALTER TABLE harness.queue
+    ADD COLUMN IF NOT EXISTS work_origin JSONB;
 """
 
 # Same bound the file store applies in ``QueueStore.requeue``.
@@ -200,6 +222,15 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         gtm_manager = DEFAULT_GTM_MANAGER
     else:
         gtm_manager = gtm_manager.strip()
+    # The record-only work-origin block (task easybutt0n-17).  Serialised into
+    # the JSONB column exactly like ``skip_reasons``/``roles``: the dict is
+    # stored verbatim so the column holds the SAME shape as the file store's
+    # JSON and a re-read round-trips it 1:1.  ``None`` when the entry carries
+    # no block (a legacy row, or an entry enqueued without one); a non-dict
+    # never reaches the column (the enqueue path validated it already, so
+    # this only guards a hand-built entry).
+    work_origin = getattr(entry, "work_origin", None)
+    work_origin_json = json.dumps(work_origin) if isinstance(work_origin, dict) else None
     return [
         entry.queue_id,
         entry.name,
@@ -233,6 +264,7 @@ def _entry_values(entry: QueueEntry) -> list[Any]:
         getattr(entry, "interrupted_run", None),
         getattr(entry, "successor", None),
         bool(getattr(entry, "needs_review", False)),
+        work_origin_json,
     ]
 
 
@@ -364,6 +396,9 @@ class PgQueueStore:
                 # easybutt0n-17: the restart-recovery lineage columns, in the
                 # same single committed unit as the migrations above.
                 txn.execute(_MIGRATION_RESTART_RECOVERY_SQL)
+                # easybutt0n-17: the record-only work-origin column, in the
+                # same single committed unit as the migrations above.
+                txn.execute(_MIGRATION_WORK_ORIGIN_SQL)
                 txn.commit()
         except Exception as exc:
             raise OperationalError(f"migration failed: {exc}") from exc
@@ -622,6 +657,22 @@ class PgQueueStore:
                     return None
                 return parsed if isinstance(parsed, dict) else None
             return None
+        if column == "work_origin":
+            # easybutt0n-17: the record-only work-origin block.  psycopg
+            # decodes JSONB itself; a raw string is decoded explicitly.
+            # Anything that is not a dict round-trips to None -- the same
+            # "entry carries no work origin" state a NULL column models.
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+            return None
         if column == "skip_reasons":
             if value is None:
                 return []
@@ -856,6 +907,11 @@ class PgQueueStore:
             # ``overseer1-op`` must not silently fall back to the default
             # manager (GTM-MANAGER-G1-a).
             gtm_manager=entry.gtm_manager,
+            # The work-origin block carries over, exactly like the file
+            # store's requeue: a retry of ticket work is still that
+            # ticket's work (task easybutt0n-17).  Copied, not shared, so a
+            # later edit of one never mutates the other.
+            work_origin=copy.deepcopy(entry.work_origin),
             not_before=float(not_before) if not_before is not None else None,
             wait_reason=(
                 str(wait_reason)[:_MAX_WAIT_REASON_CHARS]

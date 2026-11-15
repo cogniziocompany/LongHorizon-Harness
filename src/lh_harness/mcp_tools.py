@@ -430,6 +430,45 @@ def _requester_param() -> dict[str, Any]:
     }
 
 
+def _work_origin_param() -> dict[str, Any]:
+    """MCP schema for the task easybutt0n-17 work-origin block.
+
+    A nested object (``type: object``) with ``additionalProperties: false`` so
+    a chat client cannot smuggle a sub-field the store does not recognize.
+    The block is OPTIONAL: omitting it means the work records no origin.
+    The store performs the real validation (``kind`` must be one of the three
+    kinds; ``ticket`` and ``goal_ref`` are strings or null).
+    """
+
+    return {
+        "type": "object",
+        "description": (
+            "Optional record of where this work came from. Send kind ('ticket', "
+            "'goal', or 'ops'), plus ticket (a YouTrack issue id) and/or goal_ref "
+            "(a goal-board item id) as strings or null. RECORD-ONLY: it is "
+            "stored and reported back; it never authorizes or gates anything."
+        ),
+        "additionalProperties": False,
+        "properties": {
+            "kind": {
+                "type": "string",
+                "description": "Where the work comes from: 'ticket', 'goal', or 'ops'.",
+                "enum": ["ticket", "goal", "ops"],
+            },
+            "ticket": {
+                "type": ["string", "null"],
+                "description": "Optional YouTrack issue id (e.g. 'YT-42'). <=128 chars.",
+                "maxLength": 128,
+            },
+            "goal_ref": {
+                "type": ["string", "null"],
+                "description": "Optional goal-board item id. <=128 chars.",
+                "maxLength": 128,
+            },
+        },
+    }
+
+
 def _fields_param() -> dict[str, Any]:
     """Schema for an ask's declared response fields (task A3d)."""
     return {
@@ -551,6 +590,11 @@ def tools_manifest(*, caller_scoped: bool = True) -> list[dict[str, Any]]:
                 # additionalProperties=false; the store validates and normalizes
                 # it, stamping observed_addr/verified_caller server-side.
                 "requester": _requester_param(),
+                # easybutt0n-17: the optional, record-only work-origin block.
+                # It says WHERE the work came from (a YouTrack ticket, a
+                # goal-board item, an ops chore); it never decides whether
+                # the work may run.  The store validates it.
+                "work_origin": _work_origin_param(),
             },
         ),
         _tool_spec(
@@ -1433,6 +1477,13 @@ def _enqueue(
     # succeed.  AdditionalProperties=false in the schema keeps a non-dict
     # requester from reaching here unguarded.
     body["requester"] = arguments.get("requester")
+    # easybutt0n-17: the optional work-origin block is forwarded ONLY when
+    # actually supplied (an absent block means the work records no origin,
+    # and the store's validator owns the shape -- the same split the
+    # requester block uses).
+    raw_work_origin = arguments.get("work_origin")
+    if raw_work_origin is not None:
+        body["work_origin"] = raw_work_origin
     from fastapi import HTTPException  # lazy: R6 503 carrier from the store
     try:
         entry = queue_store.create(
