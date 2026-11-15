@@ -134,15 +134,20 @@ def _run_events(root: Path, run_id: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def test_non_git_workspace_passes_through_and_creates_the_run(tmp_path: Path) -> None:
-    """A workspace that is not a git repo is launchable as-is, at both paths.
+def test_non_git_workspace_is_refused_before_any_run_is_created(tmp_path: Path) -> None:
+    """An existing plain directory is refused on the create path too (easybutt0n-17).
 
-    A plain directory (fresh workspace root, no ``.git`` of any form) is not
-    something the branch guard protects: the run is created in it unchanged,
-    the guard records the ``not-a-repo`` pass-through in the provenance
-    event, and nothing ever spawns ``git`` (the supervisor API tests stub
-    ``subprocess.Popen``, so a guard that shelled out here would blow up
-    with a TypeError mapped to HTTP 400 — the regression this test pins).
+    The queue Launcher already refuses this launch
+    (``workspace_not_a_repo``); the direct create path used to resolve the
+    same ``not-a-repo`` base and hand the plain directory straight to
+    ``supervisor.create_run``, so the run was ACCEPTED and STARTED onto a
+    workspace the queue path had refused.  This pins that both doors now
+    give the same answer: HTTP 409, the queue path's exact reason text, and
+    NOTHING created — no run row, no run-created event, no process.  The
+    guard reads the ``not-a-repo`` mode ``resolve_run_base`` already
+    resolved (no second ``.git`` probe, no subprocess), so the stubbed-
+    ``Popen`` TypeError regression the old pass-through test pinned stays
+    pinned by the missing/none-workspace tests below.
     """
 
     plain = tmp_path / "ws-plain"
@@ -154,16 +159,77 @@ def test_non_git_workspace_passes_through_and_creates_the_run(tmp_path: Path) ->
         json={"task": "guard me", "workspace": str(plain), "max_rounds": 2},
     )
 
+    assert response.status_code == 409
+    # The queue path's exact refusal text, verbatim: one builder, one wording.
+    assert response.json()["detail"] == (
+        f"workspace_not_a_repo: workspace {plain} is not a git checkout"
+    )
+    # Nothing was created and nothing was spawned.
+    assert supervisor.created == []
+    # No run-created provenance event exists for a run that was never made.
+    assert not list(root.glob("*/lh_harness/role_orchestration/events.jsonl"))
+    # The guard cut no run branch and created no worktree.
+    assert plain.is_dir() and not (plain / ".git").exists()
+    assert set(tmp_path.glob("ws-plain.run-*")) == set()
+
+
+def test_git_checkout_workspace_is_created_unchanged_on_the_create_path(
+    tmp_path: Path,
+) -> None:
+    """A real checkout launches exactly as before: the refusal is narrow.
+
+    A guard that refused everything would be useless.  The same request
+    shape that ``test_non_git_workspace_is_refused_before_any_run_is_created``
+    refuses is made here against a real repository with a real ``origin``
+    (the branch guard needs one to resolve the default branch), and the run
+    is created in place, unchanged.
+    """
+
+    repo = _make_repo(tmp_path, name="ws-create-checkout")
+    client, supervisor, root = _client(tmp_path)
+
+    response = client.post(
+        "/api/runs",
+        json={"task": "guard me", "workspace": str(repo), "max_rounds": 2},
+    )
+
     assert response.status_code == 200
     assert len(supervisor.created) == 1
-    assert Path(supervisor.created[0]["workspace"]).resolve() == plain.resolve()
-    # The pass-through is recorded in the run-created provenance event.
+    assert Path(supervisor.created[0]["workspace"]).resolve() == repo.resolve()
+    # The workspace was not touched: still on the default branch, still clean.
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert _git(repo, "status", "--porcelain").strip() == ""
+    events = _run_events(root, response.json()["run"]["id"])
+    assert "run.created" in events
+    assert '"workspace_base": "mode=on-default' in events
+
+
+def test_missing_workspace_directory_keeps_its_current_behaviour(tmp_path: Path) -> None:
+    """A workspace the operator named but has not created is NOT this refusal.
+
+    Only an EXISTING directory that is not a checkout is refused; a path
+    that does not exist yet is the worker's to create, so the run is created
+    exactly as before the guard gained the refusal.
+    """
+
+    not_created = tmp_path / "ws-not-created-yet"
+    client, supervisor, root = _client(tmp_path)
+
+    response = client.post(
+        "/api/runs",
+        json={"task": "guard me", "workspace": str(not_created), "max_rounds": 2},
+    )
+
+    assert response.status_code == 200
+    assert len(supervisor.created) == 1
+    assert supervisor.created[0]["workspace"] == str(not_created)
+    # The run-created provenance event records the not-a-repo mode as before.
     events = _run_events(root, response.json()["run"]["id"])
     assert "run.created" in events
     assert '"workspace_base": "mode=not-a-repo' in events
-    # The guard cut no run branch and created no worktree.
-    assert plain.resolve() == Path(supervisor.created[0]["workspace"]).resolve()
-    assert set(tmp_path.glob("ws-plain.run-*")) == set()
+    # The refusal did not fire, and the directory itself was not created by
+    # the guard (the worker creates it at spawn time).
+    assert not not_created.exists()
 
 
 def test_clean_default_branch_creates_run_unchanged_with_base_summary(tmp_path: Path) -> None:

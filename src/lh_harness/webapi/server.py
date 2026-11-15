@@ -84,7 +84,12 @@ from ..queue import (
     _select_queue_store,
 )
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
-from ..workspace_guard import WorkspaceBaseError, probe_open_pr_gh, resolve_run_base
+from ..workspace_guard import (
+    WorkspaceBaseError,
+    probe_open_pr_gh,
+    require_git_checkout,
+    resolve_run_base,
+)
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
@@ -3759,6 +3764,23 @@ def create_app(
                 )
             except WorkspaceBaseError as exc:
                 raise HTTPException(status_code=409, detail=f"workspace base refused: {exc}") from exc
+            # Workspace preflight (easybutt0n-17): the same named refusal the
+            # queue Launcher makes (launcher.py, ``require_git_checkout``).
+            # The direct create path used to resolve a base and hand the plain
+            # directory straight to ``supervisor.create_run``, so a run was
+            # ACCEPTED and STARTED onto a workspace that the queue path had
+            # already refused (``workspace_not_a_repo``) -- two answers to the
+            # same question, depending only on which door the caller used.
+            # The guard's OWN resolution already classified the workspace
+            # (``base.mode == "not-a-repo"``), so this reads that mode; no
+            # second ``.git`` probe, no second implementation.  A workspace
+            # that does not exist yet is NOT this refusal (the worker creates
+            # it), and ``base is None`` (no explicit workspace) is not either.
+            # Like the branch-base refusal above, this fails loudly as 409
+            # BEFORE any run row is created and before any process is spawned.
+            not_a_repo = require_git_checkout(base, guarded_workspace)
+            if not_a_repo is not None:
+                raise HTTPException(status_code=409, detail=not_a_repo) from None
             created = supervisor.create_run(
                 task=task,
                 agent=agent,
