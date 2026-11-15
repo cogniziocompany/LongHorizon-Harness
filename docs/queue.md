@@ -523,16 +523,17 @@ round-trips the block 1:1.
 ### The read-only duplicate-work view
 
 `GET /api/queue/duplicate-work` lists the claims held by MORE THAN ONE live
-run. A claim is identified by the recorded `ticket` when there is one, and
-otherwise by the branch the work continues. A run is live while its lifecycle
-status is one of the active statuses (`creating`/`starting`/`running`/
-`waiting_approval`/`stopping`); a finished or failed run holds no claim, so
+run. A claim is identified by the recorded `ticket` when there is one, then by
+the recorded `goal_ref`, and otherwise by the branch the work continues. A run
+is live while its lifecycle status is one of the active statuses
+(`creating`/`starting`/`running`/`waiting_approval`/`stopping`); a finished or
+failed run holds no claim, so
 two runs that worked the same ticket at different times (the normal case of a
 retry after a crash) are not reported. A queue entry that has not launched yet
 is queued work, not work in flight, so it holds no claim either.
 
 The response is `{"ok": true, "duplicates": [...], "count": N}`, where each
-group carries `claim_kind` (`ticket`/`branch`), `claim`, `count`, and the
+group carries `claim_kind` (`ticket`/`goal`/`branch`), `claim`, `count`, and the
 `runs` holding it. An empty list means no live run claims the same piece of
 work. The route reads the queue and the run records and writes nothing.
 

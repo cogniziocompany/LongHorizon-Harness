@@ -14,15 +14,22 @@ the Harness queue stays the only execution store and YouTrack the only
 ticket store.
 
 THE CLAIM KEY.  A claim is identified by the recorded ticket id when there
-is one; otherwise, when the entry recorded no ticket, by the branch it
+is one; otherwise, when the entry recorded no ticket, by the recorded goal
+reference; and otherwise, when the entry recorded neither, by the branch it
 continues.  So:
 
-  * two live runs both claiming ticket ``YT-42``  -> a duplicate, and
+  * two live runs both claiming ticket ``YT-42``  -> a duplicate,
+  * two live runs both working goal ``goal-board-7`` with no recorded
+    ticket -> a duplicate too, and
   * two live runs both continuing branch ``feat/x`` with no recorded
-    ticket -> a duplicate too.
+    ticket and no recorded goal -> a duplicate as well.
 
-An entry that records NEITHER a ticket NOR a branch claims nothing and is
-never reported: it names no shared piece of work.
+A recorded ticket outranks a recorded goal: one ticket names one piece of
+work, so two runs claiming the same ticket are doing the same work even
+when they name different goals.
+
+An entry that records NEITHER a ticket NOR a goal NOR a branch claims
+nothing and is never reported: it names no shared piece of work.
 
 WHAT COUNTS AS LIVE.  A run is live while its lifecycle status is one of the
 active statuses (``creating``/``starting``/``running``/``waiting_approval``/

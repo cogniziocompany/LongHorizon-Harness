@@ -171,9 +171,10 @@ def validate_work_origin(value: Any) -> dict[str, Any] | None:
     object with exactly three keys:
 
     ``kind``      "ticket" | "goal" | "ops" -- required, and anything else
-                  is refused (a plain ``ValueError`` -> the enqueue path's
-                  existing 422 mapping).  The message names the three valid
-                  kinds so a caller can fix the body without guessing.
+                  is refused with an ``UnknownQueueFieldError`` -> the
+                  enqueue path's 400 mapping, the same one an unknown body
+                  key gets.  The message names the three valid kinds so a
+                  caller can fix the body without guessing.
     ``ticket``    the YouTrack issue id, a string or null.
     ``goal_ref``  the goal-board item id, a string or null.
 
