@@ -58,6 +58,7 @@ from ..caller_auth import (
 from ..mcp_tools import dispatch as _dispatch_mcp_tool, normalize_request_token, tools_manifest
 from .. import effect_lease, effect_lease_wire
 from ..overseer_state import resolve_overseer_root
+from ..duplicate_work import find_duplicate_work
 from . import mcp_jsonrpc as mcp_protocol
 from ..build_info import build_info
 from ..model_catalog import discover_model_catalog
@@ -69,7 +70,13 @@ from ..supervisor.lifecycle import (
     is_active_status,
     resume_epoch,
 )
-from ..supervisor.control_bus import CommandConflict, RevisionConflict, _append_jsonl, _atomic_bytes_write
+from ..supervisor.control_bus import (
+    CommandConflict,
+    RevisionConflict,
+    _append_jsonl,
+    _atomic_bytes_write,
+    _read_json_file,
+)
 from ..fleet import get_reporter
 from ..fleet.channel import get_channel, loopback_api_base, start_channel, stop_channel
 from ..queue import (
@@ -860,6 +867,63 @@ def _queue_entry_summary(item: Any) -> dict[str, Any]:
         data["skip_reasons"] = reasons[-_QUEUE_SKIP_REASONS_KEEP:]
         data["skip_reasons_total"] = len(reasons)
     return data
+
+
+def _live_run_rows(runs_root: Any) -> list[dict[str, Any]]:
+    """Read one row per run directory: its lifecycle status and its origin.
+
+    The canonical managed-run layout keeps the lifecycle status in
+    ``control/status.json`` and the provenance (including the record-only
+    ``work_origin`` block) in ``control/owner.json``.  This reads both
+    directly, so the duplicate-work view works the same whether or not a
+    supervisor is attached to this app -- the view is a READ-ONLY
+    projection of the run records, not a supervisor operation.
+
+    A run directory that cannot be read safely (outside the runs root, a
+    broken symlink, malformed JSON) is simply absent from the result: the
+    view reports what it can read and never fails a request over one bad
+    directory.
+    """
+
+    if runs_root is None:
+        return []
+    root = Path(runs_root)
+    try:
+        if not root.is_dir():
+            return []
+        entries = sorted(root.iterdir())
+    except OSError:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        try:
+            run_dir = safe_run_dir(root, entry.name)
+            if run_dir is None or not run_dir.is_dir():
+                continue
+            control = safe_run_control(root, run_dir, allow_missing=True)
+            if control is None:
+                continue
+            status = _read_json_file(control / "status.json")
+            owner = _read_json_file(control / "owner.json")
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not isinstance(status, dict):
+            status = {}
+        if not isinstance(owner, dict):
+            owner = {}
+        row: dict[str, Any] = {
+            "id": entry.name,
+            "status": str(status.get("status") or ""),
+        }
+        work_origin = owner.get("work_origin")
+        if isinstance(work_origin, dict):
+            row["work_origin"] = work_origin
+        branch = owner.get("branch")
+        if isinstance(branch, str) and branch.strip():
+            row["branch"] = branch.strip()
+        rows.append(row)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -3542,6 +3606,39 @@ def create_app(
             )
         records = queue_store.read_shadow_records(since=since_ts)
         return {"ok": True, "count": len(records), "events": records}
+
+    @app.get("/api/queue/duplicate-work")
+    def duplicate_work() -> dict[str, Any]:
+        """The READ-ONLY duplicate-work view (task easybutt0n-17).
+
+        Lists the claims held by MORE THAN ONE live run: the YouTrack ticket
+        a run recorded in its ``work_origin`` block (or, for work that
+        recorded no ticket, the branch it continues) that two live runs claim
+        at the same time.  An empty list means no live run claims the same
+        piece of work -- the normal case, and the case the view must stay
+        quiet about.
+
+        READ-ONLY BY CONSTRUCTION: this route reads the queue and the run
+        rows and returns what it finds.  It writes nothing, creates no
+        store, refuses nothing, and gates nothing -- the ``work_origin``
+        block is a record of where work came from, never a decision about
+        whether it may run.  The Harness queue stays the only execution
+        store and YouTrack the only ticket store.
+
+        Declared BEFORE ``GET /api/queue/{queue_id}`` so the literal path
+        segment "duplicate-work" is never read as a queue id.
+        """
+
+        if queue_store is None:
+            raise HTTPException(status_code=501, detail="queue requires a configured runs root")
+        entries = queue_store.list()
+        runs = _live_run_rows(runs_root)
+        groups = find_duplicate_work(runs, entries=entries)
+        return {
+            "ok": True,
+            "duplicates": groups,
+            "count": len(groups),
+        }
 
     @app.get("/api/queue/{queue_id}")
     def get_queue_entry(queue_id: str, request: Request) -> dict[str, Any]:

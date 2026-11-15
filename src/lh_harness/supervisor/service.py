@@ -1884,6 +1884,12 @@ class RunSupervisor:
             for field in ("agent", "model", "role_configs", "workspace", "max_rounds", "prompt_language"):
                 if field in owner:
                     item[field] = owner[field]
+            # easybutt0n-17: the record-only work-origin block travels with the
+            # run row so the read-only duplicate-work view can group the live
+            # runs that claim the same ticket (or branch).  RECORD-ONLY: it is
+            # carried, never consulted to decide anything.
+            if "work_origin" in owner:
+                item["work_origin"] = owner["work_origin"]
             items.append(item)
             # TASK 260: parking is triggered by the same poll that observes
             # the terminal lifecycle, so a run whose workspace must be parked
@@ -2000,6 +2006,7 @@ class RunSupervisor:
         # sites default to None.
         queue_id: str | None = None,
         trio: str | None = None,
+        work_origin: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create one worker, replaying a durable result for request retries."""
 
@@ -2023,6 +2030,7 @@ class RunSupervisor:
                 workspace_base_summary=workspace_base_summary,
                 queue_id=queue_id,
                 trio=trio,
+                work_origin=work_origin,
             )
         request = {
             "task": task,
@@ -2164,6 +2172,7 @@ class RunSupervisor:
         _idempotency_fingerprint: str | None = None,
         queue_id: str | None = None,
         trio: str | None = None,
+        work_origin: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self.attached_only:
             raise ValueError("this API is attached to an existing worker and cannot create runs")
@@ -2219,6 +2228,7 @@ class RunSupervisor:
                 _idempotency_fingerprint=_idempotency_fingerprint,
                 queue_id=queue_id,
                 trio=trio,
+                work_origin=work_origin,
             )
 
     def _create_run_once_reserved(
@@ -2248,6 +2258,7 @@ class RunSupervisor:
         _idempotency_fingerprint: str | None,
         queue_id: str | None = None,
         trio: str | None = None,
+        work_origin: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         workspace_path.mkdir(parents=True, exist_ok=True)
         # Re-resolve after mkdir: a pre-existing symlink or a concurrently
@@ -2346,6 +2357,15 @@ class RunSupervisor:
             reservation["queue_id"] = str(queue_id)[:100]
         if trio:
             reservation["trio"] = str(trio)[:100]
+        # easybutt0n-17: the optional, record-only work-origin block, copied
+        # from the queue entry onto the run.  It records WHERE the work came
+        # from (a YouTrack ticket, a goal-board item, an ops chore) so a
+        # recovering agent can confirm its own origin.  RECORD-ONLY: the run
+        # never reads it to decide anything.  Omitted when unset (direct
+        # launches); the block is stored verbatim so the run's owner record
+        # holds the same shape the queue entry does.
+        if isinstance(work_origin, dict) and work_origin:
+            reservation["work_origin"] = dict(work_origin)
         # Pre-spawn agent check (easybutt0n-238 B): a role whose agent has no
         # worker installed on THIS node cannot be driven here at all.  The
         # worker used to start anyway, fail to spawn the agent, and die with a

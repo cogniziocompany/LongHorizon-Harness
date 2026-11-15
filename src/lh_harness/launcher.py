@@ -2193,6 +2193,11 @@ class Launcher:
                 # grouped by queue entry and trio.
                 queue_id=entry.queue_id,
                 trio=entry.trio,
+                # easybutt0n-17: the record-only work-origin block is copied
+                # from the queue entry onto the run, so the run says where
+                # its work came from.  RECORD-ONLY: nothing reads it to
+                # decide whether the run may proceed.
+                work_origin=entry.work_origin,
             )
             run_id = str(created.get("id") or "")
             # Pre-spawn agent refusal (easybutt0n-238 B): the supervisor

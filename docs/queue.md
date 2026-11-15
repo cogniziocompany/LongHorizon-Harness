@@ -41,6 +41,11 @@ capacity allows.
     "agent": "claude",
     "session_id": "b5038555-9e10-4bb3-a81e-aa03a602d445",
     "notify": "sendmessage:overseer1"
+  },
+  "work_origin": {
+    "kind": "ticket",
+    "ticket": "YT-42",
+    "goal_ref": null
   }
 }
 ```
@@ -51,10 +56,19 @@ both. The response is `{"ok": true, "queue_id": "q-<16hex>"}`.
 The optional `gtm_manager` field names the manager that owns the task — see
 *The go-to-market manager*.
 
+The optional `work_origin` block records where the work came from — see
+*The work-origin block*.
+
 ### `GET /api/queue`
 
 List entries. Optional `?status=pending|launched|done|failed`. The response
 contains `entries`, `groups`, and `counts`.
+
+### `GET /api/queue/duplicate-work`
+
+The read-only duplicate-work view: the claims held by more than one live run.
+The response contains `duplicates` and `count`. See *The read-only
+duplicate-work view*.
 
 ### `DELETE /api/queue/{queue_id}`
 
@@ -357,6 +371,7 @@ visible to any caller with the bearer token through `GET /api/queue`.
 | `wait_reason` | `str \| None` | `None` | why the entry waits (`provider_quota` / `provider_rate_limit`); set only together with `not_before` | Launcher, via `requeue` |
 | `time_limit_minutes` | `int \| None` | `None` | wall-clock limit in minutes (1-1440) from `launched_at`; see *Per-task wall-clock limit* | Caller, at enqueue, or `POST /api/runs/{id}/time_limit` |
 | `gtm_manager` | `str` | `"overseer1"` | `overseer1` or `overseer1-op`; any other value is refused at enqueue (422); see *The go-to-market manager* | Caller, at enqueue |
+| `work_origin` | `dict \| None` | `None` | optional record-only block: `kind` (`ticket`/`goal`/`ops`), `ticket`, `goal_ref`; see *The work-origin block* | Caller, at enqueue |
 
 There is no dedicated `done_at`/`failed_at` field. The terminal time of an entry
 is the `updated_at` value at the moment `mark_done` or `mark_failed` runs (both
@@ -364,11 +379,11 @@ go through `update`, `queue.py:406`–`409`); the terminal cause is in `reason`.
 
 ### Caller-supplied vs. service-owned
 
-A caller supplies twelve input fields through the enqueue body: `name`, `task` (or
+A caller supplies thirteen input fields through the enqueue body: `name`, `task` (or
 `task_file`), `workspace`, `trio` (or `roles`), `max_rounds`, `priority`,
-`base_check`, `requested_by`, `dedup_key`, `requester`, `time_limit_minutes`, and
-`gtm_manager`. Of these, `max_rounds`, `priority`, `base_check`,
-`dedup_key`, `time_limit_minutes`, and `gtm_manager` are optional; the rest are required
+`base_check`, `requested_by`, `dedup_key`, `requester`, `time_limit_minutes`,
+`gtm_manager`, and `work_origin`. Of these, `max_rounds`, `priority`, `base_check`,
+`dedup_key`, `time_limit_minutes`, `gtm_manager`, and `work_origin` are optional; the rest are required
 (`requested_by` may be omitted when a `requester` block is supplied and no
 verified caller is stamped; it is then derived as `name@host [session_ref]`).
 `task_file` and `roles` are alternative input keys for `task` and `trio`
@@ -469,6 +484,57 @@ JSON.
 
 Reassignment (changing the manager of a live entry) and the run-side copy are
 separate work: this field is the queue-entry half only.
+
+## The work-origin block (`work_origin`, task easybutt0n-17)
+
+Every new queue entry may record WHERE the work came from: a YouTrack ticket,
+a goal-board item, or an operations chore. The block is a JSON object under the
+body key `work_origin`, stored on the entry as a plain dict, returned by
+`GET /api/queue`, carried onto requeued successors, copied onto the run the
+entry launches, and projected into the run summaries.
+
+| key | required | rule |
+|---|---|---|
+| `kind` | yes | `ticket`, `goal` or `ops`; anything else is refused by name (400) |
+| `ticket` | no | the YouTrack issue id; a string or `null`; at most 128 chars |
+| `goal_ref` | no | the goal-board item id; a string or `null`; at most 128 chars |
+
+The block is OPTIONAL. An enqueue without it is accepted and the entry carries
+no origin (`work_origin: null`); an entry written before the field existed (an
+old JSON file, or a Postgres row written before the column) reads back the same
+way.
+
+Unknown sub-keys are rejected by name (400), like unknown body keys (task 233).
+An unknown body key that is a SIBLING of `work_origin` is still rejected by
+name (400) — `work_origin` is the one new accepted body key, and nothing else
+becomes acceptable because of it.
+
+**RECORD-ONLY.** The block records where the work came from; it never decides
+anything. No gate reads it, no store is added for it, no new write path is
+added for it. The Harness queue stays the only execution store and YouTrack
+stays the only ticket store; this block is a pointer to a ticket, never a
+second copy of the work and never an authorization.
+
+The Postgres backend stores it in the `work_origin` column (`JSONB`, applied
+in-code as migration 010 alongside the other in-code columns); the file store
+persists it in the entry JSON. Both stores hold the same shape, so a re-read
+round-trips the block 1:1.
+
+### The read-only duplicate-work view
+
+`GET /api/queue/duplicate-work` lists the claims held by MORE THAN ONE live
+run. A claim is identified by the recorded `ticket` when there is one, and
+otherwise by the branch the work continues. A run is live while its lifecycle
+status is one of the active statuses (`creating`/`starting`/`running`/
+`waiting_approval`/`stopping`); a finished or failed run holds no claim, so
+two runs that worked the same ticket at different times (the normal case of a
+retry after a crash) are not reported. A queue entry that has not launched yet
+is queued work, not work in flight, so it holds no claim either.
+
+The response is `{"ok": true, "duplicates": [...], "count": N}`, where each
+group carries `claim_kind` (`ticket`/`branch`), `claim`, `count`, and the
+`runs` holding it. An empty list means no live run claims the same piece of
+work. The route reads the queue and the run records and writes nothing.
 
 ## Idempotent enqueue (`dedup_key`)
 

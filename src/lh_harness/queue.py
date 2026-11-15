@@ -82,6 +82,24 @@ _REQUESTER_MAX_SESSION_ID_CHARS = 128
 _REQUESTER_MAX_SESSION_REF_CHARS = 64
 _REQUESTER_MAX_NOTIFY_CHARS = 512
 
+# The work-origin block (task easybutt0n-17).  A JSON object on the entry body
+# (key "work_origin", stored on QueueEntry as a plain dict) that mechanically
+# records WHERE the work came from: a YouTrack ticket, a goal-board item, or
+# an operations chore.  It is RECORD-ONLY: the block is stored, copied to the
+# run and projected into the summaries, but nothing reads it to decide whether
+# work may start.  The Harness queue stays the only execution store and
+# YouTrack the only ticket store; this block is a pointer, never a second
+# copy of the work and never an authorization.
+#
+# ``kind`` is the discriminant: "ticket" (the work is a YouTrack issue),
+# "goal" (the work is a goal-board item) or "ops" (operational chores with no
+# ticket and no goal).  ``ticket`` names the YouTrack id, ``goal_ref`` names
+# the goal id.  Both are strings or null; neither is required, so an "ops"
+# chore may carry neither.
+_WORK_ORIGIN_KINDS = frozenset({"ticket", "goal", "ops"})
+_WORK_ORIGIN_MAX_TICKET_CHARS = 128
+_WORK_ORIGIN_MAX_GOAL_REF_CHARS = 128
+
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
@@ -127,6 +145,7 @@ KNOWN_REQUEST_KEYS = frozenset(
         "requester",
         "time_limit_minutes",
         "gtm_manager",
+        "work_origin",
     }
 )
 
@@ -142,6 +161,75 @@ TIME_LIMIT_MAX_MINUTES = 1440
 # reassigned, so the default is that manager, never "nobody".
 GTM_MANAGERS = frozenset({"overseer1", "overseer1-op"})
 DEFAULT_GTM_MANAGER = "overseer1"
+
+
+def validate_work_origin(value: Any) -> dict[str, Any] | None:
+    """The optional, record-only ``work_origin`` block.
+
+    ``None`` (the field was not supplied) means "this work has no recorded
+    origin" and is what a legacy entry carries.  A supplied block is an
+    object with exactly three keys:
+
+    ``kind``      "ticket" | "goal" | "ops" -- required, and anything else
+                  is refused (a plain ``ValueError`` -> the enqueue path's
+                  existing 422 mapping).  The message names the three valid
+                  kinds so a caller can fix the body without guessing.
+    ``ticket``    the YouTrack issue id, a string or null.
+    ``goal_ref``  the goal-board item id, a string or null.
+
+    Unknown keys inside the block are refused the same way an unknown body
+    key is: with the offending names, so a caller never has a typo silently
+    dropped.  The refusal keeps the same spirit as the body-level
+    unknown-field rejection (task 233).
+
+    This function is shared by the enqueue body of both stores
+    (``_normalize_request``), so the file store and the Postgres store accept
+    and refuse exactly the same blocks.
+
+    RECORD-ONLY: the returned block is stored and projected, never enforced.
+    Nothing in the launcher, the gate, or the queue state machine reads it.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, dict):
+        raise UnknownQueueFieldError("work_origin must be an object")
+
+    unknown = sorted(set(value) - {"kind", "ticket", "goal_ref"})
+    if unknown:
+        raise UnknownQueueFieldError(
+            "unknown field(s): " + ", ".join(unknown)
+        )
+
+    if "kind" not in value:
+        raise UnknownQueueFieldError("work_origin.kind is required")
+    kind = value["kind"]
+    if isinstance(kind, bool) or not isinstance(kind, str) or kind.strip() not in _WORK_ORIGIN_KINDS:
+        # An invalid kind is the same class of client error as an unknown
+        # field -- a value outside the accepted set -- so it is refused with
+        # the same 400 that names the offending field, not with the 422 the
+        # free-form validation errors use.  The message names the three
+        # valid kinds so the caller can fix the body without guessing.
+        raise UnknownQueueFieldError(
+            "work_origin.kind must be one of: " + ", ".join(sorted(_WORK_ORIGIN_KINDS))
+        )
+    kind = kind.strip()
+
+    # ``ticket`` and ``goal_ref`` are both optional strings; a null stays null
+    # (an "ops" chore names neither a ticket nor a goal).  A non-string,
+    # non-null value is refused rather than coerced.
+    ticket = _bounded(
+        value.get("ticket"),
+        field="work_origin.ticket",
+        max_chars=_WORK_ORIGIN_MAX_TICKET_CHARS,
+    ) or None
+    goal_ref = _bounded(
+        value.get("goal_ref"),
+        field="work_origin.goal_ref",
+        max_chars=_WORK_ORIGIN_MAX_GOAL_REF_CHARS,
+    ) or None
+
+    return {"kind": kind, "ticket": ticket, "goal_ref": goal_ref}
 
 
 def validate_gtm_manager(value: Any) -> str:
@@ -384,6 +472,13 @@ class QueueEntry:
     # A legacy entry -- an old JSON file written before the field existed, or
     # a Postgres row written before migration 007 -- loads as the default too.
     gtm_manager: str = DEFAULT_GTM_MANAGER
+    # The optional, record-only work-origin block (task easybutt0n-17):
+    # ``{"kind": "ticket"|"goal"|"ops", "ticket": <str>|None,
+    # "goal_ref": <str>|None}``.  ``None`` on every legacy entry (an old JSON
+    # file written before the field existed, or a Postgres row written before
+    # the column).  RECORD-ONLY: it says where the work came from; it never
+    # decides whether the work may run.
+    work_origin: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -429,6 +524,7 @@ class QueueEntry:
             "model",
             "roles",
             "gtm_manager",
+            "work_origin",
         ):
             if key in data:
                 kwargs[key] = data[key]
@@ -1141,6 +1237,12 @@ def _normalize_request(body: dict[str, Any], *, settings_runtime: Any = None) ->
         # ``validate_gtm_manager`` (a plain ValueError -> the enqueue path's
         # 422 mapping).
         "gtm_manager": validate_gtm_manager(body.get("gtm_manager")),
+        # The optional, record-only work-origin block (task easybutt0n-17):
+        # where the work came from (a YouTrack ticket, a goal-board item, an
+        # ops chore).  Absent means "no recorded origin"; a supplied block is
+        # validated by ``validate_work_origin``.  It is STORED and PROJECTED
+        # only -- no gate, no store, no write path reads it.
+        "work_origin": validate_work_origin(body.get("work_origin")),
     }
 
 
@@ -1861,6 +1963,11 @@ class QueueStore:
             # ``overseer1-op`` must not silently fall back to the default
             # manager (GTM-MANAGER-G1-a).
             gtm_manager=entry.gtm_manager,
+            # The work-origin block carries over: a retry of work that came
+            # from a ticket is still that ticket's work, and the duplicate
+            # view must still see it (task easybutt0n-17).  Copied, not
+            # shared, so a later edit of one never mutates the other.
+            work_origin=copy.deepcopy(entry.work_origin),
             not_before=float(not_before) if not_before is not None else None,
             wait_reason=str(wait_reason)[:64] if (not_before is not None and wait_reason) else None,
         )
