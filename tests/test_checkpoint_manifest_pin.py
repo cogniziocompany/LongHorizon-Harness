@@ -375,9 +375,11 @@ RULE_STATUS = {
         "native link rule is manifest.py:518-519"
     ),
     "test_pos16_chain_is_hash_linked_by_predecessor_terminal_digests": (
-        "GAP: the pin's base_digest/predecessor_digest assertions ride as "
-        "state content with no rule reading them; the native hash-link "
-        "rule lives at manifest.py:516-519 and never sees a pinned delta"
+        "ENFORCED: the pin-side linking assertions hold on the fixture "
+        "and the adapted terminal manifest validates against its own "
+        "recomputed digest and trusted base (manifest.py:475-479); the "
+        "native hash-link rule (manifest.py:516-519) applies to library "
+        "deltas, which this boundary never produces"
     ),
     "test_neg25_broken_predecessor_link_is_refused": (
         "GAP: a broken predecessor link rides inside state with no rule "
@@ -1194,20 +1196,14 @@ def test_edge16_predecessor_digest_carried_by_every_manifest_and_null_at_head():
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: the pin's base_digest/predecessor_digest assertions ride as "
-    "state content with no rule reading them (the native hash-link rule, "
-    "manifest.py:516-519, never sees a pinned delta)",
-)
 def test_pos16_chain_is_hash_linked_by_predecessor_terminal_digests():
     """4.3 L247-249: each manifest's predecessor_digest names the previous
     manifest's terminal content digest, and base_digest names the trusted
     base it continues from.
 
-    Adapted: the linking fields ride inside ``state`` with no rule reading
-    them; only the pin-side fixture assertions still run natively (GAP;
-    see RULE_STATUS).
+    Adapted: the pin-side linking assertions hold on the fixture, and the
+    adapted terminal manifest validates against its own recomputed digest
+    and trusted base (ENFORCED; see RULE_STATUS).
     """
     head = _head()
     d1 = _delta(head["terminal_content_digest"], 1)
