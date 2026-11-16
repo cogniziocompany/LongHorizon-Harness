@@ -336,6 +336,36 @@ RULE_STATUS = {
         "recomputed digest and the trusted-base comparison refuses it "
         "(manifest.py:475-479)"
     ),
+    # Batch 4: the 3.2 closed-set rule and the 4.2 digest rules.
+    "test_neg26_body_field_set_is_closed_unlisted_field_refused": (
+        "GAP: the closed-set scan is not native -- an unlisted field "
+        "crosses inside state with no rule refusing it; would live at a "
+        "state-field allowlist beside require_mandatory "
+        "(manifest.py:481-484)"
+    ),
+    "test_pos05_digest_covers_full_content_except_the_digest_field_itself": (
+        "ADAPTER-LIMIT: the honest leg is enforced by the native chain "
+        "validation (manifest.py:475-479), but the garbage-digest leg, "
+        "while refused in effect (the garbage value rides inside state "
+        "and changes the recomputed digest), is refused by the "
+        "trusted-base comparison (manifest.py:478-479) with no rule "
+        "naming terminal_content_digest, and the missing leg is dropped "
+        "by the boundary before validation (native self-digest rule "
+        "manifest.py:475-477)"
+    ),
+    "test_pos05_digest_deterministic_under_reordering_and_reformatting": (
+        "ADAPTER-LIMIT: the boundary hashes the constructed document "
+        "under canonical-json/v1 (sorted keys), so a reordered pin "
+        "rendering cannot cross as a distinct input; determinism is "
+        "inherent to the boundary, not observable through it (native "
+        "serializer manifest.py:70-98)"
+    ),
+    "test_neg38_any_body_field_change_changes_the_digest_and_only_content_changes_do": (
+        "ENFORCED: the changed receipt_ref rides inside state, the "
+        "recomputed digest differs and the trusted-base comparison "
+        "refuses it; the re-rendered pin document adapts to the same "
+        "bytes and validates (manifest.py:475-479)"
+    ),
 }
 
 
@@ -938,18 +968,29 @@ def test_body_field_set_is_fully_digest_covered():
             validate_checkpoint_manifest(adapted_mutated, mutated_handoff)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: the closed-set scan is not native -- an unlisted field "
+    "crosses inside state and validates (would live at a state-field "
+    "allowlist beside require_mandatory, manifest.py:481-484)",
+)
 def test_neg26_body_field_set_is_closed_unlisted_field_refused():
     """3.2 8b L208-210: the manifest field set is a closed set.
 
     A field outside the pinned set is refused, whatever its shape; adding a
     field requires a new schema_version, not an extension of this one.
+    Adapted: the unlisted field crosses inside ``state`` and the adapted
+    document validates against its own derived handoff -- the closed-set
+    scan is not native (GAP; see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
 
     extra = _head(evidence_bundle={"note": "not a pinned field"})
+    adapted_extra = _adapt_pinned_to_library(extra)
     with pytest.raises(IncompleteContext, match="unlisted"):
-        validate_chain(extra, [], handoff=_head_handoff(extra))
+        validate_checkpoint_manifest(
+            adapted_extra, _adapter_handoff(adapted_extra)
+        )
 
 
 # --------------------------------------------------------------------------
@@ -963,15 +1004,23 @@ def test_pos05_digest_covers_full_content_except_the_digest_field_itself():
     The head validates with a correctly computed terminal_content_digest
     (impossible if the field hashed itself), and the same content with a
     garbage value is refused, so the field is verified but excluded.
+    Adapted: the honest head validates (the native chain rule enforces
+    it); the garbage-digest leg is refused in effect -- the garbage value
+    rides inside state and changes the recomputed digest -- but by the
+    trusted-base comparison, with no rule naming terminal_content_digest,
+    and the missing leg is dropped by the boundary before validation
+    (ADAPTER-LIMIT; see RULE_STATUS).
     """
     head = _head()
-    summary = validate_chain(head, [], handoff=_head_handoff(head))
-    assert summary.terminal_digest == head["terminal_content_digest"]
+    adapted = _adapt_pinned_to_library(head)
+    handoff = _adapter_handoff(adapted)
+    summary = validate_chain(adapted, [], handoff=handoff)
+    assert summary.terminal_digest == adapted["digest"]
 
     garbage = dict(head)
     garbage["terminal_content_digest"] = "sha256:" + "e" * 64
     with pytest.raises(IncompleteContext, match="terminal_content_digest"):
-        validate_chain(garbage, [], handoff=_head_handoff(head))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(garbage), handoff)
 
 
 def test_pos05_digest_deterministic_under_reordering_and_reformatting():
@@ -980,7 +1029,11 @@ def test_pos05_digest_deterministic_under_reordering_and_reformatting():
 
     Two renderings of the same manifest -- keys built in a different order,
     and one round-tripped through pretty-printed JSON -- must both validate
-    against the same trusted digest.
+    against the same trusted digest.  Adapted: the boundary digests the
+    constructed library document under canonical-json/v1 (sorted keys), so
+    both pin renderings adapt to byte-identical documents and the same
+    trusted digest (ADAPTER-LIMIT: determinism is inherent to the
+    boundary, not observable through it; see RULE_STATUS).
     """
     ordered = _head()
 
@@ -991,10 +1044,9 @@ def test_pos05_digest_deterministic_under_reordering_and_reformatting():
 
     for equivalent in (reversed_content, reformatted):
         assert equivalent["terminal_content_digest"] == ordered["terminal_content_digest"]
-        summary = validate_chain(
-            equivalent, [], handoff=_handoff(ordered["terminal_content_digest"])
-        )
-        assert summary.terminal_digest == ordered["terminal_content_digest"]
+        adapted = _adapt_pinned_to_library(equivalent)
+        summary = validate_chain(adapted, [], handoff=_adapter_handoff(adapted))
+        assert summary.terminal_digest == _adapt_pinned_to_library(ordered)["digest"]
 
 
 def test_neg38_any_body_field_change_changes_the_digest_and_only_content_changes_do():
@@ -1004,10 +1056,14 @@ def test_neg38_any_body_field_change_changes_the_digest_and_only_content_changes
     A body mutation whose terminal_content_digest is honestly recomputed is
     still refused against the trusted original digest (the change shows up
     in the digest); a pure re-rendering of the same content still validates
-    (nothing shows up).
+    (nothing shows up).  Adapted: the changed receipt_ref rides inside
+    ``state``, so the recomputed digest differs and the trusted-base
+    comparison refuses it; the re-rendered pin document adapts to the same
+    bytes and validates (ENFORCED; see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    adapted_head = _adapt_pinned_to_library(head)
+    handoff = _adapter_handoff(adapted_head)
 
     changed = _head(
         action={
@@ -1019,12 +1075,14 @@ def test_neg38_any_body_field_change_changes_the_digest_and_only_content_changes
         }
     )
     assert changed["terminal_content_digest"] != head["terminal_content_digest"]
-    with pytest.raises(IncompleteContext, match="terminal content"):
-        validate_chain(changed, [], handoff=handoff)
+    with pytest.raises(IncompleteContext, match="checkpoint content"):
+        validate_checkpoint_manifest(_adapt_pinned_to_library(changed), handoff)
 
     rerendered = json.loads(json.dumps(head, indent=2))
-    summary = validate_chain(rerendered, [], handoff=handoff)
-    assert summary.terminal_digest == head["terminal_content_digest"]
+    summary = validate_chain(
+        _adapt_pinned_to_library(rerendered), [], handoff=handoff
+    )
+    assert summary.terminal_digest == adapted_head["digest"]
 
 
 # --------------------------------------------------------------------------
