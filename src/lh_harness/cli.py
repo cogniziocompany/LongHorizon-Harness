@@ -538,6 +538,13 @@ def main(argv: list[str] | None = None) -> int:
         from .settings_store import apply_startup_settings
 
         apply_startup_settings()
+        # easybutt0n-17: run-event webhook transport.  Initialized only after
+        # the settings store has applied DB values over the environment; an
+        # unset LH_HARNESS_EVENT_WEBHOOK_URL makes this a one-boolean-check
+        # no-op (no thread, no queue, no socket).
+        from .event_webhook import get_event_webhook
+
+        get_event_webhook()
     run_defaults: dict[str, object] = {}
     config_error: ProjectConfigError | None = None
     if raw_argv[:1] == ["run"]:

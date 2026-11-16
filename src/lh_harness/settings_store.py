@@ -229,6 +229,28 @@ CATALOG: tuple[SettingSpec, ...] = (
         False,
         restart=False,
     ),
+    # easybutt0n-17: outbound run-event webhook.  The transport
+    # (lh_harness.event_webhook) reads these from the environment like every
+    # other LH_HARNESS_* option; the URL stays empty everywhere until an
+    # operator opts in, and an empty URL means the feature is fully OFF.
+    SettingSpec(
+        "LH_HARNESS_EVENT_WEBHOOK_URL",
+        "Run-event webhook endpoint; empty = feature off (only http:// or https:// URLs are accepted)",
+        False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_EVENT_WEBHOOK_SECRET",
+        "HMAC-SHA256 secret for the run-event webhook's X-LH-Signature header (optional)",
+        True,
+        kind="credential",
+        restriction="event-webhook",
+    ),
+    SettingSpec(
+        "LH_HARNESS_EVENT_WEBHOOK_EVENTS",
+        "Comma-separated run-event webhook allowlist (default: run.failed,run.cancelled,"
+        "run.completed,operator.approval.pending)",
+        False,
+    ),
 )
 CATALOG_BY_NAME = {spec.name: spec for spec in CATALOG}
 
