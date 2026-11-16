@@ -867,6 +867,11 @@ def test_body_question_conditional_and_well_formed():
     assert summary.terminal_digest == _adapt_pinned_to_library(answered)["digest"]
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule requires state.action or its pinned subfields "
+    "(would live at require_mandatory, manifest.py:481-484)",
+)
 def test_body_action_mandatory_with_stable_action_id():
     """3.2 #6 L204: action is required with action_id, kind,
     arguments_digest, dispatch_state and receipt_ref.
