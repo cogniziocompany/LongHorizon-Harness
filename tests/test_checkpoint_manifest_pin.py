@@ -284,6 +284,32 @@ RULE_STATUS = {
         "manifest maps to a base checkpoint; a state rule would sit at "
         "manifest.py:481-484"
     ),
+    # Batch 2: the remaining 3.1 envelope rules (2) and 3.2 rules 1-3.
+    "test_edge18_envelope_created_at_mandatory": (
+        "GAP: no rule requires state.created_at -- null is not presence; "
+        "would live at require_mandatory (manifest.py:481-484)"
+    ),
+    "test_edge18_envelope_producer_mandatory": (
+        "GAP: no rule requires state.producer -- null is not presence; "
+        "would live at require_mandatory (manifest.py:481-484)"
+    ),
+    "test_body_task_object_mandatory_with_stable_ids": (
+        "ADAPTER-LIMIT: the deleted-task leg cannot cross the boundary "
+        "(the adapter lifts task_id out of it, KeyError); the partial-task "
+        "and foreign-task_id legs ride inside state.task with no rule "
+        "reading them (a state rule would sit at manifest.py:481-484); "
+        "native scope binding manifest.py:268-272 reads only the lifted key"
+    ),
+    "test_edge20_body_revision_mirrors_the_envelope_exactly": (
+        "GAP: no rule reads state.revision or compares its mirror fields "
+        "to the envelope; would live at require_mandatory + a mirror check "
+        "(manifest.py:481-484)"
+    ),
+    "test_edge35_body_config_mandatory_named_and_matching_config_in_force": (
+        "GAP: no rule requires state.config or checks it against the "
+        "trusted config in force; would live at require_mandatory + a "
+        "trusted-value check (manifest.py:481-484)"
+    ),
 }
 
 
@@ -439,66 +465,78 @@ def test_edge16_envelope_predecessor_digest_null_only_for_the_chain_head():
         validate_checkpoint_manifest(_adapt_pinned_to_library(d1), handoff)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule requires state.created_at (would live at "
+    "require_mandatory, manifest.py:481-484)",
+)
 def test_edge18_envelope_created_at_mandatory():
     """3.1 L186: created_at is required; null is not presence.
 
     Completeness requires the field set, not a content volume (pin 11.2
     EDGE-18): a manifest with substantial content but no production time is
-    still incomplete.
+    still incomplete.  Adapted: created_at rides inside ``state``, where
+    the library has no presence rule (GAP; see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     del missing["created_at"]
     missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="created_at"):
-        validate_chain(missing, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
     nulled = _head(created_at=None)
     with pytest.raises(IncompleteContext, match="created_at"):
-        validate_chain(nulled, [], handoff=_head_handoff(nulled))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(nulled), handoff)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule requires state.producer (would live at "
+    "require_mandatory, manifest.py:481-484)",
+)
 def test_edge18_envelope_producer_mandatory():
-    """3.1 L187: producer is required; null is not presence."""
+    """3.1 L187: producer is required; null is not presence.
+
+    Adapted: producer rides inside ``state``, where the library has no
+    presence rule (GAP; see RULE_STATUS).
+    """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     del missing["producer"]
     missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="producer"):
-        validate_chain(missing, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
     nulled = _head(producer=None)
     with pytest.raises(IncompleteContext, match="producer"):
-        validate_chain(nulled, [], handoff=_head_handoff(nulled))
-
-
-# --------------------------------------------------------------------------
-# 3.2 The mandatory value schema, manifest body (pin L199-210) -- 9 rules
-# --------------------------------------------------------------------------
+        validate_checkpoint_manifest(_adapt_pinned_to_library(nulled), handoff)
 
 
 def test_body_task_object_mandatory_with_stable_ids():
     """3.2 #1 L199: task is required, with task_id, requirement_ids, attempt_id.
 
     task_id binds to the trusted scope (A1: the binding comes from the
-    handoff, not from the manifest's own claim).
+    handoff, not from the manifest's own claim).  Adapted: task_id is
+    lifted to a scope key; the deleted-task leg cannot cross the boundary
+    and the partial/foreign shapes ride inside state.task with no rule
+    (ADAPTER-LIMIT; see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     del missing["task"]
-    missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="task"):
-        validate_chain(missing, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
     partial = _head(task={"task_id": TASK_ID, "attempt_id": "att-1"})
     with pytest.raises(IncompleteContext, match="task"):
-        validate_chain(partial, [], handoff=_head_handoff(partial))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(partial), handoff)
 
     foreign = _head(
         task={
@@ -508,23 +546,30 @@ def test_body_task_object_mandatory_with_stable_ids():
         }
     )
     with pytest.raises(IncompleteContext, match="task"):
-        validate_chain(foreign, [], handoff=_head_handoff(foreign))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(foreign), handoff)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule reads state.revision or checks its mirror fields "
+    "(would live at require_mandatory + mirror check, manifest.py:481-484)",
+)
 def test_edge20_body_revision_mirrors_the_envelope_exactly():
     """3.2 #2 L200: revision is required and mirrors policy_revision and
     schema_version from the envelope, plus source_revision.
 
     A mirror that disagrees with the envelope makes the manifest invalid.
+    Adapted: revision rides inside ``state`` with no rule reading it (GAP;
+    see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     del missing["revision"]
     missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="revision"):
-        validate_chain(missing, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
     disagreeing_policy = _head(
         revision={
@@ -534,7 +579,9 @@ def test_edge20_body_revision_mirrors_the_envelope_exactly():
         }
     )
     with pytest.raises(IncompleteContext, match="revision"):
-        validate_chain(disagreeing_policy, [], handoff=_head_handoff(disagreeing_policy))
+        validate_checkpoint_manifest(
+            _adapt_pinned_to_library(disagreeing_policy), handoff
+        )
 
     disagreeing_version = _head(
         revision={
@@ -544,8 +591,8 @@ def test_edge20_body_revision_mirrors_the_envelope_exactly():
         }
     )
     with pytest.raises(IncompleteContext, match="revision"):
-        validate_chain(
-            disagreeing_version, [], handoff=_head_handoff(disagreeing_version)
+        validate_checkpoint_manifest(
+            _adapt_pinned_to_library(disagreeing_version), handoff
         )
 
     no_source = _head(
@@ -555,34 +602,49 @@ def test_edge20_body_revision_mirrors_the_envelope_exactly():
         }
     )
     with pytest.raises(IncompleteContext, match="revision"):
-        validate_chain(no_source, [], handoff=_head_handoff(no_source))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(no_source), handoff)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule requires state.config or checks it against the "
+    "trusted config in force (would live at require_mandatory + trusted-value "
+    "check, manifest.py:481-484)",
+)
 def test_edge35_body_config_mandatory_named_and_matching_config_in_force():
     """3.2 #3 L201 with section 5: config is required as a named value map.
 
     The active attempt's config is immutable underneath a written manifest
     (pin 11.2 EDGE-35): a manifest whose config keys or values differ from
     the config in force -- which lives in the trusted handoff, never in the
-    manifest (A1) -- is refused.
+    manifest (A1) -- is refused.  Adapted: config rides inside ``state``
+    with no rule reading it, and the adapter handoff carries no config in
+    force to check against (GAP; see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     del missing["config"]
     missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="config"):
-        validate_chain(missing, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
     extra_key = _head(config={"retention": "until-acceptance", "channel": "stable",
                               "retries": 3})
     with pytest.raises(IncompleteContext, match="config"):
-        validate_chain(extra_key, [], handoff=_head_handoff(extra_key))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(extra_key), handoff)
 
     changed_value = _head(config={"retention": "forever", "channel": "stable"})
     with pytest.raises(IncompleteContext, match="config"):
-        validate_chain(changed_value, [], handoff=_head_handoff(changed_value))
+        validate_checkpoint_manifest(
+            _adapt_pinned_to_library(changed_value), handoff
+        )
+
+
+# --------------------------------------------------------------------------
+# 3.2 The mandatory value schema, manifest body (pin L199-210) -- 9 rules
+# --------------------------------------------------------------------------
 
 
 def test_neg39_body_cursor_requires_epoch_and_stale_epoch_is_refused():
