@@ -79,10 +79,12 @@ import pytest
 
 from lh_harness.checkpoint import (
     ChainSummary,
+    CheckpointManifest,
     IncompleteContext,
     TrustedHandoff,
     canonical_bytes,
     validate_chain,
+    validate_checkpoint_manifest,
 )
 
 # --------------------------------------------------------------------------
@@ -1024,3 +1026,89 @@ def test_edge20_removal_is_validation_not_deletion():
             head, [offending], handoff=_handoff(offending["terminal_content_digest"])
         )
     assert offending == pristine, "refusal must not strip or mutate the document"
+
+
+# --------------------------------------------------------------------------
+# Re-slice A: the adapter (skeleton) and its green positive control
+#
+# The 31 tests above encode the *pinned* manifest shape and are red against
+# the current library by design (they are the step-3 target, reworked onto
+# this adapter in re-slice B).  This section adds only the adapter skeleton
+# plus one positive control proving the adapter's output is a document the
+# current library accepts.  Nothing above is modified.
+# --------------------------------------------------------------------------
+
+
+ADAPTER_SCOPE = {"tenant_id": "t-1", "task_id": TASK_ID, "policy_revision": POLICY_REVISION}
+
+ADAPTER_STATE = {
+    "instructions": "do the guarded thing",
+    "evidence": {"receipt": "sha256:base-receipt"},
+    "budget": 5,
+    "status": "active",
+}
+
+
+def _adapt_pinned_to_library(pinned: dict) -> dict:
+    """Return a manifest document the current library accepts.
+
+    Re-slice A step 1 (skeleton): the document is built exactly the way the
+    existing passing test ``test_positive_empty_delta_chain_matches_base_terminal``
+    in ``tests/test_checkpoint_manifest.py`` builds one -- a
+    :class:`CheckpointManifest` rendered by ``as_document`` (scope keys at
+    the top level, ``checkpoint_id``/``sequence``/``state``/``cursor``, plus
+    a ``digest`` computed by ``with_digest``), which is the shape
+    ``validate_checkpoint_manifest`` checks: scope binding, checkpoint
+    identity and sequence against the trusted base, and the self-digest.
+
+    ``pinned`` is not consulted yet; step 2 maps the pinned document produced
+    by :func:`_pinned_content` into this shape field by field.
+    """
+    return (
+        CheckpointManifest(
+            checkpoint_id="cp-base",
+            sequence=0,
+            state=json.loads(json.dumps(ADAPTER_STATE)),
+            scope=dict(ADAPTER_SCOPE),
+            cursor={"round": 0},
+        )
+        .with_digest()
+        .as_document()
+    )
+
+
+def _adapter_handoff(document: dict) -> TrustedHandoff:
+    """The trusted handoff the adapted document must validate against.
+
+    The trusted base triple names exactly the adapted document's own
+    identity, sequence and computed digest, so a positive validation is the
+    library accepting the adapter's shape, not a coincidence of matching
+    digests.
+    """
+    return TrustedHandoff(
+        scope=dict(ADAPTER_SCOPE),
+        required_state_schemas={},
+        expected_base={
+            "checkpoint_id": document["checkpoint_id"],
+            "sequence": document["sequence"],
+            "digest": document["digest"],
+        },
+        expected_terminal={
+            "delta_id": document["checkpoint_id"],
+            "sequence": document["sequence"],
+            "digest": document["digest"],
+        },
+    )
+
+
+def test_positive_control_adapted_document_validates():
+    """Positive control: the adapter's document passes the library validation.
+
+    This is re-slice A's green anchor: it proves the adapter produces a
+    document ``validate_checkpoint_manifest`` accepts (scope binding, base
+    identity, self-digest), independent of the 31 red pin tests above.
+    """
+    document = _adapt_pinned_to_library(_pinned_content())
+    computed = validate_checkpoint_manifest(document, _adapter_handoff(document))
+    assert computed == document["digest"]
+    assert computed.startswith("sha256:")
