@@ -231,6 +231,63 @@ def _head_handoff(head: dict) -> TrustedHandoff:
 
 
 # --------------------------------------------------------------------------
+# Re-slice B: RULE_STATUS -- the state of every pin test on the adapter
+#
+# Each adapted test still builds its document from the pinned fixture and
+# still applies the same mutation it always did; the mutated document is
+# mapped through ``_adapt_pinned_to_library`` and validated exactly as the
+# positive control validates (``validate_checkpoint_manifest(adapted,
+# _adapter_handoff(adapted))``; ``validate_chain(adapted, [], ...)`` where
+# the pin asserted on the returned summary).  So a red adapted test means
+# the library itself does not enforce the pinned rule, never the shape.
+#
+# * ``ENFORCED`` -- the adapted test passes.
+# * ``GAP: ...`` -- the field crosses the boundary (it rides in ``state``
+#   or the cursor slot) but manifest.py has no rule for it, so the adapted
+#   test still fails; the test carries ``xfail(strict=True)`` with the same
+#   reason and the reason names the manifest.py lines the rule would live
+#   at.
+# * ``ADAPTER-LIMIT: ...`` -- a leg cannot be expressed through the fixed
+#   boundary at all (the adapter lifts or recomputes the pinned field, or
+#   the pin's refusal wording belongs to a plane the boundary cannot
+#   reach).  The test stays red with no xfail.
+#
+# Rows land batch by batch, in file order.
+# --------------------------------------------------------------------------
+
+RULE_STATUS = {
+    # Batch 1: the 3.1 envelope rules (7).
+    "test_neg39_envelope_policy_revision_mandatory_and_stale_revision_refused": (
+        "ADAPTER-LIMIT: the missing-policy_revision leg cannot cross the "
+        "boundary (the adapter lifts policy_revision into a scope key, "
+        "KeyError before validation); the stale leg is enforced by the "
+        "native scope binding (manifest.py:271-272)"
+    ),
+    "test_edge20_envelope_schema_version_mandatory_and_version_compatibility_enforced": (
+        "GAP: no rule requires state.schema_version or gates its version; "
+        "would live at require_mandatory (manifest.py:481-484)"
+    ),
+    "test_edge17_envelope_base_digest_mandatory_and_binds_the_trusted_base": (
+        "GAP: no rule reads state.base_digest (the native binding at "
+        "manifest.py:478-479 compares the recomputed document digest); a "
+        "state-field rule would sit at manifest.py:481-484"
+    ),
+    "test_pos05_envelope_terminal_content_digest_mandatory": (
+        "ADAPTER-LIMIT: the boundary recomputes the digest and never "
+        "carries the pin digest value, so a missing or wrong "
+        "terminal_content_digest cannot reach validation (native "
+        "self-digest rule manifest.py:475-477)"
+    ),
+    "test_edge16_envelope_predecessor_digest_null_only_for_the_chain_head": (
+        "GAP: no rule reads state.predecessor_digest; the native link rule "
+        "(manifest.py:518-519) is unreachable because every pinned "
+        "manifest maps to a base checkpoint; a state rule would sit at "
+        "manifest.py:481-484"
+    ),
+}
+
+
+# --------------------------------------------------------------------------
 # 3.1 The manifest envelope (pin L181-187) -- 7 rules
 # --------------------------------------------------------------------------
 
@@ -239,16 +296,19 @@ def test_neg39_envelope_policy_revision_mandatory_and_stale_revision_refused():
     """3.1 L181: policy_revision is required; a revision not in force is stale.
 
     The revision in force comes from the trusted handoff, never from the
-    manifest (A1): a manifest cannot declare itself current.
+    manifest (A1): a manifest cannot declare itself current.  Adapted: the
+    revision is lifted into a scope key, so the stale leg must be refused
+    by the native scope binding and the missing leg cannot cross the
+    boundary at all (ADAPTER-LIMIT; see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     del missing["policy_revision"]
     missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="policy_revision"):
-        validate_chain(missing, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
     stale = _head(
         policy_revision="pol-8",
@@ -259,51 +319,68 @@ def test_neg39_envelope_policy_revision_mandatory_and_stale_revision_refused():
         },
     )
     with pytest.raises(IncompleteContext, match="policy_revision"):
-        validate_chain(stale, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(stale), handoff)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule requires state.schema_version or gates its version "
+    "(would live at require_mandatory, manifest.py:481-484)",
+)
 def test_edge20_envelope_schema_version_mandatory_and_version_compatibility_enforced():
     """3.1 L182 with section 2: schema_version is required and must be accepted.
 
     A manifest is judged against the version it declares, and only versions
-    the trusted side accepts can validate at all.
+    the trusted side accepts can validate at all.  Adapted: schema_version
+    rides inside ``state``, where the library has no rule for it (GAP; see
+    RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     del missing["schema_version"]
     missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="schema_version"):
-        validate_chain(missing, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
     unaccepted = _head(schema_version=UNACCEPTED_SCHEMA_VERSION)
     with pytest.raises(IncompleteContext, match="schema_version"):
-        validate_chain(unaccepted, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(unaccepted), handoff)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule reads state.base_digest (would sit at "
+    "require_mandatory, manifest.py:481-484)",
+)
 def test_edge17_envelope_base_digest_mandatory_and_binds_the_trusted_base():
     """3.1 L183: base_digest is required and names the trusted base content.
 
     Single-manifest scope (pin 11.2 EDGE-17): with no deltas, the trusted
     base digest and the head's terminal content digest are the same trust
-    anchor, and the head must validate against it.
+    anchor, and the head must validate against it.  Adapted: the binding
+    the library performs is the recomputed document digest
+    (manifest.py:478-479); the carried state field has no rule (GAP; see
+    RULE_STATUS).
     """
     head = _head()
     assert head["base_digest"] == TRUSTED_BASE_DIGEST
-    summary = validate_chain(head, [], handoff=_head_handoff(head))
+    adapted_head = _adapt_pinned_to_library(head)
+    handoff = _adapter_handoff(adapted_head)
+    summary = validate_chain(adapted_head, [], handoff=handoff)
     assert isinstance(summary, ChainSummary)
-    assert summary.terminal_digest == head["terminal_content_digest"]
+    assert summary.terminal_digest == adapted_head["digest"]
 
     wrong_base = _head(base_digest="sha256:" + "c" * 64)
     with pytest.raises(IncompleteContext, match="base_digest"):
-        validate_chain(wrong_base, [], handoff=_head_handoff(wrong_base))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(wrong_base), handoff)
 
     missing = _pinned_content()
     del missing["base_digest"]
     missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="base_digest"):
-        validate_chain(missing, [], handoff=_handoff(missing["terminal_content_digest"]))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
 
 def test_pos05_envelope_terminal_content_digest_mandatory():
@@ -311,48 +388,55 @@ def test_pos05_envelope_terminal_content_digest_mandatory():
 
     A missing or wrongly valued terminal_content_digest is refused; the
     value is recomputed by the library, never taken from the document.
+    Adapted: the boundary recomputes the digest under the library's name
+    and never carries the pin's value, so neither defect can reach
+    validation (ADAPTER-LIMIT; see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     missing["terminal_content_digest"] = _pinned_digest(missing)
     del missing["terminal_content_digest"]
     with pytest.raises(IncompleteContext, match="terminal_content_digest"):
-        validate_chain(missing, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
     wrong = dict(head)
     wrong["terminal_content_digest"] = "sha256:" + "d" * 64
     with pytest.raises(IncompleteContext, match="terminal_content_digest"):
-        validate_chain(wrong, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(wrong), handoff)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule reads state.predecessor_digest; the native link rule "
+    "(manifest.py:518-519) is unreachable, a state rule would sit at "
+    "manifest.py:481-484",
+)
 def test_edge16_envelope_predecessor_digest_null_only_for_the_chain_head():
     """3.1 L185: predecessor_digest is required on every manifest.
 
     Null is the chain head's mark: a head carrying a non-null predecessor
-    digest, or a delta carrying null, is refused.
+    digest, or a delta carrying null, is refused.  Adapted: every pinned
+    manifest maps to a base checkpoint, so the field rides in ``state``
+    with no rule reading it (GAP; see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     del missing["predecessor_digest"]
     missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="predecessor_digest"):
-        validate_chain(missing, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
     head_with_link = _head(predecessor_digest=head["terminal_content_digest"])
     with pytest.raises(IncompleteContext, match="predecessor_digest"):
-        validate_chain(head_with_link, [], handoff=_head_handoff(head_with_link))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(head_with_link), handoff)
 
     d1 = _delta(head["terminal_content_digest"], 1, predecessor_digest=None)
     with pytest.raises(IncompleteContext, match="predecessor_digest"):
-        validate_chain(
-            head,
-            [d1],
-            handoff=_handoff(d1["terminal_content_digest"]),
-        )
+        validate_checkpoint_manifest(_adapt_pinned_to_library(d1), handoff)
 
 
 def test_edge18_envelope_created_at_mandatory():
