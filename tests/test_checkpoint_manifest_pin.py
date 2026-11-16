@@ -393,6 +393,50 @@ RULE_STATUS = {
         "(the digest is recomputed); the native terminal rule is "
         "manifest.py:632-633"
     ),
+    # Batch 6: the section 7 removed-element rules (8).
+    "test_neg26_removed_narrative_text_is_refused": (
+        "GAP: no rule scans state values for narrative text; would live at "
+        "a removed-element scan beside require_mandatory "
+        "(manifest.py:481-484)"
+    ),
+    "test_neg26_removed_secret_material_is_refused": (
+        "GAP: no rule scans state values for secret material; would live "
+        "at a removed-element scan beside require_mandatory "
+        "(manifest.py:481-484)"
+    ),
+    "test_neg26_removed_latency_or_timing_values_are_refused": (
+        "GAP: no rule scans state values for latency or timing values; "
+        "would live at a removed-element scan beside require_mandatory "
+        "(manifest.py:481-484)"
+    ),
+    "test_neg26_removed_threshold_or_slo_values_are_refused": (
+        "GAP: no rule scans state values for threshold or SLO values; "
+        "would live at a removed-element scan beside require_mandatory "
+        "(manifest.py:481-484)"
+    ),
+    "test_neg26_removed_host_or_session_identifiers_are_refused": (
+        "GAP: no rule scans state keys/values for host or session "
+        "identifiers; would live at a removed-element scan beside "
+        "require_mandatory (manifest.py:481-484)"
+    ),
+    "test_neg26_removed_embedded_predecessor_content_is_refused": (
+        "GAP: no rule refuses an embedded predecessor document inside "
+        "state; would live at a removed-element scan beside "
+        "require_mandatory (manifest.py:481-484)"
+    ),
+    "test_neg26_removed_unlisted_or_extension_field_is_refused": (
+        "GAP: the closed-set scan is not native -- an unlisted or "
+        "extension field crosses inside state and validates, and the "
+        "future-schema leg has no version gate; would live at a "
+        "state-field allowlist beside require_mandatory "
+        "(manifest.py:481-484)"
+    ),
+    "test_edge20_removal_is_validation_not_deletion": (
+        "GAP: no removed-element rule fires, so the offending document is "
+        "not refused and the non-mutation assertion never runs; the "
+        "validation-not-deletion rule would live beside "
+        "require_mandatory (manifest.py:481-484)"
+    ),
 }
 
 
@@ -1273,18 +1317,36 @@ def test_pos16_restore_side_validation_covers_content_predecessor_and_terminal()
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule scans state values for narrative text (would "
+    "live at a removed-element scan beside require_mandatory, "
+    "manifest.py:481-484)",
+)
 def test_neg26_removed_narrative_text_is_refused():
-    """Section 7 L293: free-form narrative or summary text is removed."""
+    """Section 7 L293: free-form narrative or summary text is removed.
+
+    Adapted: the narrative field crosses inside ``state`` with no rule
+    scanning for it (GAP; see RULE_STATUS).
+    """
     narrative = _head(summary="the run went well and everyone was happy")
+    adapted = _adapt_pinned_to_library(narrative)
     with pytest.raises(IncompleteContext, match="narrative"):
-        validate_chain(narrative, [], handoff=_head_handoff(narrative))
+        validate_checkpoint_manifest(adapted, _adapter_handoff(adapted))
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule scans state values for secret material (would "
+    "live at a removed-element scan beside require_mandatory, "
+    "manifest.py:481-484)",
+)
 def test_neg26_removed_secret_material_is_refused():
     """Section 7 L294: secret, credential or private key material is removed.
 
     The secret sits inside a *pinned* free-string field, so only a value
-    scan for secret material can catch it.
+    scan for secret material can catch it.  Adapted: the secret rides
+    inside ``state`` with no rule scanning for it (GAP; see RULE_STATUS).
     """
     secret = _head(
         action={
@@ -1295,12 +1357,23 @@ def test_neg26_removed_secret_material_is_refused():
             "receipt_ref": "-----BEGIN PRIVATE KEY-----",
         }
     )
+    adapted = _adapt_pinned_to_library(secret)
     with pytest.raises(IncompleteContext, match="secret"):
-        validate_chain(secret, [], handoff=_head_handoff(secret))
+        validate_checkpoint_manifest(adapted, _adapter_handoff(adapted))
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule scans state values for latency or timing values "
+    "(would live at a removed-element scan beside require_mandatory, "
+    "manifest.py:481-484)",
+)
 def test_neg26_removed_latency_or_timing_values_are_refused():
-    """Section 7 L295: latency, timing or performance values are removed."""
+    """Section 7 L295: latency, timing or performance values are removed.
+
+    Adapted: the latency value rides inside ``state`` with no rule
+    scanning for it (GAP; see RULE_STATUS).
+    """
     latency = _head(
         config={
             "retention": "until-acceptance",
@@ -1308,12 +1381,23 @@ def test_neg26_removed_latency_or_timing_values_are_refused():
             "dispatch_latency_ms": 42,
         }
     )
+    adapted = _adapt_pinned_to_library(latency)
     with pytest.raises(IncompleteContext, match="latency"):
-        validate_chain(latency, [], handoff=_head_handoff(latency))
+        validate_checkpoint_manifest(adapted, _adapter_handoff(adapted))
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule scans state values for threshold or SLO values "
+    "(would live at a removed-element scan beside require_mandatory, "
+    "manifest.py:481-484)",
+)
 def test_neg26_removed_threshold_or_slo_values_are_refused():
-    """Section 7 L296: threshold values, targets or SLOs are removed."""
+    """Section 7 L296: threshold values, targets or SLOs are removed.
+
+    Adapted: the threshold value rides inside ``state`` with no rule
+    scanning for it (GAP; see RULE_STATUS).
+    """
     threshold = _head(
         config={
             "retention": "until-acceptance",
@@ -1321,8 +1405,9 @@ def test_neg26_removed_threshold_or_slo_values_are_refused():
             "error_threshold": 3,
         }
     )
+    adapted = _adapt_pinned_to_library(threshold)
     with pytest.raises(IncompleteContext, match="threshold"):
-        validate_chain(threshold, [], handoff=_head_handoff(threshold))
+        validate_checkpoint_manifest(adapted, _adapter_handoff(adapted))
 
 
 def test_neg26_removed_host_or_session_identifiers_are_refused():
