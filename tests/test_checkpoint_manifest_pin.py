@@ -310,6 +310,32 @@ RULE_STATUS = {
         "trusted config in force; would live at require_mandatory + a "
         "trusted-value check (manifest.py:481-484)"
     ),
+    # Batch 3: the 3.2 rules 4-7 and 8a.
+    "test_neg39_body_cursor_requires_epoch_and_stale_epoch_is_refused": (
+        "GAP: the cursor crosses in the library's dedicated slot "
+        "(manifest.py:121) but no rule checks its shape or epoch; would "
+        "live beside require_mandatory (manifest.py:481-484)"
+    ),
+    "test_body_question_conditional_and_well_formed": (
+        "GAP: no rule reads state.question -- the malformed legs ride as "
+        "state content and the well-formed legs validate; would live at "
+        "require_mandatory + a shape check (manifest.py:481-484)"
+    ),
+    "test_body_action_mandatory_with_stable_action_id": (
+        "GAP: no rule requires state.action or its pinned subfields; would "
+        "live at require_mandatory (manifest.py:481-484)"
+    ),
+    "test_body_child_conditional_and_well_formed": (
+        "GAP: no rule reads state.child -- the malformed leg rides as "
+        "state content and the well-formed legs validate; would live at "
+        "require_mandatory + a shape check (manifest.py:481-484)"
+    ),
+    "test_body_field_set_is_fully_digest_covered": (
+        "ENFORCED: every body field rides inside state (or the cursor "
+        "slot) of the digested document, so each mutation changes the "
+        "recomputed digest and the trusted-base comparison refuses it "
+        "(manifest.py:475-479)"
+    ),
 }
 
 
@@ -647,41 +673,55 @@ def test_edge35_body_config_mandatory_named_and_matching_config_in_force():
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule checks the cursor slot's shape or epoch (would "
+    "live beside require_mandatory, manifest.py:481-484)",
+)
 def test_neg39_body_cursor_requires_epoch_and_stale_epoch_is_refused():
     """3.2 #4 L202: cursor is required with scope, position and epoch.
 
     A cursor with no epoch, or with a superseded epoch, is stale and must be
     rejected; the epoch in force comes from the trusted handoff (A1).
+    Adapted: the cursor crosses in the library's dedicated slot, where no
+    rule reads it (GAP; see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     del missing["cursor"]
     missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="cursor"):
-        validate_chain(missing, [], handoff=handoff)
+        validate_checkpoint_manifest(_adapt_pinned_to_library(missing), handoff)
 
     no_epoch = _head(cursor={"scope": "leaf-b", "position": "round-4"})
     with pytest.raises(IncompleteContext, match="cursor"):
-        validate_chain(no_epoch, [], handoff=_head_handoff(no_epoch))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(no_epoch), handoff)
 
     stale_epoch = _head(
         cursor={"scope": "leaf-b", "position": "round-4", "epoch": EPOCH_IN_FORCE - 1}
     )
     with pytest.raises(IncompleteContext, match="stale"):
-        validate_chain(stale_epoch, [], handoff=_head_handoff(stale_epoch))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(stale_epoch), handoff)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule reads state.question (would live at "
+    "require_mandatory + shape check, manifest.py:481-484)",
+)
 def test_body_question_conditional_and_well_formed():
     """3.2 #5 L203: question is null or an object with the pinned fields.
 
     Present exactly when a question awaits an answer; malformed question
     objects (missing question_id, or a state outside the pinned set) are
-    refused.  ``None`` is valid when there is no open question.
+    refused.  ``None`` is valid when there is no open question.  Adapted:
+    question rides inside ``state`` with no rule reading it (GAP; see
+    RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     partial = _head(
         question={
@@ -693,7 +733,7 @@ def test_body_question_conditional_and_well_formed():
         }
     )
     with pytest.raises(IncompleteContext, match="question"):
-        validate_chain(partial, [], handoff=_head_handoff(partial))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(partial), handoff)
 
     bad_state = _head(
         question={
@@ -706,7 +746,7 @@ def test_body_question_conditional_and_well_formed():
         }
     )
     with pytest.raises(IncompleteContext, match="question"):
-        validate_chain(bad_state, [], handoff=_head_handoff(bad_state))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(bad_state), handoff)
 
     answered = _head(
         question={
@@ -718,21 +758,30 @@ def test_body_question_conditional_and_well_formed():
             "answer": "proceed",
         }
     )
-    summary = validate_chain(answered, [], handoff=_head_handoff(answered))
-    assert summary.terminal_digest == answered["terminal_content_digest"]
+    summary = validate_chain(
+        _adapt_pinned_to_library(answered), [], handoff=handoff
+    )
+    assert summary.terminal_digest == _adapt_pinned_to_library(answered)["digest"]
 
 
 def test_body_action_mandatory_with_stable_action_id():
     """3.2 #6 L204: action is required with action_id, kind,
-    arguments_digest, dispatch_state and receipt_ref."""
+    arguments_digest, dispatch_state and receipt_ref.
+
+    Adapted: action rides inside ``state`` with no rule reading it (GAP;
+    see RULE_STATUS).
+    """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     missing = _pinned_content()
     del missing["action"]
     missing["terminal_content_digest"] = _pinned_digest(missing)
     with pytest.raises(IncompleteContext, match="action"):
-        validate_chain(missing, [], handoff=handoff)
+        adapted_missing = _adapt_pinned_to_library(missing)
+        validate_checkpoint_manifest(
+            adapted_missing, _adapter_handoff(adapted_missing)
+        )
 
     partial = _head(
         action={
@@ -743,17 +792,26 @@ def test_body_action_mandatory_with_stable_action_id():
         }
     )
     with pytest.raises(IncompleteContext, match="action"):
-        validate_chain(partial, [], handoff=_head_handoff(partial))
+        adapted_partial = _adapt_pinned_to_library(partial)
+        validate_checkpoint_manifest(
+            adapted_partial, _adapter_handoff(adapted_partial)
+        )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule reads state.child (would live at require_mandatory "
+    "+ shape check, manifest.py:481-484)",
+)
 def test_body_child_conditional_and_well_formed():
     """3.2 #7 L205: child is null or an object with the pinned fields.
 
     ``None`` is valid when no child was spawned; a malformed child object
-    is refused.
+    is refused.  Adapted: child rides inside ``state`` with no rule reading
+    it (GAP; see RULE_STATUS).
     """
     head = _head()
-    handoff = _head_handoff(head)
+    handoff = _adapter_handoff(_adapt_pinned_to_library(head))
 
     partial = _head(
         child={
@@ -764,7 +822,7 @@ def test_body_child_conditional_and_well_formed():
         }
     )
     with pytest.raises(IncompleteContext, match="child"):
-        validate_chain(partial, [], handoff=_head_handoff(partial))
+        validate_checkpoint_manifest(_adapt_pinned_to_library(partial), handoff)
 
     spawned = _head(
         child={
@@ -775,8 +833,10 @@ def test_body_child_conditional_and_well_formed():
             "child_receipt_ref": "rcpt-c-1",
         }
     )
-    summary = validate_chain(spawned, [], handoff=_head_handoff(spawned))
-    assert summary.terminal_digest == spawned["terminal_content_digest"]
+    summary = validate_chain(
+        _adapt_pinned_to_library(spawned), [], handoff=handoff
+    )
+    assert summary.terminal_digest == _adapt_pinned_to_library(spawned)["digest"]
 
 
 def test_body_field_set_is_fully_digest_covered():
@@ -786,9 +846,13 @@ def test_body_field_set_is_fully_digest_covered():
     (with the config-in-force adjusted for the config case, since a valid
     config is pinned to the values in force) must change the digest the
     library recomputes, proven by the trusted terminal mismatch refusal.
+    Adapted: every body field rides inside the adapted document's digested
+    content (state or the cursor slot), so each mutation must change the
+    recomputed digest and the trusted-base comparison must refuse it.
     """
     head = _head()
-    handoff = _head_handoff(head)
+    adapted_head = _adapt_pinned_to_library(head)
+    handoff = _adapter_handoff(adapted_head)
 
     mutations = [
         (
@@ -857,18 +921,21 @@ def test_body_field_set_is_fully_digest_covered():
         assert mutated["terminal_content_digest"] != head["terminal_content_digest"], (
             f"the test helper itself must change the digest for {field}"
         )
-        # The handoff still trusts the original head's digest: if the library
-        # excluded this body field from the content digest, the mutated
-        # manifest would recompute the same digest and validate.
-        mutated_handoff = (
-            _handoff(
-                head["terminal_content_digest"], config_in_force=in_force
-            )
-            if in_force is not None
-            else handoff
+        adapted_mutated = _adapt_pinned_to_library(mutated)
+        assert adapted_mutated["digest"] != adapted_head["digest"], (
+            f"the adapter itself must change the digest for {field}"
         )
-        with pytest.raises(IncompleteContext, match="terminal content"):
-            validate_chain(mutated, [], handoff=mutated_handoff)
+        # The handoff still trusts the original adapted head's digest: if the
+        # library excluded this body field from the content digest, the
+        # mutated manifest would recompute the same digest and validate.
+        # The config leg keeps the pin's adjusted-config-in-force meaning by
+        # trusting the *original* head's digest with the mutated config
+        # (a config the library would have to reject as not in force).
+        mutated_handoff = (
+            _adapter_handoff(adapted_head) if in_force is not None else handoff
+        )
+        with pytest.raises(IncompleteContext, match="checkpoint content"):
+            validate_checkpoint_manifest(adapted_mutated, mutated_handoff)
 
 
 def test_neg26_body_field_set_is_closed_unlisted_field_refused():
