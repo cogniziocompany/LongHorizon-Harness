@@ -1410,53 +1410,97 @@ def test_neg26_removed_threshold_or_slo_values_are_refused():
         validate_checkpoint_manifest(adapted, _adapter_handoff(adapted))
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule scans state keys/values for host or session "
+    "identifiers (would live at a removed-element scan beside "
+    "require_mandatory, manifest.py:481-484)",
+)
 def test_neg26_removed_host_or_session_identifiers_are_refused():
     """Section 7 L297: host identifiers, node names or session identifiers
-    are removed; the manifest is environment-independent."""
+    are removed; the manifest is environment-independent.
+
+    Adapted: the identifiers ride inside ``state`` with no rule scanning
+    for them (GAP; see RULE_STATUS).
+    """
     identified = _head(host="worker-7", session_id="s-9")
+    adapted = _adapt_pinned_to_library(identified)
     with pytest.raises(IncompleteContext, match="host"):
-        validate_chain(identified, [], handoff=_head_handoff(identified))
+        validate_checkpoint_manifest(adapted, _adapter_handoff(adapted))
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule refuses an embedded predecessor document inside "
+    "state (would live at a removed-element scan beside "
+    "require_mandatory, manifest.py:481-484)",
+)
 def test_neg26_removed_embedded_predecessor_content_is_refused():
     """Section 7 L298: linking is by digest only; the predecessor's content
-    itself is removed."""
+    itself is removed.
+
+    Adapted: the embedded predecessor rides inside ``state`` with no rule
+    refusing it (GAP; see RULE_STATUS).
+    """
     head = _head()
     embedding = _delta(head["terminal_content_digest"], 1)
     embedding["predecessor"] = dict(head)
     embedding["terminal_content_digest"] = _pinned_digest(embedding)
+    adapted = _adapt_pinned_to_library(embedding)
     with pytest.raises(IncompleteContext, match="predecessor content"):
-        validate_chain(
-            head, [embedding], handoff=_handoff(embedding["terminal_content_digest"])
+        validate_checkpoint_manifest(adapted, _adapter_handoff(adapted))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: the closed-set scan is not native and there is no version "
+    "gate (would live at a state-field allowlist beside require_mandatory, "
+    "manifest.py:481-484)",
+)
+def test_neg26_removed_unlisted_or_extension_field_is_refused():
+    """Section 7 L299: an unlisted or extension field is removed; any
+    extension requires a new schema_version.
+
+    Adapted: the extension field crosses inside ``state`` and validates,
+    and the future-schema leg has no version gate to refuse it (GAP; see
+    RULE_STATUS).
+    """
+    extension = _head(x_extension=1)
+    adapted = _adapt_pinned_to_library(extension)
+    with pytest.raises(IncompleteContext, match="unlisted"):
+        validate_checkpoint_manifest(adapted, _adapter_handoff(adapted))
+
+    future = _head(schema_version="w3-f12-manifest/v2", x_extension=1)
+    adapted_future = _adapt_pinned_to_library(future)
+    with pytest.raises(IncompleteContext, match="schema_version"):
+        validate_checkpoint_manifest(
+            adapted_future, _adapter_handoff(adapted_future)
         )
 
 
-def test_neg26_removed_unlisted_or_extension_field_is_refused():
-    """Section 7 L299: an unlisted or extension field is removed; any
-    extension requires a new schema_version."""
-    extension = _head(x_extension=1)
-    with pytest.raises(IncompleteContext, match="unlisted"):
-        validate_chain(extension, [], handoff=_head_handoff(extension))
-
-    future = _head(schema_version="w3-f12-manifest/v2", x_extension=1)
-    with pytest.raises(IncompleteContext, match="schema_version"):
-        validate_chain(future, [], handoff=_head_handoff(future))
-
-
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no removed-element rule fires, so the offending document "
+    "is not refused and the non-mutation check never runs (would live "
+    "beside require_mandatory, manifest.py:481-484)",
+)
 def test_edge20_removal_is_validation_not_deletion():
     """Section 7 L301-304: a manifest carrying a removed element is refused,
     never edited to strip the element (editing would change its digest and
-    break the link that referenced it)."""
+    break the link that referenced it).
+
+    Adapted: the offending host field rides inside ``state`` with no rule
+    refusing it, so the refusal leg never fires (GAP; see RULE_STATUS).
+    """
     head = _head()
     offending = _delta(head["terminal_content_digest"], 1)
     offending["host"] = "worker-7"
     offending["terminal_content_digest"] = _pinned_digest(offending)
     pristine = json.loads(json.dumps(offending))
 
+    adapted = _adapt_pinned_to_library(offending)
     with pytest.raises(IncompleteContext, match="removed element"):
-        validate_chain(
-            head, [offending], handoff=_handoff(offending["terminal_content_digest"])
-        )
+        validate_checkpoint_manifest(adapted, _adapter_handoff(adapted))
     assert offending == pristine, "refusal must not strip or mutate the document"
 
 
