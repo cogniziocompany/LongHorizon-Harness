@@ -1039,38 +1039,63 @@ def test_edge20_removal_is_validation_not_deletion():
 # --------------------------------------------------------------------------
 
 
-ADAPTER_SCOPE = {"tenant_id": "t-1", "task_id": TASK_ID, "policy_revision": POLICY_REVISION}
+# The pin has no tenant field at all; the pinned plane's trusted handoff
+# (``_handoff`` above) carries ``tenant_id: "t-1"`` as its scope fact, so the
+# trusted side is the adapter's only possible source for it.
+ADAPTER_TENANT_ID = "t-1"
 
-ADAPTER_STATE = {
-    "instructions": "do the guarded thing",
-    "evidence": {"receipt": "sha256:base-receipt"},
-    "budget": 5,
-    "status": "active",
-}
+# The pin also has no checkpoint identity or sequence of its own; the pinned
+# handoff's ``expected_base`` names them, and the adapted document takes its
+# identity from there (single-manifest scope: it *is* the base).
+ADAPTER_BASE_CHECKPOINT_ID = "cp-base"
+ADAPTER_BASE_SEQUENCE = 0
 
 
 def _adapt_pinned_to_library(pinned: dict) -> dict:
-    """Return a manifest document the current library accepts.
+    """Map the pinned manifest content onto the library's document shape.
 
-    Re-slice A step 1 (skeleton): the document is built exactly the way the
-    existing passing test ``test_positive_empty_delta_chain_matches_base_terminal``
-    in ``tests/test_checkpoint_manifest.py`` builds one -- a
-    :class:`CheckpointManifest` rendered by ``as_document`` (scope keys at
-    the top level, ``checkpoint_id``/``sequence``/``state``/``cursor``, plus
-    a ``digest`` computed by ``with_digest``), which is the shape
-    ``validate_checkpoint_manifest`` checks: scope binding, checkpoint
-    identity and sequence against the trusted base, and the self-digest.
+    Re-slice A step 2: the input is the pinned document produced by
+    :func:`_pinned_content`, mapped field by field into the shape
+    ``validate_checkpoint_manifest`` accepts (``manifest.py``): top-level
+    scope keys, checkpoint identity + sequence + state against a trusted
+    base, and a self-digest under the library's field name.
 
-    ``pinned`` is not consulted yet; step 2 maps the pinned document produced
-    by :func:`_pinned_content` into this shape field by field.
+    * ``policy_revision`` (pin envelope) is promoted to a top-level scope
+      key, where ``_require_scope_binding`` reads it (manifest.py L268-272).
+    * ``task_id`` is lifted out of the pinned ``task`` body object into a
+      top-level scope key (same reader).
+    * ``tenant_id`` has no pinned form; it comes from the trusted side
+      (``ADAPTER_TENANT_ID``), matching the pinned handoff's scope.
+    * ``checkpoint_id``/``sequence`` have no pinned form either; they come
+      from the trusted base the pinned handoff declares.
+    * ``cursor`` (pin body #4) rides in the library document's dedicated
+      ``cursor`` slot (``CheckpointManifest.cursor``, manifest.py L121).
+    * every remaining pinned field -- envelope ``schema_version``,
+      ``base_digest``, ``predecessor_digest``, ``created_at``, ``producer``
+      and body ``task``, ``revision``, ``config``, ``question``, ``action``,
+      ``child`` -- is carried over verbatim inside ``state``.
+    * the digest is recomputed the library's way: field name ``digest``
+      (the pin calls it ``terminal_content_digest``) and value from
+      ``with_digest()`` -- sha256 over canonical-json/v1 of the document
+      with its own ``digest`` key excluded (manifest.py L88-98).
     """
+    scope = {
+        "tenant_id": ADAPTER_TENANT_ID,
+        "task_id": pinned["task"]["task_id"],
+        "policy_revision": pinned["policy_revision"],
+    }
+    state = {
+        key: value
+        for key, value in pinned.items()
+        if key not in ("policy_revision", "cursor")
+    }
     return (
         CheckpointManifest(
-            checkpoint_id="cp-base",
-            sequence=0,
-            state=json.loads(json.dumps(ADAPTER_STATE)),
-            scope=dict(ADAPTER_SCOPE),
-            cursor={"round": 0},
+            checkpoint_id=ADAPTER_BASE_CHECKPOINT_ID,
+            sequence=ADAPTER_BASE_SEQUENCE,
+            state=json.loads(json.dumps(state)),
+            scope=scope,
+            cursor=json.loads(json.dumps(pinned["cursor"])),
         )
         .with_digest()
         .as_document()
@@ -1080,13 +1105,17 @@ def _adapt_pinned_to_library(pinned: dict) -> dict:
 def _adapter_handoff(document: dict) -> TrustedHandoff:
     """The trusted handoff the adapted document must validate against.
 
-    The trusted base triple names exactly the adapted document's own
-    identity, sequence and computed digest, so a positive validation is the
-    library accepting the adapter's shape, not a coincidence of matching
-    digests.
+    The scope binding names exactly the adapted document's own top-level
+    scope keys, and the trusted base triple names its own identity, sequence
+    and computed digest, so a positive validation is the library accepting
+    the adapter's shape, not a coincidence of matching digests.
     """
     return TrustedHandoff(
-        scope=dict(ADAPTER_SCOPE),
+        scope={
+            "tenant_id": document["tenant_id"],
+            "task_id": document["task_id"],
+            "policy_revision": document["policy_revision"],
+        },
         required_state_schemas={},
         expected_base={
             "checkpoint_id": document["checkpoint_id"],
@@ -1104,9 +1133,11 @@ def _adapter_handoff(document: dict) -> TrustedHandoff:
 def test_positive_control_adapted_document_validates():
     """Positive control: the adapter's document passes the library validation.
 
-    This is re-slice A's green anchor: it proves the adapter produces a
-    document ``validate_checkpoint_manifest`` accepts (scope binding, base
-    identity, self-digest), independent of the 31 red pin tests above.
+    This is re-slice A's green anchor: it proves that the pinned content
+    produced by :func:`_pinned_content`, mapped field by field through
+    :func:`_adapt_pinned_to_library`, yields a document
+    ``validate_checkpoint_manifest`` accepts (scope binding, base identity,
+    self-digest), independent of the 31 red pin tests above.
     """
     document = _adapt_pinned_to_library(_pinned_content())
     computed = validate_checkpoint_manifest(document, _adapter_handoff(document))
