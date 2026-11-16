@@ -366,6 +366,33 @@ RULE_STATUS = {
         "refuses it; the re-rendered pin document adapts to the same "
         "bytes and validates (manifest.py:475-479)"
     ),
+    # Batch 5: the 4.3 predecessor-link rules.
+    "test_edge16_predecessor_digest_carried_by_every_manifest_and_null_at_head": (
+        "GAP: no rule reads state.predecessor_digest -- the head/delta "
+        "distinction is erased by the boundary (every pinned manifest "
+        "maps to a base checkpoint), and the malformed legs ride as state "
+        "content; a state rule would sit at manifest.py:481-484, the "
+        "native link rule is manifest.py:518-519"
+    ),
+    "test_pos16_chain_is_hash_linked_by_predecessor_terminal_digests": (
+        "GAP: the pin's base_digest/predecessor_digest assertions ride as "
+        "state content with no rule reading them; the native hash-link "
+        "rule lives at manifest.py:516-519 and never sees a pinned delta"
+    ),
+    "test_neg25_broken_predecessor_link_is_refused": (
+        "GAP: a broken predecessor link rides inside state with no rule "
+        "refusing it; the native link rule (manifest.py:518-519) is "
+        "unreachable because the boundary maps every pinned manifest to a "
+        "base checkpoint; a state rule would sit at manifest.py:481-484"
+    ),
+    "test_pos16_restore_side_validation_covers_content_predecessor_and_terminal": (
+        "ADAPTER-LIMIT: the content-tamper leg is refused in effect (the "
+        "mutated state changes the recomputed digest, manifest.py:475-479) "
+        "but by the trusted-base comparison with no predecessor/terminal "
+        "wording; the stored-digest-tamper leg is dropped by the boundary "
+        "(the digest is recomputed); the native terminal rule is "
+        "manifest.py:632-633"
+    ),
 }
 
 
@@ -1090,57 +1117,90 @@ def test_neg38_any_body_field_change_changes_the_digest_and_only_content_changes
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no rule reads state.predecessor_digest; the head/delta "
+    "distinction is erased by the boundary (would sit at manifest.py:481-484)",
+)
 def test_edge16_predecessor_digest_carried_by_every_manifest_and_null_at_head():
     """4.3 L245-246: every manifest carries predecessor_digest; null marks
     the chain head, and a delta must carry its predecessor's digest.
 
     A valid head (null) followed by valid deltas (non-null, each naming the
-    previous terminal content digest) validates.
+    previous terminal content digest) validates.  Adapted: every pinned
+    manifest maps to a base checkpoint, so the field rides in ``state``
+    with no rule reading it (GAP; see RULE_STATUS).
     """
     head = _head()
     d1 = _delta(head["terminal_content_digest"], 1)
     d2 = _delta(d1["terminal_content_digest"], 2)
     assert head["predecessor_digest"] is None
     assert d1["predecessor_digest"] == head["terminal_content_digest"]
+    adapted_d2 = _adapt_pinned_to_library(d2)
     summary = validate_chain(
-        head, [d1, d2], handoff=_handoff(d2["terminal_content_digest"])
+        adapted_d2, [], handoff=_adapter_handoff(adapted_d2)
     )
-    assert summary.terminal_digest == d2["terminal_content_digest"]
+    assert summary.terminal_digest == adapted_d2["digest"]
 
     null_delta = _delta(head["terminal_content_digest"], 1, predecessor_digest=None)
+    adapted_null = _adapt_pinned_to_library(null_delta)
     with pytest.raises(IncompleteContext, match="predecessor_digest"):
-        validate_chain(
-            head, [null_delta], handoff=_handoff(null_delta["terminal_content_digest"])
+        validate_checkpoint_manifest(
+            adapted_null, _adapter_handoff(adapted_null)
         )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: the pin's base_digest/predecessor_digest assertions ride as "
+    "state content with no rule reading them (the native hash-link rule, "
+    "manifest.py:516-519, never sees a pinned delta)",
+)
 def test_pos16_chain_is_hash_linked_by_predecessor_terminal_digests():
     """4.3 L247-249: each manifest's predecessor_digest names the previous
     manifest's terminal content digest, and base_digest names the trusted
-    base it continues from."""
+    base it continues from.
+
+    Adapted: the linking fields ride inside ``state`` with no rule reading
+    them; only the pin-side fixture assertions still run natively (GAP;
+    see RULE_STATUS).
+    """
     head = _head()
     d1 = _delta(head["terminal_content_digest"], 1)
     d2 = _delta(d1["terminal_content_digest"], 2)
     assert d1["base_digest"] == TRUSTED_BASE_DIGEST
     assert d2["base_digest"] == TRUSTED_BASE_DIGEST
     assert d2["predecessor_digest"] == d1["terminal_content_digest"]
+    adapted_d2 = _adapt_pinned_to_library(d2)
     summary = validate_chain(
-        head, [d1, d2], handoff=_handoff(d2["terminal_content_digest"])
+        adapted_d2, [], handoff=_adapter_handoff(adapted_d2)
     )
     assert isinstance(summary, ChainSummary)
-    assert summary.terminal_digest == d2["terminal_content_digest"]
+    assert summary.terminal_digest == adapted_d2["digest"]
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: a broken predecessor link rides inside state with no rule "
+    "refusing it; the native link rule (manifest.py:518-519) is unreachable "
+    "through the boundary",
+)
 def test_neg25_broken_predecessor_link_is_refused():
     """4.3 L250-253: a predecessor link that does not equal the predecessor's
     terminal content digest is a broken link and is refused, even when the
-    delta's own digest is honestly recomputed over its tampered content."""
+    delta's own digest is honestly recomputed over its tampered content.
+
+    Adapted: the boundary maps every pinned manifest to a base checkpoint,
+    so the broken link rides inside ``state`` and validates (GAP; see
+    RULE_STATUS).
+    """
     head = _head()
     d1 = _delta("sha256:" + "0" * 64, 1)
     assert d1["predecessor_digest"] == "sha256:" + "0" * 64
+    adapted_d1 = _adapt_pinned_to_library(d1)
     with pytest.raises(IncompleteContext, match="predecessor"):
-        validate_chain(
-            head, [d1], handoff=_handoff(d1["terminal_content_digest"])
+        validate_checkpoint_manifest(
+            adapted_d1, _adapter_handoff(adapted_d1)
         )
 
     honest = _delta(head["terminal_content_digest"], 1)
@@ -1158,9 +1218,10 @@ def test_neg25_broken_predecessor_link_is_refused():
     assert tampered["predecessor_digest"] == honest["predecessor_digest"]
     assert tampered["terminal_content_digest"] != honest["terminal_content_digest"]
     d2 = _delta(honest["terminal_content_digest"], 2)
+    adapted_chain = [_adapt_pinned_to_library(tampered), _adapt_pinned_to_library(d2)]
     with pytest.raises(IncompleteContext, match="predecessor"):
         validate_chain(
-            head, [tampered, d2], handoff=_handoff(d2["terminal_content_digest"])
+            adapted_chain[0], adapted_chain[1:], handoff=_adapter_handoff(adapted_chain[0])
         )
 
 
@@ -1170,26 +1231,41 @@ def test_pos16_restore_side_validation_covers_content_predecessor_and_terminal()
 
     Tampering terminal content (with the self digest recomputed) or the
     stored terminal digest is refused; the honest chain validates.
+    Adapted: the content-tamper leg is refused in effect (the mutated
+    state changes the recomputed digest) but by the trusted-base
+    comparison with no predecessor/terminal wording, and the
+    stored-digest-tamper leg is dropped by the boundary (ADAPTER-LIMIT;
+    see RULE_STATUS).
     """
     head = _head()
     d1 = _delta(head["terminal_content_digest"], 1)
-    handoff = _handoff(d1["terminal_content_digest"])
-    summary = validate_chain(head, [d1], handoff=handoff)
-    assert summary.terminal_digest == d1["terminal_content_digest"]
+    adapted_d1 = _adapt_pinned_to_library(d1)
+    handoff = _adapter_handoff(adapted_d1)
+    summary = validate_chain(adapted_d1, [], handoff=handoff)
+    assert summary.terminal_digest == adapted_d1["digest"]
 
     tampered_content = _delta(
         head["terminal_content_digest"],
         1,
-        cursor={"scope": "leaf-b", "position": "round-99", "epoch": EPOCH_IN_FORCE},
     )
+    tampered_content["cursor"] = {
+        "scope": "leaf-b",
+        "position": "round-99",
+        "epoch": EPOCH_IN_FORCE,
+    }
+    tampered_content["terminal_content_digest"] = _pinned_digest(tampered_content)
     assert tampered_content["terminal_content_digest"] != d1["terminal_content_digest"]
     with pytest.raises(IncompleteContext, match="terminal"):
-        validate_chain(head, [tampered_content], handoff=handoff)
+        validate_checkpoint_manifest(
+            _adapt_pinned_to_library(tampered_content), handoff
+        )
 
     tampered_digest = dict(d1)
     tampered_digest["terminal_content_digest"] = "sha256:" + "f" * 64
     with pytest.raises(IncompleteContext, match="terminal_content_digest"):
-        validate_chain(head, [tampered_digest], handoff=handoff)
+        validate_checkpoint_manifest(
+            _adapt_pinned_to_library(tampered_digest), handoff
+        )
 
 
 # --------------------------------------------------------------------------
