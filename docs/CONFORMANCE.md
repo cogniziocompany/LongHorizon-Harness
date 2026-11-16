@@ -121,16 +121,26 @@ deletion.
   changes) and step 5 (change manifest.py only as far as needed to go
   green) of this leaf. Nothing in this file changes code.
 
-## Shape contract: pin versus library (PROPOSAL, not decided)
+## Shape contract: pin versus library (DECIDED)
 
 Re-slice A (2026-11-16) of ticket easybutt0n-171 records how the pinned
 content built by `_pinned_content` (tests/test_checkpoint_manifest_pin.py)
 differs from the document shape the manifest library validates. Each row
 below is one difference the test-local adapter `_adapt_pinned_to_library`
-(tests/test_checkpoint_manifest_pin.py) bridges today. This is a proposal,
-not a decision: nothing here is implemented as a library change, agreed,
-or scheduled -- re-slice B (reworking the 31 pin tests onto the adapter)
-and any manifest.py change remain undecided and out of scope.
+(tests/test_checkpoint_manifest_pin.py) bridges today.
+
+Status: DECIDED -- decided continuity1-op 2026-11-16, one round, evidence PR #206 body table at cc34ae96.
+The LIBRARY is the decided native shape; the PIN stays the pinned exchange
+contract; the ADAPTER is a permanent named boundary, not scaffolding.
+Four standing guards: (a) digests are recomputed at the boundary on the
+native form, never copied across; (b) scope keys are equality-checked
+against the trusted handoff, never trusted from the document alone; (c) the
+adapter fails on unnamed fields in both directions (closed set, no silent
+drops); (d) this section carries the decision receipt above.
+Re-slice B (2026-11-16) moved the 31 pin tests onto the adapter. As a REPORT,
+not a pass: 4 ENFORCED, 22 GAP (strict xfail naming the rule), 5
+ADAPTER-LIMIT (left red with the reason). No manifest.py change is part of
+this decision; library changes for the GAP rows are separate work.
 
 Two rows name absences on the pin side, not library defects: the pin has
 no tenant field and no checkpoint identity of its own. The library renders
