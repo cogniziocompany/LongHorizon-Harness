@@ -120,3 +120,29 @@ deletion.
 - These verdicts are the input to step 3 (pin tests, red before the library
   changes) and step 5 (change manifest.py only as far as needed to go
   green) of this leaf. Nothing in this file changes code.
+
+## Shape contract: pin versus library (PROPOSAL, not decided)
+
+Re-slice A (2026-11-16) of ticket easybutt0n-171 records how the pinned
+content built by `_pinned_content` (tests/test_checkpoint_manifest_pin.py)
+differs from the document shape the manifest library validates. Each row
+below is one difference the test-local adapter `_adapt_pinned_to_library`
+(tests/test_checkpoint_manifest_pin.py) bridges today. This is a proposal,
+not a decision: nothing here is implemented as a library change, agreed,
+or scheduled -- re-slice B (reworking the 31 pin tests onto the adapter)
+and any manifest.py change remain undecided and out of scope.
+
+Two rows name absences on the pin side, not library defects: the pin has
+no tenant field and no checkpoint identity of its own. The library renders
+a document's scope keys at the top level because `as_document` merges the
+scope mapping into the rendered document (manifest.py:131).
+
+| Field | Pin form | Library form | file:line in manifest.py |
+|---|---|---|---|
+| `tenant_id` | absent: the pin has no tenant field; the pinned trusted handoff carries `tenant_id` as a scope fact | top-level scope key; the document's value must equal the trusted handoff scope's value | manifest.py:268-272 |
+| `task_id` | nested: `task.task_id` inside the pinned `task` body object | top-level scope key; must equal the trusted handoff scope's value | manifest.py:268-272 |
+| `policy_revision` | envelope field on the manifest (pin 3.1) | top-level scope key read by the scope binding, not as an envelope field; must equal the trusted handoff scope's value | manifest.py:264-272 |
+| `checkpoint_id`, `sequence` | absent: the pin carries no checkpoint identity or sequence; the pinned handoff's `expected_base` names them | required document fields, compared for identity and sequence against the trusted base triple | manifest.py:117-118, manifest.py:469-473 |
+| remaining pinned fields (`schema_version`, `base_digest`, `predecessor_digest`, `created_at`, `producer`, `task`, `revision`, `config`, `question`, `action`, `child`) | top-level fields on the pinned manifest | carried inside `state`, which the validator requires to be present and an object | manifest.py:119, manifest.py:481-484 |
+| `cursor` | top-level pinned body field (pin 3.2 rule 4) | dedicated `cursor` slot on the rendered document, digest-covered like the rest | manifest.py:121, manifest.py:129 |
+| digest field | `terminal_content_digest`: sha256 over the full pinned content minus that key | `digest`: sha256 over the document minus its own `digest` key, recomputed by the validator and only compared as carried | manifest.py:88-98, manifest.py:475-477 |
