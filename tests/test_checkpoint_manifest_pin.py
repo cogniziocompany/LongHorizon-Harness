@@ -354,11 +354,10 @@ RULE_STATUS = {
         "manifest.py:475-477)"
     ),
     "test_pos05_digest_deterministic_under_reordering_and_reformatting": (
-        "ADAPTER-LIMIT: the boundary hashes the constructed document "
-        "under canonical-json/v1 (sorted keys), so a reordered pin "
-        "rendering cannot cross as a distinct input; determinism is "
-        "inherent to the boundary, not observable through it (native "
-        "serializer manifest.py:70-98)"
+        "ENFORCED: both pin renderings adapt to the same library document "
+        "and validate against the same recomputed digest; the boundary's "
+        "canonical-json/v1 serializer (manifest.py:70-98) is what makes "
+        "re-ordering and re-formatting digest-neutral"
     ),
     "test_neg38_any_body_field_change_changes_the_digest_and_only_content_changes_do": (
         "ENFORCED: the changed receipt_ref rides inside state, the "
@@ -1107,11 +1106,10 @@ def test_pos05_digest_deterministic_under_reordering_and_reformatting():
 
     Two renderings of the same manifest -- keys built in a different order,
     and one round-tripped through pretty-printed JSON -- must both validate
-    against the same trusted digest.  Adapted: the boundary digests the
-    constructed library document under canonical-json/v1 (sorted keys), so
-    both pin renderings adapt to byte-identical documents and the same
-    trusted digest (ADAPTER-LIMIT: determinism is inherent to the
-    boundary, not observable through it; see RULE_STATUS).
+    against the same trusted digest.  Adapted: both renderings adapt to the
+    same library document and validate against the same recomputed digest;
+    the boundary's canonical-json/v1 serializer is what makes re-ordering
+    and re-formatting digest-neutral (ENFORCED; see RULE_STATUS).
     """
     ordered = _head()
 
