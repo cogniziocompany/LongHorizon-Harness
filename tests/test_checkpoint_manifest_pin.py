@@ -605,11 +605,6 @@ def test_edge18_envelope_created_at_mandatory():
         validate_checkpoint_manifest(_adapt_pinned_to_library(nulled), handoff)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: no rule requires state.producer (would live at "
-    "require_mandatory, manifest.py:481-484)",
-)
 def test_edge18_envelope_producer_mandatory():
     """3.1 L187: producer is required; null is not presence.
 
