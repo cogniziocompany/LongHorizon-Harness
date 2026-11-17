@@ -480,7 +480,7 @@ def validate_checkpoint_manifest(
     # plane, where the envelope's own field rules apply.  The native
     # library shape carries no envelope fields, so nothing fires for it;
     # like SCHEMA_ID, the accepted set is pinned by the validator, never
-    # read from the document.  Both rules run before the trusted-base
+    # read from the document.  All three rules run before the trusted-base
     # comparison so a refusal names the envelope rule instead of
     # surfacing as a generic content mismatch.
     state = document.get("state")
@@ -510,6 +510,11 @@ def validate_checkpoint_manifest(
         # never a copy of the field; only presence is enforced here.
         if "base_digest" not in state:
             raise IncompleteContext("envelope base_digest is mandatory")
+        # EDGE-18: created_at is mandatory, and null is not presence: a
+        # manifest with substantial content but no production time is
+        # still incomplete, so the field must be set to a value.
+        if state.get("created_at") is None:
+            raise IncompleteContext("envelope created_at is mandatory")
 
     if computed != expected_base.get("digest"):
         if envelope:

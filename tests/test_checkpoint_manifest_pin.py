@@ -583,11 +583,6 @@ def test_edge16_envelope_predecessor_digest_null_only_for_the_chain_head():
         validate_checkpoint_manifest(_adapt_pinned_to_library(d1), handoff)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: no rule requires state.created_at (would live at "
-    "require_mandatory, manifest.py:481-484)",
-)
 def test_edge18_envelope_created_at_mandatory():
     """3.1 L186: created_at is required; null is not presence.
 
