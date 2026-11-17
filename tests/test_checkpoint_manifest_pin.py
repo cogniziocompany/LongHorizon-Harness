@@ -498,11 +498,6 @@ def test_edge20_envelope_schema_version_mandatory_and_version_compatibility_enfo
         validate_checkpoint_manifest(_adapt_pinned_to_library(unaccepted), handoff)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: no rule reads state.base_digest (would sit at "
-    "require_mandatory, manifest.py:481-484)",
-)
 def test_edge17_envelope_base_digest_mandatory_and_binds_the_trusted_base():
     """3.1 L183: base_digest is required and names the trusted base content.
 

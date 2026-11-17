@@ -476,15 +476,15 @@ def validate_checkpoint_manifest(
     if document.get("digest") != computed:
         raise IncompleteContext("checkpoint self-digest mismatch")
 
-    # L1 (EDGE-20): a state carrying any pinned envelope field is on the
-    # envelope plane, where ``schema_version`` is mandatory and only an
-    # accepted version validates at all.  The native library shape carries
-    # no envelope fields, so nothing fires for it; like SCHEMA_ID, the
-    # accepted set is pinned by the validator, never read from the document.
-    # It runs before the trusted-base comparison so the refusal names the
-    # rule instead of surfacing as a generic content mismatch.
+    # L1: a state carrying any pinned envelope field is on the envelope
+    # plane, where the envelope's own field rules apply.  The native
+    # library shape carries no envelope fields, so nothing fires for it;
+    # like SCHEMA_ID, the accepted set is pinned by the validator, never
+    # read from the document.  Both rules run before the trusted-base
+    # comparison so a refusal names the envelope rule instead of
+    # surfacing as a generic content mismatch.
     state = document.get("state")
-    if isinstance(state, Mapping) and any(
+    envelope = isinstance(state, Mapping) and any(
         field in state
         for field in (
             "base_digest",
@@ -493,7 +493,10 @@ def validate_checkpoint_manifest(
             "producer",
             "terminal_content_digest",
         )
-    ):
+    )
+    if envelope:
+        # EDGE-20: schema_version is mandatory, and only an accepted
+        # version validates at all.
         if "schema_version" not in state:
             raise IncompleteContext("envelope schema_version is mandatory")
         declared = state["schema_version"]
@@ -502,8 +505,20 @@ def validate_checkpoint_manifest(
                 "envelope schema_version is not accepted: "
                 f"{declared!r} not in ['w3-f12-manifest/v1']"
             )
+        # EDGE-17: base_digest is mandatory.  Guard (a): the carried value
+        # is never trusted, so its binding is the recomputed digest below,
+        # never a copy of the field; only presence is enforced here.
+        if "base_digest" not in state:
+            raise IncompleteContext("envelope base_digest is mandatory")
 
     if computed != expected_base.get("digest"):
+        if envelope:
+            # EDGE-17: on the envelope plane this comparison is the carried
+            # base_digest's binding, so the refusal names the field.
+            raise IncompleteContext(
+                "checkpoint content does not match trusted base "
+                "(envelope base_digest does not bind the trusted base content)"
+            )
         raise IncompleteContext("checkpoint content does not match trusted base")
 
     if not isinstance(state, Mapping):
