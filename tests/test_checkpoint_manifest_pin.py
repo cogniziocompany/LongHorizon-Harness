@@ -476,11 +476,6 @@ def test_neg39_envelope_policy_revision_mandatory_and_stale_revision_refused():
         validate_checkpoint_manifest(_adapt_pinned_to_library(stale), handoff)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: no rule requires state.schema_version or gates its version "
-    "(would live at require_mandatory, manifest.py:481-484)",
-)
 def test_edge20_envelope_schema_version_mandatory_and_version_compatibility_enforced():
     """3.1 L182 with section 2: schema_version is required and must be accepted.
 

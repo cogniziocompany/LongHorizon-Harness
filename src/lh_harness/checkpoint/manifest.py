@@ -475,10 +475,37 @@ def validate_checkpoint_manifest(
     computed = document_digest(document)
     if document.get("digest") != computed:
         raise IncompleteContext("checkpoint self-digest mismatch")
+
+    # L1 (EDGE-20): a state carrying any pinned envelope field is on the
+    # envelope plane, where ``schema_version`` is mandatory and only an
+    # accepted version validates at all.  The native library shape carries
+    # no envelope fields, so nothing fires for it; like SCHEMA_ID, the
+    # accepted set is pinned by the validator, never read from the document.
+    # It runs before the trusted-base comparison so the refusal names the
+    # rule instead of surfacing as a generic content mismatch.
+    state = document.get("state")
+    if isinstance(state, Mapping) and any(
+        field in state
+        for field in (
+            "base_digest",
+            "predecessor_digest",
+            "created_at",
+            "producer",
+            "terminal_content_digest",
+        )
+    ):
+        if "schema_version" not in state:
+            raise IncompleteContext("envelope schema_version is mandatory")
+        declared = state["schema_version"]
+        if declared not in ("w3-f12-manifest/v1",):
+            raise IncompleteContext(
+                "envelope schema_version is not accepted: "
+                f"{declared!r} not in ['w3-f12-manifest/v1']"
+            )
+
     if computed != expected_base.get("digest"):
         raise IncompleteContext("checkpoint content does not match trusted base")
 
-    state = document.get("state")
     if not isinstance(state, Mapping):
         raise IncompleteContext("checkpoint state is missing or not an object")
     require_mandatory(state, handoff.required_state_schemas)
