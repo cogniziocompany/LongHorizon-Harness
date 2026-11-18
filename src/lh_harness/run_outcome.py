@@ -18,7 +18,9 @@ all.  This module derives three optional fields for terminal runs:
     report's ``error``, else the ``Stopped:`` line of ``worker.log``.
 
 Both reasons are ASCII-only and at most 200 characters (callers forward them
-into ASCII-only channels, e.g. CT110 gate rationales).
+into ASCII-only channels, e.g. CT110 gate rationales).  The summary projection
+can also request the canonical report status and strict boolean completion
+verdict from the same memoized report read.
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ import stat
 import threading
 from pathlib import Path
 from typing import Any, Callable
+
+from .supervisor.lifecycle import canonical_lifecycle_status
 
 REASON_MAX_CHARS = 200
 # The worker prints its summary (``Stopped:   <abort_reason>``) at the end of
@@ -95,18 +99,21 @@ def derive_outcome(
     report: dict[str, Any] | None,
     status_record: dict[str, Any] | None = None,
     log_tail: str = "",
-) -> dict[str, str]:
+    include_report_fields: bool = False,
+) -> dict[str, Any]:
     """``{"outcome", "abort_reason", "failure_reason"}`` for a terminal run.
 
+    ``include_report_fields`` also returns the canonical report status and the
+    boolean completion verdict (or ``None`` for a missing/non-boolean value).
     Returns ``{}`` for a run that is not terminal (neither its lifecycle nor
     its report says it ended), so live rows keep their old shape.  Keys whose
-    value would be empty are left out.
+    value would be empty are left out, except the optional report fields.
     """
 
     report = report if isinstance(report, dict) else {}
     status_record = status_record if isinstance(status_record, dict) else {}
     lifecycle = _status_value(lifecycle_status)
-    report_status = _status_value(report.get("status"))
+    report_status = canonical_lifecycle_status(report.get("status"), default="")
     # The lifecycle status is the reconciled authority (the supervisor can
     # fail a run whose report claims completion); the report fills in when the
     # lifecycle is not terminal yet.
@@ -135,7 +142,13 @@ def derive_outcome(
         if part and part not in seen:
             seen.append(part)
 
-    result = {"outcome": outcome}
+    result: dict[str, Any] = {"outcome": outcome}
+    if include_report_fields:
+        completion_satisfied = report.get("completion_satisfied")
+        result["report_status"] = report_status or None
+        result["completion_satisfied"] = (
+            completion_satisfied if isinstance(completion_satisfied, bool) else None
+        )
     if abort:
         result["abort_reason"] = abort
     failure = ascii_reason(" | ".join(seen))
@@ -153,7 +166,7 @@ class OutcomeCache:
 
     def __init__(self, max_entries: int = 4096) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[str, tuple[tuple[Any, ...], dict[str, str]]] = {}
+        self._entries: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
         self._max = max_entries
 
     @staticmethod
@@ -171,7 +184,8 @@ class OutcomeCache:
         lifecycle_status: str,
         status_record: dict[str, Any],
         read_report: Callable[[Path], dict[str, Any]],
-    ) -> dict[str, str]:
+        include_report_fields: bool = False,
+    ) -> dict[str, Any]:
         report_path = logs_dir / "report.json"
         log_path = run_dir / "worker.log"
         key_sig = (
@@ -179,6 +193,7 @@ class OutcomeCache:
             str(status_record.get("failure_reason") or ""),
             self._sig(report_path),
             self._sig(log_path),
+            include_report_fields,
         )
         cache_key = str(run_dir)
         with self._lock:
@@ -194,7 +209,13 @@ class OutcomeCache:
             and not status_record.get("failure_reason")
         )
         log_tail = read_log_tail(log_path) if needs_log and key_sig[3] is not None else ""
-        value = derive_outcome(lifecycle_status, report, status_record, log_tail)
+        value = derive_outcome(
+            lifecycle_status,
+            report,
+            status_record,
+            log_tail,
+            include_report_fields=include_report_fields,
+        )
         with self._lock:
             if len(self._entries) >= self._max:
                 self._entries.clear()
