@@ -150,3 +150,36 @@ def test_build_summary_projection_keeps_baseline_shape() -> None:
     # ``pending_decision_owner`` is NOT attached by the projection itself;
     # the endpoint handler is responsible for that bounded read.
     assert "pending_decision_owner" not in row
+
+
+def test_build_summary_projection_surfaces_report_status_and_completion_satisfied() -> None:
+    # Terminal run: ``report_status`` / ``completion_satisfied`` come off the
+    # same ``report`` record ``build_snapshot`` reads (snapshot.py reads
+    # ``report.get("status")`` canonicalised, and ``report.get("completion_satisfied")``
+    # only when it is a real bool).  So for a completed + satisfied run the
+    # summary row must agree with the snapshot's values for that run.
+    terminal_item = {
+        "id": "run-done",
+        "status": "completed",
+        "mtime": 1700000001.0,
+        "workspace": "/tmp/r",
+        "report": {"status": "completed", "completion_satisfied": True},
+    }
+    row = _build_summary_projection(terminal_item)
+    assert row["status"] == "completed"
+    assert row["report_status"] == "completed"
+    assert row["completion_satisfied"] is True
+
+    # Running run: non-terminal, so both fields are null (absent, matching
+    # how ``outcome``/``abort_reason``/``failure_reason`` stay off live rows).
+    running_item = {
+        "id": "run-live",
+        "status": "running",
+        "mtime": 1700000002.0,
+        "workspace": "/tmp/r",
+        "report": {"status": "running"},
+    }
+    live_row = _build_summary_projection(running_item)
+    assert live_row["status"] == "running"
+    assert live_row.get("report_status") is None
+    assert live_row.get("completion_satisfied") is None

@@ -1760,11 +1760,12 @@ class RunSupervisor:
             # failure_reason, the supervisor's failure_reason, or the worker's
             # "Stopped:" line), memoized per report so a poll stays cheap.
             # Live rows keep their old shape.
-            outcome: dict[str, str] = {}
+            outcome: dict[str, Any] = {}
             if canonical_lifecycle_status(status_name) in TERMINAL_STATUSES:
                 try:
                     outcome = _OUTCOME_CACHE.get(
-                        Path(entry.path), logs_dir, status_name, status, _read_json
+                        Path(entry.path), logs_dir, status_name, status, _read_json,
+                        include_report_fields=True,
                     )
                 except Exception:  # never let a bad report break the list
                     outcome = {}

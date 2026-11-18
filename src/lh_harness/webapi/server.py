@@ -1896,6 +1896,24 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
         value = item.get(field)
         if isinstance(value, str) and value:
             row[field] = value
+    # ``OutcomeCache`` derives these from report.json for terminal runs, so
+    # summary rows consume the already-read report fields on the item itself.
+    # The nested fallback keeps this projection compatible with callers that
+    # build a snapshot-shaped item directly.
+    if canonical_lifecycle_status(item.get("status") or "") in TERMINAL_STATUSES:
+        report_status = item.get("report_status")
+        completion_satisfied = item.get("completion_satisfied")
+        if "report_status" not in item or "completion_satisfied" not in item:
+            report = item.get("report")
+            report = report if isinstance(report, dict) else {}
+            if "report_status" not in item and report.get("status") is not None:
+                report_status = canonical_lifecycle_status(report.get("status"))
+            if "completion_satisfied" not in item:
+                completion_satisfied = report.get("completion_satisfied")
+                if not isinstance(completion_satisfied, bool):
+                    completion_satisfied = None
+        row["completion_satisfied"] = completion_satisfied
+        row["report_status"] = report_status
     if isinstance(item.get("round"), int) and not isinstance(item.get("round"), bool):
         row["round"] = item["round"]
     return row
