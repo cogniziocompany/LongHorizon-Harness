@@ -32,7 +32,6 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
-from .supervisor.lifecycle import canonical_lifecycle_status
 
 REASON_MAX_CHARS = 200
 # The worker prints its summary (``Stopped:   <abort_reason>``) at the end of
@@ -113,6 +112,11 @@ def derive_outcome(
     report = report if isinstance(report, dict) else {}
     status_record = status_record if isinstance(status_record, dict) else {}
     lifecycle = _status_value(lifecycle_status)
+    # Imported here, not at module top: supervisor/__init__ re-exports service,
+    # which imports this module, so a top-level import is circular when
+    # run_outcome is imported first (tests/webapi/test_runs_summary_outcome.py).
+    from .supervisor.lifecycle import canonical_lifecycle_status
+
     report_status = canonical_lifecycle_status(report.get("status"), default="")
     # The lifecycle status is the reconciled authority (the supervisor can
     # fail a run whose report claims completion); the report fills in when the
