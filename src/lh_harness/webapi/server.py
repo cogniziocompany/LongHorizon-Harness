@@ -1896,6 +1896,22 @@ def _build_summary_projection(item: dict[str, Any]) -> dict[str, Any]:
         value = item.get(field)
         if isinstance(value, str) and value:
             row[field] = value
+    # ``report_status`` / ``completion_satisfied`` read the same ``report``
+    # record ``build_snapshot`` does (snapshot.py: ``report.get("status")``
+    # canonicalised, ``report.get("completion_satisfied")`` only when it is a
+    # real bool).  Terminal runs only: live rows keep their old shape, so a
+    # non-terminal run surfaces null for both.
+    if canonical_lifecycle_status(item.get("status") or "") in TERMINAL_STATUSES:
+        report = item.get("report")
+        report = report if isinstance(report, dict) else {}
+        completion_satisfied = report.get("completion_satisfied")
+        if not isinstance(completion_satisfied, bool):
+            completion_satisfied = None
+        report_status = report.get("status")
+        if report_status is not None:
+            report_status = canonical_lifecycle_status(str(report_status))
+        row["completion_satisfied"] = completion_satisfied
+        row["report_status"] = report_status
     if isinstance(item.get("round"), int) and not isinstance(item.get("round"), bool):
         row["round"] = item["round"]
     return row
