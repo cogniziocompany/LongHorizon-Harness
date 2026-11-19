@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### V1.5 release qualification
+
+- **Waived mid-round restore gap: `easybutt0n-48`.** V1.5 waives only the
+  absent mid-round checkpoint writer and the second-worker restore path that
+  resumes an interrupted in-flight round instead of replaying it. Until both
+  land, the interrupted round is replayed and its executor/effect can run
+  twice. This is an approved known gap, not a mid-round restore PASS and not
+  a waiver of E2b as a whole. At LHH#190 head `62845b81`, CT111 recorded
+  `1 passed, 1 xfailed, 0 failed` (comment `6696256116`): the completed-round
+  second-worker restore passed and the mid-round case stayed
+  `xfail(strict=True)`. The strict marker stays until the same change lands
+  both missing behaviours and removes the marker; a soft xfail, skip, or the
+  completed-round result presented as full E2b does not satisfy the row.
+- **All other E2b requirements remain unwaived and required.** The
+  completed-round checkpoint-restore/manager-restart case must still run on
+  CT111 with the 300-second targeted-test bound and retained evidence. It
+  must restore the completed-round history and task state on a fresh second
+  worker, continue round numbering without duplicate ledger records, validate
+  checkpoint fingerprints fail-closed, preserve durable run state, and record
+  the interruption plus `role_harness_resumed` in events and final close-out.
+  Atomic queue state, exactly one `-r1` successor with
+  `retry_of`/`interrupted_run` lineage, and the one-successor fence remain
+  mandatory. Assertion 3's effect-detection and restart-fence idempotency
+  also remain mandatory; only the interrupted in-flight round's replay and
+  resulting duplicate executor/effect caused by the named missing capability
+  are inside `easybutt0n-48`. This note is not a merge, deploy, full-E2b PASS,
+  or final V1.5 acceptance.
+
 ### Added
 
 - **The auditor can independently verify a pull request, read-only.** The

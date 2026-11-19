@@ -276,6 +276,10 @@ async def _run_impl(
     current_task_state = ""
     current_task_contract = ""
     round_index = 0
+    # The in-flight round restored from a mid-round checkpoint, and the phases of
+    # it that the lost worker already finished.  Empty on every other path.
+    mid_round_payload: dict[str, Any] | None = None
+    mid_round_resume_phases: frozenset[str] = frozenset()
 
     if resume:
         # A resumed worker reopens the same ledger, so the loop continues from
@@ -288,6 +292,32 @@ async def _run_impl(
             last_plan = rounds[-1].plan_text
             current_task_state = rounds[-1].task_state
             current_task_contract = rounds[-1].task_contract
+        # A round that was IN FLIGHT when the previous worker died left a
+        # mid-round checkpoint but no ledger record.  Restoring it RESUMES that
+        # round instead of replaying it: the phases it already finished (whose
+        # effects must not run twice) are taken from the checkpoint and the loop
+        # continues at the first unfinished phase.  The round index is NOT
+        # advanced here -- the loop's own ``round_index += 1`` lands on the
+        # interrupted round and ``round_budget`` continues to count from the last
+        # COMPLETED round, exactly as the completed-round restore does.
+        try:
+            mid_round = _resumable_mid_round(role_dir, {item.round_index for item in rounds})
+        except ValueError as exc:
+            # Fail closed: a torn or tampered mid-round checkpoint is a failed
+            # restore, never a best-effort replay.
+            logger.exception("mid-round restore refused: %s", exc)
+            return _write_terminal_failure(
+                config,
+                task,
+                status="failed",
+                reason=f"mid-round restore failed: {exc}",
+                exc=exc,
+                abort_reason="mid_round_restore_failed",
+                progress=_run_progress,
+            )
+        if mid_round is not None:
+            mid_round_payload = mid_round
+            mid_round_resume_phases = _restored_mid_round_phases(mid_round)
 
     # After a resume ``max_total_episodes`` is the *additional* budget, so the
     # effective ceiling continues from the restored rounds.
@@ -361,6 +391,79 @@ async def _run_impl(
         round_dir = rounds_dir / f"round_{round_index:03d}"
         _ensure_dir_nofollow(round_dir)
         emit("round_start", round=round_index, round_budget=gate.round_budget)
+
+        # The round phases this restored worker must NOT re-run: on a resumed
+        # round the in-flight checkpoint proves they already finished, and
+        # re-running one re-issues the round's effect.  Empty on a fresh round
+        # and on a round that has no mid-round checkpoint.  The payload (the
+        # outputs of the phases that will not re-run) is consumed once, by the
+        # round it belongs to.
+        restored_phases = mid_round_resume_phases
+        restored_payload = mid_round_payload
+        mid_round_resume_phases = frozenset()
+        mid_round_payload = None
+        # Round-scoped outputs: the manager checkpoint is written before the
+        # executor runs, so these must start empty for every round rather than
+        # carry the previous round's values.
+        executor_output = ""
+        auditor_report = ""
+        if restored_payload is not None:
+            executor_output = str(restored_payload.get("executor_output") or "")
+            auditor_report = str(restored_payload.get("auditor_report") or "")
+            _restored_round_outputs(round_dir, executor_output, auditor_report)
+            _append_event(
+                events_path,
+                "managed_round_resumed",
+                {
+                    "round": round_index,
+                    "phase": restored_payload.get("phase"),
+                    "skipped_phases": sorted(restored_phases),
+                },
+            )
+
+        def _checkpoint_phase(
+            *,
+            phase: str,
+            round_index: int = round_index,
+            next_step: RoleNextStep | None = None,
+            plan_text: str = "",
+            executor_output: str = "",
+            auditor_report: str = "",
+            related_report_refs: list[str] | None = None,
+        ) -> None:
+            """Make this round's progress durable after a phase finished.
+
+            ``_record_round`` only runs once the round COMPLETES, so without this
+            a worker lost mid-round leaves nothing for the resumed worker and the
+            round is replayed -- re-issuing its effect.  The payload carries every
+            field the resumed worker needs to rebuild the round without running a
+            phase again, so ``phase`` names the last phase that FINISHED.
+
+            The write is best-effort with respect to the run: a checkpoint write
+            failure must not fail an otherwise healthy round, so it is logged and
+            the round continues (the durable ledger still records completion).
+            """
+
+            try:
+                _write_mid_round_checkpoint(
+                    role_dir,
+                    ManagedRound(
+                        round_index=round_index,
+                        next_step=next_step,
+                        plan_text=plan_text,
+                        executor_output=executor_output,
+                        auditor_report=auditor_report,
+                        task_state=current_task_state,
+                        task_contract=current_task_contract,
+                        related_report_refs=list(related_report_refs or []),
+                    ),
+                    phase,
+                )
+            except OSError:
+                logger.exception("mid-round checkpoint write failed for round %s", round_index)
+
+        if "round_start" not in restored_phases:
+            _checkpoint_phase(phase="round_start")
 
         # The manager sees the original task, its maintained task state,
         # and auditor reports. It never receives raw trajectories or previous
@@ -516,6 +619,13 @@ async def _run_impl(
 
         next_step = _effective_next_step(parse_role_manager_next_step(plan_text))
         last_plan = plan_text
+        _checkpoint_phase(
+            phase="manager_done",
+            next_step=next_step,
+            plan_text=plan_text,
+            executor_output=executor_output,
+            related_report_refs=related_report_refs,
+        )
         _append_event(
             events_path,
             "manager_round_done",
@@ -675,28 +785,42 @@ async def _run_impl(
         )
         emit("role_start", round=round_index, role=f"{next_step}_executor")
 
-        executor_result = await _run_role_episode(
-            executor_agent,
-            executor_prompt,
-            env,
-            executor_budget,
-            live_trajectory_path=str(round_dir / "executor_raw_trajectory.jsonl"),
-        )
         executor_episode_root = log_dir / (
             "gui_executor_episodes" if next_step == MANAGER_NEXT_GUI else "cli_executor_episodes"
         )
-        executor_final_screenshot = (
-            await _capture_environment_screenshot(env)
-            if next_step == MANAGER_NEXT_GUI
-            else None
-        )
-        _save_role_result(
-            round_dir,
-            "executor",
-            executor_result,
-            episode_root=executor_episode_root,
-            final_screenshot=executor_final_screenshot,
-        )
+        if "executor_done" in restored_phases:
+            # The round's effect already ran on the lost worker. Re-running the
+            # executor here would issue it a second time -- the exact thing this
+            # capability exists to prevent -- so its recorded output is reused.
+            executor_result = _restored_executor_result(restored_payload or {})
+            executor_final_screenshot = None
+            _save_role_result(
+                round_dir,
+                "executor",
+                executor_result,
+                episode_root=executor_episode_root,
+                final_screenshot=executor_final_screenshot,
+            )
+        else:
+            executor_result = await _run_role_episode(
+                executor_agent,
+                executor_prompt,
+                env,
+                executor_budget,
+                live_trajectory_path=str(round_dir / "executor_raw_trajectory.jsonl"),
+            )
+            executor_final_screenshot = (
+                await _capture_environment_screenshot(env)
+                if next_step == MANAGER_NEXT_GUI
+                else None
+            )
+            _save_role_result(
+                round_dir,
+                "executor",
+                executor_result,
+                episode_root=executor_episode_root,
+                final_screenshot=executor_final_screenshot,
+            )
         executor_output = _visible_output(executor_result).strip() or "(executor agent produced no readable natural-language output)"
         _write_local(round_dir / "executor_output.txt", executor_output)
         if executor_result.status == "cancelled":
@@ -791,6 +915,16 @@ async def _run_impl(
             status=executor_result.status,
             duration_ms=executor_result.duration_ms,
         )
+        # The round's effect has now been issued. Record that durably BEFORE the
+        # auditor runs, so a loss anywhere after this point resumes the round
+        # without running the executor again.
+        _checkpoint_phase(
+            phase="executor_done",
+            next_step=next_step,
+            plan_text=plan_text,
+            executor_output=executor_output,
+            related_report_refs=related_report_refs,
+        )
 
         # The auditor audits only the just-finished subtask. Its natural
         # language report becomes the trusted intermediate state for later rounds.
@@ -815,16 +949,41 @@ async def _run_impl(
         )
         emit("role_start", round=round_index, role=f"{next_step}_auditor")
 
-        auditor_result = await _run_role_episode(
-            auditor_for_step,
-            auditor_prompt,
-            env,
-            auditor_budget,
-            live_trajectory_path=str(round_dir / "auditor_raw_trajectory.jsonl"),
-        )
         auditor_episode_root = log_dir / (
             "gui_auditor_episodes" if next_step == MANAGER_NEXT_GUI else "cli_auditor_episodes"
         )
+        if "auditor_done" in restored_phases:
+            # The auditor already reported on the lost worker; its report is part
+            # of the restored checkpoint, so it is reused rather than re-run.
+            auditor_result = _restored_auditor_result(restored_payload or {})
+            auditor_final_screenshot = None
+            _save_role_result(
+                round_dir,
+                "auditor",
+                auditor_result,
+                episode_root=auditor_episode_root,
+                final_screenshot=auditor_final_screenshot,
+            )
+        else:
+            auditor_result = await _run_role_episode(
+                auditor_for_step,
+                auditor_prompt,
+                env,
+                auditor_budget,
+                live_trajectory_path=str(round_dir / "auditor_raw_trajectory.jsonl"),
+            )
+            auditor_final_screenshot = (
+                await _capture_environment_screenshot(env)
+                if next_step == MANAGER_NEXT_GUI
+                else None
+            )
+            _save_role_result(
+                round_dir,
+                "auditor",
+                auditor_result,
+                episode_root=auditor_episode_root,
+                final_screenshot=auditor_final_screenshot,
+            )
         auditor_final_screenshot = (
             await _capture_environment_screenshot(env)
             if next_step == MANAGER_NEXT_GUI
@@ -913,20 +1072,26 @@ async def _run_impl(
             gate.abort_reason = auditor_failure.abort_reason
             gate.failure_reason = auditor_failure.user_message
             break
-        auditor_report, auditor_status = await _auditor_report_with_format_repair(
-            env=env,
-            config=config,
-            round_dir=round_dir,
-            events_path=events_path,
-            # By default, repair uses the same concrete GUI/CLI auditor that
-            # produced the report. Callers may still provide an explicit
-            # override for compatibility or backend specialization.
-            format_repair_agent=auditor_format_repair_agent or auditor_for_step,
-            auditor_budget=auditor_budget,
-            primary_result=auditor_result,
-            round_index=round_index,
-            episode_root=auditor_episode_root,
-        )
+        if "auditor_done" in restored_phases and auditor_report:
+            # The restored checkpoint already holds the normalized report, so the
+            # format-repair pass must not run again: it exists to fix a malformed
+            # fresh report, not to re-derive a recorded one.
+            auditor_status = _episode_status(auditor_result)
+        else:
+            auditor_report, auditor_status = await _auditor_report_with_format_repair(
+                env=env,
+                config=config,
+                round_dir=round_dir,
+                events_path=events_path,
+                # By default, repair uses the same concrete GUI/CLI auditor that
+                # produced the report. Callers may still provide an explicit
+                # override for compatibility or backend specialization.
+                format_repair_agent=auditor_format_repair_agent or auditor_for_step,
+                auditor_budget=auditor_budget,
+                primary_result=auditor_result,
+                round_index=round_index,
+                episode_root=auditor_episode_root,
+            )
         repair_status = auditor_status.get("format_repair_status")
         if isinstance(repair_status, dict) and repair_status.get("status") == "cancelled":
             record = ManagedRound(
@@ -956,8 +1121,19 @@ async def _run_impl(
             break
         _write_local(round_dir / "auditor_report.txt", auditor_report)
         await _write_remote_round_text(env, config, round_index, "auditor_report.txt", auditor_report)
+        # Record the audit durably too: a loss between here and ``_record_round``
+        # would otherwise leave only the executor_done checkpoint, and the
+        # resumed round would re-audit work the lost worker had already audited.
+        _checkpoint_phase(
+            phase="auditor_done",
+            next_step=next_step,
+            plan_text=plan_text,
+            executor_output=executor_output,
+            auditor_report=auditor_report,
+            related_report_refs=related_report_refs,
+        )
 
-        record = ManagedRound(
+        record = _completed_round_record(
             round_index=round_index,
             next_step=next_step,
             plan_text=plan_text,
@@ -966,7 +1142,7 @@ async def _run_impl(
             task_state=current_task_state,
             task_contract=current_task_contract,
             related_report_refs=related_report_refs,
-            executor_status=_episode_status(executor_result),
+            executor_result=executor_result,
             auditor_status=auditor_status,
         )
         rounds.append(record)
@@ -2453,6 +2629,32 @@ def _round_checkpoint_path(role_dir: Path, round_index: int) -> Path:
     return role_dir / "rounds" / f"round_{round_index:03d}" / "checkpoint.json"
 
 
+_CHECKPOINT_KIND_COMPLETED = "managed_round"
+# An in-flight round's checkpoint is the same envelope under a second kind, so a
+# reader can tell "the round finished" from "the round was still running" at the
+# path both kinds share.  A completed checkpoint always wins: `_record_round`
+# overwrites the mid-round one in place when the round completes.
+_CHECKPOINT_KIND_MID_ROUND = "managed_round_mid_round"
+
+
+def _checkpoint_envelope(fields: dict[str, Any], checkpoint_kind: str) -> dict[str, Any]:
+    """Wrap a round's durable fields in the fingerprinted checkpoint envelope.
+
+    The fingerprint is the SHA-256 over the canonical JSON of ``fields`` -- the
+    same recipe the supervisor validates (``supervisor/service.py:3357``), so a
+    checkpoint written here is accepted there.  Keeping one envelope builder for
+    both kinds means the mid-round and completed checkpoints cannot drift apart.
+    """
+
+    canonical = json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload = dict(fields)
+    payload["schema_version"] = 1
+    payload["checkpoint_kind"] = checkpoint_kind
+    payload["recorded_at"] = time.time()
+    payload["fingerprint"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return payload
+
+
 def _round_checkpoint(record: ManagedRound) -> dict[str, Any]:
     """Build an independently verifiable checkpoint for one recorded round.
 
@@ -2460,13 +2662,206 @@ def _round_checkpoint(record: ManagedRound) -> dict[str, Any]:
     plus a content hash so resume/continuation can detect a torn write.
     """
 
-    payload = asdict(record)
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    payload["schema_version"] = 1
-    payload["checkpoint_kind"] = "managed_round"
-    payload["recorded_at"] = time.time()
-    payload["fingerprint"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return _checkpoint_envelope(asdict(record), _CHECKPOINT_KIND_COMPLETED)
+
+
+def _completed_round_record(
+    *,
+    round_index: int,
+    next_step: RoleNextStep,
+    plan_text: str,
+    executor_output: str,
+    auditor_report: str,
+    task_state: str,
+    task_contract: str,
+    related_report_refs: list[str],
+    executor_result: EpisodeResult,
+    auditor_status: dict[str, Any],
+) -> ManagedRound:
+    """Build a round's final record once its auditor has reported.
+
+    Shared by the loop's normal completion path and by the mid-round restore
+    path, so a resumed round that never re-runs its auditor records exactly the
+    same fields a freshly-run round does -- the ledger cannot tell them apart,
+    which is what "resumed, not replayed" has to mean.
+    """
+
+    return ManagedRound(
+        round_index=round_index,
+        next_step=next_step,
+        plan_text=plan_text,
+        executor_output=executor_output,
+        auditor_report=auditor_report,
+        task_state=task_state,
+        task_contract=task_contract,
+        related_report_refs=related_report_refs,
+        executor_status=_episode_status(executor_result),
+        auditor_status=auditor_status,
+    )
+
+
+def _restored_round_outputs(
+    round_dir: Path, executor_output: str, auditor_report: str
+) -> None:
+    """Re-materialise the artifacts of the phases a restored round skips.
+
+    A resumed round must look on disk exactly like one whose phases ran, so the
+    outputs those phases wrote are restored from the checkpoint instead of being
+    produced by re-running the phase.  An empty value writes nothing: that phase
+    never finished, so it has nothing to restore.
+    """
+
+    if executor_output:
+        _write_local(round_dir / "executor_output.txt", executor_output)
+    if auditor_report:
+        _write_local(round_dir / "auditor_report.txt", auditor_report)
+
+
+def _restored_executor_result(payload: dict[str, Any]) -> EpisodeResult:
+    """The executor episode a restored round carries instead of re-running.
+
+    Re-running it is precisely what the round's "no effect issued twice"
+    invariant forbids, so the recorded output stands in for the episode.
+    """
+
+    return EpisodeResult(
+        status="done",
+        actions_log=str(payload.get("executor_output") or ""),
+        metadata={"restored_from_mid_round_checkpoint": True},
+    )
+
+
+def _restored_auditor_result(payload: dict[str, Any]) -> EpisodeResult:
+    """The auditor episode a restored round carries instead of re-auditing."""
+
+    return EpisodeResult(
+        status="done",
+        actions_log=str(payload.get("auditor_report") or ""),
+        metadata={"restored_from_mid_round_checkpoint": True},
+    )
+
+
+def _mid_round_checkpoint_fields(record: ManagedRound, phase: str) -> dict[str, Any]:
+    """The in-flight round's durable fields, tagged with the phase it reached."""
+
+    fields = asdict(record)
+    fields["phase"] = phase
+    return fields
+
+
+def _write_mid_round_checkpoint(role_dir: Path, record: ManagedRound, phase: str) -> Path:
+    """Make an in-flight round's progress durable without appending the ledger.
+
+    ``_record_round`` runs only once a round COMPLETES, so a worker lost while the
+    round is in flight leaves no checkpoint for it and the resumed worker replays
+    the round -- running the round's effect a second time.  This writer is called
+    at round start and again after every phase, so the round's progress is
+    durable before the phase whose effect must not repeat.
+
+    It writes to the completed checkpoint's path on purpose: the round's own
+    completion then graduates the file in place, so a mid-round checkpoint is
+    never a second artifact that could be silently deleted.  ``phase`` records
+    how far the round got; only the latest write survives.
+    """
+
+    checkpoint = _checkpoint_envelope(
+        _mid_round_checkpoint_fields(record, phase), _CHECKPOINT_KIND_MID_ROUND
+    )
+    checkpoint_path = _round_checkpoint_path(role_dir, record.round_index)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_local(checkpoint_path, json.dumps(checkpoint, ensure_ascii=False, indent=2))
+    return checkpoint_path
+
+
+def _load_mid_round_checkpoint(path: Path) -> dict[str, Any] | None:
+    """Read a round's mid-round checkpoint, validating its fingerprint.
+
+    Returns ``None`` when the file is absent or is a completed-round checkpoint
+    (nothing in flight to resume) and raises ``ValueError`` when it claims to be
+    a mid-round checkpoint but is torn, unreadable or tampered.  That is the
+    fail-closed rule the supervisor applies to completed checkpoints
+    (``supervisor/service.py:3357``): a broken restore is a failed restore, never
+    a best-effort replay.
+    """
+
+    try:
+        if not path.is_file():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"mid-round checkpoint {path} is unreadable: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"mid-round checkpoint {path} is not an object")
+    if payload.get("checkpoint_kind") != _CHECKPOINT_KIND_MID_ROUND:
+        return None
+    stored = payload.get("fingerprint")
+    if not isinstance(stored, str) or not stored:
+        raise ValueError(f"mid-round checkpoint {path} has no fingerprint")
+    canonical_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"schema_version", "checkpoint_kind", "recorded_at", "fingerprint"}
+    }
+    canonical = json.dumps(
+        canonical_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != stored:
+        raise ValueError(f"mid-round checkpoint {path} does not validate")
     return payload
+
+
+def _resumable_mid_round(role_dir: Path, recorded_indices: set[int]) -> dict[str, Any] | None:
+    """Find the in-flight round a lost worker left behind, if any.
+
+    A resumable mid-round checkpoint is one whose kind is the in-flight kind,
+    whose fingerprint validates, and whose round index has NO ``rounds.jsonl``
+    record -- the round never completed.  Only the latest such round is
+    returned: rounds are sequential, so the in-flight round is the highest index
+    seen.  A checkpoint for an index that IS recorded is a completed round and is
+    ignored here; the ledger restore already covers it.
+    """
+
+    rounds_dir = role_dir / "rounds"
+    try:
+        if not rounds_dir.is_dir():
+            return None
+        candidates = sorted(rounds_dir.glob("*/checkpoint.json"))
+    except OSError:
+        return None
+    found: dict[str, Any] | None = None
+    for path in candidates:
+        try:
+            index = int(path.parent.name.split("_")[-1])
+        except ValueError:
+            continue
+        if index in recorded_indices:
+            continue
+        payload = _load_mid_round_checkpoint(path)
+        if payload is not None:
+            found = payload
+    return found
+
+
+# The phases of one round, in the order the loop runs them.  Each name is the
+# phase recorded in the mid-round checkpoint immediately AFTER that phase
+# finished, so a restored round resumes at the first name not in its checkpoint.
+_ROUND_PHASES: tuple[str, ...] = ("round_start", "manager_done", "executor_done", "auditor_done")
+
+
+def _restored_mid_round_phases(payload: dict[str, Any]) -> frozenset[str]:
+    """The round phases a mid-round checkpoint proves were already finished.
+
+    ``phase`` names the last phase the lost worker completed.  Every phase
+    before it finished too (the loop runs them in order), so the restored round
+    skips exactly those and re-runs the one that was in progress.  An unknown or
+    missing phase restores nothing and the round is replayed -- the
+    pre-capability behaviour, never a wrong resume.
+    """
+
+    phase = payload.get("phase")
+    if not isinstance(phase, str) or phase not in _ROUND_PHASES:
+        return frozenset()
+    return frozenset(_ROUND_PHASES[: _ROUND_PHASES.index(phase) + 1])
 
 
 async def _record_round(
