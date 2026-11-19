@@ -455,8 +455,11 @@ def validate_checkpoint_manifest(
 
     Checks, in order: the pinned schema id, the scope binding, the base
     identity and sequence, the self-digest (recomputed -- the carried
-    ``digest`` is only compared, never trusted), the base content digest
-    against the trusted handoff, and finally the mandatory state schemas.
+    ``digest`` is only compared, never trusted), the envelope-plane field
+    rules (mandatory fields and the body ``task`` object), the base content
+    digest against the trusted handoff (which, on the envelope plane, is
+    also the carried ``terminal_content_digest``'s binding), and finally
+    the mandatory state schemas.
     """
     _require_schema(handoff)
     document = (
@@ -480,9 +483,9 @@ def validate_checkpoint_manifest(
     # plane, where the envelope's own field rules apply.  The native
     # library shape carries no envelope fields, so nothing fires for it;
     # like SCHEMA_ID, the accepted set is pinned by the validator, never
-    # read from the document.  All four rules run before the trusted-base
-    # comparison so a refusal names the envelope rule instead of
-    # surfacing as a generic content mismatch.
+    # read from the document.  Every rule in the block runs before the
+    # trusted-base comparison so a refusal names the envelope rule
+    # instead of surfacing as a generic content mismatch.
     state = document.get("state")
     envelope = isinstance(state, Mapping) and any(
         field in state
@@ -521,13 +524,37 @@ def validate_checkpoint_manifest(
         if state.get("producer") is None:
             raise IncompleteContext("envelope producer is mandatory")
 
+        # Pin 3.2 #1 (L199): ``task`` is a required object carrying
+        # ``task_id``, ``requirement_ids`` and ``attempt_id`` -- stable
+        # ids.  On the envelope plane the object rides inside ``state``,
+        # so presence and shape are the library's to check; the scope
+        # binding above is what binds its ``task_id`` to the trusted
+        # handoff (A1: the binding never comes from the manifest's own
+        # claim).
+        task = state.get("task")
+        if not isinstance(task, Mapping):
+            raise IncompleteContext("envelope body task object is mandatory")
+        for field in ("task_id", "requirement_ids", "attempt_id"):
+            if field not in task:
+                raise IncompleteContext(
+                    "envelope body task is missing required stable id: "
+                    f"{field}"
+                )
+
     if computed != expected_base.get("digest"):
         if envelope:
             # EDGE-17: on the envelope plane this comparison is the carried
-            # base_digest's binding, so the refusal names the field.
+            # base_digest's binding, so the refusal names the field.  Pin
+            # 4.3 (L254-256) calls this same comparison the content leg of
+            # the restore-side validation (content/predecessor/terminal),
+            # and under the file's contract the recomputed digest *is* the
+            # manifest's terminal content digest, so the pin's digest
+            # field rides along in the refusal.
             raise IncompleteContext(
                 "checkpoint content does not match trusted base "
-                "(envelope base_digest does not bind the trusted base content)"
+                "(envelope base_digest does not bind the trusted base "
+                "content; envelope terminal_content_digest does not match "
+                "the manifest's own terminal content)"
             )
         raise IncompleteContext("checkpoint content does not match trusted base")
 

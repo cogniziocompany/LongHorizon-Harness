@@ -1517,8 +1517,12 @@ def _adapt_pinned_to_library(pinned: dict) -> dict:
 
     * ``policy_revision`` (pin envelope) is promoted to a top-level scope
       key, where ``_require_scope_binding`` reads it (manifest.py L268-272).
+      A pinned document with the field deleted crosses with the key absent
+      (``None``), not as a crash: the refusal is the library's to make, so
+      the leg reaches validation and is refused there, naming the field.
     * ``task_id`` is lifted out of the pinned ``task`` body object into a
-      top-level scope key (same reader).
+      top-level scope key (same reader); a deleted ``task`` object crosses
+      the same way -- key absent, refusal deferred to the library.
     * ``tenant_id`` has no pinned form; it comes from the trusted side
       (``ADAPTER_TENANT_ID``), matching the pinned handoff's scope.
     * ``checkpoint_id``/``sequence`` have no pinned form either; they come
@@ -1534,10 +1538,15 @@ def _adapt_pinned_to_library(pinned: dict) -> dict:
       ``with_digest()`` -- sha256 over canonical-json/v1 of the document
       with its own ``digest`` key excluded (manifest.py L88-98).
     """
+    task_object = pinned.get("task")
     scope = {
         "tenant_id": ADAPTER_TENANT_ID,
-        "task_id": pinned["task"]["task_id"],
-        "policy_revision": pinned["policy_revision"],
+        "task_id": (
+            task_object.get("task_id")
+            if isinstance(task_object, dict)
+            else None
+        ),
+        "policy_revision": pinned.get("policy_revision"),
     }
     state = {
         key: value
