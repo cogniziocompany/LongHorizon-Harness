@@ -476,11 +476,6 @@ def test_neg39_envelope_policy_revision_mandatory_and_stale_revision_refused():
         validate_checkpoint_manifest(_adapt_pinned_to_library(stale), handoff)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: no rule requires state.schema_version or gates its version "
-    "(would live at require_mandatory, manifest.py:481-484)",
-)
 def test_edge20_envelope_schema_version_mandatory_and_version_compatibility_enforced():
     """3.1 L182 with section 2: schema_version is required and must be accepted.
 
@@ -503,11 +498,6 @@ def test_edge20_envelope_schema_version_mandatory_and_version_compatibility_enfo
         validate_checkpoint_manifest(_adapt_pinned_to_library(unaccepted), handoff)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: no rule reads state.base_digest (would sit at "
-    "require_mandatory, manifest.py:481-484)",
-)
 def test_edge17_envelope_base_digest_mandatory_and_binds_the_trusted_base():
     """3.1 L183: base_digest is required and names the trusted base content.
 
@@ -593,11 +583,6 @@ def test_edge16_envelope_predecessor_digest_null_only_for_the_chain_head():
         validate_checkpoint_manifest(_adapt_pinned_to_library(d1), handoff)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: no rule requires state.created_at (would live at "
-    "require_mandatory, manifest.py:481-484)",
-)
 def test_edge18_envelope_created_at_mandatory():
     """3.1 L186: created_at is required; null is not presence.
 
@@ -620,11 +605,6 @@ def test_edge18_envelope_created_at_mandatory():
         validate_checkpoint_manifest(_adapt_pinned_to_library(nulled), handoff)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: no rule requires state.producer (would live at "
-    "require_mandatory, manifest.py:481-484)",
-)
 def test_edge18_envelope_producer_mandatory():
     """3.1 L187: producer is required; null is not presence.
 
@@ -1537,8 +1517,12 @@ def _adapt_pinned_to_library(pinned: dict) -> dict:
 
     * ``policy_revision`` (pin envelope) is promoted to a top-level scope
       key, where ``_require_scope_binding`` reads it (manifest.py L268-272).
+      A pinned document with the field deleted crosses with the key absent
+      (``None``), not as a crash: the refusal is the library's to make, so
+      the leg reaches validation and is refused there, naming the field.
     * ``task_id`` is lifted out of the pinned ``task`` body object into a
-      top-level scope key (same reader).
+      top-level scope key (same reader); a deleted ``task`` object crosses
+      the same way -- key absent, refusal deferred to the library.
     * ``tenant_id`` has no pinned form; it comes from the trusted side
       (``ADAPTER_TENANT_ID``), matching the pinned handoff's scope.
     * ``checkpoint_id``/``sequence`` have no pinned form either; they come
@@ -1554,10 +1538,15 @@ def _adapt_pinned_to_library(pinned: dict) -> dict:
       ``with_digest()`` -- sha256 over canonical-json/v1 of the document
       with its own ``digest`` key excluded (manifest.py L88-98).
     """
+    task_object = pinned.get("task")
     scope = {
         "tenant_id": ADAPTER_TENANT_ID,
-        "task_id": pinned["task"]["task_id"],
-        "policy_revision": pinned["policy_revision"],
+        "task_id": (
+            task_object.get("task_id")
+            if isinstance(task_object, dict)
+            else None
+        ),
+        "policy_revision": pinned.get("policy_revision"),
     }
     state = {
         key: value

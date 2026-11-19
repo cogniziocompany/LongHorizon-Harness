@@ -141,6 +141,12 @@ Re-slice B (2026-11-16) moved the 31 pin tests onto the adapter. As a REPORT,
 not a pass: 4 ENFORCED, 22 GAP (strict xfail naming the rule), 5
 ADAPTER-LIMIT (left red with the reason). No manifest.py change is part of
 this decision; library changes for the GAP rows are separate work.
+Leaf L1 (2026-11-17) closes four of those GAP rows: the library boundary
+(manifest.py:497-523) now enforces the envelope mandatory-field rules
+`schema_version` (with accepted-version compatibility), `base_digest`
+(binding the trusted base via the recomputed comparison at manifest.py:525),
+`created_at` and `producer`, so their four pin tests pass; the other 18 GAP
+rows and the 5 ADAPTER-LIMIT rows are unchanged.
 
 Two rows name absences on the pin side, not library defects: the pin has
 no tenant field and no checkpoint identity of its own. The library renders

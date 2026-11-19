@@ -455,8 +455,11 @@ def validate_checkpoint_manifest(
 
     Checks, in order: the pinned schema id, the scope binding, the base
     identity and sequence, the self-digest (recomputed -- the carried
-    ``digest`` is only compared, never trusted), the base content digest
-    against the trusted handoff, and finally the mandatory state schemas.
+    ``digest`` is only compared, never trusted), the envelope-plane field
+    rules (mandatory fields and the body ``task`` object), the base content
+    digest against the trusted handoff (which, on the envelope plane, is
+    also the carried ``terminal_content_digest``'s binding), and finally
+    the mandatory state schemas.
     """
     _require_schema(handoff)
     document = (
@@ -475,10 +478,86 @@ def validate_checkpoint_manifest(
     computed = document_digest(document)
     if document.get("digest") != computed:
         raise IncompleteContext("checkpoint self-digest mismatch")
+
+    # L1: a state carrying any pinned envelope field is on the envelope
+    # plane, where the envelope's own field rules apply.  The native
+    # library shape carries no envelope fields, so nothing fires for it;
+    # like SCHEMA_ID, the accepted set is pinned by the validator, never
+    # read from the document.  Every rule in the block runs before the
+    # trusted-base comparison so a refusal names the envelope rule
+    # instead of surfacing as a generic content mismatch.
+    state = document.get("state")
+    envelope = isinstance(state, Mapping) and any(
+        field in state
+        for field in (
+            "base_digest",
+            "predecessor_digest",
+            "created_at",
+            "producer",
+            "terminal_content_digest",
+        )
+    )
+    if envelope:
+        # EDGE-20: schema_version is mandatory, and only an accepted
+        # version validates at all.
+        if "schema_version" not in state:
+            raise IncompleteContext("envelope schema_version is mandatory")
+        declared = state["schema_version"]
+        if declared not in ("w3-f12-manifest/v1",):
+            raise IncompleteContext(
+                "envelope schema_version is not accepted: "
+                f"{declared!r} not in ['w3-f12-manifest/v1']"
+            )
+        # EDGE-17: base_digest is mandatory.  Guard (a): the carried value
+        # is never trusted, so its binding is the recomputed digest below,
+        # never a copy of the field; only presence is enforced here.
+        if "base_digest" not in state:
+            raise IncompleteContext("envelope base_digest is mandatory")
+        # EDGE-18: created_at is mandatory, and null is not presence: a
+        # manifest with substantial content but no production time is
+        # still incomplete, so the field must be set to a value.
+        if state.get("created_at") is None:
+            raise IncompleteContext("envelope created_at is mandatory")
+        # EDGE-18: producer is mandatory, and null is not presence: a
+        # manifest must name what produced it, so the field must be set
+        # to a value.
+        if state.get("producer") is None:
+            raise IncompleteContext("envelope producer is mandatory")
+
+        # Pin 3.2 #1 (L199): ``task`` is a required object carrying
+        # ``task_id``, ``requirement_ids`` and ``attempt_id`` -- stable
+        # ids.  On the envelope plane the object rides inside ``state``,
+        # so presence and shape are the library's to check; the scope
+        # binding above is what binds its ``task_id`` to the trusted
+        # handoff (A1: the binding never comes from the manifest's own
+        # claim).
+        task = state.get("task")
+        if not isinstance(task, Mapping):
+            raise IncompleteContext("envelope body task object is mandatory")
+        for field in ("task_id", "requirement_ids", "attempt_id"):
+            if field not in task:
+                raise IncompleteContext(
+                    "envelope body task is missing required stable id: "
+                    f"{field}"
+                )
+
     if computed != expected_base.get("digest"):
+        if envelope:
+            # EDGE-17: on the envelope plane this comparison is the carried
+            # base_digest's binding, so the refusal names the field.  Pin
+            # 4.3 (L254-256) calls this same comparison the content leg of
+            # the restore-side validation (content/predecessor/terminal),
+            # and under the file's contract the recomputed digest *is* the
+            # manifest's terminal content digest, so the pin's digest
+            # field rides along in the refusal.
+            raise IncompleteContext(
+                "checkpoint content does not match trusted base "
+                "(envelope base_digest does not bind the trusted base "
+                "content; envelope terminal_content_digest does not match "
+                "the manifest's own terminal content)"
+            )
         raise IncompleteContext("checkpoint content does not match trusted base")
 
-    state = document.get("state")
     if not isinstance(state, Mapping):
         raise IncompleteContext("checkpoint state is missing or not an object")
     require_mandatory(state, handoff.required_state_schemas)
