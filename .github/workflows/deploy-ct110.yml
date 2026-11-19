@@ -659,3 +659,35 @@ jobs:
             echo "- units staged and shipped through the 224 bytes-verified hops"
             echo "- install-only: timer NOT enabled, tick mode NOT touched (operator rollout step)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Independent release QA review (lease ovf-release-qa-review-hook-1720) ──
+  # Paxton 2026-11-07 17:1xZ: production releases are auto-approved and
+  # validated live by the cognizioware-qa independent review. This node deploy
+  # is NOT live until the review returns PASS. The review drives the harness
+  # admin surface (the node's web UI + API): meta, profiles, runs. A non-PASS
+  # verdict fails the run (release not live) and triggers the remediation
+  # loop (PR comment, overseer1 gateway message, YouTrack tickets under
+  # easybutt0n). Rollback lever unchanged: re-run this workflow with the last
+  # green wheel/run id, target unchanged.
+  qa-review:
+    name: Independent release QA review
+    needs: [preflight, deploy]
+    if: ${{ !inputs.dry_run && needs.deploy.result == 'success' }}
+    uses: cogniziocompany/cognizioware-mcp-tools/.github/workflows/release-qa-review.yml@main
+    with:
+      target: admin-harness
+      env: prod
+      # The node under review: the same URL the deploy job just verified.
+      base_url: ${{ vars[format('{0}_WEB_URL', inputs.target == 'ct111' && 'CT111' || 'CT110')] || 'http://192.168.21.168:8799' }}
+      caller_repo: ${{ github.repository }}
+      caller_sha: ${{ needs.preflight.outputs.sha }}
+      pr_number: 0
+      poll_minutes: 25
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: read
+    secrets:
+      qa_gate_dispatch_token: ${{ secrets.QA_GATE_DISPATCH_TOKEN }}
+      fleet_chat_notify_key: ${{ secrets.FLEET_CHAT_NOTIFY_KEY }}
+      youtrack_write_token: ${{ secrets.YOUTRACK_WRITE_TOKEN }}

@@ -215,3 +215,25 @@ with `pip install --force-reinstall --no-deps` (or rebuild it), `systemctl resta
 lh-harness.service`, and confirm `systemctl is-active` +
 `curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8799/api/meta`
 (its `build.commit` names the running commit).
+
+## Independent release QA review (since 2026-11-07)
+
+Paxton 2026-11-07 17:1xZ (lease `ovf-release-qa-review-hook-1720`): production
+releases are auto-approved and validated live by the cognizioware-qa
+independent review. The `qa-review` job at the end of
+`.github/workflows/deploy-ct110.yml` calls the reusable
+`cognizioware-mcp-tools/release-qa-review.yml@main` for `target=admin-harness`
+against the deployed node's web URL (`CT110_WEB_URL`/`CT111_WEB_URL`, the same
+URL the deploy job's `/api/meta` verification used).
+
+- The node release is **not live until the review returns PASS** (FAIL /
+  BLOCKED / NO-VERDICT all fail the run).
+- A non-PASS verdict triggers the remediation loop: PR comment, overseer1
+  gateway message, one YouTrack ticket per finding under `easybutt0n`
+  (SPIKE when the solution is unknown), idempotent by dedup key.
+- Rollback lever is unchanged: re-run this workflow with the last green
+  wheel/run id, `target` unchanged (see the rollback sections above).
+- The `admin-harness` QA surface is currently soft-skipped (LAN-only, deferred
+  to the overseer spike); the verdict mapper treats that vacuous run as
+  NO-VERDICT = not live (fail closed), so the hook cannot silently pass until
+  the spike lands.
