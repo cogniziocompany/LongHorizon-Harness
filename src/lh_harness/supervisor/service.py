@@ -1535,6 +1535,14 @@ class RunSupervisor:
 
     def _refresh(self, run_id: str) -> dict[str, Any]:
         bus = self._bus(run_id)
+        # easybutt0n-17: probe liveness BEFORE taking the supervisor-wide
+        # lifecycle lock.  The probe only reads (/proc stat, owner record,
+        # an optional ``ps`` fork for PID-reuse checks); it serializes
+        # nothing.  Holding the lock across it made every cold dead-pid
+        # reconcile queue every other supervisor request behind a read.
+        # Correctness is unchanged: the branches below that need both the
+        # probe result and a consistent status re-check under the lock.
+        alive = self._is_alive(run_id)
         with self._lifecycle_lock:
             status = bus.read_status()
             status = self._replay_pending_lifecycle(run_id, bus, status)
@@ -1614,7 +1622,6 @@ class RunSupervisor:
                     )
                 return next_status
 
-            alive = self._is_alive(run_id)
             old_status = canonical_lifecycle_status(status.get("status"), default="idle")
             next_status = old_status
             if alive:
@@ -1695,6 +1702,28 @@ class RunSupervisor:
                     if _missing_completion_evidence(report, report_status):
                         status["failure_reason"] = _MISSING_COMPLETION_EVIDENCE
             status = {**status, "status": next_status, "alive": alive}
+            if (
+                next_status == old_status
+                and not status.get("failure_reason")
+                and "exit_code" not in status
+                and "finished_at" not in status
+                and "report_status" not in status
+            ):
+                # easybutt0n-17: the candidate carries nothing the read did
+                # not - same lifecycle status, no new failure reason, no
+                # exit/finish/report fields - so the rewrite below would
+                # re-serialize identical content and make a LIVE unchanged
+                # row pay one fsync per poll (measured 14 ms/row).  Prove
+                # the no-op instead of assuming it: re-read the durable
+                # record under the lock and merge the candidate into it
+                # exactly as the write path would.  Only a merge that
+                # reproduces the record byte for byte (which is also when
+                # ``update_status`` itself would perform no write) allows
+                # the skip, and the record is then returned as the answer -
+                # the same value the transaction would have returned.
+                durable = bus.read_status()
+                if _merge_lifecycle_status(durable, status) == durable:
+                    return durable
             status = bus.update_status(
                 lambda current: _merge_lifecycle_status(current, status)
             )
