@@ -249,6 +249,20 @@ class _RoundArtifactReads:
     every open whose path contains a ``rounds`` path component covers all of
     them; stat/scandir of a round DIRECTORY is metadata, not a read.
 
+    Anchored opens must be resolved too.  ``_saved_task_from_rounds`` walks
+    with ``dir_fd``: it opens ``runs_root`` by absolute path, then opens each
+    NEXT component as a bare name (``run0042``, ``lh_harness``,
+    ``role_orchestration``, ``rounds``, ``round_001``,
+    ``task_contract.txt``) anchored on the previous descriptor.  A guard that
+    only inspects the literal path string is blind to every one of those
+    opens -- the round-artifact read itself is ``os.open("task_contract.txt",
+    ..., dir_fd=round_fd)``, a five-character path with no ``rounds`` in it
+    anywhere.  The guard therefore keeps a map of every open DIRECTORY
+    descriptor to the real directory it resolved to, and classifies an
+    anchored open by joining that directory with the opened name.  A
+    descriptor opened without ``O_DIRECTORY`` is a file read, not a place to
+    anchor further opens, and is never added to the map.
+
     The secured-read guards test ``os.open in os.supports_dir_fd`` to decide
     whether anchored openat walks are available.  A plain wrapper function is
     NOT a member of that frozenset, so swapping ``os.open`` alone would
@@ -262,21 +276,63 @@ class _RoundArtifactReads:
         self.paths: list[str] = []
         self._lock = threading.Lock()
         self._active = False
+        self._dir_by_fd: dict[int, str] = {}
+
+    def _record(self, directory: str, name: str) -> None:
+        text = os.path.join(directory, name)
+        if os.sep + "rounds" + os.sep in text:
+            self.count += 1
+            if len(self.paths) < 20:
+                self.paths.append(text)
 
     def __enter__(self) -> "_RoundArtifactReads":
         original_open = os.open
         original_supports = os.supports_dir_fd
+        directory_flag = getattr(os, "O_DIRECTORY", 0)
         counter = self
 
         def counting_open(path, *args, **kwargs):
+            dir_fd = kwargs.get("dir_fd")
+            if dir_fd is None and len(args) >= 4:
+                # ``os.open(path, flags, mode, dir_fd)`` positional form.
+                dir_fd = args[3]
+            flags = kwargs.get("flags")
+            if flags is None and args:
+                flags = args[0]
             if counter._active:
-                text = str(path)
-                if os.sep + "rounds" + os.sep in text:
+                if dir_fd is not None:
                     with counter._lock:
-                        counter.count += 1
-                        if len(counter.paths) < 20:
-                            counter.paths.append(text)
-            return original_open(path, *args, **kwargs)
+                        base = counter._dir_by_fd.get(dir_fd)
+                    if base is not None and directory_flag and not (
+                        isinstance(flags, int) and (int(flags) & directory_flag)
+                    ):
+                        # Only FILE opens count as reads; opening a directory
+                        # component of the anchored walk is metadata.
+                        with counter._lock:
+                            counter._record(base, os.fspath(path))
+                else:
+                    text = os.fspath(path)
+                    if os.sep + "rounds" + os.sep in text:
+                        with counter._lock:
+                            counter.count += 1
+                            if len(counter.paths) < 20:
+                                counter.paths.append(text)
+            fd = original_open(path, *args, **kwargs)
+            if counter._active and isinstance(fd, int):
+                # Remember open DIRECTORY descriptors so anchored opens of
+                # round artifacts can be resolved to a real path.  A bare fd
+                # leak here is harmless: the map dies with the context.
+                if isinstance(flags, int) and directory_flag and (int(flags) & directory_flag):
+                    with counter._lock:
+                        if dir_fd is not None:
+                            base = counter._dir_by_fd.get(dir_fd)
+                            if base is not None:
+                                counter._dir_by_fd[fd] = os.path.join(
+                                    base, os.fspath(path)
+                                )
+                                return fd
+                        counter._dir_by_fd[fd] = str(os.path.abspath(os.fspath(path)))
+            return fd
 
         self._original_open = original_open
         self._original_supports = original_supports
@@ -289,11 +345,104 @@ class _RoundArtifactReads:
         self._active = False
         os.open = self._original_open
         os.supports_dir_fd = self._original_supports
+        self._dir_by_fd.clear()
 
     def reset(self) -> None:
         with self._lock:
             self.count = 0
             self.paths.clear()
+
+
+def test_round_artifact_read_guard_self_check(tmp_path: Path) -> None:
+    """The guard must catch an ANCHORED (``dir_fd``) round-artifact open.
+
+    This is the guard's own self-check (easybutt0n-80).  The historical guard
+    matched only opens whose literal path string contained ``/rounds/``, but
+    the production reader (``_saved_task_from_rounds``) opens the round
+    artifact as a BARE NAME anchored on a directory descriptor -- no
+    ``rounds`` anywhere in the string it passes.  A blind guard certifies
+    nothing: the "no round-artifact reads" assertions in the budget tests
+    below would pass even while every run's rounds tree was being walked.
+    This test performs a deliberate anchored open of a real round artifact,
+    exactly the production shape, and requires the guard to count it.
+    """
+
+    run_dir = tmp_path / "runs" / "selfcheck-run"
+    round_dir = run_dir / "lh_harness" / "role_orchestration" / "rounds" / "round_001"
+    round_dir.mkdir(parents=True)
+    artifact = round_dir / "task_contract.txt"
+    artifact.write_text("deliberate anchored open target\n", encoding="utf-8")
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+
+    with _RoundArtifactReads() as reads:
+        # The production shape: walk component by component with dir_fd,
+        # opening the artifact by bare name against the round directory's fd.
+        root_fd = os.open(str(tmp_path / "runs"), directory_flags)
+        try:
+            run_fd = os.open(run_dir.name, directory_flags, dir_fd=root_fd)
+            try:
+                logs_fd = os.open("lh_harness", directory_flags, dir_fd=run_fd)
+                try:
+                    role_fd = os.open(
+                        "role_orchestration", directory_flags, dir_fd=logs_fd
+                    )
+                    try:
+                        rounds_fd = os.open("rounds", directory_flags, dir_fd=role_fd)
+                        try:
+                            one_fd = os.open(
+                                "round_001", directory_flags, dir_fd=rounds_fd
+                            )
+                            try:
+                                fd = os.open(
+                                    "task_contract.txt", file_flags, dir_fd=one_fd
+                                )
+                                try:
+                                    os.read(fd, 64)
+                                finally:
+                                    os.close(fd)
+                            finally:
+                                os.close(one_fd)
+                        finally:
+                            os.close(rounds_fd)
+                    finally:
+                        os.close(role_fd)
+                finally:
+                    os.close(logs_fd)
+            finally:
+                os.close(run_fd)
+        finally:
+            os.close(root_fd)
+
+    assert reads.count == 1, (
+        f"the round-artifact read guard counted {reads.count} anchored reads of "
+        "a deliberately opened round artifact; it is blind to dir_fd opens and "
+        "cannot certify the no-round-artifact-read assertions"
+    )
+    assert reads.paths and reads.paths[0].endswith(
+        os.path.join("rounds", "round_001", "task_contract.txt")
+    ), f"guard recorded unexpected paths: {reads.paths}"
+
+    # The path-string half of the guard still works for ordinary opens.
+    with _RoundArtifactReads() as reads:
+        fd = os.open(str(artifact), file_flags)
+        try:
+            os.read(fd, 64)
+        finally:
+            os.close(fd)
+    assert reads.count == 1
+
+    # And it stays quiet for control records, which the listing may read.
+    control_dir = run_dir / "control"
+    control_dir.mkdir(parents=True, exist_ok=True)
+    with _RoundArtifactReads() as reads:
+        fd = os.open(str(control_dir), directory_flags)
+        try:
+            os.close(fd)
+        finally:
+            pass
+    assert reads.count == 0
 
 
 def _timed_get(client: TestClient, path: str) -> tuple[float, dict[str, Any]]:
