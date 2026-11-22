@@ -101,6 +101,26 @@ def _status_for(event_type: str, raw_name: str) -> str | None:
     return None
 
 
+def _tail_record_candidate(line: bytes) -> bool:
+    """Whether one raw JSONL line would count as a valid record.
+
+    A cheap JSON-level check (no ``normalize_event``), used only to compute
+    the ``sequence`` of the final record when it carries no explicit event id.
+    It applies the same blank/oversized/malformed/non-object skips as the
+    whole-window parse.
+    """
+
+    if not line.strip():
+        return False
+    if len(line) > _MAX_EVENT_LINE_BYTES:
+        return False
+    try:
+        record = json.loads(line.strip().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(record, dict)
+
+
 def normalize_event(
     record: dict[str, Any],
     *,
@@ -361,6 +381,10 @@ class EventTailer:
         for example one oversized final line.  ``last_tail_bytes_read`` records
         the total bytes read so callers/tests can assert the poll stayed a
         tail read.  A missing/unreadable log yields ``[]``, never an error.
+
+        For ``wanted == 1`` (the liveness-poll mode) the first chunk is
+        scanned backward and only the final complete record is normalized,
+        instead of every record in the window.
         """
 
         self.last_warnings = []
@@ -378,6 +402,15 @@ class EventTailer:
             if size <= 0:
                 return []
             chunk = min(_TAIL_CHUNK_BYTES, size)
+            if wanted == 1:
+                # Liveness polls want only the final complete record.  Parse
+                # the chunk backward and stop at the first complete record
+                # from the end instead of normalizing every record in the
+                # window; on any miss fall through to the whole-window loop
+                # below, which grows the chunk exactly as before.
+                events = self._scan_last_backward(fd, size, chunk)
+                if events:
+                    return events
             while True:
                 start = max(0, size - chunk)
                 os.lseek(fd, start, os.SEEK_SET)
@@ -389,6 +422,89 @@ class EventTailer:
                 chunk = min(chunk * 8, _MAX_EVENT_LOG_BYTES, size)
         finally:
             os.close(fd)
+
+    def _scan_last_backward(self, fd: int, size: int, chunk: int) -> list[EventEnvelope]:
+        """Normalize only the final complete record of one tail chunk.
+
+        A backward scan of a single chunk read.  The skip rules of
+        :meth:`_parse_tail_records` apply unchanged -- a partial first line
+        when the chunk starts mid-record, an incomplete final line, and
+        blank/oversized/malformed/non-object records -- but ``normalize_event``
+        runs at most once, on the first complete record found from the end.
+        Returns ``[]`` when the chunk holds no complete record so the caller
+        can fall back to the whole-window loop.
+        """
+
+        start = max(0, size - chunk)
+        os.lseek(fd, start, os.SEEK_SET)
+        raw = os.read(fd, size - start)
+        self.last_tail_bytes_read += len(raw)
+        base_offset = start
+        head_truncated = start > 0
+        if head_truncated:
+            # The first bytes may be the middle of a record.  Drop the partial
+            # record; offsets stay relative to the real file.
+            first_newline = raw.find(b"\n")
+            if first_newline < 0:
+                return []
+            base_offset += first_newline + 1
+            raw = raw[first_newline + 1 :]
+        if raw and not raw.endswith((b"\n", b"\r")):
+            # A worker may be writing the final line while we read.  Never
+            # parse that incomplete tail; it will be picked up on the next poll.
+            last_newline = raw.rfind(b"\n")
+            raw = raw[: last_newline + 1] if last_newline >= 0 else b""
+        if not raw:
+            return []
+        lines = raw.splitlines(keepends=True)
+        # Byte offset of every line so warnings and envelope offsets match the
+        # whole-window parse exactly.
+        line_offsets: list[int] = []
+        offset = base_offset
+        for line in lines:
+            line_offsets.append(offset)
+            offset += len(line)
+        for index in range(len(lines) - 1, -1, -1):
+            line = lines[index]
+            line_start = line_offsets[index]
+            text = line.strip()
+            if not text:
+                continue
+            if len(line) > _MAX_EVENT_LINE_BYTES:
+                self.last_warnings.append(
+                    f"ignored oversized event at byte offset {line_start}"
+                )
+                continue
+            try:
+                record = json.loads(text.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.last_warnings.append(f"ignored malformed event at byte offset {line_start}")
+                continue
+            if not isinstance(record, dict):
+                self.last_warnings.append(f"ignored non-object event at byte offset {line_start}")
+                continue
+            # ``sequence`` only feeds synthesized event ids (records without an
+            # explicit one).  Count the preceding valid records for that legacy
+            # case alone so such ids match the whole-window parse.
+            sequence = 1
+            if record.get("event_id") in (None, ""):
+                sequence += sum(1 for prior in lines[:index] if _tail_record_candidate(prior))
+            try:
+                return [
+                    normalize_event(
+                        record,
+                        run_id=self.run_id,
+                        sequence=sequence,
+                        offset=line_start,
+                        fallback_event_id=(
+                            f"{self.run_id}:offset-{line_start:016x}" if head_truncated else None
+                        ),
+                    )
+                ]
+            except EventNormalizationError as exc:
+                self.last_warnings.append(f"ignored event {sequence}: {exc}")
+                continue
+        return []
 
     def _parse_tail_records(
         self,
