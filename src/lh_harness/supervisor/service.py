@@ -1697,13 +1697,21 @@ class RunSupervisor:
                 and "finished_at" not in status
                 and "report_status" not in status
             ):
-                # easybutt0n-17: nothing durable changed - same lifecycle
-                # status, no new failure reason, no exit/finish/report
-                # fields.  Rewriting identical content under the lock made
-                # a LIVE unchanged row pay one fsync per poll (measured
-                # 14 ms/row).  Skip the write; the read status is already
-                # the durable truth.
-                return status
+                # easybutt0n-17: the candidate carries nothing the read did
+                # not - same lifecycle status, no new failure reason, no
+                # exit/finish/report fields - so the rewrite below would
+                # re-serialize identical content and make a LIVE unchanged
+                # row pay one fsync per poll (measured 14 ms/row).  Prove
+                # the no-op instead of assuming it: re-read the durable
+                # record under the lock and merge the candidate into it
+                # exactly as the write path would.  Only a merge that
+                # reproduces the record byte for byte (which is also when
+                # ``update_status`` itself would perform no write) allows
+                # the skip, and the record is then returned as the answer -
+                # the same value the transaction would have returned.
+                durable = bus.read_status()
+                if _merge_lifecycle_status(durable, status) == durable:
+                    return durable
             status = bus.update_status(
                 lambda current: _merge_lifecycle_status(current, status)
             )
