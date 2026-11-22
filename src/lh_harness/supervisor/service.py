@@ -494,6 +494,15 @@ def _ps_query(pid: int, field: str) -> str | None:
         return None
 
 
+def _reconcile_concurrency_from_env() -> int:
+    """Bounded in-flight reconcile cap (default 3, 1..8 via env)."""
+    raw = os.environ.get("LH_HARNESS_RECONCILE_CONCURRENCY", "")
+    try:
+        value = int(raw) if raw else 3
+    except ValueError:
+        value = 3
+    return max(1, min(8, value))
+
 
 def _task_name(task: Any) -> str:
     """First non-empty line of a run's task text, cut to 120 characters."""
@@ -856,6 +865,9 @@ class RunSupervisor:
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._commands: dict[str, list[str]] = {}
         self._lifecycle_lock = threading.RLock()
+        self._reconcile_slots = threading.BoundedSemaphore(
+            _reconcile_concurrency_from_env()
+        )
 
     @contextmanager
     def _supervisor_locked(self):
@@ -1707,6 +1719,19 @@ class RunSupervisor:
                 )
             return status
 
+    def _refresh_bounded(self, run_id: str) -> dict[str, Any]:
+        """One `_refresh`, holding one of the bounded reconcile slots.
+
+        The cap exists for the POST-RESTART WAVE, not for steady state:
+        after a restart no Popen handles exist, so the first full listing
+        reconciles every active run at once.  Without a cap, overlapping
+        pollers multiply the wave (measured 3 pollers -> 96 refreshes,
+        5.0 s wall on 24 rows); with it the excess pollers block on the
+        semaphore and reuse each other's results instead of stacking.
+        """
+        with self._reconcile_slots:
+            return self._refresh(run_id)
+
     def list_run_summaries(self, statuses: set[str] | None = None) -> list[dict[str, Any]]:
         """Enumerate runs cheaply, without per-run deep boundary validation.
 
@@ -1860,7 +1885,7 @@ class RunSupervisor:
                 if status_name in TERMINAL_STATUSES:
                     status = {**durable_status, "status": status_name, "alive": False}
                 else:
-                    status = self._refresh(run_dir.name)
+                    status = self._refresh_bounded(run_dir.name)
                 report = _read_json(logs / "report.json")
                 owner = _read_json(run_dir / "control" / "owner.json")
                 mtime = run_dir.stat().st_mtime
