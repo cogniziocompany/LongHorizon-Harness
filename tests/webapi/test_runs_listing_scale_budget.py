@@ -231,8 +231,13 @@ def _scale_client(root: Path) -> TestClient:
 
 @pytest.fixture()
 def scale_client(scale_root: Path) -> Iterator[tuple[TestClient, Path]]:
-    with _scale_client(scale_root) as client:
-        yield client, scale_root
+    # Deliberately NOT entered as a context manager: entering starts the app
+    # lifespan, which starts the fleet-reporter thread, and that thread issues
+    # its own full runs listings in the background.  Those background walks
+    # would race the request-window counters below and make the "no rounds
+    # walk" assertions flaky.  The repo's other webapi tests construct the
+    # plain client the same way for the same reason.
+    yield _scale_client(scale_root), scale_root
 
 
 class _RoundArtifactReads:
@@ -399,17 +404,19 @@ def test_full_listing_within_budget_and_no_round_artifact_reads(scale_client) ->
             assert "id" in row and "status" in row and "task" in row
 
 
-def test_expired_cache_listing_does_not_rewalk_rounds(
+def test_expired_cache_listing_refreshes_incrementally(
     scale_client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A listing after every time-based cache expires must not re-derive rows.
+    """After every wall-clock cache expires, an unchanged listing is cheap.
 
-    The #179/#193 wall-clock TTLs only hide repeats for a few seconds; the
-    wedge is what happens when they EXPIRE, so the benchmark must exercise
-    the expired path.  Pre-fix, the expired listing re-enumerated the runs
-    root and re-derived every row (including the rounds walk for task text).
-    Post-fix, an expired listing may re-check per-run stamps, but nothing
-    changed, so no row may be re-derived by walking its round directories.
+    The #179/#193 TTLs only hide repeats for a few seconds; the wedge is what
+    happens when they EXPIRE, so the benchmark must exercise the expired
+    path.  Pre-fix, every expired listing re-enumerated the runs root and
+    re-READ every run's ``status.json`` + ``owner.json`` (measured on main:
+    402 record reads for N=200, per request, forever -- the GIL-bound scan
+    the CT111 poller kept pinned).  Post-fix, an expired listing may re-check
+    each run's stamp, but with nothing changed no per-run record may be
+    re-read and no round directory may be walked.
     """
 
     client, _root = scale_client
@@ -422,13 +429,22 @@ def test_expired_cache_listing_does_not_rewalk_rounds(
     monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
 
     walks: list[int] = []
-    original = supervisor_service._saved_task_from_rounds
+    original_walk = supervisor_service._saved_task_from_rounds
 
-    def counting(runs_root, run_id, *, first_line):
+    def counting_walk(runs_root, run_id, *, first_line):
         walks.append(1)
-        return original(runs_root, run_id, first_line=first_line)
+        return original_walk(runs_root, run_id, first_line=first_line)
 
-    monkeypatch.setattr(supervisor_service, "_saved_task_from_rounds", counting)
+    monkeypatch.setattr(supervisor_service, "_saved_task_from_rounds", counting_walk)
+
+    record_reads = {"count": 0}
+    original_read = supervisor_service._read_json_file
+
+    def counting_read(path, **kwargs):
+        record_reads["count"] += 1
+        return original_read(path, **kwargs)
+
+    monkeypatch.setattr(supervisor_service, "_read_json_file", counting_read)
     with _RoundArtifactReads() as reads:
         expired_seconds, body = _timed_get(client, "/api/runs?fields=summary")
         assert len(body["runs"]) == RUN_COUNT
@@ -444,6 +460,12 @@ def test_expired_cache_listing_does_not_rewalk_rounds(
         f"the expired-cache listing walked the round directories of {len(walks)} "
         "runs to re-derive task text; the per-run summary must carry it so no "
         "request pays a rounds walk"
+    )
+    assert record_reads["count"] == 0, (
+        f"the expired-cache listing re-read {record_reads['count']} per-run "
+        f"control records although nothing changed (a fresh scan of N="
+        f"{RUN_COUNT} runs re-reads ~{2 * RUN_COUNT}); the refresh must be "
+        "incremental, keyed on each run's own status stamp"
     )
 
 
