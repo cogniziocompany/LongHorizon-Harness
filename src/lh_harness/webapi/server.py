@@ -1188,7 +1188,7 @@ class StateRegistry:
             return False
         return True
 
-    def state_for(self, run_id: str) -> DashboardState | None:
+    def state_for(self, run_id: str, *, refresh_control_capability: bool = True) -> DashboardState | None:
         if not _safe_run_id(run_id):
             return None
         # An embedded dashboard is intentionally single-run.  Reject foreign
@@ -1230,7 +1230,9 @@ class StateRegistry:
                     # Remember the freshly walked boundary so the next hit
                     # can be validated with a single stat.
                     self._remember_boundary(run_id)
-            return self._refresh_control_capability(run_id, cached)
+            if refresh_control_capability:
+                return self._refresh_control_capability(run_id, cached)
+            return cached
         if self.runs_root is None or not _safe_run_id(run_id):
             return None
         paths = self._run_paths(run_id)
@@ -1245,7 +1247,9 @@ class StateRegistry:
         self._states[run_id] = state
         self._remember_boundary(run_id)
         self._evict_states()
-        return self._refresh_control_capability(run_id, state)
+        if refresh_control_capability:
+            return self._refresh_control_capability(run_id, state)
+        return state
 
     def _remember_boundary(self, run_id: str) -> None:
         """Record the boundary stamp for a freshly walked run."""
@@ -1554,7 +1558,7 @@ def _latest_projection(
     run_id = str(item.get("id") or "")
     if not run_id:
         return None
-    state = registry.state_for(run_id)
+    state = registry.state_for(run_id, refresh_control_capability=False)
     if state is None:
         return None
     status = canonical_lifecycle_status(item.get("status"), default="unknown")
