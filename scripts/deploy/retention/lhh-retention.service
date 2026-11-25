@@ -1,0 +1,10 @@
+[Unit]
+Description=LongHorizon-Harness work-tree retention (easybutt0n-304)
+
+[Service]
+Type=oneshot
+User=root
+Environment=LHH_WORK_ROOT=/home/harness/work
+ExecStart=/usr/bin/python3 /opt/lhh-retention/lhh_retention.py --apply
+Nice=10
+IOSchedulingClass=idle

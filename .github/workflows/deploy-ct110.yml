@@ -362,6 +362,53 @@ jobs:
             exit 1
           fi
 
+      # easybutt0n-304: the retention timer is node-local janitor state, so it
+      # is installed as part of the deploy itself (the same bytes-verified
+      # hops as the wheel and the overseer units: runner --scp--> PVE host
+      # --pct push--> CT110, sha256-checked at both hops by
+      # run_on_ct110.sh), not by a separate ad-hoc push.  Unlike the overseer
+      # units stage this ENABLES the timer: retention has no read-only/acting
+      # duality to stage, and a node without the timer is the state the rule
+      # exists to prevent.  Idempotent: re-running refreshes the installed
+      # files and daemon-reload, and enable --now on an already-enabled timer
+      # is a no-op.
+      - name: Install node retention timer (easybutt0n-304)
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # Stage exactly like the overseer-units job's "Stage unit files"
+          # step (the deploy job's stage/ already holds the wheel).
+          mkdir -p stage/retention
+          cp scripts/deploy/retention/lhh_retention.py      stage/retention/
+          cp scripts/deploy/retention/lhh-retention.service stage/retention/
+          cp scripts/deploy/retention/lhh-retention.timer   stage/retention/
+          # Ship the staged bytes + install + enable inside CT110.  Nothing
+          # here touches the rollback state: this step runs after the deploy
+          # step's own install and only adds node-local files.
+          scripts/deploy/ct110/run_on_ct110.sh retention
+
+      # easybutt0n-304 read-back: prove the timer took (is-enabled == enabled)
+      # and print the dry-run total line to the job log so a deploy record
+      # shows what the first real pass WOULD delete on that node.  The
+      # dry-run script only lists (no --apply), so this reads state and
+      # deletes nothing.
+      - name: Read back retention timer state and dry-run total (easybutt0n-304)
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          state="$(scripts/deploy/ct110/run_on_ct110.sh exec systemctl is-enabled lhh-retention.timer || true)"
+          echo "lhh-retention.timer is-enabled: $state"
+          if [ "$state" != "enabled" ]; then
+            echo "::error::lhh-retention.timer is not enabled after the retention stage (is-enabled: ${state:-unknown})"
+            exit 1
+          fi
+          last="$(scripts/deploy/ct110/run_on_ct110.sh exec /usr/bin/python3 /opt/lhh-retention/lhh_retention.py | tail -n 1)"
+          echo "retention dry-run TOTAL line: $last"
+          case "$last" in
+            "TOTAL would delete"*) ;;
+            *) echo "::error::unexpected dry-run last line (expected 'TOTAL would delete ...'): $last"; exit 1 ;;
+          esac
+
       # Bounded wait, then the commit check.  Run 37162090599 (b6f51f9) called
       # /api/meta ONCE, 1.3 s after the restart, got curl exit 7 (nothing
       # listening yet) and "rolled back".  verify_meta.py polls up to 90 s in
