@@ -43,9 +43,16 @@
 #               wheel's repo checkout on the host).  The units stage NEVER
 #               enables or starts the timer — read-only shadowing and the
 #               acting flip are operator steps (docs/OVERSEER-TICK-CT110.md).
+#   retention — easybutt0n-304: install the work-tree retention timer
+#               (scripts/deploy/retention/): lhh_retention.py into
+#               /opt/lhh-retention/ (0755) and the two lhh-retention units
+#               into /etc/systemd/system/, then daemon-reload and enable
+#               --now lhh-retention.timer.  Unlike the units stage this DOES
+#               enable the timer: retention is a node-local janitor with no
+#               acting/read-only duality to stage (docs/node-retention.md).
 set -euo pipefail
 
-MODE="${1:?usage: ct110_deploy.sh deploy|rollback}"
+MODE="${1:?usage: ct110_deploy.sh deploy|rollback|units|retention}"
 
 # Tuning knobs (overridable via environment for testing).
 DEPLOY_DIR="${LH_DEPLOY_DIR:-/root/lh-deploy}"        # where the runner staged this script + wheel
@@ -315,8 +322,21 @@ case "$MODE" in
     log "CT110_UNITS_STAGE_OK"
     ;;
 
+  retention)
+    log "installing lhh-retention timer (easybutt0n-304)"
+    [[ -f "$DEPLOY_DIR/lhh_retention.py" ]]       || die "staged retention script missing: $DEPLOY_DIR/lhh_retention.py"
+    [[ -f "$DEPLOY_DIR/lhh-retention.service" ]]  || die "staged unit missing: $DEPLOY_DIR/lhh-retention.service"
+    [[ -f "$DEPLOY_DIR/lhh-retention.timer" ]]    || die "staged unit missing: $DEPLOY_DIR/lhh-retention.timer"
+    install -D -m 0755 "$DEPLOY_DIR/lhh_retention.py" /opt/lhh-retention/lhh_retention.py
+    install -D -m 0644 "$DEPLOY_DIR/lhh-retention.service" /etc/systemd/system/lhh-retention.service
+    install -D -m 0644 "$DEPLOY_DIR/lhh-retention.timer" /etc/systemd/system/lhh-retention.timer
+    systemctl daemon-reload
+    systemctl enable --now lhh-retention.timer
+    log "CT110_RETENTION_OK (timer installed and enabled)"
+    ;;
+
   *)
-    echo "usage: ct110_deploy.sh deploy|rollback|units" >&2
+    echo "usage: ct110_deploy.sh deploy|rollback|units|retention" >&2
     exit 1
     ;;
 esac
