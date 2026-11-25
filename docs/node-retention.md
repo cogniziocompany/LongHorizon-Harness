@@ -25,7 +25,7 @@ default) only lists what it *would* do; `--apply` deletes.
    start with `_` or `.scratch` (scratch/parked trees) and top-level loose
    files are kept for 14 days, then deleted.
 
-**Never deleted — flagged instead:**
+**Never deleted:**
 
 - **Queue-named workspaces**: any workspace a queue entry from the last 30
   days names, and the base workspaces (`cognizioware-mcp-tools`,
@@ -38,6 +38,10 @@ default) only lists what it *would* do; `--apply` deletes.
   (`unpushed-commits`) is **never deleted — it is flagged** (`FLAG-KEEP`) so a
   human can decide. The same applies when git itself cannot be read
   (`git-unreadable`).
+
+Only the git-unsafe copies produce `FLAG-KEEP` lines in the output; the
+queue-named and live protections above apply silently, and the pass's total
+line counts them (`protected live runs N, queue-named workspaces N`).
 
 Also never touched, whatever their age: `.lh-harness`, `.git`, `.cache`,
 `.config`, `.ssh`, `.local` and `.npm` at the top of the work root.
