@@ -494,8 +494,12 @@ async def _run_impl(
 
         # Instructions carried over from the end-of-round human gate (queued
         # operator notes and/or an approval's free-form input) are injected into
-        # this round's manager prompt.
-        if gate.carryover_instructions:
+        # this round's manager prompt.  A restored round skips its manager
+        # episode, so there is no prompt to deliver them to: consuming them
+        # here would write ``human_instructions.txt`` and log an injection no
+        # agent ever saw, and the instruction would be lost.  They stay in the
+        # carryover instead and the next live manager round delivers them.
+        if gate.carryover_instructions and "manager_done" not in restored_phases:
             instruction_heading = (
                 "Operator instructions injected through the dashboard (high priority; incorporate them this round):"
                 if config.prompt_language == "en"

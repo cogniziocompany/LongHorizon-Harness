@@ -49,6 +49,8 @@ from typing import Any, Callable, List, Tuple
 
 import pytest
 
+from lh_harness.environment.local import LocalEnvironment
+from lh_harness.manager import run
 from lh_harness.queue import QueueEntry, QueueStore
 from lh_harness.restart_recovery import (
     INTERRUPTED_BY_RESTART,
@@ -63,7 +65,9 @@ from .test_checkpoint_restore_recovery import (
     _EXECUTED,
     _Killed,
     _PLAN,
+    _ScriptedAgent,
     _checkpointed_rounds,
+    _config,
     _ledger_rounds,
     _make_workspace_repo,
     _report,
@@ -743,3 +747,124 @@ async def test_the_auditor_result_is_saved_exactly_once_per_restored_round(
     # CLI rounds take no environment screenshot at all (GUI rounds take one
     # per GUI episode that ran); a leftover second capture is counted here.
     assert screenshots == 0
+
+
+# --------------------------------------------------------------------------
+# Pass criterion 2c: an operator instruction queued while the worker was lost
+# is delivered exactly once, by the next round that actually runs a manager.
+#
+# The round-start claim hands queued instructions to the carryover, and the
+# carryover is consumed by "this round's manager prompt".  On a restored round
+# there is no manager prompt: the plan is the checkpointed one.  Consuming the
+# carryover there would write ``human_instructions.txt`` and log an injection
+# that no agent ever saw, and the instruction would be lost for good.  It must
+# instead stay in the carryover until the next live manager round.
+# --------------------------------------------------------------------------
+
+_INSTRUCTION = "check the config file before anything else"
+
+
+def _injections(role: Path) -> list[dict[str, Any]]:
+    return [item for item in _events(role) if item["event"] == "human_instructions_injected"]
+
+
+async def _run_with_instruction(tmp_path: Path, *, replies: list[Any]):
+    """``_run_manager`` with a queued operator instruction handed to ``run``.
+
+    The instruction is the one the operator typed while the first worker was
+    dying.  The producer the CLI wires in (``gate_state.drain_injections``) is
+    a drain, and the loop polls it at every round start, so the queue hands
+    each instruction out exactly once.
+    """
+    agent = _ScriptedAgent(replies)
+    queue = [[_INSTRUCTION]]
+
+    def _drain() -> list[str]:
+        return queue.pop(0) if queue else []
+
+    report = await run(
+        task="finish the refactor",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=_config(tmp_path),
+        agent=agent,
+        resume=True,
+        pending_instructions=_drain,
+    )
+    return report, agent
+
+
+@pytest.mark.parametrize(
+    ("phase", "lost_replies", "resumed_replies"),
+    [
+        # Lost while producing the EXECUTOR reply: the plan finished, so the
+        # restored round skips its manager and runs executor -> auditor.
+        (
+            "manager_done",
+            [_PLAN, _EXECUTED, _CLEAN_AUDIT, _PLAN, _Killed("manager killed")],
+            [_EXECUTED, _CLEAN_AUDIT, _DONE],
+        ),
+        # Lost while producing the AUDITOR reply: the effect was issued, so the
+        # restored round skips manager AND executor and runs only its auditor.
+        (
+            "executor_done",
+            [_PLAN, _EXECUTED, _CLEAN_AUDIT, _PLAN, _EXECUTED, _Killed("manager killed")],
+            [_CLEAN_AUDIT, _DONE],
+        ),
+    ],
+    ids=["manager_done", "executor_done"],
+)
+@pytest.mark.asyncio
+async def test_an_instruction_queued_across_a_mid_round_loss_is_delivered_exactly_once(
+    tmp_path: Path,
+    phase: str,
+    lost_replies: list[Any],
+    resumed_replies: list[Any],
+) -> None:
+    """The queued instruction reaches the next live manager prompt, once."""
+
+    # ---- First worker: round 1 completes; round 2 is lost in flight. -------
+    await _run_manager(tmp_path, resume=False, replies=lost_replies)
+    assert _mid_round_checkpoint(tmp_path)["phase"] == phase
+    assert _injections(_role_dir(tmp_path)) == [], "nothing was queued on the first worker"
+
+    # ---- Second worker: fresh invocation; the instruction is in its queue. -
+    report, agent = await _run_with_instruction(tmp_path, replies=resumed_replies)
+
+    assert report["status"] == "complete"
+    assert [item["round_index"] for item in _ledger_rounds(tmp_path)] == [1, 2, 3]
+    resumed_events = [
+        item for item in _events(_role_dir(tmp_path)) if item["event"] == "managed_round_resumed"
+    ]
+    assert "manager_done" in resumed_events[0]["skipped_phases"], (
+        "the restored round really skipped its manager episode"
+    )
+
+    # The restored round 2 ran no manager, so it must not have consumed the
+    # instruction: no injection is recorded for it and no file is written.
+    rounds_dir = _role_dir(tmp_path) / "rounds"
+    assert not (rounds_dir / "round_002" / "human_instructions.txt").exists(), (
+        "the restored round has no manager prompt to inject into"
+    )
+
+    # The next live manager round (round 3) delivers it, exactly once.  Only
+    # the role prompts that can act on it are counted: the final-response role
+    # legitimately sees the operator's instruction again as history, so that
+    # its reply can address it.
+    manager_prompts = [p for p in agent.prompts if p.startswith(_MANAGER_PROMPT)]
+    assert len(manager_prompts) == 1, "only round 3 is planned by a live manager"
+    assert _INSTRUCTION in manager_prompts[0], "the instruction reaches the manager prompt"
+    acting_prompts = [
+        p
+        for p in agent.prompts
+        if p.startswith((_MANAGER_PROMPT, _CLI_EXECUTOR_PROMPT, _GUI_EXECUTOR_PROMPT))
+    ]
+    assert sum(_INSTRUCTION in prompt for prompt in acting_prompts) == 1, (
+        "the instruction is injected into exactly one manager or executor prompt"
+    )
+    assert (rounds_dir / "round_003" / "human_instructions.txt").read_text(
+        encoding="utf-8"
+    ) == _INSTRUCTION
+    injections = _injections(_role_dir(tmp_path))
+    assert [(item["round"], item["chars"]) for item in injections] == [(3, len(_INSTRUCTION))], (
+        "exactly one human_instructions_injected event, for the round that delivered it"
+    )
