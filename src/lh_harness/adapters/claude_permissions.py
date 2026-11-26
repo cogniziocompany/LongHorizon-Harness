@@ -56,7 +56,9 @@ AUDITOR_NETWORK_GIT_DENY: tuple[str, ...] = (
 # CLI's READ verbs along with the write ones, so an auditor that wanted to
 # look at a pull request had to shell out to something else.  The auditor's
 # independent reach is now the harness's own read-only verifier
-# (``scripts/auditor_verify_pr.py``), and this deny list is spelled per
+# (``lh_harness/verify_pr.py``, the installed entry that
+# ``auditor_verifier_command`` names by its absolute installed path, with the
+# ``verify-pr`` subcommand), and this deny list is spelled per
 # WRITE so that a read is not blocked by the same rule that blocks a write.
 #
 # The spellings below are the write paths that a `gh` read allowlist would

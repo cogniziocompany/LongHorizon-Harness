@@ -174,7 +174,8 @@ def build_auditor_subprocess_env(
         env.pop(name, None)
 
     # The token goes in under the ONE name the harness's read-only verifier
-    # (``scripts/auditor_verify_pr.py`` / ``ReadOnlyGitHubClient``) reads.
+    # (the installed ``lh_harness/verify_pr.py`` entry, reached by its
+    # absolute installed path, / ``ReadOnlyGitHubClient``) reads.
     # It is deliberately NOT also exposed as ``GH_TOKEN``: the verifier
     # treats ``GH_TOKEN`` as a shared/executor credential and refuses to act
     # when the two are equal, so mirroring it there made every in-auditor PR

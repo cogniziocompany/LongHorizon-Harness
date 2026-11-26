@@ -68,12 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the project virtualenv, and where it did resolve it resolved to the
   *installed* package, which has no `verify-pr` subcommand at all.  A
   verification surface the verifier cannot invoke is not a verification
-  surface.  The auditor's instructions now name
-  `python3 scripts/auditor_verify_pr.py --repo <owner/name> --number <n>
-  [--reviewed-sha <sha>]`, a script that resolves THIS checkout's own `src`
-  tree ahead of anything installed in site-packages, so the auditor verifies
-  against the code in the working tree it is auditing.  Exit code 0 means
-  confirmed; any other exit means NOT confirmed.
+  surface.  The auditor's instructions now name the harness's own installed
+  entry, `<python> <install-location>/lh_harness/verify_pr.py verify-pr
+  --repo <owner/name> --number <n> --reviewed-sha <sha>`, rendered by
+  `auditor_verifier_command` from the absolute path of the package that
+  builds the prompt, so the auditor runs the verifier belonging to THIS
+  harness from any directory (see the reachability fix below).  Exit code 0
+  means confirmed; any other exit means NOT confirmed.
 
   **The blanket `Bash(gh *)` deny is replaced by per-spelling write denies.**
   Denying `gh` wholesale took out the local `gh` CLI's READ verbs along with
@@ -316,9 +317,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored, so a local analysis run cannot commit it.
 
 - The auditor's role instruction now names BOTH halves of the invocation an
-  auditor needs: the command that resolves in the agent environment
-  (`python3 scripts/auditor_verify_pr.py --repo <owner/name> --number <n>
-  --reviewed-sha <sha>`) and the credential variable the verifier reads
+  auditor needs: the command that resolves in the agent environment (the
+  installed `lh_harness/verify_pr.py` entry, rendered by
+  `auditor_verifier_command` as the harness's own interpreter plus the
+  module's absolute installed path and the `verify-pr` subcommand) and the
+  credential variable the verifier reads
   (`LH_HARNESS_AUDITOR_GITHUB_TOKEN`).  The instruction previously said
   "the auditor's dedicated read-only token" without saying which variable
   that was, so an auditor could not set it — and an auditor that guessed the
@@ -364,3 +367,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no-op. Covered by `tests/webapi/test_pg_migrations.py` (fresh apply +
   double-apply) and documented in `docs/queue.md` (Postgres backend and
   migration order).
+- The auditor now reaches the verifier by its installed path (#218).  The
+  role instructions named `python3 scripts/auditor_verify_pr.py`, a path
+  relative to the harness checkout, but the auditor's shell starts in the
+  TASK workspace, where no `scripts/` directory exists -- and on a wheel
+  install it exists nowhere on the host at all, because the wheel ships only
+  `src/lh_harness`.  An auditor told to run it reported the verifier as
+  absent and gated the run without verifying anything.  The command the
+  instructions name is now rendered by `auditor_verifier_command` at
+  prompt-build time: the harness's own interpreter (`sys.executable`) plus
+  the ABSOLUTE installed path of `lh_harness/verify_pr.py` (its own location
+  IS the installed location of the harness that shipped it, in a checkout and
+  in a wheel install alike) followed by the `verify-pr` subcommand.  The
+  entry module pins its own package root ahead of anything already imported,
+  so the verifier that runs belongs to the harness that rendered the command,
+  and nothing under the task workspace or on the auditor's cwd can shadow it.
+  The command carries no credential; the verifier reads the auditor's own
+  token from `LH_HARNESS_AUDITOR_GITHUB_TOKEN` at run time.  Covered by
+  `tests/test_auditor_verifier_installed_path.py` and
+  `tests/test_auditor_verification_reach.py`.

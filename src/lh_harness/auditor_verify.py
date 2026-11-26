@@ -1024,8 +1024,9 @@ class VerificationResult:
 # costs the full cap.
 #
 # The count lives at a STRUCTURED boundary, never in prose: each invocation
-# of the read-only verifier (``lh-harness verify-pr`` /
-# ``scripts/auditor_verify_pr.py``) is exactly one verification step, and the
+# of the read-only verifier (the installed ``lh_harness/verify_pr.py`` entry
+# named by :func:`auditor_verifier_command`, with the ``verify-pr``
+# subcommand) is exactly one verification step, and the
 # counter is keyed to the episode identifier the harness stamps into the
 # auditor's child environment (:data:`AUDITOR_EPISODE_ID_ENV`).  Nothing here
 # matches keywords in the auditor's natural-language output.
