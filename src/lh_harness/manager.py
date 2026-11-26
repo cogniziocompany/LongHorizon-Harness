@@ -510,143 +510,168 @@ async def _run_impl(
             )
             gate.carryover_instructions = ""
 
-        _write_local(round_dir / "manager_input.txt", manager_prompt)
-        await _write_remote_round_text(env, config, round_index, "manager_input.txt", manager_prompt)
-        _append_event(
-            events_path,
-            "manager_round_start",
-            {"round": round_index, "prompt_chars": len(manager_prompt)},
-        )
-        emit("role_start", round=round_index, role="manager")
-
-        manager_result = await _run_role_episode(
-            manager_agent,
-            manager_prompt,
-            env,
-            manager_budget,
-            live_trajectory_path=str(round_dir / "manager_raw_trajectory.jsonl"),
-        )
-        _save_role_result(
-            round_dir,
-            "manager",
-            manager_result,
-            episode_root=log_dir / "manager_episodes",
-        )
-        if manager_result.status == "cancelled":
-            gate.abort_reason = "user_cancelled"
-            _append_event(
-                events_path,
-                "role_harness_cancelled",
-                {
-                    "round": round_index,
-                    "phase": "manager",
-                    **_episode_event_fields(manager_result, event_status="cancelled"),
-                },
-            )
-            break
-        manager_failure = classify_agent_runtime_failure(manager_result)
-        if manager_failure is not None:
-            recoverable_timeout = manager_failure.kind == "timeout"
-            plan_text = (
-                ("Next: invalid\n\nReason:\n" if recoverable_timeout else "Next: blocked\n\nReason:\n")
-                + manager_failure.user_message
-                if config.prompt_language == "en"
-                else ("下一步: 无效\n\n原因:\n" if recoverable_timeout else "下一步: 阻塞\n\n阻塞原因:\n")
-                + manager_failure.user_message
-            )
-            record = ManagedRound(
-                round_index=round_index,
-                next_step=MANAGER_NEXT_INVALID if recoverable_timeout else MANAGER_NEXT_BLOCKED,
-                plan_text=plan_text,
-                harness_feedback=manager_failure.user_message,
-                task_state=current_task_state,
-                task_contract=current_task_contract,
-                manager_status=_failed_episode_status(
-                    manager_result, manager_failure.user_message
-                ),
-                auditor_status={"invalid_plan": True} if recoverable_timeout else {},
-            )
+        if "manager_done" in restored_phases:
+            # The lost worker already planned this round and checkpointed the
+            # plan.  Re-running the manager here would REPLAN the round -- a
+            # second manager episode whose new plan replaces the one the lost
+            # worker's executor (or auditor) already acted on -- so the
+            # checkpointed plan, route and task state are reused instead, and
+            # the round continues at the first phase that did not finish.
+            restored = _managed_round_from_dict(restored_payload or {})
+            manager_result = _restored_manager_result(restored_payload or {})
+            plan_text = restored.plan_text
+            next_step = restored.next_step
+            current_task_state = restored.task_state
+            current_task_contract = restored.task_contract
+            related_report_refs = list(restored.related_report_refs)
+            last_plan = plan_text
             _write_local(round_dir / "manager_plan.txt", plan_text)
-            _write_local(round_dir / "harness_feedback.txt", manager_failure.user_message)
-            rounds.append(record)
-            await _record_round(env, config, role_dir, events_path, record)
+            _write_local(round_dir / "task_state.txt", current_task_state)
+            _write_local(round_dir / "task_contract.txt", current_task_contract)
+            _save_role_result(
+                round_dir,
+                "manager",
+                manager_result,
+                episode_root=log_dir / "manager_episodes",
+            )
+        else:
+            _write_local(round_dir / "manager_input.txt", manager_prompt)
+            await _write_remote_round_text(env, config, round_index, "manager_input.txt", manager_prompt)
             _append_event(
                 events_path,
-                "agent_runtime_failed",
+                "manager_round_start",
+                {"round": round_index, "prompt_chars": len(manager_prompt)},
+            )
+            emit("role_start", round=round_index, role="manager")
+
+            manager_result = await _run_role_episode(
+                manager_agent,
+                manager_prompt,
+                env,
+                manager_budget,
+                live_trajectory_path=str(round_dir / "manager_raw_trajectory.jsonl"),
+            )
+            _save_role_result(
+                round_dir,
+                "manager",
+                manager_result,
+                episode_root=log_dir / "manager_episodes",
+            )
+            if manager_result.status == "cancelled":
+                gate.abort_reason = "user_cancelled"
+                _append_event(
+                    events_path,
+                    "role_harness_cancelled",
+                    {
+                        "round": round_index,
+                        "phase": "manager",
+                        **_episode_event_fields(manager_result, event_status="cancelled"),
+                    },
+                )
+                break
+            manager_failure = classify_agent_runtime_failure(manager_result)
+            if manager_failure is not None:
+                recoverable_timeout = manager_failure.kind == "timeout"
+                plan_text = (
+                    ("Next: invalid\n\nReason:\n" if recoverable_timeout else "Next: blocked\n\nReason:\n")
+                    + manager_failure.user_message
+                    if config.prompt_language == "en"
+                    else ("下一步: 无效\n\n原因:\n" if recoverable_timeout else "下一步: 阻塞\n\n阻塞原因:\n")
+                    + manager_failure.user_message
+                )
+                record = ManagedRound(
+                    round_index=round_index,
+                    next_step=MANAGER_NEXT_INVALID if recoverable_timeout else MANAGER_NEXT_BLOCKED,
+                    plan_text=plan_text,
+                    harness_feedback=manager_failure.user_message,
+                    task_state=current_task_state,
+                    task_contract=current_task_contract,
+                    manager_status=_failed_episode_status(
+                        manager_result, manager_failure.user_message
+                    ),
+                    auditor_status={"invalid_plan": True} if recoverable_timeout else {},
+                )
+                _write_local(round_dir / "manager_plan.txt", plan_text)
+                _write_local(round_dir / "harness_feedback.txt", manager_failure.user_message)
+                rounds.append(record)
+                await _record_round(env, config, role_dir, events_path, record)
+                _append_event(
+                    events_path,
+                    "agent_runtime_failed",
+                    {
+                        "round": round_index,
+                        "phase": "manager",
+                        "kind": manager_failure.kind,
+                        "message": manager_failure.message,
+                        **_episode_event_fields(
+                            manager_result,
+                            event_status="failed",
+                            error_message=manager_failure.user_message,
+                        ),
+                    },
+                )
+                emit(
+                    "role_done",
+                    round=round_index,
+                    role="manager",
+                    status="failed",
+                    duration_ms=manager_result.duration_ms,
+                    error=manager_failure.user_message,
+                )
+                if recoverable_timeout:
+                    if await _human_gate(gate, "progress", round_index, current_task_state):
+                        break
+                    continue
+                gate.abort_reason = manager_failure.abort_reason
+                gate.failure_reason = manager_failure.user_message
+                break
+            plan_text = extract_role_manager_plan_text(_visible_output(manager_result)).strip()
+            if not plan_text:
+                plan_text = (
+                    "Next: blocked\n\nReason:\nThe manager produced no readable natural-language output."
+                    if config.prompt_language == "en"
+                    else "下一步: 阻塞\n\n阻塞原因:\n任务管理器没有产生可读取的自然语言输出。"
+                )
+            current_task_state = extract_role_task_state(plan_text, fallback=current_task_state)
+            current_task_contract = extract_role_task_contract(plan_text, fallback=current_task_contract)
+            related_report_refs = extract_related_report_refs(plan_text)
+            _write_local(round_dir / "manager_plan.txt", plan_text)
+            _write_local(round_dir / "task_state.txt", current_task_state)
+            _write_local(round_dir / "task_contract.txt", current_task_contract)
+            await _write_remote_round_text(env, config, round_index, "manager_plan.txt", plan_text)
+            await _write_remote_round_text(env, config, round_index, "task_state.txt", current_task_state)
+            await _write_remote_round_text(env, config, round_index, "task_contract.txt", current_task_contract)
+
+            next_step = _effective_next_step(parse_role_manager_next_step(plan_text))
+            last_plan = plan_text
+            _checkpoint_phase(
+                phase="manager_done",
+                next_step=next_step,
+                plan_text=plan_text,
+                executor_output=executor_output,
+                related_report_refs=related_report_refs,
+            )
+            _append_event(
+                events_path,
+                "manager_round_done",
                 {
                     "round": round_index,
-                    "phase": "manager",
-                    "kind": manager_failure.kind,
-                    "message": manager_failure.message,
-                    **_episode_event_fields(
-                        manager_result,
-                        event_status="failed",
-                        error_message=manager_failure.user_message,
-                    ),
+                    "next_step": next_step,
+                    "plan_chars": len(plan_text),
+                    "task_state_chars": len(current_task_state),
+                    "task_contract_chars": len(current_task_contract),
+                    "related_report_refs": related_report_refs,
+                    **_episode_event_fields(manager_result, event_status="completed"),
                 },
             )
             emit(
                 "role_done",
                 round=round_index,
                 role="manager",
-                status="failed",
+                status=manager_result.status,
                 duration_ms=manager_result.duration_ms,
-                error=manager_failure.user_message,
+                next_step=next_step,
             )
-            if recoverable_timeout:
-                if await _human_gate(gate, "progress", round_index, current_task_state):
-                    break
-                continue
-            gate.abort_reason = manager_failure.abort_reason
-            gate.failure_reason = manager_failure.user_message
-            break
-        plan_text = extract_role_manager_plan_text(_visible_output(manager_result)).strip()
-        if not plan_text:
-            plan_text = (
-                "Next: blocked\n\nReason:\nThe manager produced no readable natural-language output."
-                if config.prompt_language == "en"
-                else "下一步: 阻塞\n\n阻塞原因:\n任务管理器没有产生可读取的自然语言输出。"
-            )
-        current_task_state = extract_role_task_state(plan_text, fallback=current_task_state)
-        current_task_contract = extract_role_task_contract(plan_text, fallback=current_task_contract)
-        related_report_refs = extract_related_report_refs(plan_text)
-        _write_local(round_dir / "manager_plan.txt", plan_text)
-        _write_local(round_dir / "task_state.txt", current_task_state)
-        _write_local(round_dir / "task_contract.txt", current_task_contract)
-        await _write_remote_round_text(env, config, round_index, "manager_plan.txt", plan_text)
-        await _write_remote_round_text(env, config, round_index, "task_state.txt", current_task_state)
-        await _write_remote_round_text(env, config, round_index, "task_contract.txt", current_task_contract)
-
-        next_step = _effective_next_step(parse_role_manager_next_step(plan_text))
-        last_plan = plan_text
-        _checkpoint_phase(
-            phase="manager_done",
-            next_step=next_step,
-            plan_text=plan_text,
-            executor_output=executor_output,
-            related_report_refs=related_report_refs,
-        )
-        _append_event(
-            events_path,
-            "manager_round_done",
-            {
-                "round": round_index,
-                "next_step": next_step,
-                "plan_chars": len(plan_text),
-                "task_state_chars": len(current_task_state),
-                "task_contract_chars": len(current_task_contract),
-                "related_report_refs": related_report_refs,
-                **_episode_event_fields(manager_result, event_status="completed"),
-            },
-        )
-        emit(
-            "role_done",
-            round=round_index,
-            role="manager",
-            status=manager_result.status,
-            duration_ms=manager_result.duration_ms,
-            next_step=next_step,
-        )
 
         if next_step == MANAGER_NEXT_DONE:
             if _latest_auditor_is_clean_complete(rounds, language=config.prompt_language):
@@ -984,18 +1009,6 @@ async def _run_impl(
                 episode_root=auditor_episode_root,
                 final_screenshot=auditor_final_screenshot,
             )
-        auditor_final_screenshot = (
-            await _capture_environment_screenshot(env)
-            if next_step == MANAGER_NEXT_GUI
-            else None
-        )
-        _save_role_result(
-            round_dir,
-            "auditor",
-            auditor_result,
-            episode_root=auditor_episode_root,
-            final_screenshot=auditor_final_screenshot,
-        )
         if auditor_result.status == "cancelled":
             record = ManagedRound(
                 round_index=round_index,
@@ -2715,6 +2728,21 @@ def _restored_round_outputs(
         _write_local(round_dir / "executor_output.txt", executor_output)
     if auditor_report:
         _write_local(round_dir / "auditor_report.txt", auditor_report)
+
+
+def _restored_manager_result(payload: dict[str, Any]) -> EpisodeResult:
+    """The manager episode a restored round carries instead of re-planning.
+
+    Re-running it would replace the checkpointed plan the lost worker's
+    executor (or auditor) already acted on, so the recorded plan stands in for
+    the episode.
+    """
+
+    return EpisodeResult(
+        status="done",
+        actions_log=str(payload.get("plan_text") or ""),
+        metadata={"restored_from_mid_round_checkpoint": True},
+    )
 
 
 def _restored_executor_result(payload: dict[str, Any]) -> EpisodeResult:
