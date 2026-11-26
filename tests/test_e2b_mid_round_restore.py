@@ -291,10 +291,13 @@ async def test_the_completed_round_restore_on_a_second_worker_keeps_queue_and_ru
     assert on_disk_successor["interrupted_run"] == run_id
 
     # ---- Second worker: fresh invocation, no shared in-memory state. ------
+    # The lost worker had planned round 2 and run its executor already, so the
+    # resumed round 2 skips both and continues at its auditor; round 3's
+    # manager then claims completion.
     report2, agent2 = await _run_manager(
         tmp_path,
         resume=True,
-        replies=[_PLAN, _EXECUTED, _CLEAN_AUDIT, _DONE],
+        replies=[_CLEAN_AUDIT, _DONE],
     )
 
     assert report2["status"] == "complete"
@@ -404,17 +407,22 @@ async def test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_w
     )
 
     # ---- Second worker: fresh invocation, no shared in-memory state. ------
-    # The restored round 2 does NOT re-run its executor, so the scripted agent
-    # never receives a reply for that phase: the list is manager, auditor,
-    # manager.  Leaving the executor's ``_EXECUTED`` in the list would feed it to
-    # the auditor, and ``_ScriptedAgent`` counts every ``_EXECUTED`` reply as an
-    # effect regardless of role, which would inflate the count with an effect
-    # that never ran.
-    resumed, _agent2 = await _run_manager(
+    # The restored round 2 does NOT re-run its manager or executor, so the
+    # scripted agent never receives a reply for either phase: the list is
+    # auditor, manager.  Leaving the executor's ``_EXECUTED`` in the list would
+    # feed it to the auditor, and ``_ScriptedAgent`` counts every ``_EXECUTED``
+    # reply as an effect regardless of role, which would inflate the count with
+    # an effect that never ran.
+    resumed, agent2 = await _run_manager(
         tmp_path,
         resume=True,
-        replies=[_PLAN, _CLEAN_AUDIT, _DONE],
+        replies=[_CLEAN_AUDIT, _DONE],
         on_execute=_on_execute,
+    )
+    # The resumed round's only manager episode belongs to round 3: the restored
+    # round 2 was planned by the lost worker and is not planned again.
+    assert sum("LongHorizon-Harness manager agent" in prompt for prompt in agent2.prompts) == 1, (
+        "the restored round must not run a second manager episode"
     )
 
     # The interrupted round was resumed, not replayed: across BOTH workers
@@ -444,3 +452,294 @@ async def test_a_mid_round_checkpoint_restores_the_in_flight_round_on_a_second_w
     resume_event = next(item for item in events if item["event"] == "role_harness_resumed")
     assert resume_event["restored_rounds"] == 1
     assert resume_event["resume_from_round"] == 1
+
+
+# --------------------------------------------------------------------------
+# Pass criterion 2b: the restored round skips EVERY phase the checkpoint
+# proves finished, starting with the manager's own plan.
+#
+# The phases are named by the reply the lost worker was producing when it
+# died, because the scripted agent raises the ``_Killed`` stand-in in place of
+# that reply -- so the phase that was in progress never finishes, and the
+# checkpoint names the phase before it:
+#
+#   lost while producing the EXECUTOR reply  -> checkpoint ``manager_done``
+#   lost while producing the AUDITOR reply   -> checkpoint ``executor_done``
+# --------------------------------------------------------------------------
+
+_MANAGER_PROMPT = "You are the LongHorizon-Harness manager agent"
+_CLI_EXECUTOR_PROMPT = "You are the LongHorizon-Harness CLI executor"
+_GUI_EXECUTOR_PROMPT = "You are the LongHorizon-Harness GUI executor"
+_CLI_AUDITOR_PROMPT = "You are the read-only LongHorizon-Harness CLI auditor"
+_GUI_AUDITOR_PROMPT = "You are the read-only LongHorizon-Harness GUI auditor"
+
+# A plan that routes the next subtask to the GUI executor: the restore must
+# carry this route through, not assume every restored plan is ``cli``.
+_GUI_PLAN = "Next: gui\n\nCurrent Task State:\nstill working\n\nPlan:\nopen the dialog"
+
+
+def _mid_round_checkpoint(tmp_path: Path, round_index: int = 2) -> dict[str, Any]:
+    payload = json.loads(
+        (_role_dir(tmp_path) / "rounds" / f"round_{round_index:03d}" / "checkpoint.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload.get("checkpoint_kind") == "managed_round_mid_round", (
+        "the in-flight round's checkpoint is the mid-round kind"
+    )
+    return payload
+
+
+def _ledger_round(tmp_path: Path, round_index: int) -> dict[str, Any]:
+    matches = [item for item in _ledger_rounds(tmp_path) if item["round_index"] == round_index]
+    assert len(matches) == 1, f"round {round_index} must have exactly one ledger record"
+    return matches[0]
+
+
+def _count(prompts: list[str], header: str) -> int:
+    return sum(prompt.startswith(header) for prompt in prompts)
+
+
+@pytest.mark.asyncio
+async def test_a_resume_at_manager_done_reuses_the_checkpointed_plan_without_replanning(
+    tmp_path: Path,
+) -> None:
+    """Resuming at ``manager_done``: the manager is NOT called again.
+
+    The lost worker planned round 2 (``Next: cli``) and died while its executor
+    was producing the reply, so the checkpoint names ``manager_done``.  The
+    resumed worker must continue with the checkpointed plan and route -- the
+    executor and auditor act on THAT plan -- and the round record must say
+    ``cli`` with the checkpointed plan text, never a re-planned route.
+    """
+
+    # Round 1 completes; round 2's manager plans, then the worker is lost
+    # while the executor reply is being produced.
+    await _run_manager(
+        tmp_path,
+        resume=False,
+        replies=[_PLAN, _EXECUTED, _CLEAN_AUDIT, _PLAN, _Killed("manager killed")],
+    )
+    checkpoint = _mid_round_checkpoint(tmp_path)
+    assert checkpoint["phase"] == "manager_done", "the plan finished; the executor did not"
+    assert checkpoint["next_step"] == "cli"
+    assert checkpoint["plan_text"] == _PLAN
+
+    # The resumed round 2 runs executor -> auditor on the checkpointed plan;
+    # round 3's manager then claims completion.
+    report, agent = await _run_manager(
+        tmp_path,
+        resume=True,
+        replies=[_EXECUTED, _CLEAN_AUDIT, _DONE],
+    )
+
+    assert report["status"] == "complete"
+    assert report["completion_satisfied"] is True
+    # No second manager episode for the restored round: the only manager
+    # prompt the resumed worker sent belongs to round 3.
+    assert _count(agent.prompts, _MANAGER_PROMPT) == 1, (
+        "the restored round must not run a manager episode; only the round "
+        "after it is planned"
+    )
+    assert _count(agent.prompts, _CLI_EXECUTOR_PROMPT) == 1, (
+        "the restored round's executor runs exactly once, on the checkpointed cli route"
+    )
+    assert _count(agent.prompts, _GUI_EXECUTOR_PROMPT) == 0
+    # The executor and auditor saw the checkpointed plan, not a new one.
+    executor_prompt = next(p for p in agent.prompts if p.startswith(_CLI_EXECUTOR_PROMPT))
+    assert _PLAN in executor_prompt, "the executor acts on the checkpointed plan text"
+
+    # The round record reports truthfully: the route and plan are the ones
+    # the lost worker checkpointed.
+    record = _ledger_round(tmp_path, 2)
+    assert record["next_step"] == "cli"
+    assert record["plan_text"] == _PLAN
+    assert record["executor_output"] == _EXECUTED
+    assert record["auditor_report"]
+    # The resumed worker's own event names what it really skipped.
+    resumed_events = [
+        item for item in _events(_role_dir(tmp_path)) if item["event"] == "managed_round_resumed"
+    ]
+    assert [item["skipped_phases"] for item in resumed_events] == [["manager_done", "round_start"]]
+
+
+@pytest.mark.asyncio
+async def test_a_resume_at_executor_done_skips_the_manager_and_executor_and_audits_once(
+    tmp_path: Path,
+) -> None:
+    """Resuming at ``executor_done``: manager and executor are NOT called.
+
+    The lost worker planned round 2 and its executor already issued the
+    round's effect; the worker is lost while the auditor reply is produced, so
+    the checkpoint names ``executor_done``.  The resumed worker must continue
+    at the auditor -- the effect is never issued a second time -- and the
+    auditor runs exactly once for the restored round.
+    """
+
+    effects: list[int] = []
+
+    def _on_execute(call_number: int) -> None:
+        effects.append(call_number)
+
+    # Round 1 completes; round 2's manager plans, its executor runs, and the
+    # worker is lost while the auditor reply is being produced.
+    await _run_manager(
+        tmp_path,
+        resume=False,
+        replies=[_PLAN, _EXECUTED, _CLEAN_AUDIT, _PLAN, _EXECUTED, _Killed("manager killed")],
+        on_execute=_on_execute,
+    )
+    checkpoint = _mid_round_checkpoint(tmp_path)
+    assert checkpoint["phase"] == "executor_done", "the effect was issued before the loss"
+    assert checkpoint["executor_output"] == _EXECUTED
+    assert len(effects) == 2, "round 1's effect and the interrupted round 2's effect"
+
+    # The resumed round 2 runs only its auditor; round 3's manager then
+    # claims completion.
+    report, agent = await _run_manager(
+        tmp_path,
+        resume=True,
+        replies=[_CLEAN_AUDIT, _DONE],
+        on_execute=_on_execute,
+    )
+
+    assert report["status"] == "complete"
+    assert report["completion_satisfied"] is True
+    assert _count(agent.prompts, _MANAGER_PROMPT) == 1, (
+        "the restored round must not run a manager episode; only the round after it is planned"
+    )
+    assert _count(agent.prompts, _CLI_EXECUTOR_PROMPT) == 0, (
+        "the restored round's executor must not run: its effect was already issued"
+    )
+    assert _count(agent.prompts, _GUI_EXECUTOR_PROMPT) == 0
+    assert _count(agent.prompts, _CLI_AUDITOR_PROMPT) == 1, (
+        "the restored round's auditor runs exactly once"
+    )
+    assert len(effects) == 2, (
+        "the interrupted round's effect must not run again on the second worker"
+    )
+    # The auditor audited the checkpointed plan and the checkpointed executor
+    # output, not a re-planned round.
+    auditor_prompt = agent.prompts[0]
+    assert auditor_prompt.startswith(_CLI_AUDITOR_PROMPT)
+    assert _EXECUTED in auditor_prompt
+
+    record = _ledger_round(tmp_path, 2)
+    assert record["next_step"] == "cli"
+    assert record["plan_text"] == _PLAN
+    assert record["executor_output"] == _EXECUTED
+    assert record["auditor_report"]
+    resumed_events = [
+        item for item in _events(_role_dir(tmp_path)) if item["event"] == "managed_round_resumed"
+    ]
+    assert [item["skipped_phases"] for item in resumed_events] == [
+        ["executor_done", "manager_done", "round_start"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_checkpointed_gui_plan_is_restored_as_a_gui_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checkpointed ``Next: gui`` plan is restored as a GUI round.
+
+    Every scripted plan above routes to ``cli``; this is the blind spot.  The
+    route is the lost worker's decision, recorded in the checkpoint, and the
+    resumed worker must carry it through: the restored round binds the GUI
+    executor and GUI auditor and records ``next_step: gui``.
+    """
+
+    # The GUI route must not be suppressed by the environment's opt-out.
+    monkeypatch.delenv("LH_HARNESS_DISABLE_GUI_ROUTE", raising=False)
+
+    await _run_manager(
+        tmp_path,
+        resume=False,
+        replies=[_PLAN, _EXECUTED, _CLEAN_AUDIT, _GUI_PLAN, _Killed("manager killed")],
+    )
+    checkpoint = _mid_round_checkpoint(tmp_path)
+    assert checkpoint["phase"] == "manager_done"
+    assert checkpoint["next_step"] == "gui", "the lost worker's plan routes to the GUI executor"
+
+    report, agent = await _run_manager(
+        tmp_path,
+        resume=True,
+        replies=[_EXECUTED, _CLEAN_AUDIT, _DONE],
+    )
+
+    assert report["status"] == "complete"
+    assert _count(agent.prompts, _MANAGER_PROMPT) == 1, "the restored round is not re-planned"
+    assert _count(agent.prompts, _GUI_EXECUTOR_PROMPT) == 1, (
+        "the restored round runs the GUI executor the checkpointed plan asked for"
+    )
+    assert _count(agent.prompts, _GUI_AUDITOR_PROMPT) == 1
+    assert _count(agent.prompts, _CLI_EXECUTOR_PROMPT) == 0
+    assert _count(agent.prompts, _CLI_AUDITOR_PROMPT) == 0
+    gui_executor_prompt = next(p for p in agent.prompts if p.startswith(_GUI_EXECUTOR_PROMPT))
+    assert _GUI_PLAN in gui_executor_prompt, "the GUI executor acts on the checkpointed plan"
+
+    record = _ledger_round(tmp_path, 2)
+    assert record["next_step"] == "gui"
+    assert record["plan_text"] == _GUI_PLAN
+
+
+@pytest.mark.asyncio
+async def test_the_auditor_result_is_saved_exactly_once_per_restored_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each round's auditor result is saved exactly once, resumed or not.
+
+    The auditor's saved result (raw trajectory plus the final screenshot its
+    episode produced) is one artifact per round.  Saving it twice rewrites the
+    round's trajectory a second time and -- for a GUI round -- takes a second
+    screenshot after the auditor has finished, so the saved ``final`` screenshot
+    is not the one the auditor ended on.  The save is counted at the production
+    writer, for every round across both workers.
+    """
+
+    import lh_harness.manager as manager_module
+
+    real_save = manager_module._save_role_result
+    auditor_saves: dict[str, int] = {}
+    screenshots = 0
+    real_capture = manager_module._capture_environment_screenshot
+
+    def _counting_save(round_dir, role_name, result, **kwargs):
+        if role_name == "auditor":
+            auditor_saves[round_dir.name] = auditor_saves.get(round_dir.name, 0) + 1
+        return real_save(round_dir, role_name, result, **kwargs)
+
+    async def _counting_capture(env):
+        nonlocal screenshots
+        screenshots += 1
+        return await real_capture(env)
+
+    monkeypatch.setattr(manager_module, "_save_role_result", _counting_save)
+    monkeypatch.setattr(manager_module, "_capture_environment_screenshot", _counting_capture)
+
+    # Both kinds of round are covered: round 1 is a fresh round (its auditor
+    # runs on the first worker), round 2 is lost while its auditor runs and is
+    # restored on the second worker (its auditor runs there), round 3 is a
+    # fresh round on the second worker.
+    await _run_manager(
+        tmp_path,
+        resume=False,
+        replies=[_PLAN, _EXECUTED, _CLEAN_AUDIT, _PLAN, _EXECUTED, _Killed("manager killed")],
+    )
+    assert _mid_round_checkpoint(tmp_path)["phase"] == "executor_done"
+    report, _agent = await _run_manager(
+        tmp_path,
+        resume=True,
+        replies=[_CLEAN_AUDIT, _DONE],
+    )
+    assert report["status"] == "complete"
+    assert [item["round_index"] for item in _ledger_rounds(tmp_path)] == [1, 2, 3]
+
+    assert auditor_saves == {"round_001": 1, "round_002": 1}, (
+        f"each round's auditor result must be saved exactly once, got {auditor_saves}"
+    )
+    # CLI rounds take no environment screenshot at all (GUI rounds take one
+    # per GUI episode that ran); a leftover second capture is counted here.
+    assert screenshots == 0
