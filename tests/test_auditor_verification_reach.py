@@ -41,6 +41,7 @@ from lh_harness.adapters.claude_permissions import (
     _AUDITOR_ROLES,
     policy_for_role,
 )
+from lh_harness.auditor_verify import auditor_verifier_command
 from lh_harness.prompt_texts import CLI_AUDITOR_INSTRUCTIONS
 
 try:  # pragma: no cover - the RED state simply does not have it yet
@@ -69,18 +70,25 @@ def test_the_auditor_verifier_script_exists() -> None:
 
 
 def test_the_role_instruction_names_a_resolvable_invocation() -> None:
-    """The auditor's instructions name the script that actually exists.
+    """The auditor's instructions name the command that resolves from its cwd.
 
-    The instruction used to tell the auditor to run ``lh-harness
-    verify-pr``, a form that does not resolve here.  What is asserted is
-    that the command form the auditor is told to RUN is the resolving one.
+    The instruction has now named two forms that did NOT resolve for the
+    auditor.  The first, ``lh-harness verify-pr``, is not on the auditor's
+    PATH.  The second, ``python3 scripts/auditor_verify_pr.py``, is relative
+    to the current directory -- and the auditor's shell starts in the TASK
+    workspace, where there is no ``scripts/`` directory, so the auditor
+    reported the verifier as absent.  What is asserted is that the command
+    the auditor is told to RUN is the exact absolute one the harness renders
+    from its own interpreter and installed package.
     """
 
     instructions = CLI_AUDITOR_INSTRUCTIONS["en"]
 
-    assert "scripts/auditor_verify_pr.py" in instructions
-    # The instruction must present the script as the command to run.
-    assert re.search(r"run `python3 scripts/auditor_verify_pr\.py", instructions)
+    assert auditor_verifier_command() in instructions
+    # The instruction must present that command as the one to run.
+    assert re.search(r"Run exactly this command: `" + re.escape(auditor_verifier_command()), instructions)
+    # ... and must no longer instruct the workspace-relative script form.
+    assert not re.search(r"run `python3 scripts/auditor_verify_pr\.py", instructions)
 
 
 def test_the_chinese_role_instruction_names_the_same_invocation() -> None:
@@ -88,8 +96,9 @@ def test_the_chinese_role_instruction_names_the_same_invocation() -> None:
 
     instructions = CLI_AUDITOR_INSTRUCTIONS["zh"]
 
-    assert "scripts/auditor_verify_pr.py" in instructions
-    assert "python3 scripts/auditor_verify_pr.py" in instructions
+    assert auditor_verifier_command() in instructions
+    assert f"命令原文如下：`{auditor_verifier_command()}`" in instructions
+    assert not re.search(r"运行 harness 自带的只读校验器：`python3 scripts/auditor_verify_pr\.py", instructions)
 
 
 def test_the_role_instruction_names_the_auditor_token_variable() -> None:

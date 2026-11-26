@@ -67,6 +67,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -74,6 +76,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
+    "auditor_verifier_command",
     "AUDITOR_EPISODE_ID_ENV",
     "AUDITOR_GITHUB_TOKEN_ENV",
     "AUDITOR_GITHUB_SCOPE_ENV",
@@ -125,6 +128,51 @@ SHARED_CREDENTIAL_ENV_VARS: tuple[str, ...] = (
     "LH_HARNESS_FLEET_GITHUB_TOKEN",
     "LH_HARNESS_FLEET_TOKEN",
 )
+
+
+def auditor_verifier_command() -> str:
+    """The exact, absolute command the auditor runs to verify a pull request.
+
+    The auditor's shell starts in the TASK workspace, so a command that is
+    relative to the current directory resolves inside that workspace -- where
+    the harness's ``scripts/auditor_verify_pr.py`` does not exist, and (on a
+    wheel install) exists nowhere on the host at all.  An auditor told to run
+    such a command reports the verifier as absent and gates the run without
+    ever verifying anything.
+
+    So the command is built here, at prompt-build time, from the harness that
+    is building the prompt:
+
+    *   the interpreter is :data:`sys.executable` -- the very Python running
+        this harness, by absolute path.  The auditor's child environment
+        carries neither ``PYTHONPATH`` nor ``VIRTUAL_ENV``, so neither a bare
+        ``python3`` nor a console-script name is guaranteed to resolve to the
+        interpreter that has ``lh_harness`` installed;
+    *   the verifier is ``lh_harness/verify_pr.py``, named by the ABSOLUTE
+        path of this package's own install location (``src/`` in a checkout,
+        ``site-packages/`` in a wheel install -- the only place a wheel puts
+        anything).  It is NOT reached as ``-m lh_harness``: that resolves
+        ``lh_harness`` through the interpreter's ``sys.path``, which is
+        whatever copy that interpreter imports (a stale editable install, an
+        older wheel), not necessarily THIS harness.  The entry module pins
+        its own package root ahead of anything already imported, so the
+        verifier that runs belongs to the harness that rendered this command.
+
+    The command depends on nothing under the task workspace and nothing on
+    the auditor's cwd.  It carries no credential: the verifier reads its
+    token from :data:`AUDITOR_GITHUB_TOKEN_ENV` at run time, so the command
+    never names the token's VALUE, and the placeholder arguments are the ones
+    ``verify-pr`` accepts.  ``scripts/auditor_verify_pr.py`` remains a valid
+    invocation ONLY from inside a harness checkout, where it deliberately
+    shadows site-packages; the auditor is never in one.
+    """
+
+    interpreter = shlex.quote(sys.executable or "python3")
+    entry = Path(__file__).resolve().parent / "verify_pr.py"
+    return (
+        f"{interpreter} {shlex.quote(str(entry))} verify-pr "
+        "--repo <owner/name> --number <n> --reviewed-sha <sha>"
+    )
 
 #: The verification result of ONE read.  This is the module's internal
 #: vocabulary; it is deliberately NOT the auditor's contract header, which
