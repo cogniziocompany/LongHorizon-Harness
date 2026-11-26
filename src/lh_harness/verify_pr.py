@@ -32,7 +32,7 @@ verbatim in the auditor's prompt.
 
 Usage (from ANY directory)::
 
-    <python> /.../lh_harness/verify_pr.py --repo owner/name --number 181 \\
+    <python> /.../lh_harness/verify_pr.py verify-pr --repo owner/name --number 181 \\
         [--reviewed-sha <sha>] [--json]
 
 The credential is read from the environment by the verifier itself
