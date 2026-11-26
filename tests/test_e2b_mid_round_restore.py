@@ -868,3 +868,180 @@ async def test_an_instruction_queued_across_a_mid_round_loss_is_delivered_exactl
     assert [(item["round"], item["chars"]) for item in injections] == [(3, len(_INSTRUCTION))], (
         "exactly one human_instructions_injected event, for the round that delivered it"
     )
+
+
+# --------------------------------------------------------------------------
+# Pass criterion 2d: a carried instruction and an end-of-round gate note are
+# BOTH delivered, each exactly once.
+#
+# The claim path (round start) JOINS queued instructions into the carryover,
+# but the end-of-round gate used to ASSIGN its note over the carryover.  On a
+# restored round the manager episode is skipped, so the carryover is never
+# consumed there; a gate decision with a note on that round replaced the
+# carried operator instruction before the next live manager round could
+# deliver it.  The gate must join the way the claim does: carried first, then
+# the note.
+# --------------------------------------------------------------------------
+
+# Unique markers: neither is a substring of the other, and neither appears in
+# the scripted task, plans, audits, or any other text the prompt is built from.
+_CARRIED_MARKER = "CARRIED-MARKER-7f3a9c re-run the migration fixture first"
+_GATE_NOTE_MARKER = "GATE-NOTE-MARKER-4b1d6e keep the rollback script alongside"
+
+
+async def _run_with_gate_note(tmp_path: Path, *, replies: list[Any], note: str):
+    """``run`` with an operator instruction in the queue AND an end-of-round
+    human gate whose decision carries ``note`` as its instructions.
+
+    The gate is the real one (``_human_gate`` through ``run(human_hook=...)``);
+    only the operator is scripted.  It attaches the same note to every
+    decision, the way a dashboard operator's standing instruction would, and
+    stops the run once the manager claims completion (a "continue" there would
+    reopen the run and extend the budget).
+    """
+    agent = _ScriptedAgent(replies)
+    queue = [[_CARRIED_MARKER]]
+    gate_rounds: list[int] = []
+
+    def _drain() -> list[str]:
+        return queue.pop(0) if queue else []
+
+    async def _human_hook(context: dict[str, Any]) -> dict[str, Any]:
+        gate_rounds.append(context["round_index"])
+        action = "stop" if context["outcome"] == "completed" else "continue"
+        return {"action": action, "instructions": note}
+
+    report = await run(
+        task="finish the refactor",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=_config(tmp_path),
+        agent=agent,
+        resume=True,
+        pending_instructions=_drain,
+        human_hook=_human_hook,
+    )
+    return report, agent, gate_rounds
+
+
+@pytest.mark.parametrize(
+    ("phase", "lost_replies", "resumed_replies"),
+    [
+        (
+            "manager_done",
+            [_PLAN, _EXECUTED, _CLEAN_AUDIT, _PLAN, _Killed("manager killed")],
+            [_EXECUTED, _CLEAN_AUDIT, _DONE],
+        ),
+        (
+            "executor_done",
+            [_PLAN, _EXECUTED, _CLEAN_AUDIT, _PLAN, _EXECUTED, _Killed("manager killed")],
+            [_CLEAN_AUDIT, _DONE],
+        ),
+    ],
+    ids=["manager_done", "executor_done"],
+)
+@pytest.mark.asyncio
+async def test_a_carried_instruction_and_a_gate_note_are_both_delivered_exactly_once(
+    tmp_path: Path,
+    phase: str,
+    lost_replies: list[Any],
+    resumed_replies: list[Any],
+) -> None:
+    """A gate note on the restored round must not replace the carried instruction."""
+
+    # ---- First worker: round 1 completes; round 2 is lost in flight. -------
+    await _run_manager(tmp_path, resume=False, replies=lost_replies)
+    assert _mid_round_checkpoint(tmp_path)["phase"] == phase
+
+    # ---- Second worker: the instruction is queued, and its end-of-round
+    # gate on the RESTORED round 2 answers with a note. ----------------------
+    report, agent, gate_rounds = await _run_with_gate_note(
+        tmp_path, replies=resumed_replies, note=_GATE_NOTE_MARKER
+    )
+
+    assert report["status"] == "complete"
+    assert [item["round_index"] for item in _ledger_rounds(tmp_path)] == [1, 2, 3]
+    resumed_events = [
+        item for item in _events(_role_dir(tmp_path)) if item["event"] == "managed_round_resumed"
+    ]
+    assert "manager_done" in resumed_events[0]["skipped_phases"], (
+        "the restored round really skipped its manager episode"
+    )
+    assert gate_rounds[:1] == [2], "the restored round 2 reached its end-of-round gate"
+    assert 3 in gate_rounds, "the live round 3 also reached its gate"
+
+    # The restored round ran no manager, so it delivered nothing yet.
+    rounds_dir = _role_dir(tmp_path) / "rounds"
+    assert not (rounds_dir / "round_002" / "human_instructions.txt").exists(), (
+        "the restored round has no manager prompt to inject into"
+    )
+
+    # The next live manager prompt (round 3) carries BOTH texts, each exactly
+    # once, with the carried instruction first.
+    manager_prompts = [p for p in agent.prompts if p.startswith(_MANAGER_PROMPT)]
+    assert len(manager_prompts) == 1, "only round 3 is planned by a live manager"
+    prompt = manager_prompts[0]
+    assert prompt.count(_CARRIED_MARKER) == 1, (
+        "the carried operator instruction must reach the next live manager prompt once"
+    )
+    assert prompt.count(_GATE_NOTE_MARKER) == 1, (
+        "the gate note must reach the next live manager prompt once"
+    )
+    assert prompt.index(_CARRIED_MARKER) < prompt.index(_GATE_NOTE_MARKER), (
+        "the carried instruction precedes the gate note in the joined carryover"
+    )
+
+    # Only the role prompts that can act on the instructions are counted: the
+    # final-response role legitimately sees both texts again as history.
+    acting_prompts = [
+        p
+        for p in agent.prompts
+        if p.startswith((_MANAGER_PROMPT, _CLI_EXECUTOR_PROMPT, _GUI_EXECUTOR_PROMPT))
+    ]
+    for marker in (_CARRIED_MARKER, _GATE_NOTE_MARKER):
+        assert sum(marker in p for p in acting_prompts) == 1, (
+            f"{marker.split()[0]} is injected into exactly one manager or executor prompt"
+        )
+    assert (rounds_dir / "round_003" / "human_instructions.txt").read_text(
+        encoding="utf-8"
+    ) == f"{_CARRIED_MARKER}\n{_GATE_NOTE_MARKER}"
+    injections = _injections(_role_dir(tmp_path))
+    assert [item["round"] for item in injections] == [3], (
+        "exactly one human_instructions_injected event, for the round that delivered them"
+    )
+    assert injections[0]["chars"] == len(f"{_CARRIED_MARKER}\n{_GATE_NOTE_MARKER}")
+
+
+@pytest.mark.asyncio
+async def test_a_gate_note_on_a_plain_run_is_delivered_exactly_once(tmp_path: Path) -> None:
+    """A plain (non-restored) run with no carried instruction is unchanged: the
+    gate note alone reaches the next manager prompt exactly once, and no
+    carried text appears anywhere."""
+
+    async def _human_hook(context: dict[str, Any]) -> dict[str, Any]:
+        action = "stop" if context["outcome"] == "completed" else "continue"
+        return {"action": action, "instructions": _GATE_NOTE_MARKER}
+
+    agent = _ScriptedAgent([_PLAN, _EXECUTED, _CLEAN_AUDIT, _DONE])
+    report = await run(
+        task="finish the refactor",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=_config(tmp_path),
+        agent=agent,
+        human_hook=_human_hook,
+    )
+
+    assert report["status"] == "complete"
+    assert [item["round_index"] for item in _ledger_rounds(tmp_path)] == [1, 2]
+    manager_prompts = [p for p in agent.prompts if p.startswith(_MANAGER_PROMPT)]
+    assert len(manager_prompts) == 2, "both rounds are planned by a live manager"
+    prompt = manager_prompts[1]
+    assert prompt.count(_GATE_NOTE_MARKER) == 1, (
+        "the gate note reaches the next manager prompt exactly once"
+    )
+    assert _CARRIED_MARKER not in prompt, "nothing was carried, so no carried text appears"
+    delivered = _role_dir(tmp_path) / "rounds" / "round_002" / "human_instructions.txt"
+    assert delivered.read_text(encoding="utf-8") == _GATE_NOTE_MARKER, (
+        "the plain run writes exactly the gate note, the way it did before the join"
+    )
+    injections = _injections(_role_dir(tmp_path))
+    assert [(item["round"], item["chars"]) for item in injections] == [(2, len(_GATE_NOTE_MARKER))]

@@ -1404,7 +1404,15 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
     decision = decision if isinstance(decision, dict) else {}
     instructions = str(decision.get("instructions") or "").strip()
     if instructions:
-        ctx.carryover_instructions = instructions
+        # Join, the way the round-start claim does, instead of assigning over
+        # the carryover: on a restored round the manager episode is skipped, so
+        # a carried instruction is still waiting here when this gate runs, and
+        # an assignment would replace it before any live manager round saw it.
+        # Earlier carried instructions come first and the note is appended;
+        # empty parts are skipped, so an empty carryover yields exactly the note.
+        ctx.carryover_instructions = "\n".join(
+            part for part in [ctx.carryover_instructions, instructions] if part
+        )
         ctx.operator_instructions.append(instructions)
     action = str(decision.get("action") or "continue")
 
