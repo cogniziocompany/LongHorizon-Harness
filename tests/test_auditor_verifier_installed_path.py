@@ -66,10 +66,14 @@ from lh_harness.role_prompts import (
     build_role_auditor_prompt,
 )
 
-# A sentinel shaped like a fine-grained GitHub token, so that any code path
-# that treats "token-shaped" specially is exercised.  It belongs to no real
-# account and must never leave the child's environment.
-SENTINEL_TOKEN = "github_pat_SENTINELDO_NOT_ECHO_0123456789abcdefABCDEF"
+# A sentinel credential VALUE: obviously fake, self-labelled, and -- unlike a
+# real token -- deliberately NOT shaped like any GitHub token family.  The
+# verifier treats the credential as opaque (it is only ever read from the
+# environment and sent as a bearer header), so no code path on the
+# fail-closed routes below keys off the token's shape, and a sentinel that
+# matched a token shape would itself be a token-shaped string in this diff.
+# It belongs to no real account and must never leave the child's environment.
+SENTINEL_TOKEN = "FAKE-SENTINEL-DO-NOT-ECHO-0123456789abcdefABCDEF"
 
 # Matches any token-shaped value in a place that must carry none.
 _TOKEN_SHAPE = re.compile(r"(ghp_|gho_|github_pat_)[A-Za-z0-9_]{8,}")
