@@ -187,6 +187,7 @@ async def _run_impl(
     final_response_agent: AgentAdapter | None = None,
     human_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     pending_instructions: Callable[[], list[str]] | None = None,
+    instruction_delivered: Callable[[str], None] | None = None,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
     resume: bool = False,
     _run_progress: _RunProgress | None = None,
@@ -212,6 +213,15 @@ async def _run_impl(
     ``"continue"`` keeps the run going (reopening / extending the budget when it
     was about to finish, and injecting any instructions); ``"stop"`` ends the
     run. Queued non-blocking operator instructions are drained here too.
+
+    ``pending_instructions`` claims queued operator instructions (called at
+    every round start and, through the hook, at every end of round) and
+    ``instruction_delivered`` is invoked with each instruction text at the
+    moment it is actually placed into a live agent prompt.  The dashboard wires
+    the pair so the operator-visible 'applied' receipt follows DELIVERY rather
+    than the claim: an instruction claimed by a worker that dies before it can
+    deliver (a restored round has no manager prompt) stays pending on the
+    control bus and the next restore delivers it exactly once.
 
     ``progress`` is an optional synchronous ``(event, payload)`` sink for
     operator-facing status lines (the CLI prints them to the console).
@@ -512,7 +522,27 @@ async def _run_impl(
                 "human_instructions_injected",
                 {"round": round_index, "chars": len(gate.carryover_instructions)},
             )
+            delivered_instructions = gate.carryover_instructions
             gate.carryover_instructions = ""
+            # The queued operator instructions in that carryover are now in the
+            # prompt this round's manager episode will read, so THIS is the
+            # moment they are applied.  The receipt is written last, after the
+            # durable delivery artifacts, so a worker lost in between re-offers
+            # the instruction on restore (a visible second delivery) rather than
+            # dropping it under an 'applied' receipt (LHH#215 review comment
+            # 7195082321, note 2).  The whole carryover is handed over so the
+            # receipt follows whichever path claimed it (round start or the
+            # end-of-round gate); a gate note has no bus command and matches
+            # nothing.  Receipting is best-effort: it must never fail a round
+            # whose delivery already happened.
+            if instruction_delivered is not None:
+                try:
+                    instruction_delivered(delivered_instructions)
+                except Exception:
+                    logger.exception(
+                        "applied receipt failed for an operator instruction in round %s",
+                        round_index,
+                    )
 
         if "manager_done" in restored_phases:
             # The lost worker already planned this round and checkpointed the

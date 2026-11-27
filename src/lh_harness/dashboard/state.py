@@ -301,6 +301,15 @@ class DashboardState:
         # Free-form operator notes to inject into upcoming manager prompts,
         # independent of a blocking approval checkpoint.
         self._pending_injections: list[str] = []
+        # Operator instructions this PROCESS has already handed to the manager
+        # loop but that have not been delivered into an agent prompt yet.  The
+        # 'applied' receipt is written only on delivery (``mark_instruction_applied``),
+        # so the command stays receipt-free on the bus; without this set the next
+        # round-start claim or end-of-round gate would hand the same text out a
+        # second time.  It is deliberately in-memory: a worker that dies before
+        # delivering loses the set, so the restored worker sees the command still
+        # pending and delivers it exactly once.  See LHH#215 review note 2.
+        self._claimed_injections: set[str] = set()
 
     # ------------------------------------------------------------------
     # Run selection (manual dashboard browsing across per-run result folders)
@@ -1484,16 +1493,66 @@ class DashboardState:
         return messages[-bounded_limit:]
 
     def drain_injections(self) -> list[str]:
+        """Claim queued operator instructions for the manager loop, once per process.
+
+        This no longer receipts a command as 'applied'.  Claiming only hands the
+        text to the loop; the instruction is 'applied' when it is DELIVERED into
+        an agent prompt (``mark_instruction_applied``, called from the manager's
+        delivery site).  Until then the command stays receipt-free, so a worker
+        lost between the claim and the delivery -- e.g. a restored round that
+        skips its manager episode, then dies again -- leaves the instruction
+        pending on the bus and the next restore delivers it exactly once, instead
+        of dropping it with an 'applied' receipt (LHH#215 review comment 7195082321, note 2).
+        """
         drained: list[str] = []
+        # One claim at a time per process: the round-start claim and the
+        # end-of-round gate both call this, and each must hand out a command
+        # exactly once.  The bus read takes its own cross-process lock; this
+        # lock only serialises the check-then-claim against itself.
+        with self._lock:
+            for command in self.control_bus.pending():
+                if command.get("kind") != "inject_instruction":
+                    continue
+                command_id = str(command.get("command_id") or "")
+                if command_id and command_id in self._claimed_injections:
+                    continue
+                payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+                text = str(payload.get("instructions", "")).strip()
+                if text:
+                    drained.append(text)
+                if command_id:
+                    self._claimed_injections.add(command_id)
+        return drained
+
+    def mark_instruction_applied(self, text: str) -> None:
+        """Receipt as 'applied' every pending ``inject_instruction`` that ``text``
+        delivered -- the same receipt shape the drain used to write.
+
+        Called by the manager loop with the exact carryover it placed into a live
+        agent prompt.  The carryover is a ``"\\n"``-join of whole instructions,
+        each stripped and otherwise verbatim, whether it was claimed at round
+        start or by the end-of-round gate; so a pending command is delivered iff
+        its text is one of the joined parts.  The part check is a substring test
+        on purpose: an operator instruction may itself span several lines (the
+        API bounds length but not newlines), and the join keeps such a text
+        contiguous.  A gate note has no control-bus command and matches nothing.
+        Commands already receipted (by an earlier delivery or a previous
+        process) are not pending and are left untouched; ``ControlBus.receipt``
+        is idempotent per command id.
+        """
+        delivered_carryover = (text or "").strip()
+        if not delivered_carryover:
+            return
         for command in self.control_bus.pending():
             if command.get("kind") != "inject_instruction":
                 continue
             payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
-            text = str(payload.get("instructions", "")).strip()
-            if text:
-                drained.append(text)
-            self.control_bus.receipt(command, "applied", result={"instructions": text})
-        return drained
+            delivered = str(payload.get("instructions", "")).strip()
+            if not delivered or delivered not in delivered_carryover:
+                continue
+            self.control_bus.receipt(command, "applied", result={"instructions": delivered})
+            with self._lock:
+                self._claimed_injections.discard(str(command.get("command_id") or ""))
 
 
 def _open_nofollow(path: Path, *, directory: bool = False, strict_parent: bool = False) -> int:

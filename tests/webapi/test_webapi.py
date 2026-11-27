@@ -356,7 +356,12 @@ def test_api_snapshot_replay_and_artifact(tmp_path: Path) -> None:
             "status": "queued",
         }
     ]
-    state.drain_injections()
+    assert state.drain_injections() == ["keep going"]
+    # A claim alone does not apply the instruction: the worker may die before
+    # its live manager prompt, and the bus must then still offer the command.
+    claimed_snapshot = client.get("/api/runs/run-1/snapshot").json()
+    assert claimed_snapshot["operator_messages"][0]["status"] == "queued"
+    state.mark_instruction_applied("keep going")
     applied_snapshot = client.get("/api/runs/run-1/snapshot").json()
     assert applied_snapshot["operator_messages"][0]["text"] == "keep going"
     assert applied_snapshot["operator_messages"][0]["status"] == "applied"
