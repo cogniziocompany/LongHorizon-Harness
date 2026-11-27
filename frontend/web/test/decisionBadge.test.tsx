@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { Approval, RunSummary } from '../../core/src/types';
+import { statusDotAttributes } from '../../core/src/statusDots';
 import { UiLanguageProvider } from '../src/i18n';
 import { ApprovalCard, DecisionBadge, OwnerNotePanel } from '../src/App';
 
@@ -221,10 +222,9 @@ test('ApprovalCard renders owner_note clickable links and bullets together', () 
 // confirm the rendered HTML matches what the sidebar would emit.
 
 function sidebarSessionItem(run: RunSummary): JSX.Element {
-  const statusClass = (status: string): string => `status-dot status-${status.replaceAll('_', '-')}`;
   return (
     <button className={`session-item ${run.id === 'selected' ? 'selected' : ''}`}>
-      <span className={statusClass(run.status)} />
+      <span {...statusDotAttributes(run.status, { role: 'img' })} />
       <span className="session-copy">
         <strong>{run.task || 'Untitled task'}</strong>
         <small>{run.id}</small>

@@ -16,7 +16,11 @@ try {
 
 try {
   await build({
-    entryPoints: [resolve('test/runFeed.test.ts'), resolve('test/contention.test.ts')],
+    entryPoints: [
+      resolve('test/runFeed.test.ts'),
+      resolve('test/contention.test.ts'),
+      resolve('test/statusDots.test.ts'),
+    ],
     bundle: true,
     platform: 'node',
     format: 'esm',
@@ -26,7 +30,7 @@ try {
   await new Promise((resolveRun, rejectRun) => {
     const child = spawn(
       process.execPath,
-      ['--test', join(directory, 'runFeed.test.js'), join(directory, 'contention.test.js')],
+      ['--test', join(directory, 'runFeed.test.js'), join(directory, 'contention.test.js'), join(directory, 'statusDots.test.js')],
       { stdio: 'inherit' },
     );
     child.on('error', rejectRun);
