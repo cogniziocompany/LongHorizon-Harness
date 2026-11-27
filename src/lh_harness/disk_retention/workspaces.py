@@ -26,7 +26,9 @@ Deny by default.  A workspace is kept when
   ``QUEUE_TERMINAL_STATUSES`` allowlist (``done``/``failed``), so a queue
   entry in ``blocked`` — a NON-terminal queue state even though ``blocked``
   is a terminal *run* state — keeps the workspace;
-* its age is at or below the threshold (strictly older selects);
+* its age is at or below the threshold (strictly older selects) — or the
+  threshold itself is ``0`` or negative, which disables the rule entirely
+  so no clone is ever old enough;
 * the explicit ``LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED`` flag is not
   set — the sweep then only *lists* candidates.
 
@@ -163,7 +165,8 @@ def should_retain_workspace(
     4. ``age_seconds > max_age_seconds`` (equal keeps).
 
     A negative or non-finite age is treated as "unknown" and kept; a
-    negative threshold disables the rule (nothing is ever old enough).
+    threshold of ``0`` or less disables the rule (nothing is ever old
+    enough), so only a strictly positive threshold can select anything.
     """
 
     parts = Path(path).parts
@@ -176,7 +179,12 @@ def should_retain_workspace(
         return False
     if not math.isfinite(age) or not math.isfinite(limit):
         return False
-    if age < 0.0 or limit < 0.0:
+    if age < 0.0 or limit <= 0.0:
+        # A threshold of 0 (or less) disables the rule: nothing is ever old
+        # enough.  ``0`` used to fall through to ``age > limit`` below and
+        # select EVERY terminal workspace within seconds of it finishing,
+        # while the docs promised "0 disables the rule" -- so the disabled
+        # reading is the one the code must honour (LHH#222 review).
         return False
     if states is None:
         return False
@@ -482,7 +490,11 @@ def _sweep_one(
     return WorkspaceRetentionReport(
         path=str(ws),
         state=STATE_KEPT_RECENT,
-        reason=f"age {age / SECONDS_PER_HOUR:.1f}h <= threshold {config.workspace_max_age_hours}h; kept",
+        reason=(
+            f"rule disabled (threshold {config.workspace_max_age_hours}h <= 0); kept"
+            if max_age <= 0.0
+            else f"age {age / SECONDS_PER_HOUR:.1f}h <= threshold {config.workspace_max_age_hours}h; kept"
+        ),
         age_seconds=age,
         age_source=source,
         states=states,

@@ -18,8 +18,13 @@ The four ``LH_HARNESS_DISK_*`` settings are:
 * ``LH_HARNESS_DISK_RESUME_PCT`` — auto-resume threshold (default ``85``).
 
 A mis-set value is logged and ignored — the next setting (or the default)
-is used in its place.  A value of ``0`` or a negative integer disables the
-rule that owns it; ``-1`` for the cache cap means "no cap".
+is used in its place.  A value of ``0`` or a negative integer disables
+the terminal-run clone-workspace age rule
+(``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS``: no clone is ever old
+enough), and ``0`` or a negative cache cap means "no cap".  This does
+NOT hold for the run-folder or parked work-tree age rules: there ``0``
+(or a negative) is a threshold of zero, so every folder/tree that is not
+live is eligible — set those to a positive number.
 
 Two further settings gate TERMINAL-run clone-workspace retention
 (``workspaces.py``), which removes the working clone of a finished run
@@ -30,7 +35,8 @@ under the node work root:
   workspace: the dry-run listing is the only thing that runs.
 * ``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`` — how long a workspace must
   have belonged only to TERMINAL runs before it is eligible (default
-  ``72``).
+  ``72``).  ``0`` or a negative value disables the rule: no clone is ever
+  old enough, so the sweep lists and removes nothing.
 """
 
 from __future__ import annotations
