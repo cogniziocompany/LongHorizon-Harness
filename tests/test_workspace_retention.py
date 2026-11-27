@@ -19,6 +19,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1222,9 +1223,13 @@ class TestDirtyGuardKeepsUncommittedClones:
         if how == "nonzero_exit":
             (shim / "git").write_text("#!/bin/sh\necho 'shim: git is broken' >&2\nexit 128\n")
         else:
-            (shim / "git").write_text("#!/bin/sh\nsleep 60\n")
+            # Absolute sleep: with no PATH a bare ``sleep`` exits 127 instead
+            # of hanging, and the probe would report exit 127, not a timeout.
+            (shim / "git").write_text(f"#!/bin/sh\n{shutil.which('sleep') or '/bin/sleep'} 60\n")
         (shim / "git").chmod(0o755)
-        monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+        # ``os.environ['PATH']`` is absent in some environments (the PR-gate
+        # runner runs without one); a keep-only guard must not depend on it.
+        monkeypatch.setenv("PATH", os.pathsep.join(p for p in (str(shim), os.environ.get("PATH", "")) if p))
         if how == "timeout":
             monkeypatch.setattr(mod, "GIT_PROBE_TIMEOUT_SECONDS", 0.5)
         # The shim really is the git the probe runs, and it really fails.
