@@ -39,6 +39,9 @@ def build_meta(
     drain: dict[str, Any] | None = None,
     launcher_stalled: bool = False,
     launcher_stall_cycles: int | None = None,
+    launcher_last_pass_at: float | None = None,
+    launcher_loop_failure: str | None = None,
+    lease_holder: dict[str, Any] | None = None,
     build: dict[str, Any] | None = None,
     disk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -89,6 +92,12 @@ def build_meta(
     result["launcher_stalled"] = bool(launcher_stalled)
     if launcher_stall_cycles is not None:
         result["launcher_stall_cycles"] = int(launcher_stall_cycles)
+    # easybutt0n-61: expose launch-loop liveness separately from the lease's
+    # exclusion holder.  Both keys stay present with None before the first
+    # pass / when the file lease is unavailable, so absence is never ambiguous.
+    result["launcher_last_pass_at"] = launcher_last_pass_at
+    result["launcher_loop_failure"] = launcher_loop_failure
+    result["lease_holder"] = lease_holder
     if mcp_gateway_alias is not None:
         result["mcp_gateway_alias"] = mcp_gateway_alias
     if model_discovery is not None:
