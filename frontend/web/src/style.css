@@ -121,7 +121,7 @@ button, input, textarea, select { font-family: inherit; }
 .owner-note { margin-top: 10px; padding: 10px 12px; border: 1px solid #3d3d3d; border-radius: 7px; background: #232323; }.owner-note-toggle { display: inline-flex; align-items: center; gap: 7px; padding: 0; border: 0; color: #c5c5c5; background: transparent; font-size: 11px; font-weight: 600; cursor: pointer; }.owner-note-toggle:hover { color: #eee; }.owner-note-author { margin-left: 6px; color: #888; font-weight: 400; font-size: 10px; }.owner-note-body { margin-top: 8px; color: #d6d6d6; font-size: 12px; line-height: 1.55; white-space: normal; }.owner-note-body p { margin: 0 0 8px; }.owner-note-body p:last-child { margin-bottom: 0; }.owner-note-body ul { margin: 0 0 8px; padding-left: 18px; }.owner-note-body a { color: #6db4d6; text-decoration: underline; }.owner-note-body code { padding: 1px 4px; border-radius: 3px; color: #f0d99e; background: #2c2c2c; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
 .message-live { padding: 13px 14px; border: 1px solid #3b3b3b; border-radius: 9px; background: #292929; }.message-live .message-avatar { color: #f5d884; background: rgba(242, 201, 76, .2); }.working-line, .empty-conversation { display: flex; align-items: center; gap: 10px; margin: 20px 0; color: #929292; font-size: 12px; }.thinking-dot { width: 7px; height: 7px; border-radius: 50%; background: #f2c94c; animation: codex-pulse 1.2s ease-in-out infinite; }@keyframes codex-pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
 .approval-card { margin-top: 24px; padding: 15px 16px; border: 1px solid rgba(242, 153, 74, .45); border-radius: 10px; background: rgba(242, 153, 74, .08); }.approval-avatar { color: #f6d4ae; background: #9a5b2d; }.approval-input { width: 100%; min-height: 64px; margin-top: 12px; padding: 9px; border: 1px solid #4b4b4b; border-radius: 7px; outline: 0; resize: vertical; color: #eee; background: #252525; font-size: 12px; }.approval-input:focus { border-color: #6c6c6c; }.approval-actions { display: flex; gap: 8px; margin-top: 12px; }.approval-actions button { padding: 7px 11px; border: 1px solid #555; border-radius: 6px; color: #eee; background: #353535; font-size: 11px; }.approval-actions button:hover { background: #444; }
-.composer-wrap { width: min(820px, calc(100% - 52px)); margin: -90px auto 18px; padding: 10px 12px 8px; border: 1px solid #4a4a4a; border-radius: 12px; background: #2b2b2b; box-shadow: 0 10px 30px rgba(0,0,0,.18); }.composer-wrap textarea { display: block; width: 100%; min-height: 28px; max-height: 130px; padding: 3px 2px; border: 0; outline: 0; resize: vertical; color: #eee; background: transparent; font-size: 13px; line-height: 1.5; }.composer-wrap textarea::placeholder { color: #858585; }.composer-notice { margin: 6px 2px 0; padding: 5px 8px; border: 1px solid #4a6b4a; border-radius: 7px; color: #9fd49f; background: rgba(40, 70, 40, .35); font-size: 10px; line-height: 1.45; }.composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 7px; color: #777; font-size: 10px; }.composer-footer kbd { padding: 2px 4px; border: 1px solid #494949; border-radius: 4px; color: #999; background: #222; font-size: 9px; }.composer-footer button { padding: 6px 10px; border: 0; border-radius: 6px; color: #fff; background: var(--codex-green); font-size: 11px; }.composer-footer button:disabled { background: #4a4a4a; }
+.composer-wrap { width: min(820px, calc(100% - 52px)); margin: -90px auto 18px; padding: 10px 12px 8px; border: 1px solid #4a4a4a; border-radius: 12px; background: #2b2b2b; box-shadow: 0 10px 30px rgba(0,0,0,.18); }.composer-wrap textarea { display: block; width: 100%; min-height: 28px; max-height: 130px; padding: 3px 2px; border: 0; outline: 0; resize: vertical; color: #eee; background: transparent; font-size: 13px; line-height: 1.5; }.composer-wrap textarea::placeholder { color: #858585; }.composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 7px; color: #777; font-size: 10px; }.composer-footer kbd { padding: 2px 4px; border: 1px solid #494949; border-radius: 4px; color: #999; background: #222; font-size: 9px; }.composer-footer button { padding: 6px 10px; border: 0; border-radius: 6px; color: #fff; background: var(--codex-green); font-size: 11px; }.composer-footer button:disabled { background: #4a4a4a; }
 .error-line { display: flex; align-items: center; gap: 8px; width: min(820px, calc(100% - 52px)); margin: -105px auto 10px; padding: 8px 10px; border: 1px solid rgba(235, 87, 87, .35); border-radius: 7px; color: #f5b3b3; background: rgba(235, 87, 87, .1); font-size: 11px; }.error-line span { color: #eb5757; font-weight: 700; }.error-line button { margin-left: auto; border: 0; color: #f5b3b3; background: transparent; font-size: 10px; }
 .drawer-backdrop { position: fixed; inset: 0; z-index: 30; display: flex; justify-content: flex-end; background: rgba(0,0,0,.47); }.details-drawer { position: relative; display: flex; flex-direction: column; width: min(var(--drawer-width, 410px), 92vw); height: 100dvh; min-height: 0; padding: 22px 20px; overflow: hidden; border-left: 1px solid #3d3d3d; background: #1c1c1c; box-shadow: -18px 0 45px rgba(0,0,0,.35); }.create-drawer { width: min(540px, 92vw); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .drawer-resize-handle { position: absolute; top: 0; left: 0; z-index: 2; display: grid; place-items: center; width: 6px; height: 100%; padding: 0; border: 0; background: transparent; color: transparent; cursor: col-resize; touch-action: none; }
@@ -144,6 +144,14 @@ button, input, textarea, select { font-family: inherit; }
   --codex-muted: #a3a3a3;
   --codex-subtle: #767676;
   --codex-green: #10a37f;
+  /* LHH#155 status palette: the 'waiting' amber, defined once per theme.
+     Text/border values clear 4.5:1 against their own surfaces; the raw
+     accent (#f2c94c) stays a non-text accent only. */
+  --codex-waiting: #f2c94c;
+  --codex-waiting-text: #f5c766;
+  --codex-waiting-muted: #b0b0b0;
+  --codex-waiting-bg: rgba(242, 201, 76, .12);
+  --codex-waiting-border: rgba(242, 201, 76, .45);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", Inter, "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -193,6 +201,14 @@ body { background: var(--codex-bg); color: var(--codex-text); -webkit-font-smoot
   --codex-muted: #747578;
   --codex-subtle: #a6a7a9;
   --codex-green: #10a37f;
+  /* Same 'waiting' amber token, re-pointed for the light surface: the chip
+     text is a darkened amber and the muted line a darkened neutral so both
+     clear 4.5:1 on the light chip background. */
+  --codex-waiting: #e0a400;
+  --codex-waiting-text: #6b4f0f;
+  --codex-waiting-muted: #6b6d70;
+  --codex-waiting-bg: #fdf6e3;
+  --codex-waiting-border: #e6cf94;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", Inter, "Segoe UI", sans-serif;
 }
 html, body, #root { background: #fff; color: var(--codex-text); }
@@ -229,6 +245,32 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .decision-badge { border-color: #ead7a7; color: #8a6a2c; background: #fff9e9; }.decision-badge-key { color: #8a6a2c; }.decision-badge-value { color: #6b521f; }.owner-note { border-color: #ececed; background: #fafafa; }.owner-note-toggle { color: #55575a; }.owner-note-author { color: #8a8b8d; }.owner-note-body { color: #2a2c2f; }.owner-note-body a { color: #2b6cb0; }.owner-note-body code { color: #6b521f; background: #f0e8d8; }
 .approval-answers { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }.approval-answers button { padding: 5px 9px; border: 1px solid #cfdfe4; border-radius: 6px; color: #316b7b; background: #f3fafb; font-size: 11px; }.approval-answers button:hover { border-color: #7eafb9; background: #e8f5f7; }
 .composer-wrap { width: min(570px, calc(100% - 40px)); margin: -110px 0 16px clamp(24px, 10.8%, 118px); padding: 13px 15px 10px; border: 1px solid #e2e2e3; border-radius: 16px; background: #fff; box-shadow: 0 5px 24px rgba(0, 0, 0, .1); }.composer-wrap textarea { min-height: 32px; color: #1a1c1f; font-size: 14px; }.composer-wrap textarea::placeholder { color: #b3b4b6; }.composer-footer { color: #9b9c9e; }.composer-footer kbd { border-color: #e3e3e3; color: #7b7c7f; background: #f7f7f7; }.composer-footer button { color: #fff; background: #1a1c1f; }.composer-footer button:disabled { color: #b0b1b3; background: #e7e7e8; }.composer-disabled { opacity: .9; }
+
+/* LHH#155 status palette — the 'waiting' amber, in one place.
+   `.composer-queued-chip` is an INLINE chip above the composer input: it
+   sizes to its content instead of filling the composer width, so a queued
+   follow-up reads as a neutral status note rather than a full-width error
+   banner.  All colour comes from the --codex-waiting-* tokens defined in
+   the theme :root blocks; no per-use hex copies live here. */
+.composer-queued-chip { display: inline-flex; align-items: flex-start; gap: 8px; max-width: 100%; margin: 8px 0 2px; padding: 7px 11px; border: 1px solid var(--codex-waiting-border); border-radius: 9px; color: var(--codex-waiting-text); background: var(--codex-waiting-bg); font-size: 15px; line-height: 1.45; }
+.composer-queued-chip-icon { display: inline-flex; align-items: center; flex: 0 0 auto; margin-top: 2px; color: var(--codex-waiting); }
+.composer-queued-chip-copy { display: grid; gap: 2px; min-width: 0; }
+.composer-queued-chip-title { font-weight: 600; }
+.composer-queued-chip-meta { color: var(--codex-waiting-muted); font-size: 15px; }
+.composer-queued-chip .composer-queued-chip-icon svg { width: 16px; height: 16px; }
+/* The reason the Send button is unavailable.  A greyed-out button with no
+   explanation is the failure mode LHH#155 is fixing, so the reason is always
+   rendered next to the button whenever the button is disabled. */
+.composer-send-reason { display: block; margin-top: 5px; color: var(--codex-waiting-muted); font-size: 13px; }
+
+/* The pending operator bubble in the thread: a queued instruction that the
+   worker has not consumed yet.  It reuses the same waiting amber tokens as
+   the composer chip so the two read as one status, and carries the same
+   readable text size. */
+.message-pending .message-body { border: 1px solid var(--codex-waiting-border); background: var(--codex-waiting-bg); }
+.message-pending .message-text { color: var(--codex-waiting-text); }
+.message-pending-badge { display: inline-flex; align-items: center; gap: 5px; margin-top: 7px; padding: 3px 8px; border: 1px solid var(--codex-waiting-border); border-radius: 6px; color: var(--codex-waiting-text); background: transparent; font-size: 15px; font-weight: 600; }
+.message-pending-badge svg { width: 14px; height: 14px; flex: 0 0 auto; }
 .error-line { width: min(570px, calc(100% - 40px)); margin: -112px 0 10px clamp(24px, 10.8%, 118px); border-color: #e5bebe; color: #a74e4e; background: #fff8f8; }.error-line button { color: #a74e4e; }
 .drawer-backdrop { background: rgba(0, 0, 0, .2); }.details-drawer { background: #fff; border-left-color: #e3e3e3; box-shadow: -12px 0 30px rgba(0,0,0,.1); }.drawer-eyebrow { color: #a0a1a3; }.drawer-header h2 { color: #1a1c1f; }.drawer-close, .drawer-toggle { color: #77787a; }.drawer-close:hover, .drawer-toggle:hover { color: #1a1c1f; background: #f0f0f0; }.details-tabs { border-bottom-color: #ececed; }.details-tabs button { color: #858689; }.details-tabs button.active { color: #2d2f31; background: #f0f0f0; }.drawer-rounds button { border-color: #e0e0e1; color: #6e7072; background: #fafafa; }.drawer-rounds button.active { color: #202225; border-color: #c9cacc; background: #ededee; }.drawer-pre { border-color: #e4e4e5; color: #444648; background: #fafafa; }.drawer-field input, .drawer-field textarea, .drawer-field select { border-color: #dedfe0; color: #252729; background: #fafafa; }.drawer-actions button { border-color: #dedfe0; color: #424446; background: #f3f3f4; }.drawer-actions .primary-action { border-color: #1a1c1f; background: #1a1c1f; }
 .drawer-error { display: block; padding: 12px 4px; color: #a74e4e; font-size: 11px; line-height: 1.5; }

@@ -14,6 +14,7 @@ import {
   CircleCheck,
   CircleDotDashed,
   CircleX,
+  Clock,
   Copy,
   Ellipsis,
   ExternalLink,
@@ -189,6 +190,50 @@ function roleTitle(role: string | null | undefined): string {
   return role.replaceAll('_', ' ');
 }
 
+/**
+ * LHH#155: the copy an operator sees when a follow-up is accepted onto the
+ * control bus but not yet consumed by the worker.
+ *
+ * The queueing behaviour is correct, so the wording has to read as a plain
+ * status note: it says what happened and when the message will arrive, and
+ * it avoids the internal vocabulary ("episode", "stage boundary") that made
+ * the old notice read like an error to a non-technical operator.
+ *
+ * `role` is the role that is working right now, `round` is the run's current
+ * round and `maxRounds` is the round budget the run was started with.
+ */
+export interface QueuedNoticeCopy {
+  /** The primary, operator-facing sentence. */
+  title: string;
+  /** The muted second line: "<Role> - round <n>/<max>". */
+  meta: string;
+}
+
+export function queuedNoticeCopy(
+  role: string | null | undefined,
+  round: number | null | undefined,
+  maxRounds: number | null | undefined,
+  language: UiLanguage = 'en',
+): QueuedNoticeCopy {
+  const roleName = role ? roleTitle(role) : uiText(language, '工作进程', 'the worker');
+  const roundNumber = typeof round === 'number' && Number.isFinite(round) ? round : null;
+  const budget = typeof maxRounds === 'number' && Number.isFinite(maxRounds) && maxRounds > 0 ? maxRounds : null;
+  // "<Role> - round <n>/<max>" in English; the same facts in Chinese.
+  const meta = roundNumber === null
+    ? uiText(language, `${roleName} - 轮次未知`, `${roleName} - round unknown`)
+    : budget !== null
+      ? uiText(language, `${roleName} - 第 ${roundNumber}/${budget} 轮`, `${roleName} - round ${roundNumber}/${budget}`)
+      : uiText(language, `${roleName} - 第 ${roundNumber} 轮`, `${roleName} - round ${roundNumber}`);
+  return {
+    title: uiText(
+      language,
+      `消息已排队 - 当${roleName}完成本步骤时将会送达。`,
+      `Message queued - it will be delivered when the ${roleName} finishes this step.`,
+    ),
+    meta,
+  };
+}
+
 function statusLabel(status: string, hasFinalResponse = false, language: UiLanguage = 'zh'): string {
   if (status === 'waiting_approval' && hasFinalResponse) return uiText(language, '结果待确认', 'Result awaiting confirmation');
   const labels = language === 'zh' ? {
@@ -337,7 +382,7 @@ function commandErrorText(message: string, language: UiLanguage): string {
     .replace(/--rounds 必须在 1–(\d+) 之间/u, '--rounds must be between 1 and $1');
 }
 
-interface ConversationMessage {
+export interface ConversationMessage {
   id: string;
   kind: MessageKind;
   role: string;
@@ -352,6 +397,12 @@ interface ConversationMessage {
   sortTime?: number;
   /** Round slot for messages that sit between rounds rather than inside one. */
   sortRound?: number;
+  /**
+   * LHH#155: true while an operator message is still queued on the control
+   * bus and has not been consumed by a role yet.  Pending messages render as
+   * a read-only pending bubble; once consumed they render normally.
+   */
+  pending?: boolean;
   /** Whether the text is backed by the harness completion authority. */
   authority?: 'final_response' | 'auditor' | 'report' | 'none';
 }
@@ -745,7 +796,7 @@ function roundForTime(snapshot: Snapshot, time: number | undefined): number {
   return slot;
 }
 
-function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, TrajectoryView>, liveTrajectory: TrajectoryView | null, artifacts: ArtifactProjection, language: UiLanguage): ConversationMessage[] {
+export function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, TrajectoryView>, liveTrajectory: TrajectoryView | null, artifacts: ArtifactProjection, language: UiLanguage): ConversationMessage[] {
   const messages: ConversationMessage[] = [];
   const task = snapshot.mission.task.trim();
   const taskTime = snapshot.run.started_at || snapshot.events.find((event) => event.type === 'run.started')?.ts;
@@ -880,6 +931,10 @@ function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, Traje
       time,
       sortTime: time,
       sortRound: roundForTime(snapshot, time),
+      // LHH#155: carry the delivery status through.  A message the worker has
+      // not consumed yet renders as a PENDING bubble; once the backend
+      // reports it consumed ('applied') it becomes an ordinary message again.
+      pending: item.status === 'queued',
     });
   }
   for (const approval of snapshot.approvals) {
@@ -906,11 +961,11 @@ export default function App() {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [runId, setRunId] = useState(readRunId);
   const [error, setError] = useState('');
-  // Form-like delivery feedback (2026-10-11): injections are accepted onto the
-  // control bus immediately but only CONSUMED at the next role/round boundary.
-  // The notice says so explicitly and clears at the boundary (active_role
-  // change), so operators stop re-sending messages that were already queued.
-  const [composerNotice, setComposerNotice] = useState('');
+  // LHH#155: the role the worker was on when the operator's follow-up was
+  // accepted.  The queued notice itself is derived from the LIVE snapshot
+  // (see `queuedInstructionCount` below), so it appears while a message is
+  // actually queued and disappears by itself once the worker consumes it.
+  const [composerNoticeRole, setComposerNoticeRole] = useState<string | null>(null);
   const [dismissedFeedError, setDismissedFeedError] = useState('');
   const [instruction, setInstruction] = useState('');
   const [busy, setBusy] = useState(false);
@@ -956,8 +1011,6 @@ export default function App() {
   const trajectoryRequest = useRef(0);
 
   const feed = useRunFeed(runId, authRevision);
-  const composerNoticeRole = feed.snapshot.active_role;
-  useEffect(() => { setComposerNotice(''); }, [composerNoticeRole]);
   const snapshot = feed.snapshot;
   const connection = feed.connection;
 
@@ -1020,14 +1073,34 @@ export default function App() {
   // first and then race the worker to type.
   const composerResumes = Boolean(runId) && !snapshot.controls.can_inject && canResumeRun;
   const composerInteractive = Boolean(runId && snapshot.controls.can_inject) || composerResumes;
-  const composerCanSend = composerInteractive && Boolean(instruction.trim()) && Boolean(
+  // LHH#155: an empty composer cannot send — that rule is unchanged.  But the
+  // Send button must never be disabled WITHOUT a reason the operator can see.
+  // While a message is queued the footer states the queue depth and the
+  // composer stays live, so a second follow-up can be typed and queued too.
+  const composerHasText = Boolean(instruction.trim());
+  const composerCommandValid = Boolean(
     typedCommand ? commandOptions.some((item) => item.name === typedCommandName) : true,
   );
+  const composerCanSend = composerInteractive && composerHasText && composerCommandValid;
   // How many operator messages are queued but not yet consumed by a role —
   // the count the delivery notice surfaces so repeated sends are visible.
   const queuedInstructionCount = (feed.snapshot.operator_messages ?? []).filter(
     (message) => message.status === 'queued',
   ).length;
+  // LHH#155: the queued notice is derived from the LIVE run state, so it is
+  // present exactly while a message is queued and vanishes once the worker
+  // consumes it.  The role comes from the snapshot the backend reported (the
+  // role that is working now), the round from the run's active round and the
+  // maximum from the run's own round budget — never from the static MAX_ROUNDS
+  // constant, which is an upper bound and not this run's budget.
+  const queuedNotice = queuedInstructionCount > 0
+    ? queuedNoticeCopy(
+      composerNoticeRole ?? snapshot.active_role,
+      activeRound,
+      snapshot.run.max_rounds,
+      language,
+    )
+    : null;
   // Sending from a resumable run goes through the lifecycle call, which tracks
   // `controlBusy`; without it the send button stays live and fires twice.
   const composerBusy = busy || (composerResumes && controlBusy);
@@ -1051,6 +1124,23 @@ export default function App() {
       : pendingApprovals.length > 0
         ? text('等待你的确认', 'Waiting for your approval')
         : text('输入已停用', 'Input disabled');
+  // LHH#155: the Send button is never greyed out without a reason next to
+  // it.  While a message is queued the footer states the queue depth, so an
+  // operator who sees a disabled Send button always knows why.
+  const composerQueuedNote = queuedInstructionCount > 0
+    ? text(
+      `· ${queuedInstructionCount} 条消息已排队`,
+      `· ${queuedInstructionCount} message${queuedInstructionCount === 1 ? '' : 's'} queued`,
+    )
+    : '';
+  // The reason the Send button is unavailable, if it is.
+  const composerSendReason = !composerInteractive
+    ? text('输入已停用', 'Input is disabled')
+    : !composerHasText
+      ? text('请输入消息后发送', 'Type a message to send')
+      : !composerCommandValid
+        ? text('未知指令', 'Unknown command')
+        : '';
 
   function operationKey(scope: string, fingerprint: string): { id: string; key: string } {
     const id = `${scope}\u0000${fingerprint}`;
@@ -1352,16 +1442,16 @@ export default function App() {
     try {
       const resp = await postInstruction(runId, messageText, requestKey);
       // Form-like feedback (2026-10-11): the injection is ACCEPTED onto the
-      // control bus but is only CONSUMED at the next role/round boundary —
-      // the active role never pauses mid-episode. Say so explicitly, with the
-      // queue depth, instead of silently clearing the composer (operators
-      // re-sent the same message because nothing acknowledged delivery).
+      // control bus but is only CONSUMED at the next role/round boundary.
+      // The message is accepted, so the operator needs to know it is on its
+      // way and roughly when it will land — not an error-style banner that
+      // reads like something went wrong.
+      //
+      // LHH#155: the chip is derived from the LIVE snapshot rather than a
+      // one-shot string, so it stays visible for as long as the message is
+      // actually queued and disappears by itself once the worker consumes it.
       const role = resp?.delivery?.active_role || snapshot?.active_role || null;
-      const depth = (feed.snapshot.operator_messages ?? []).filter((message) => message.status === 'queued').length;
-      setComposerNotice(text(
-        `已排队：${role ? `${role} 阶段` : '工作进程'}不会暂停，操作消息在下个阶段边界读取${depth > 1 ? `（当前待读取 ${depth} 条）` : ''}`,
-        `Queued — the ${role ? `${role} stage` : 'worker'} does not pause mid-episode; operator messages are read at the next stage boundary${depth > 1 ? ` (${depth} queued)` : ''}`,
-      ));
+      setComposerNoticeRole(role);
     } catch (reason) {
       feed.appendOperatorMessage({ id: requestKey, text: messageText, created_at: createdAt, status: 'failed' });
       setError(String(reason));
@@ -1605,7 +1695,7 @@ export default function App() {
 
         {signInRequired && <div className="error-line" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{text('登录会话已过期，请重新登录。', 'Your sign-in session has expired. Sign in again to continue.')}<button onClick={() => window.location.reload()}>{text('重新登录', 'Sign in')}</button></div>}
         {!signInRequired && visibleError && <div className="error-line" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{visibleError}<button onClick={() => { setError(''); setDismissedFeedError(feed.error); }}>{text('关闭', 'Dismiss')}</button></div>}
-        <div className={`composer-wrap ${composerInteractive ? '' : 'composer-disabled'}`}><textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void sendInstruction(); } }} placeholder={composerPlaceholder} disabled={composerBusy || !composerInteractive} />{composerNotice && <div className="composer-notice" role="status">{composerNotice}</div>}<div className="composer-footer"><span>{composerFooter}{composerInteractive && <> · <kbd>⌘</kbd><kbd>↵</kbd> {text('发送', 'Send')}</>}</span><button onClick={() => void sendInstruction()} disabled={composerBusy || !composerCanSend}>{text('发送', 'Send')}</button></div></div>
+        <div className={`composer-wrap ${composerInteractive ? '' : 'composer-disabled'}`}>{queuedNotice && <div className="composer-queued-chip" data-testid="composer-queued-chip" role="status" aria-live="polite"><span className="composer-queued-chip-icon" aria-hidden="true"><Clock size={16} /></span><span className="composer-queued-chip-copy"><span className="composer-queued-chip-title">{queuedNotice.title}</span><span className="composer-queued-chip-meta">{queuedNotice.meta}</span></span></div>}<textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void sendInstruction(); } }} placeholder={composerPlaceholder} disabled={composerBusy || !composerInteractive} /><div className="composer-footer"><span>{composerFooter}{composerQueuedNote}{composerInteractive && <> · <kbd>⌘</kbd><kbd>↵</kbd> {text('发送', 'Send')}</>}</span><button onClick={() => void sendInstruction()} disabled={composerBusy || !composerCanSend} title={composerSendReason || undefined} aria-describedby={composerSendReason ? 'composer-send-reason' : undefined}>{text('发送', 'Send')}</button></div>{composerSendReason && <span id="composer-send-reason" className="composer-send-reason">{composerSendReason}</span>}</div>
       </main>
 
       {mobileStatusOpen && <button type="button" className="status-mobile-backdrop" onClick={() => setMobileStatusOpen(false)} aria-label={text('关闭任务状态', 'Close task status')} />}
@@ -2073,7 +2163,7 @@ function ExecutionArtifacts({ projection, live }: { projection: ArtifactProjecti
   </div>;
 }
 
-function ConversationMessage({ message }: { message: ConversationMessage }) {
+export function ConversationMessage({ message }: { message: ConversationMessage }) {
   const { text } = useUiLanguage();
   const [expanded, setExpanded] = useState(false);
   const [showInput, setShowInput] = useState(false);
@@ -2082,7 +2172,38 @@ function ConversationMessage({ message }: { message: ConversationMessage }) {
   const clipped = !expanded && message.text.length > CONVERSATION_TEXT_LIMIT;
   const displayText = clipped ? `${message.text.slice(0, CONVERSATION_TEXT_LIMIT).trimEnd()}…` : message.text;
   const isAgent = ['plan', 'assistant', 'verification'].includes(message.kind);
-  return <article className={`conversation-message message-${message.kind}`}><div className="message-avatar">{message.kind === 'user' ? text('你', 'You') : message.kind === 'final' ? <Sparkles size={12} /> : message.role.slice(0, 1)}</div><div className="message-body"><div className="message-meta"><strong>{message.title}</strong>{message.time && <time>{formatTime(message.time)}</time>}</div>{isAgent && message.input && <><button className="agent-input-row" onClick={() => setShowInput((current) => !current)}><span className="agent-step-icon"><ArrowRight size={14} /></span><span className="agent-input-copy"><small>{text('输入', 'Input')}</small>{compactText(message.input, 220)}</span><span className="agent-chevron">{showInput ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</span></button>{showInput && <div className="agent-input-expanded"><MessageText text={message.input} /></div>}<div className="agent-output-label">{message.kind === 'plan' ? text('计划摘要', 'Plan summary') : message.kind === 'verification' ? text('验证结论', 'Verification result') : text('执行结果', 'Execution result')}</div></>}{message.activity && message.activity.length > 0 && <TrajectorySteps steps={message.activity} />}<MessageText text={displayText} />{message.artifacts && <ExecutionArtifacts projection={message.artifacts} live={message.kind === 'live'} />}{(clipped || expanded) && <button type="button" className="message-expand" onClick={() => setExpanded((open) => !open)}>{expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}<span>{expanded ? text('收起', 'Show less') : text('展开全文', 'Show full output')}</span></button>}{message.kind === 'plan' && <span className="message-hint">{text('已隐藏内部 prompt，仅保留可执行摘要', 'Internal prompts are hidden; only the actionable summary is shown')}</span>}{message.kind === 'final' && <span className={`final-badge final-authority-${message.authority || 'none'}`}>{message.authority === 'final_response' ? text('LongHorizon 最终回复', 'LongHorizon final response') : message.authority === 'report' ? text('Auditor 最终报告', 'Auditor final report') : message.authority === 'auditor' ? text('Auditor 验证', 'Auditor verification') : text('等待权威报告', 'Awaiting authoritative report')}</span>}</div></article>;
+  return (
+    <article
+      className={`conversation-message message-${message.kind}${message.pending ? ' message-pending' : ''}`}
+      data-pending={message.pending ? 'true' : undefined}
+    >
+      <div className="message-avatar">{message.kind === 'user' ? text('你', 'You') : message.kind === 'final' ? <Sparkles size={12} /> : message.role.slice(0, 1)}</div>
+      <div className="message-body">
+        <div className="message-meta"><strong>{message.title}</strong>{message.time && <time>{formatTime(message.time)}</time>}</div>
+        {isAgent && message.input && <><button className="agent-input-row" onClick={() => setShowInput((current) => !current)}><span className="agent-step-icon"><ArrowRight size={14} /></span><span className="agent-input-copy"><small>{text('输入', 'Input')}</small>{compactText(message.input, 220)}</span><span className="agent-chevron">{showInput ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</span></button>{showInput && <div className="agent-input-expanded"><MessageText text={message.input} /></div>}<div className="agent-output-label">{message.kind === 'plan' ? text('计划摘要', 'Plan summary') : message.kind === 'verification' ? text('验证结论', 'Verification result') : text('执行结果', 'Execution result')}</div></>}
+        {message.activity && message.activity.length > 0 && <TrajectorySteps steps={message.activity} />}
+        <MessageText text={displayText} />
+        {message.artifacts && <ExecutionArtifacts projection={message.artifacts} live={message.kind === 'live'} />}
+        {(clipped || expanded) && <button type="button" className="message-expand" onClick={() => setExpanded((open) => !open)}>{expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}<span>{expanded ? text('收起', 'Show less') : text('展开全文', 'Show full output')}</span></button>}
+        {message.kind === 'plan' && <span className="message-hint">{text('已隐藏内部 prompt，仅保留可执行摘要', 'Internal prompts are hidden; only the actionable summary is shown')}</span>}
+        {message.kind === 'final' && <span className={`final-badge final-authority-${message.authority || 'none'}`}>{message.authority === 'final_response' ? text('LongHorizon 最终回复', 'LongHorizon final response') : message.authority === 'report' ? text('Auditor 最终报告', 'Auditor final report') : message.authority === 'auditor' ? text('Auditor 验证', 'Auditor verification') : text('等待权威报告', 'Awaiting authoritative report')}</span>}
+        {/*
+          LHH#155: a queued operator message renders as a read-only pending
+          bubble until the worker consumes it.  There is no backend endpoint to
+          cancel or edit a queued instruction yet (the only route is
+          POST /api/runs/{run_id}/instructions), so the bubble deliberately
+          offers no Edit/Cancel affordance — the missing endpoint is tracked as
+          a follow-up rather than faked with a control that cannot work.
+        */}
+        {message.pending && (
+          <span className="message-pending-badge" data-testid="message-pending-badge">
+            <Clock size={14} aria-hidden="true" />
+            {text('待送达', 'Pending delivery')}
+          </span>
+        )}
+      </div>
+    </article>
+  );
 }
 
 function ImageGallery({ images, label }: { images: string[]; label: string }) {
