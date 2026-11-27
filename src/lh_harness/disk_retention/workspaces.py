@@ -468,7 +468,7 @@ class CloneGitState:
 
     ``disposable`` is True only when every probe succeeded AND none of them
     found a reason to keep: the tree is clean (no tracked change, no
-    untracked file, no ignored file), HEAD has no commit
+    untracked file, no ignored file, no ``.gitmodules``), HEAD has no commit
     that is absent from every remote branch, and the checked-out branch has
     an upstream.  ``detail`` is the human half of the ``reason``; ``detail``
     is empty when the clone is disposable.
@@ -512,7 +512,7 @@ def _classify_git_state(
     Every "unknown" input (``None``) and any ``failed`` message is a keep.
     Only a repository whose status is empty, whose unpushed count is ``0``
     and whose branch has an upstream — with no failure — is disposable.
-    The ignored-file keep is decided by the caller
+    The ignored-file and ``.gitmodules`` keeps are decided by the caller
     (:func:`inspect_clone_git_state`) straight after the status probe.
     """
 
@@ -552,6 +552,11 @@ def inspect_clone_git_state(ws: Path) -> CloneGitState:
         return _classify_git_state(is_repo=False, status_porcelain=None, unpushed_count=None, has_upstream=False, failed=str(exc))
 
     try:
+        has_gitmodules = (ws / ".gitmodules").exists()
+    except OSError as exc:
+        return _classify_git_state(is_repo=True, status_porcelain=None, unpushed_count=None, has_upstream=False, failed=str(exc))
+
+    try:
         # ``--ignored=matching`` lists ignored paths as ``!!`` lines; tracked
         # and untracked entries are unchanged.  A fresh clone lists none.
         status = _run_git(ws, "status", "--porcelain", "--ignored=matching")
@@ -572,6 +577,10 @@ def inspect_clone_git_state(ws: Path) -> CloneGitState:
             # An ignored file is work too: plain ``--porcelain`` would read
             # such a clone as clean and it would be removed.
             return CloneGitState(False, "ignored files present")
+        if has_gitmodules:
+            # The submodules themselves are deliberately not probed; the
+            # file alone is enough to keep the clone.
+            return CloneGitState(False, "submodules present (not probed)")
         porcelain = ""
 
         unpushed = _run_git(ws, "rev-list", "--count", "HEAD", "--not", "--remotes")

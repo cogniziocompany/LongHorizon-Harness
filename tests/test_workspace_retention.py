@@ -1279,6 +1279,39 @@ class TestDirtyGuardKeepsUncommittedClones:
         report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
         assert report.reason == f"{STATE_KEPT_UNCOMMITTED}: ignored files present; kept"
 
+    def test_gitmodules_is_kept_without_probing_submodules(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``.gitmodules`` marks a repository with submodules; the guard does
+        not probe them, the file alone is a keep with reason
+        ``submodules present (not probed)``."""
+        import subprocess
+
+        root = tmp_path / "work"
+        # COMMITTED .gitmodules naming no network URL: the clone stays clean
+        # and fully pushed, so the file is the only reason to keep it.
+        ws = _make_clone(
+            root, "ws-gitmodules",
+            files={"src/main.py": b"print('hi')\n", ".gitmodules": b"[submodule \"vendor/x\"]\n\tpath = vendor/x\n\turl = ../x.git\n"},
+        )
+        assert (ws / ".gitmodules").exists()
+        assert _git(ws, "status", "--porcelain") == ""
+        assert _git(ws, "status", "--porcelain", "--ignored=matching") == ""
+        # No submodule is ever probed: no ``git submodule`` call is made.
+        real = subprocess.run
+        seen: list[list[str]] = []
+
+        def _spy(argv: Any, **kw: Any) -> Any:
+            seen.append(list(argv))
+            return real(argv, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _spy)
+        state = inspect_clone_git_state(ws)
+        monkeypatch.setattr(subprocess, "run", real)
+        assert state.kept is True and state.disposable is False
+        assert state.detail == "submodules present (not probed)"
+        assert not any("submodule" in argv for argv in seen)
+        report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
+        assert report.reason == f"{STATE_KEPT_UNCOMMITTED}: submodules present (not probed); kept"
+
     def test_clean_pushed_old_clone_is_still_removed_under_enforcement(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Control: the one shape the guard lets through is removed exactly as before.
 
