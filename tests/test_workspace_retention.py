@@ -1262,6 +1262,23 @@ class TestDirtyGuardKeepsUncommittedClones:
         report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
         assert "not a git repository" in report.reason
 
+    def test_ignored_file_is_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Plain ``git status --porcelain`` does not list ignored files: a clone
+        whose only work sits in an ignored path reads clean and would be removed.
+        Any ignored entry is a keep, reason ``ignored files present``."""
+        root = tmp_path / "work"
+        # The .gitignore is COMMITTED (part of the initial commit), so the only
+        # thing in the tree that is not pushed is the ignored file itself.
+        ws = _make_clone(root, "ws-ignored", files={"src/main.py": b"print('hi')\n", ".gitignore": b"*.log\n"})
+        (ws / "debug.log").write_text("ignored work\n")
+        # Isolation of the trigger: plain porcelain is empty (not dirty), and
+        # the file is listed only under --ignored.
+        assert _git(ws, "status", "--porcelain") == ""
+        assert _git(ws, "status", "--porcelain", "--ignored=matching").splitlines() == ["!! debug.log"]
+        assert _git(ws, "ls-files", "--others", "--ignored", "--exclude-standard").split() == ["debug.log"]
+        report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
+        assert report.reason == f"{STATE_KEPT_UNCOMMITTED}: ignored files present; kept"
+
     def test_clean_pushed_old_clone_is_still_removed_under_enforcement(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Control: the one shape the guard lets through is removed exactly as before.
 

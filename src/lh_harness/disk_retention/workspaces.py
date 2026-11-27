@@ -467,9 +467,10 @@ class CloneGitState:
     """Outcome of the dirty guard's read-only probes into one clone.
 
     ``disposable`` is True only when every probe succeeded AND none of them
-    found a reason to keep: the tree is clean, HEAD has no commit that is
-    absent from every remote branch, and the checked-out branch has an
-    upstream.  ``detail`` is the human half of the ``reason``; ``detail``
+    found a reason to keep: the tree is clean (no tracked change, no
+    untracked file, no ignored file), HEAD has no commit
+    that is absent from every remote branch, and the checked-out branch has
+    an upstream.  ``detail`` is the human half of the ``reason``; ``detail``
     is empty when the clone is disposable.
     """
 
@@ -511,6 +512,8 @@ def _classify_git_state(
     Every "unknown" input (``None``) and any ``failed`` message is a keep.
     Only a repository whose status is empty, whose unpushed count is ``0``
     and whose branch has an upstream — with no failure — is disposable.
+    The ignored-file keep is decided by the caller
+    (:func:`inspect_clone_git_state`) straight after the status probe.
     """
 
     if failed is not None:
@@ -549,13 +552,27 @@ def inspect_clone_git_state(ws: Path) -> CloneGitState:
         return _classify_git_state(is_repo=False, status_porcelain=None, unpushed_count=None, has_upstream=False, failed=str(exc))
 
     try:
-        status = _run_git(ws, "status", "--porcelain")
+        # ``--ignored=matching`` lists ignored paths as ``!!`` lines; tracked
+        # and untracked entries are unchanged.  A fresh clone lists none.
+        status = _run_git(ws, "status", "--porcelain", "--ignored=matching")
         if status.returncode != 0:
             return _classify_git_state(
                 is_repo=True, status_porcelain=None, unpushed_count=None, has_upstream=False,
                 failed=f"git status exited {status.returncode}: {status.stderr.strip()[:200]}",
             )
-        porcelain = status.stdout
+        ignored_lines = [line for line in status.stdout.splitlines() if line.startswith("!!")]
+        dirty_lines = [line for line in status.stdout.splitlines() if not line.startswith("!!")]
+        if dirty_lines:
+            # A tracked change or untracked file keeps its existing reason
+            # and its existing precedence over the two reasons below.
+            return _classify_git_state(
+                is_repo=True, status_porcelain="\n".join(dirty_lines), unpushed_count=None, has_upstream=False, failed=None
+            )
+        if ignored_lines:
+            # An ignored file is work too: plain ``--porcelain`` would read
+            # such a clone as clean and it would be removed.
+            return CloneGitState(False, "ignored files present")
+        porcelain = ""
 
         unpushed = _run_git(ws, "rev-list", "--count", "HEAD", "--not", "--remotes")
         if unpushed.returncode != 0:
