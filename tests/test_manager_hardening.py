@@ -367,8 +367,13 @@ async def test_late_crash_report_preserves_completed_rounds(tmp_path: Path) -> N
         (
             "Next: cli\n\nCurrent Task State:\nwork pending",
             "executor finished the requested work",
+            # Round 1 does not verify the deliverable, so round 2 still runs and
+            # completion is reached by its clean audit (the stop point).
+            "Status: incomplete\nIntegrity: clean\nContract audit: needs_revision\n"
+            "Gap:\nverification is unfinished",
+            "Next: cli\n\nCurrent Task State:\nwork finished",
+            "executor finished the requested work",
             "Status: complete\nIntegrity: clean\nContract audit: aligned",
-            "Next: done\n\nCurrent Task State:\nwork finished",
             "The requested work is complete.",
         )
     )
