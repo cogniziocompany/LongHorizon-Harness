@@ -1185,6 +1185,11 @@ class Launcher:
         # longer consumes capacity) still counts as an eligible-but-unlaunched
         # cycle only when NOTHING in the pass launched.
         self._update_stall_detector(eligible_seen, launched)
+        # easybutt0n-17: terminal-run clone-workspace retention.  A no-op
+        # unless LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED is set; runs
+        # after the launch loop so a removal can never race this pass's own
+        # launch.  The method fails open on its own.
+        self._sweep_terminal_workspaces()
 
     def _update_stall_detector(self, eligible_seen: bool, launched: bool) -> None:
         """Task 230 stall detector: N consecutive stalled cycles go loud.
@@ -1757,6 +1762,65 @@ class Launcher:
             return reason
         self._disk_full_sticky = False
         return None
+
+    def _sweep_terminal_workspaces(self) -> None:
+        """easybutt0n-17: retention of TERMINAL-run clone workspaces.
+
+        Runs once per scheduling pass, after the launch loop, on the node's
+        own work root (``supervisor.workspace_root`` — the same root
+        ``_resolve_workspace`` creates clones under).  The references are
+        the launcher's own view: ``supervisor.list_run_items()`` for runs
+        (workspace, status, ``finished_at``) and ``queue_store.list()`` for
+        entries still pending/launched/blocked, so a workspace a queue
+        entry names is never removed.
+
+        The pass is the enforcement path, so it only runs when
+        ``LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED`` is ``true`` in the
+        settings DB (read fresh every pass: no restart to enable or
+        disable).  With the flag off — the default — the launcher does not
+        touch the work root at all; the operator lists candidates with
+        ``lh-harness retention --work-root`` instead.  The sweep itself
+        still gates every removal on the same flag, so the two checks are
+        independent.  Fail-open like every other housekeeping call here: a
+        broken sweep must never stop launches.
+        """
+
+        work_root = getattr(self.supervisor, "workspace_root", None)
+        if not work_root:
+            return
+        try:
+            from .disk_retention import RetainMode, config_from_runtime, sweep_workspaces_report
+            from .settings_store import active_runtime
+
+            cfg = config_from_runtime(active_runtime())
+            if not cfg.workspace_retention_enabled:
+                return
+            payload = sweep_workspaces_report(
+                work_root,
+                run_items=self.supervisor.list_run_items(),
+                queue_entries=self.queue_store.list(),
+                config=cfg,
+                mode=RetainMode.live(),
+            )
+        except Exception as exc:  # noqa: BLE001 - retention must never freeze the launcher
+            logger.warning("terminal-workspace sweep failed; continuing: %s", exc)
+            return
+        removed = payload["totals"]["by_state"].get("removed", 0)
+        if removed:
+            self._emit_service_event(
+                "workspace.retention",
+                {
+                    "removed": removed,
+                    "work_root": payload["work_root"],
+                    "max_age_hours": payload["max_age_hours"],
+                },
+            )
+        errors = payload["totals"]["by_state"].get("error", 0)
+        if errors:
+            logger.warning(
+                "terminal-workspace sweep: %d workspace(s) could not be removed; see report states",
+                errors,
+            )
 
     def _check_eligibility(
         self,

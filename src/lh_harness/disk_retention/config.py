@@ -20,6 +20,17 @@ The four ``LH_HARNESS_DISK_*`` settings are:
 A mis-set value is logged and ignored — the next setting (or the default)
 is used in its place.  A value of ``0`` or a negative integer disables the
 rule that owns it; ``-1`` for the cache cap means "no cap".
+
+Two further settings gate TERMINAL-run clone-workspace retention
+(``workspaces.py``), which removes the working clone of a finished run
+under the node work root:
+
+* ``LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED`` — explicit opt-in flag
+  (default ``false``).  With it unset/false the sweep never deletes a
+  workspace: the dry-run listing is the only thing that runs.
+* ``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`` — how long a workspace must
+  have belonged only to TERMINAL runs before it is eligible (default
+  ``72``).
 """
 
 from __future__ import annotations
@@ -42,6 +53,8 @@ SETTING_PIP_CACHE_MAX_BYTES = "LH_HARNESS_DISK_PIP_CACHE_MAX_BYTES"
 SETTING_WARN_PCT = "LH_HARNESS_DISK_WARN_PCT"
 SETTING_PAUSE_PCT = "LH_HARNESS_DISK_PAUSE_PCT"
 SETTING_RESUME_PCT = "LH_HARNESS_DISK_RESUME_PCT"
+SETTING_WORKSPACE_RETENTION_ENABLED = "LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED"
+SETTING_WORKSPACE_MAX_AGE_HOURS = "LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS"
 
 SETTING_NAMES: tuple[str, ...] = (
     SETTING_RUN_MAX_AGE_DAYS,
@@ -52,6 +65,8 @@ SETTING_NAMES: tuple[str, ...] = (
     SETTING_WARN_PCT,
     SETTING_PAUSE_PCT,
     SETTING_RESUME_PCT,
+    SETTING_WORKSPACE_RETENTION_ENABLED,
+    SETTING_WORKSPACE_MAX_AGE_HOURS,
 )
 
 # Defaults match the operator-approved thresholds in CT110-DISK.
@@ -61,6 +76,15 @@ DEFAULT_CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_WARN_PCT = 80
 DEFAULT_PAUSE_PCT = 90
 DEFAULT_RESUME_PCT = 85
+# Terminal-run clone-workspace retention is opt-in: nothing is ever deleted
+# until an operator sets the enabled flag explicitly.  The age threshold is
+# in hours (not days) because a node's work root fills much faster than its
+# runs tree.
+DEFAULT_WORKSPACE_RETENTION_ENABLED = False
+DEFAULT_WORKSPACE_MAX_AGE_HOURS = 72
+
+_TRUTHY = frozenset({"1", "true", "yes", "on", "enabled"})
+_FALSY = frozenset({"0", "false", "no", "off", "disabled", ""})
 
 # A path inside the harness-owned control directory is illegal; the
 # retention sweep must never be pointed at the live runs tree of the very
@@ -143,6 +167,14 @@ class DiskRetentionConfig:
     cache_paths: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     runs_root: str = ""
     failed_reports_root: str = ""
+    # Terminal-run clone-workspace retention (``workspaces.py``).  The flag
+    # is the ONLY thing that opens the deletion path; the sweep lists
+    # candidates regardless, so an operator can dry-run before opting in.
+    # ``workspace_root`` is the node work root the sweep enumerates the
+    # direct children of; empty means "not configured", which is a no-op.
+    workspace_retention_enabled: bool = DEFAULT_WORKSPACE_RETENTION_ENABLED
+    workspace_max_age_hours: int = DEFAULT_WORKSPACE_MAX_AGE_HOURS
+    workspace_root: str = ""
 
     # ------------------------------------------------------------ helpers --
     def cache_max_bytes_for(self, name: str) -> int:
@@ -215,6 +247,26 @@ def _coerce_bytes(value: Any, default: int) -> int:
         return default
 
 
+def _coerce_bool(value: Any, default: bool) -> bool:
+    """Parse a settings-DB flag.
+
+    Only an explicit truthy spelling (``1``/``true``/``yes``/``on``/
+    ``enabled``) turns the flag on.  Anything else — unset, a falsy
+    spelling, or an unrecognised value — keeps the default, so a typo can
+    never enable a destructive rule.
+    """
+
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in _TRUTHY:
+        return True
+    if text in _FALSY:
+        return False
+    logger.warning("disk-retention: ignoring non-boolean value %r; using %r", value, default)
+    return default
+
+
 def config_from_values(values: Mapping[str, Any] | None) -> DiskRetentionConfig:
     """Build a config from a name→string map (the settings-DB ``values()`` output)."""
 
@@ -237,6 +289,12 @@ def config_from_values(values: Mapping[str, Any] | None) -> DiskRetentionConfig:
         warn_pct=_coerce_int(values.get(SETTING_WARN_PCT), DEFAULT_WARN_PCT),
         pause_pct=_coerce_int(values.get(SETTING_PAUSE_PCT), DEFAULT_PAUSE_PCT),
         resume_pct=_coerce_int(values.get(SETTING_RESUME_PCT), DEFAULT_RESUME_PCT),
+        workspace_retention_enabled=_coerce_bool(
+            values.get(SETTING_WORKSPACE_RETENTION_ENABLED), DEFAULT_WORKSPACE_RETENTION_ENABLED
+        ),
+        workspace_max_age_hours=_coerce_int(
+            values.get(SETTING_WORKSPACE_MAX_AGE_HOURS), DEFAULT_WORKSPACE_MAX_AGE_HOURS
+        ),
     )
 
 
@@ -265,6 +323,8 @@ __all__ = [
     "DEFAULT_RUN_MAX_AGE_DAYS",
     "DEFAULT_WARN_PCT",
     "DEFAULT_WORKTREE_MAX_AGE_DAYS",
+    "DEFAULT_WORKSPACE_MAX_AGE_HOURS",
+    "DEFAULT_WORKSPACE_RETENTION_ENABLED",
     "DiskRetentionConfig",
     "RetainMode",
     "SETTING_CACHE_MAX_BYTES",
@@ -276,6 +336,8 @@ __all__ = [
     "SETTING_RUN_MAX_AGE_DAYS",
     "SETTING_WARN_PCT",
     "SETTING_WORKTREE_MAX_AGE_DAYS",
+    "SETTING_WORKSPACE_MAX_AGE_HOURS",
+    "SETTING_WORKSPACE_RETENTION_ENABLED",
     "config_from_runtime",
     "config_from_values",
 ]

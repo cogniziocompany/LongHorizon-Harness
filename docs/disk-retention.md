@@ -16,7 +16,15 @@ state when a node starts running low on disk:
    and pause new launches at `LH_HARNESS_DISK_PAUSE_PCT` (default 90 %).
    The pause is sticky until a fresh check sees usage below
    `LH_HARNESS_DISK_RESUME_PCT` (default 85 %).
-5. **All thresholds are in the settings DB** (see
+5. **Terminal-run clone workspaces** (easybutt0n-17): once *every* run and
+   queue entry that names a working clone under the node work root has
+   reached a TERMINAL state (`completed`, `failed`, `cancelled`, `blocked`,
+   `incomplete`) and the clone has stayed that way for more than
+   `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` (default 72 h), the clone is
+   a removal candidate.  **Opt-in**: nothing is deleted unless
+   `LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED` is `true` (default
+   `false`).  See "Terminal-run clone workspaces" below.
+6. **All thresholds are in the settings DB** (see
    `docs/settings-store.md`); no threshold is hard-coded outside the loader
    in `src/lh_harness/disk_retention/config.py`.  Each appears on the
    admin screen next to the other settings.
@@ -54,11 +62,62 @@ state.
 | `LH_HARNESS_DISK_WARN_PCT` | 80 | Disk usage that triggers a warning |
 | `LH_HARNESS_DISK_PAUSE_PCT` | 90 | Disk usage that pauses new launches |
 | `LH_HARNESS_DISK_RESUME_PCT` | 85 | Disk usage under which launches auto-resume |
+| `LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED` | `false` | Explicit opt-in for terminal-run clone-workspace removal |
+| `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` | 72 | Age a terminal-run clone must exceed before it can be removed |
 
 A setting of `0` (or negative for the cache cap) disables the rule that
 owns it.  Every setting is editable from the admin screen; the names
 match the `SettingSpec` rows added to
 `src/lh_harness/settings_store.py:CATALOG`.
+
+## Terminal-run clone workspaces
+
+A run's *working clone* is the directory the supervisor resolves for the
+run under the node work root (`--workspace-root`, e.g.
+`/home/harness/work/<workspace>/`).  It is **not** run evidence; nothing
+under `.lh-harness/runs/` is ever a candidate, and neither is a workspace
+in a `queued` or `pending` queue entry.
+
+The selection rule is the pure function
+`lh_harness.disk_retention.workspaces.should_retain_workspace(path,
+states, age_seconds, max_age_seconds)`.  It selects a clone only when
+**all** of the following hold; anything else keeps it:
+
+* no path component is `.lh-harness`;
+* at least one run or queue entry names the clone (an orphan is kept —
+  we do not know what it is);
+* every referencing run/queue entry is in a TERMINAL lifecycle state
+  (`running`, `waiting_approval`, `queued`, `pending`, an unknown state,
+  or a mix of terminal and non-terminal all keep it);
+* the clone's age is strictly greater than the threshold (equal keeps).
+
+The age is measured from the most recent `finished_at` of a referencing
+terminal run (the run's own terminal-state timestamp in `status.json`),
+falling back to the clone directory's mtime when no run left one.  The
+source is reported per entry as `age_source`.
+
+Only direct children of the work root are visited; symlinks are never
+followed or removed.  The launcher runs the sweep once per scheduling
+pass **only while the flag is set** (with it off the launcher never
+touches the work root); the operator CLI lists the same candidates with
+`du`-style sizes regardless of the flag:
+
+```bash
+# List candidates with sizes; removes nothing regardless of the flag:
+lh-harness retention --runs-root <runs-root> --work-root /home/harness/work \
+    --report /tmp/retention-dryrun.json
+
+# Only with BOTH --apply and LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED=true
+# are candidates removed; otherwise the pass is identical to the dry-run:
+lh-harness retention --runs-root <runs-root> --work-root /home/harness/work --apply
+```
+
+Report states: `selectable` (candidate; would be / was removed),
+`removed`, `kept_harness_owned`, `kept_no_references`,
+`kept_active_reference`, `kept_recent`, `skipped`, `error`.
+
+Installing or enabling this on a node is an operator (infraops1) action
+after reviewing the dry-run listing; a run never enables it.
 
 ## State machine
 
@@ -72,8 +131,10 @@ match the `SettingSpec` rows added to
 ## Tests
 
 `tests/test_disk_retention.py` exercises every rule with mock
-filesystems and a fake settings DB.  Run with:
+filesystems and a fake settings DB; `tests/test_workspace_retention.py`
+covers the terminal-run clone-workspace predicate, dry-run, enforcement
+gate and settings defaults.  Run with:
 
 ```bash
-pytest tests/test_disk_retention.py -q
+pytest tests/test_disk_retention.py tests/test_workspace_retention.py -q
 ```

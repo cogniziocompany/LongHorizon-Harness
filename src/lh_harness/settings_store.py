@@ -229,6 +229,21 @@ CATALOG: tuple[SettingSpec, ...] = (
         False,
         restart=False,
     ),
+    # Terminal-run clone-workspace retention (easybutt0n-17).  The flag is an
+    # explicit opt-in: with it unset the sweep only ever lists candidates.
+    SettingSpec(
+        "LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED",
+        "Remove the working clone of TERMINAL runs older than the workspace age threshold "
+        "(default false: the sweep only lists candidates; setting true enables deletion)",
+        False,
+        restart=False,
+    ),
+    SettingSpec(
+        "LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS",
+        "Age in hours a TERMINAL-run workspace must reach before it can be removed (default 72)",
+        False,
+        restart=False,
+    ),
 )
 CATALOG_BY_NAME = {spec.name: spec for spec in CATALOG}
 
