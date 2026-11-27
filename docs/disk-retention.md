@@ -22,7 +22,8 @@ state when a node starts running low on disk:
    `cancelled`, `blocked` or `incomplete`; a queue entry only in `done` or
    `failed` (a queue `blocked`/`pending`/`launched` entry is still parked
    work and keeps the clone) — and the clone has stayed that way for more
-   than `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` (default 72 h), the clone
+   than `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` (default 72 h; `0` or a
+   negative value disables this rule), the clone
    is a removal candidate.  **Opt-in**: nothing is deleted unless
    `LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED` is `true` (default
    `false`).  See "Terminal-run clone workspaces" below.
@@ -65,12 +66,19 @@ state.
 | `LH_HARNESS_DISK_PAUSE_PCT` | 90 | Disk usage that pauses new launches |
 | `LH_HARNESS_DISK_RESUME_PCT` | 85 | Disk usage under which launches auto-resume |
 | `LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED` | `false` | Explicit opt-in for terminal-run clone-workspace removal |
-| `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` | 72 | Age a terminal-run clone must exceed before it can be removed |
+| `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` | 72 | Age a terminal-run clone must exceed before it can be removed; `0` or negative disables the rule |
 
-A setting of `0` (or negative for the cache cap) disables the rule that
-owns it.  Every setting is editable from the admin screen; the names
-match the `SettingSpec` rows added to
-`src/lh_harness/settings_store.py:CATALOG`.
+For `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`, a setting of `0` (or any
+negative value) disables the rule: no clone is ever old enough, so the
+sweep selects nothing and removes nothing even with enforcement on.  For
+`LH_HARNESS_DISK_CACHE_MAX_BYTES` (and the per-cache caps), `0` or
+negative means "no cap".  This does **not** hold for
+`LH_HARNESS_DISK_RUN_MAX_AGE_DAYS` or
+`LH_HARNESS_DISK_WORKTREE_MAX_AGE_DAYS`: those are plain age thresholds,
+so `0` (or a negative) makes every run folder / parked work tree that is
+not live eligible — set them to a positive number.  Every setting is
+editable from the admin screen; the names match the `SettingSpec` rows
+added to `src/lh_harness/settings_store.py:CATALOG`.
 
 ## Terminal-run clone workspaces
 

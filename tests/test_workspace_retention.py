@@ -39,6 +39,7 @@ from lh_harness.disk_retention import (
 )
 from lh_harness.disk_retention import config as cfg_mod
 from lh_harness.disk_retention.workspaces import (
+    KEEP_STATES,
     QUEUE_TERMINAL_STATUSES,
     STATE_ERROR,
     STATE_KEPT_ACTIVE,
@@ -153,8 +154,26 @@ class TestPredicateStatesXAges:
     def test_negative_threshold_disables(self) -> None:
         assert should_retain_workspace(self.WS, ["completed"], _old(10_000), -1.0) is False
 
-    def test_zero_threshold_selects_any_positive_age(self) -> None:
-        assert should_retain_workspace(self.WS, ["completed"], 1.0, 0.0) is True
+    @pytest.mark.parametrize("threshold", [0.0, -1.0, -72.0 * HOUR])
+    def test_zero_or_negative_threshold_disables(self, threshold: float) -> None:
+        """``0`` disables the rule just like a negative value (LHH#222 review).
+
+        Before the fix a threshold of ``0`` fell through to ``age > limit``
+        and selected EVERY terminal workspace, however young -- a 5 s old
+        clone was removed with the flag on -- while config.py and the docs
+        promised "0 disables the rule".  Only a strictly positive threshold
+        can select anything.
+        """
+        for age in (_old(10_000), _old(), THRESHOLD + 1.0, _young(), 5.0, 0.0):
+            assert should_retain_workspace(self.WS, ["completed"], age, threshold) is False, (age, threshold)
+            assert should_retain_workspace(self.WS, ["queue:done"], age, threshold) is False, (age, threshold)
+
+    def test_positive_threshold_still_selects(self) -> None:
+        # The fix must not touch the positive path: a tiny positive threshold
+        # still selects a positive age, and the 72 h default behaves as before.
+        assert should_retain_workspace(self.WS, ["completed"], 1.0, 0.5) is True
+        assert should_retain_workspace(self.WS, ["completed"], _old(), THRESHOLD) is True
+        assert should_retain_workspace(self.WS, ["completed"], _young(), THRESHOLD) is False
 
     def test_predicate_is_pure_no_fs_or_clock_access(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The predicate must not touch the filesystem, the clock, or the store."""
@@ -823,6 +842,135 @@ class TestEnforcement:
         assert sweep_workspaces(root, run_items=run_items, config=DiskRetentionConfig(workspace_max_age_hours=1), now=NOW)[0].state == STATE_SELECTABLE
         # 72 h threshold: 2 h old is kept.
         assert sweep_workspaces(root, run_items=run_items, config=DiskRetentionConfig(), now=NOW)[0].state == STATE_KEPT_RECENT
+
+
+# =============================================== threshold 0 / negative: disabled
+# LHH#222 review: ``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS=0`` selected EVERY
+# terminal workspace (a 5 s old one was removed with the flag on) although
+# config.py and docs/disk-retention.md said "0 disables the rule".  These pin
+# the safe reading: 0 and negatives disable the rule, nothing is selected and
+# nothing removed, with enforcement ON.  ``work_tree`` already holds a clone
+# that IS selected under the 72 h default (``ws-old-terminal``) plus a fresh
+# one, so it is exactly the fixture these cases need.
+DISABLED_THRESHOLDS = [0, -1]
+
+
+class TestZeroOrNegativeThresholdDisables:
+    @pytest.mark.parametrize("hours", DISABLED_THRESHOLDS)
+    def test_live_mode_with_flag_on_selects_and_removes_nothing(
+        self, work_tree: dict[str, Any], hours: int
+    ) -> None:
+        root: Path = work_tree["root"]
+        before = _snapshot(root)
+        reports = sweep_workspaces(
+            root,
+            run_items=work_tree["run_items"],
+            queue_entries=work_tree["queue_entries"],
+            config=DiskRetentionConfig(workspace_retention_enabled=True, workspace_max_age_hours=hours),
+            mode=RetainMode.live(),
+            now=NOW,
+        )
+        # Nothing is a candidate, nothing was removed, nothing changed on disk.
+        assert [r for r in reports if r.state in (STATE_SELECTABLE, STATE_REMOVED)] == []
+        assert all(r.state in KEEP_STATES for r in reports)
+        assert _snapshot(root) == before
+        # Every directory still exists -- including the one the 72 h default removes.
+        for name in ("ws-old-terminal", "ws-young-terminal", "ws-running", "ws-queued", "ws-mixed", "ws-orphan"):
+            assert (root / name).is_dir(), name
+        assert (root / ".lh-harness" / "runs" / "20261101-abc" / "logs" / "report.json").is_file()
+        # The old clone is reported as kept, and the reason says the rule is disabled.
+        got = _by_path(reports)
+        assert got["ws-old-terminal"].state == STATE_KEPT_RECENT
+        assert "disabled" in got["ws-old-terminal"].reason
+        assert got["ws-old-terminal"].size_bytes == 0  # never measured for removal
+
+    @pytest.mark.parametrize("hours", DISABLED_THRESHOLDS)
+    def test_same_tree_is_selected_and_removed_under_the_default_threshold(
+        self, work_tree: dict[str, Any], hours: int
+    ) -> None:
+        """Control: the very same fixture loses ``ws-old-terminal`` at 72 h, so the
+        empty selection above is the disabled rule, not an unselectable fixture."""
+        root: Path = work_tree["root"]
+        reports = sweep_workspaces(
+            root,
+            run_items=work_tree["run_items"],
+            queue_entries=work_tree["queue_entries"],
+            config=DiskRetentionConfig(workspace_retention_enabled=True, workspace_max_age_hours=DEFAULT_WORKSPACE_MAX_AGE_HOURS),
+            mode=RetainMode.live(),
+            now=NOW,
+        )
+        assert _by_path(reports)["ws-old-terminal"].state == STATE_REMOVED
+        assert not (root / "ws-old-terminal").exists()
+        assert hours in DISABLED_THRESHOLDS  # the parametrisation is only for the report id
+
+    @pytest.mark.parametrize("hours", DISABLED_THRESHOLDS)
+    def test_dry_run_listing_is_empty_too(
+        self, work_tree: dict[str, Any], hours: int
+    ) -> None:
+        root: Path = work_tree["root"]
+        before = _snapshot(root)
+        payload = sweep_workspaces_report(
+            root,
+            run_items=work_tree["run_items"],
+            queue_entries=work_tree["queue_entries"],
+            config=DiskRetentionConfig(workspace_retention_enabled=True, workspace_max_age_hours=hours),
+            mode=RetainMode.dry(),
+            now=NOW,
+        )
+        assert payload["max_age_hours"] == hours
+        assert payload["totals"]["candidates"] == 0
+        assert payload["totals"]["candidate_bytes"] == 0
+        assert STATE_SELECTABLE not in payload["totals"]["by_state"]
+        assert _snapshot(root) == before
+
+    @pytest.mark.parametrize("hours", DISABLED_THRESHOLDS)
+    def test_five_second_old_clone_is_not_removed(self, tmp_path: Path, hours: int) -> None:
+        """The exact review scenario: a clone whose run finished 5 s ago survives enforcement."""
+        root = tmp_path / "work"
+        ws = _tree(root, "ws-just-finished", {".git/HEAD": b"ref" * 100})
+        run_items = [{"id": "r-new", "workspace": str(ws), "status": "completed", "finished_at": NOW - 5.0}]
+        reports = sweep_workspaces(
+            root,
+            run_items=run_items,
+            config=DiskRetentionConfig(workspace_retention_enabled=True, workspace_max_age_hours=hours),
+            mode=RetainMode.live(),
+            now=NOW,
+        )
+        assert _by_path(reports)["ws-just-finished"].state == STATE_KEPT_RECENT
+        assert ws.is_dir()
+        assert (ws / ".git" / "HEAD").is_file()
+
+    @pytest.mark.parametrize("hours", DISABLED_THRESHOLDS)
+    def test_delete_path_is_unreachable(self, work_tree: dict[str, Any], hours: int, monkeypatch: pytest.MonkeyPatch) -> None:
+        import lh_harness.disk_retention.workspaces as mod
+
+        called: list[str] = []
+        monkeypatch.setattr(mod, "_delete_workspace", lambda p: called.append(str(p)))
+        monkeypatch.setattr(mod.shutil, "rmtree", lambda *a, **k: called.append("rmtree"))
+        sweep_workspaces(
+            work_tree["root"],
+            run_items=work_tree["run_items"],
+            queue_entries=work_tree["queue_entries"],
+            config=DiskRetentionConfig(workspace_retention_enabled=True, workspace_max_age_hours=hours),
+            mode=RetainMode.live(),
+            now=NOW,
+        )
+        assert called == []
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "-72"])
+    def test_setting_value_reaches_the_predicate_as_disabled(self, tmp_path: Path, raw: str) -> None:
+        """End to end through the settings loader: ``"0"``/``"-1"`` in the store -> rule off."""
+        cfg = config_from_values(
+            {cfg_mod.SETTING_WORKSPACE_RETENTION_ENABLED: "true", cfg_mod.SETTING_WORKSPACE_MAX_AGE_HOURS: raw}
+        )
+        assert cfg.workspace_retention_enabled is True
+        assert cfg.workspace_max_age_hours == int(raw)
+        root = tmp_path / "work"
+        ws = _tree(root, "ws-old-terminal")
+        run_items = [{"id": "r-old", "workspace": str(ws), "status": "completed", "finished_at": NOW - _old()}]
+        reports = sweep_workspaces(root, run_items=run_items, config=cfg, mode=RetainMode.live(), now=NOW)
+        assert reports[0].state == STATE_KEPT_RECENT
+        assert ws.is_dir()
 
 
 # =================================================================== settings
