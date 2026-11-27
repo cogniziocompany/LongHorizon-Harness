@@ -39,6 +39,7 @@ from lh_harness.disk_retention import (
 )
 from lh_harness.disk_retention import config as cfg_mod
 from lh_harness.disk_retention.workspaces import (
+    QUEUE_TERMINAL_STATUSES,
     STATE_ERROR,
     STATE_KEPT_ACTIVE,
     STATE_KEPT_HARNESS_OWNED,
@@ -48,6 +49,7 @@ from lh_harness.disk_retention.workspaces import (
     STATE_SELECTABLE,
     collect_workspace_refs,
     human_size,
+    is_terminal_reference,
 )
 
 HOUR = 3600.0
@@ -192,12 +194,13 @@ def test_collector_groups_runs_and_queue_entries_by_normalized_path() -> None:
         [_entry("/work/a", "launched"), _entry("/work/b", "pending")],
     )
     assert set(refs) == {"/work/a", "/work/b"}
-    assert sorted(refs["/work/a"].states) == ["completed", "failed", "launched"]
+    # References are tagged by source: runs as ``run:``, the queue row as ``queue:``.
+    assert sorted(refs["/work/a"].states) == ["queue:launched", "run:completed", "run:failed"]
     # Most recent terminal finished_at wins.
     assert refs["/work/a"].finished_at == 20.0
     assert refs["/work/a"].age_source == "run_finished_at"
     # An active run never lends its (possibly stale) finished_at.
-    assert refs["/work/b"].states == ["running", "pending"]
+    assert refs["/work/b"].states == ["run:running", "queue:pending"]
     assert refs["/work/b"].finished_at is None
     assert refs["/work/b"].age_source == "workspace_mtime"
 
@@ -205,7 +208,261 @@ def test_collector_groups_runs_and_queue_entries_by_normalized_path() -> None:
 def test_collector_accepts_mapping_queue_entries_and_skips_blank() -> None:
     refs = collect_workspace_refs([], [{"workspace": "  ", "status": "pending"}, {"workspace": "/w", "status": "blocked"}])
     assert set(refs) == {"/w"}
-    assert refs["/w"].states == ["blocked"]
+    assert refs["/w"].states == ["queue:blocked"]
+
+
+# ============================================== queue references (deny by default)
+# A queue entry's status is NOT a run lifecycle status.  ``blocked`` is a
+# terminal *run* outcome but a NON-terminal *queue* state (queue.py
+# _NON_TERMINAL_STATUS): the entry is still parked work.  These tests pin that
+# a queue reference is judged only through the explicit queue allowlist.
+QUEUE_STATUSES = ("pending", "launched", "blocked", "done", "failed")
+
+
+def _queue_vocabulary() -> tuple[frozenset[str], frozenset[str]]:
+    """The real queue vocabulary, imported (never copied) from queue.py."""
+
+    from lh_harness import queue as queue_mod
+
+    return queue_mod._NON_TERMINAL_STATUS, queue_mod._VALID_STATUS
+
+
+class TestQueueReferenceTerminalAllowlist:
+    def test_queue_allowlist_is_exactly_the_queue_modules_terminal_statuses(self) -> None:
+        """The allowlist mirrors ``_VALID_STATUS - _NON_TERMINAL_STATUS``; drift fails here."""
+
+        non_terminal, valid = _queue_vocabulary()
+        assert QUEUE_TERMINAL_STATUSES == frozenset(valid - non_terminal)
+        assert not (QUEUE_TERMINAL_STATUSES & non_terminal)
+
+    def test_every_non_terminal_queue_status_keeps(self) -> None:
+        from lh_harness.disk_retention.workspaces import SOURCE_QUEUE
+
+        non_terminal, _ = _queue_vocabulary()
+        assert {"blocked", "pending", "launched"} <= set(non_terminal)
+        for status in sorted(non_terminal):
+            assert should_retain_workspace("/w/ws", [f"queue:{status}"], _old(), THRESHOLD) is False, status
+            assert is_terminal_reference(SOURCE_QUEUE, status) is False, status
+
+    def test_unknown_or_missing_queue_status_keeps(self) -> None:
+        from lh_harness.disk_retention.workspaces import SOURCE_QUEUE
+
+        # Unknown words, terminal *run* words, near-misses, empty, None and non-string values
+        # are all non-terminal for a queue entry.  (Case/whitespace is normalised, so
+        # ``"Done"``/``"done "`` are terminal — pinned in the sibling test.)
+        for status in ("zapped", "", "completed", "cancelled", "incomplete", "blocked", "DONE?", "don", None, 7, True):
+            assert should_retain_workspace("/w/ws", [f"queue:{status}"], _old(), THRESHOLD) is False, repr(status)
+            assert is_terminal_reference(SOURCE_QUEUE, status) is False, repr(status)
+        # A queue status that *is* a terminal run word must not be terminal for a queue entry.
+        assert is_terminal_reference(SOURCE_QUEUE, "blocked") is False
+        assert is_terminal_reference(SOURCE_QUEUE, "completed") is False
+
+    def test_terminal_queue_statuses_select(self) -> None:
+        from lh_harness.disk_retention.workspaces import SOURCE_QUEUE
+
+        for status in ("done", "failed", "Done", " FAILED "):
+            assert is_terminal_reference(SOURCE_QUEUE, status) is True, repr(status)
+        for status in ("done", "failed"):
+            assert should_retain_workspace("/w/ws", [f"queue:{status}"], _old(), THRESHOLD) is True, status
+            # Young keeps, exactly like a young run.
+            assert should_retain_workspace("/w/ws", [f"queue:{status}"], _young(), THRESHOLD) is False, status
+
+    def test_queue_blocked_is_not_a_run_blocked(self) -> None:
+        """Same word, two vocabularies: the tag decides, never the spelling."""
+
+        assert should_retain_workspace("/w/ws", ["run:blocked"], _old(), THRESHOLD) is True
+        assert should_retain_workspace("/w/ws", ["blocked"], _old(), THRESHOLD) is True  # bare = run
+        assert should_retain_workspace("/w/ws", ["queue:blocked"], _old(), THRESHOLD) is False
+
+    def test_run_states_are_still_judged_by_the_lifecycle_vocabulary(self) -> None:
+        from lh_harness.disk_retention.workspaces import SOURCE_RUN
+
+        for state in ("completed", "failed", "cancelled", "blocked", "incomplete", "done"):
+            assert is_terminal_reference(SOURCE_RUN, state) is True, state
+        for state in ("running", "waiting_approval", "queued", "pending", "creating", "starting", "stopping", "zapped", None, ""):
+            assert is_terminal_reference(SOURCE_RUN, state) is False, repr(state)
+
+    def test_unknown_source_is_never_terminal(self) -> None:
+        assert is_terminal_reference("cron", "done") is False
+        assert is_terminal_reference("", "completed") is False
+        # An unrecognised tag is treated as a run status spelled "cron:done", which is unknown -> keep.
+        assert should_retain_workspace("/w/ws", ["cron:done"], _old(), THRESHOLD) is False
+
+    def test_queue_non_terminal_reference_wins_over_a_terminal_run(self) -> None:
+        """Mixed: a finished run plus a still-parked queue entry keeps the workspace."""
+
+        for status in ("blocked", "pending", "launched"):
+            assert should_retain_workspace("/w/ws", ["run:completed", f"queue:{status}"], _old(), THRESHOLD) is False, status
+        assert should_retain_workspace("/w/ws", ["run:completed", "queue:done"], _old(), THRESHOLD) is True
+
+    def test_predicate_is_still_pure_with_tagged_states(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import builtins
+
+        def _boom(*_a: Any, **_k: Any) -> Any:
+            raise AssertionError("predicate performed I/O")
+
+        monkeypatch.setattr(builtins, "open", _boom)
+        monkeypatch.setattr(os, "stat", _boom)
+        monkeypatch.setattr(os, "scandir", _boom)
+        monkeypatch.setattr("time.time", _boom)
+        assert should_retain_workspace("/w/ws", ["queue:blocked"], _old(), THRESHOLD) is False
+        assert should_retain_workspace("/w/ws", ["queue:done"], _old(), THRESHOLD) is True
+
+
+class TestCollectorTagsQueueReferences:
+    def test_queue_statuses_are_tagged_with_their_source(self) -> None:
+        refs = collect_workspace_refs([], [_entry("/w/ws", s) for s in QUEUE_STATUSES])
+        assert refs["/w/ws"].states == [f"queue:{s}" for s in QUEUE_STATUSES]
+
+    def test_run_statuses_are_tagged_as_runs(self) -> None:
+        refs = collect_workspace_refs([{"workspace": "/w/ws", "status": "blocked", "finished_at": 5.0}], [])
+        assert refs["/w/ws"].states == ["run:blocked"]
+        assert refs["/w/ws"].finished_at == 5.0
+
+    def test_queue_entry_with_no_status_still_counts_as_a_reference(self) -> None:
+        """A nameless-status queue entry is not dropped (that would orphan-keep by accident, not by rule)."""
+
+        entry = SimpleNamespace(workspace="/w/ws")
+        refs = collect_workspace_refs([], [entry])
+        assert refs["/w/ws"].states == ["queue:"]
+        assert should_retain_workspace("/w/ws", refs["/w/ws"].states, _old(), THRESHOLD) is False
+        # Mapping form with a missing/None status too.
+        refs = collect_workspace_refs([], [{"workspace": "/w/ws"}, {"workspace": "/w/ws", "status": None}])
+        assert refs["/w/ws"].states == ["queue:", "queue:"]
+
+    def test_run_and_queue_references_are_never_conflated(self) -> None:
+        refs = collect_workspace_refs(
+            [{"workspace": "/w/ws", "status": "completed", "finished_at": 10.0}],
+            [_entry("/w/ws", "blocked")],
+        )
+        assert sorted(refs["/w/ws"].states) == ["queue:blocked", "run:completed"]
+        assert should_retain_workspace("/w/ws", refs["/w/ws"].states, _old(), THRESHOLD) is False
+
+
+# ============================================================== sweep: queue-only
+class TestSweepQueueOnlyReferences:
+    """Enforcement ON, live mode, temp tree: a queue-only non-terminal workspace survives."""
+
+    @pytest.mark.parametrize("status", ["blocked", "pending", "launched"])
+    def test_queue_only_non_terminal_workspace_survives_enforcement(
+        self, tmp_path: Path, status: str
+    ) -> None:
+        root = tmp_path / "work"
+        ws = _tree(root, "ws-queue-only", {"src/main.py": b"x" * 2048})
+        os.utime(ws, (NOW - _old(), NOW - _old()))  # dir looks old; must not matter
+        before = _snapshot(root)
+        reports = sweep_workspaces(
+            root,
+            run_items=[],
+            queue_entries=[_entry(str(ws), status)],
+            config=DiskRetentionConfig(workspace_retention_enabled=True),
+            mode=RetainMode.live(),
+            now=NOW,
+        )
+        got = _by_path(reports)
+        assert got["ws-queue-only"].state == STATE_KEPT_ACTIVE
+        assert got["ws-queue-only"].states == [f"queue:{status}"]
+        assert got["ws-queue-only"].size_bytes == 0  # never measured for removal
+        assert _snapshot(root) == before
+        assert (ws / "src" / "main.py").is_file()
+
+    @pytest.mark.parametrize("status", ["done", "failed"])
+    def test_queue_only_terminal_workspace_is_removed_under_enforcement(
+        self, tmp_path: Path, status: str
+    ) -> None:
+        root = tmp_path / "work"
+        ws = _tree(root, "ws-queue-done")
+        os.utime(ws, (NOW - _old(), NOW - _old()))
+        reports = sweep_workspaces(
+            root,
+            run_items=[],
+            queue_entries=[_entry(str(ws), status)],
+            config=DiskRetentionConfig(workspace_retention_enabled=True),
+            mode=RetainMode.live(),
+            now=NOW,
+        )
+        assert _by_path(reports)["ws-queue-done"].state == STATE_REMOVED
+        assert not ws.exists()
+
+    def test_enforcement_on_removes_terminal_old_but_keeps_every_non_terminal_queue_workspace(
+        self, tmp_path: Path
+    ) -> None:
+        """The mixed sweep: one candidate goes, every queue-parked sibling stays."""
+
+        root = tmp_path / "work"
+        ws_old = _tree(root, "ws-old-terminal", {".git/HEAD": b"ref" * 100})
+        names = [f"ws-{s}" for s in QUEUE_STATUSES] + ["ws-queue-unknown"]
+        for name in names:
+            _tree(root, name, {".git/HEAD": b"ref" * 100})
+        ws_harness = _tree(root, ".lh-harness/runs/x", {"status.json": b"{}"})
+        for ws in [root / n for n in names] + [ws_old]:
+            os.utime(ws, (NOW - _old(), NOW - _old()))
+        run_items = [{"id": "r-old", "workspace": str(ws_old), "status": "completed", "finished_at": NOW - _old()}]
+        queue_entries = [_entry(str(root / f"ws-{s}"), s) for s in QUEUE_STATUSES]
+        queue_entries.append(_entry(str(root / "ws-queue-unknown"), "wat"))
+        before = _snapshot(root)
+
+        reports = sweep_workspaces(
+            root,
+            run_items=run_items,
+            queue_entries=queue_entries,
+            config=DiskRetentionConfig(workspace_retention_enabled=True),
+            mode=RetainMode.live(),
+            now=NOW,
+        )
+        got = _by_path(reports)
+        # Removals are exactly the terminal-and-old workspaces: the finished run's clone
+        # and the two clones named only by terminal (done/failed) queue entries.
+        assert got["ws-old-terminal"].state == STATE_REMOVED
+        assert not ws_old.exists()
+        assert sorted(n for n, r in got.items() if r.state == STATE_REMOVED) == [
+            "ws-done",
+            "ws-failed",
+            "ws-old-terminal",
+        ]
+        # Every non-terminal / unknown queue-only workspace survives, reported as active.
+        for status in ("blocked", "pending", "launched"):
+            assert got[f"ws-{status}"].state == STATE_KEPT_ACTIVE, status
+            assert (root / f"ws-{status}").is_dir(), status
+        assert got["ws-queue-unknown"].state == STATE_KEPT_ACTIVE
+        assert (root / "ws-queue-unknown").is_dir()
+        # Terminal queue entries name old workspaces -> removed too (rule, not accident).
+        for status in ("done", "failed"):
+            assert got[f"ws-{status}"].state == STATE_REMOVED, status
+        # Run evidence is never touched.
+        assert got[".lh-harness"].state == STATE_KEPT_HARNESS_OWNED
+        assert (ws_harness / "status.json").is_file()
+        removed = before - _snapshot(root)
+        assert all(
+            p.split("/")[0] in {"ws-old-terminal", "ws-done", "ws-failed"} for p in removed
+        ), sorted(removed)
+
+    def test_dry_run_with_queue_only_blocked_lists_sizes_and_removes_nothing(self, tmp_path: Path) -> None:
+        root = tmp_path / "work"
+        ws_blocked = _tree(root, "ws-blocked", {".git/HEAD": b"b" * 4096})
+        ws_old = _tree(root, "ws-old", {".git/HEAD": b"o" * 4096})
+        for ws in (ws_blocked, ws_old):
+            os.utime(ws, (NOW - _old(), NOW - _old()))
+        before = _snapshot(root)
+        payload = sweep_workspaces_report(
+            root,
+            run_items=[{"workspace": str(ws_old), "status": "completed", "finished_at": NOW - _old()}],
+            queue_entries=[_entry(str(ws_blocked), "blocked")],
+            config=DiskRetentionConfig(workspace_retention_enabled=True),
+            mode=RetainMode.dry(),
+            now=NOW,
+        )
+        by_name = {os.path.basename(e["path"]): e for e in payload["entries"]}
+        assert payload["mode"] == "dry-run"
+        assert by_name["ws-old"]["state"] == STATE_SELECTABLE
+        assert by_name["ws-old"]["size_bytes"] == 4096
+        assert by_name["ws-old"]["size_human"] == "4.0KiB"
+        # The blocked one is listed with its tagged state, kept, and carries no candidate size.
+        assert by_name["ws-blocked"]["state"] == STATE_KEPT_ACTIVE
+        assert by_name["ws-blocked"]["states"] == ["queue:blocked"]
+        assert payload["totals"]["candidates"] == 1
+        assert payload["totals"]["candidate_bytes"] == 4096
+        assert _snapshot(root) == before
 
 
 # ================================================================ human_size
@@ -369,7 +626,7 @@ class TestDryRun:
         assert decoded["totals"]["by_state"][STATE_SELECTABLE] == 1
         entry = next(e for e in decoded["entries"] if e["state"] == STATE_SELECTABLE)
         assert entry["size_bytes"] > 0 and entry["size_human"]
-        assert set(entry["states"]) == {"completed", "done"}
+        assert set(entry["states"]) == {"run:completed", "queue:done"}
 
     def test_dry_run_with_default_config_lists_and_removes_nothing(
         self, work_tree: dict[str, Any]

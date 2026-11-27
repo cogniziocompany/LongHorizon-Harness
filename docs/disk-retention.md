@@ -17,11 +17,13 @@ state when a node starts running low on disk:
    The pause is sticky until a fresh check sees usage below
    `LH_HARNESS_DISK_RESUME_PCT` (default 85 %).
 5. **Terminal-run clone workspaces** (easybutt0n-17): once *every* run and
-   queue entry that names a working clone under the node work root has
-   reached a TERMINAL state (`completed`, `failed`, `cancelled`, `blocked`,
-   `incomplete`) and the clone has stayed that way for more than
-   `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` (default 72 h), the clone is
-   a removal candidate.  **Opt-in**: nothing is deleted unless
+   queue entry that names a working clone under the node work root is
+   terminal in its own vocabulary — a run in `completed`, `failed`,
+   `cancelled`, `blocked` or `incomplete`; a queue entry only in `done` or
+   `failed` (a queue `blocked`/`pending`/`launched` entry is still parked
+   work and keeps the clone) — and the clone has stayed that way for more
+   than `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` (default 72 h), the clone
+   is a removal candidate.  **Opt-in**: nothing is deleted unless
    `LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED` is `true` (default
    `false`).  See "Terminal-run clone workspaces" below.
 6. **All thresholds are in the settings DB** (see
@@ -76,7 +78,8 @@ A run's *working clone* is the directory the supervisor resolves for the
 run under the node work root (`--workspace-root`, e.g.
 `/home/harness/work/<workspace>/`).  It is **not** run evidence; nothing
 under `.lh-harness/runs/` is ever a candidate, and neither is a workspace
-in a `queued` or `pending` queue entry.
+named by a queue entry in any non-terminal queue state (`pending`,
+`launched` or `blocked`).
 
 The selection rule is the pure function
 `lh_harness.disk_retention.workspaces.should_retain_workspace(path,
@@ -86,9 +89,17 @@ states, age_seconds, max_age_seconds)`.  It selects a clone only when
 * no path component is `.lh-harness`;
 * at least one run or queue entry names the clone (an orphan is kept —
   we do not know what it is);
-* every referencing run/queue entry is in a TERMINAL lifecycle state
-  (`running`, `waiting_approval`, `queued`, `pending`, an unknown state,
-  or a mix of terminal and non-terminal all keep it);
+* every referencing run and queue entry is terminal **in its own
+  vocabulary**.  A run is judged by the supervisor lifecycle states
+  (`completed`, `failed`, `cancelled`, `blocked`, `incomplete`); a queue
+  entry only through the explicit allowlist `done`/`failed`
+  (`QUEUE_TERMINAL_STATUSES`).  The two vocabularies share the word
+  `blocked` with opposite meanings — a *run* `blocked` is terminal, a
+  *queue* `blocked` is still parked work (`queue._NON_TERMINAL_STATUS`) —
+  so references are tagged by source and never conflated.  A run in
+  `running`, `waiting_approval`, `queued` or `pending`, a queue entry in
+  `pending`/`launched`/`blocked`, an unknown state, a mix of terminal and
+  non-terminal, all keep it;
 * the clone's age is strictly greater than the threshold (equal keeps).
 
 The age is measured from the most recent `finished_at` of a referencing

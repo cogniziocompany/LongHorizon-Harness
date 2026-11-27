@@ -21,7 +21,11 @@ Deny by default.  A workspace is kept when
 * no run or queue entry names it (an orphan — we do not know what it is);
 * any referencing run/queue entry is in a non-terminal state
   (``running``, ``waiting_approval``, ``queued``, ``pending``, …) or in a
-  state we do not recognise;
+  state we do not recognise.  Runs and queue entries are judged by their
+  OWN vocabulary: a queue status is terminal only through the explicit
+  ``QUEUE_TERMINAL_STATUSES`` allowlist (``done``/``failed``), so a queue
+  entry in ``blocked`` — a NON-terminal queue state even though ``blocked``
+  is a terminal *run* state — keeps the workspace;
 * its age is at or below the threshold (strictly older selects);
 * the explicit ``LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED`` flag is not
   set — the sweep then only *lists* candidates.
@@ -61,6 +65,72 @@ HARNESS_OWNED_COMPONENT = ".lh-harness"
 SECONDS_PER_HOUR = 3600.0
 
 
+# ------------------------------------------------------------ reference kinds
+# A workspace is referenced by two different things, and they have two
+# different status vocabularies that happen to share a word.  A *run* has a
+# supervisor lifecycle status (``supervisor/lifecycle.py``): there ``blocked``
+# is a TERMINAL manager/auditor outcome.  A *queue entry* has a queue status
+# (``queue.py``): there ``blocked`` is a NON-terminal state — the entry is
+# still parked work that resumes through ``blocked -> pending``/``launched``
+# (``queue._NON_TERMINAL_STATUS``).  Feeding a queue ``blocked`` through the
+# run-lifecycle lens therefore mistook a live queue entry for a finished run.
+# Each reference is tagged with its source, and a queue status is terminal
+# only if it is in the explicit allowlist below — nothing falls through.
+SOURCE_RUN = "run"
+SOURCE_QUEUE = "queue"
+
+# The ONLY queue statuses that mean "this entry is finished".  Mirrors
+# ``queue._VALID_STATUS - queue._NON_TERMINAL_STATUS``; a queue test pins the
+# two to each other.  Everything else — every ``_NON_TERMINAL_STATUS`` member
+# (``pending``, ``launched``, ``blocked``), an unknown status, ``None`` or a
+# missing one — keeps the workspace.
+QUEUE_TERMINAL_STATUSES = frozenset({"done", "failed"})
+
+
+def is_terminal_reference(source: str, status: Any) -> bool:
+    """Pure: is one tagged reference (``source`` + its raw ``status``) terminal?
+
+    ``SOURCE_RUN`` is judged by the supervisor lifecycle vocabulary
+    (:data:`TERMINAL_STATUSES` after canonicalisation); ``SOURCE_QUEUE`` by
+    the explicit :data:`QUEUE_TERMINAL_STATUSES` allowlist.  Any other
+    source, and any unknown/empty status, is NOT terminal — deny by default.
+    """
+
+    if source == SOURCE_QUEUE:
+        text = str(status).strip().lower() if status is not None else ""
+        return text in QUEUE_TERMINAL_STATUSES
+    if source == SOURCE_RUN:
+        canonical = canonical_lifecycle_status(status, default="")
+        return bool(canonical) and canonical in TERMINAL_STATUSES
+    return False
+
+
+def _tag(source: str, status: Any) -> str:
+    """Render one reference for the predicate's ``states`` input and the report.
+
+    ``"queue:blocked"`` and ``"run:blocked"`` are deliberately different
+    strings: the predicate resolves the tag, so a queue status can never be
+    mistaken for the run state of the same spelling.
+    """
+
+    return f"{source}:{'' if status is None else str(status).strip()}"
+
+
+def _untag(state: str) -> tuple[str, Any]:
+    """Split a tagged reference back into ``(source, status)``.
+
+    An untagged string is a *run* status — the public form the predicate has
+    always accepted — so a caller passing bare lifecycle states is unchanged.
+    """
+
+    text = str(state)
+    if ":" in text:
+        source, _, status = text.partition(":")
+        if source in (SOURCE_RUN, SOURCE_QUEUE):
+            return source, status
+    return SOURCE_RUN, text
+
+
 # ----------------------------------------------------------------- predicate
 def should_retain_workspace(
     path: str | os.PathLike[str],
@@ -71,17 +141,25 @@ def should_retain_workspace(
     """Pure selection predicate: would ``path`` be removed?
 
     Inputs are exactly the ones the caller has already gathered — the
-    workspace path, the lifecycle/queue states of every run and queue
-    entry that references it, its age in seconds, and the maximum age in
-    seconds.  This function performs no filesystem, clock or state-store
-    access; it only classifies.
+    workspace path, the states of every run and queue entry that
+    references it, its age in seconds, and the maximum age in seconds.
+    This function performs no filesystem, clock or state-store access; it
+    only classifies.
+
+    ``states`` holds one entry per reference.  A bare string is a *run*
+    lifecycle status; ``"queue:<status>"`` is a queue entry's status and is
+    terminal only if it is in :data:`QUEUE_TERMINAL_STATUSES` (so a queue
+    ``blocked``/``pending``/``launched`` keeps, while a run ``blocked`` is
+    terminal).  Use :func:`collect_workspace_refs` to produce the tagged
+    form.
 
     Selects only when ALL hold:
 
     1. no path component is ``.lh-harness``;
     2. ``states`` is non-empty (an orphan is kept);
-    3. every state is in :data:`TERMINAL_STATUSES` after canonicalisation
-       (any non-terminal or unknown state, or a mix, is kept);
+    3. every reference is terminal for its own vocabulary
+       (:func:`is_terminal_reference`); any non-terminal or unknown
+       reference, from either source, or a mix keeps;
     4. ``age_seconds > max_age_seconds`` (equal keeps).
 
     A negative or non-finite age is treated as "unknown" and kept; a
@@ -106,8 +184,8 @@ def should_retain_workspace(
     if not state_list:
         return False
     for raw in state_list:
-        canonical = canonical_lifecycle_status(raw, default="")
-        if not canonical or canonical not in TERMINAL_STATUSES:
+        source, status = _untag(raw)
+        if not is_terminal_reference(source, status):
             return False
     return age > limit
 
@@ -117,21 +195,28 @@ def should_retain_workspace(
 class WorkspaceRef:
     """Everything the sweep knows about one workspace, gathered by the caller.
 
-    ``states`` holds the canonical-or-raw lifecycle/queue status of every
-    run and queue entry naming the workspace.  ``finished_at`` is the
-    epoch timestamp the age is computed from: the most recent
-    ``finished_at`` of a referencing run when one is known (the run's own
-    terminal-state timestamp), else ``None`` and the sweep falls back to
-    the workspace directory's mtime.
+    ``states`` holds one tagged reference per run and queue entry naming the
+    workspace (``"run:<status>"`` / ``"queue:<status>"``, see :func:`_tag`),
+    which is the form the predicate resolves through
+    :func:`is_terminal_reference`.  ``finished_at`` is the epoch timestamp the
+    age is computed from: the most recent ``finished_at`` of a referencing
+    run when one is known (the run's own terminal-state timestamp), else
+    ``None`` and the sweep falls back to the workspace directory's mtime.
     """
 
     path: str
     states: list[str] = field(default_factory=list)
     finished_at: float | None = None
 
-    def add(self, state: str, finished_at: float | None = None) -> None:
-        if state:
-            self.states.append(str(state))
+    def add(self, source: str, status: Any, finished_at: float | None = None) -> None:
+        """Record one reference from ``source`` (``run``/``queue``) with its raw status.
+
+        A reference with no status at all still counts as a reference (so a
+        workspace is never mistaken for an orphan) and is tagged with an
+        empty status, which is not terminal in either vocabulary.
+        """
+
+        self.states.append(_tag(source, status))
         if finished_at is not None:
             try:
                 value = float(finished_at)
@@ -161,10 +246,14 @@ def collect_workspace_refs(
     status too, so a finished run whose queue row is still ``launched``
     keeps its workspace until the row is reconciled.
 
-    Queue statuses are passed through as-is (``pending``/``launched``/
-    ``blocked`` are not lifecycle names, so the predicate — which only
-    accepts the terminal subset — keeps them).  Nothing here reads the
-    filesystem.
+    Every reference is tagged with its source.  A queue status is NEVER
+    judged by the run-lifecycle vocabulary: ``blocked`` is a terminal
+    *run* outcome but a NON-terminal *queue* state
+    (``queue._NON_TERMINAL_STATUS``), so a queue entry — whatever its
+    status — is terminal only through :data:`QUEUE_TERMINAL_STATUSES`
+    (``done``/``failed``).  ``pending``, ``launched``, ``blocked``, an
+    unknown, ``None`` or missing queue status all keep the workspace.
+    Nothing here reads the filesystem.
     """
 
     refs: dict[str, WorkspaceRef] = {}
@@ -189,10 +278,10 @@ def collect_workspace_refs(
         # Only a terminal run may lend its finished_at: an active run's
         # status file can still carry a previous epoch's timestamp after a
         # resume, which must not make a live workspace look old.
-        if canonical_lifecycle_status(status, default="") in TERMINAL_STATUSES:
-            ref.add(str(status), finished)
+        if is_terminal_reference(SOURCE_RUN, status):
+            ref.add(SOURCE_RUN, status, finished)
         else:
-            ref.add(str(status), None)
+            ref.add(SOURCE_RUN, status, None)
     for entry in queue_entries or ():
         workspace = getattr(entry, "workspace", None)
         if workspace is None and isinstance(entry, Mapping):
@@ -203,7 +292,9 @@ def collect_workspace_refs(
         status = getattr(entry, "status", None)
         if status is None and isinstance(entry, Mapping):
             status = entry.get("status")
-        refs.setdefault(key, WorkspaceRef(path=key)).add(str(status or ""), None)
+        # Tagged as a queue reference: the predicate judges it by the queue
+        # allowlist, never by the run-lifecycle vocabulary.
+        refs.setdefault(key, WorkspaceRef(path=key)).add(SOURCE_QUEUE, status)
     return refs
 
 
@@ -377,9 +468,9 @@ def _sweep_one(
             states=states,
         )
     # Not selected: say why, so the operator can read the dry-run listing.
-    if any(
-        canonical_lifecycle_status(s, default="") not in TERMINAL_STATUSES for s in states
-    ):
+    # Same tagged resolution as the predicate, so a kept queue reference is
+    # reported as an active reference (never as "recent").
+    if any(not is_terminal_reference(*_untag(s)) for s in states):
         return WorkspaceRetentionReport(
             path=str(ws),
             state=STATE_KEPT_ACTIVE,
@@ -548,7 +639,10 @@ __all__ = [
     "ACTIVE_STATUSES",
     "HARNESS_OWNED_COMPONENT",
     "KEEP_STATES",
+    "QUEUE_TERMINAL_STATUSES",
     "SECONDS_PER_HOUR",
+    "SOURCE_QUEUE",
+    "SOURCE_RUN",
     "STATE_ERROR",
     "STATE_KEPT_ACTIVE",
     "STATE_KEPT_HARNESS_OWNED",
@@ -562,6 +656,7 @@ __all__ = [
     "WorkspaceRetentionReport",
     "collect_workspace_refs",
     "human_size",
+    "is_terminal_reference",
     "should_retain_workspace",
     "sweep_workspaces",
     "sweep_workspaces_report",

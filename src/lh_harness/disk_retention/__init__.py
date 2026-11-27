@@ -50,7 +50,9 @@ from .runs import (
     prune_runs_report,
 )
 from .workspaces import (
+    QUEUE_TERMINAL_STATUSES,
     WorkspaceRetentionReport,
+    is_terminal_reference,
     should_retain_workspace,
     sweep_workspaces,
     sweep_workspaces_report,
@@ -75,6 +77,8 @@ __all__ = [
     "prune_runs_report",
     "prune_worktrees",
     "prune_worktrees_report",
+    "QUEUE_TERMINAL_STATUSES",
+    "is_terminal_reference",
     "should_retain_workspace",
     "sweep_workspaces",
     "sweep_workspaces_report",
