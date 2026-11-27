@@ -1939,6 +1939,12 @@ class RunSupervisor:
             for field in ("agent", "model", "role_configs", "workspace", "max_rounds", "prompt_language"):
                 if field in owner:
                     item[field] = owner[field]
+            # easybutt0n-17 (workspace retention): the run's own terminal
+            # timestamp, carried so a reader can tell how long a workspace
+            # has been idle without opening status.json again.  Nothing in
+            # this method consults it.
+            if status.get("finished_at") is not None:
+                item["finished_at"] = status.get("finished_at")
             # easybutt0n-17: the record-only work-origin block travels with the
             # run row so the read-only duplicate-work view can group the live
             # runs that claim the same ticket (or branch).  RECORD-ONLY: it is

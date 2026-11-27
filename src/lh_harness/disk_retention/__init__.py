@@ -1,6 +1,6 @@
 """Harness disk retention for CT110.
 
-Five components, all configurable via the harness settings DB:
+Six components, all configurable via the harness settings DB:
 
 1. ``runs.py`` — prune ``runs/<id>`` folders older than 14 days; move
    failed-run report/summary files to ``runs/_failed-reports/<id>/`` before
@@ -14,6 +14,12 @@ Five components, all configurable via the harness settings DB:
 5. ``config.py`` — a single ``DiskRetentionConfig`` object that reads every
    threshold from the settings DB with safe defaults, and the dry-run
    ``RetainMode`` used by all four retention modules.
+6. ``workspaces.py`` — remove the working clone of a run once every run
+   and queue entry naming it is TERMINAL and the clone has been so for
+   longer than ``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`` (default 72).
+   Opt-in: ``LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED`` (default
+   false) must be set explicitly before anything is deleted; until then
+   the sweep only lists candidates.
 
 Limits: dry-run is the first mode an operator runs; no module here deletes
 or moves a real file unless ``dry_run=False`` is explicit.  See
@@ -24,6 +30,8 @@ from __future__ import annotations
 
 from .config import (
     DEFAULT_CONFIG,
+    DEFAULT_WORKSPACE_MAX_AGE_HOURS,
+    DEFAULT_WORKSPACE_RETENTION_ENABLED,
     DiskRetentionConfig,
     RetainMode,
     config_from_runtime,
@@ -41,6 +49,14 @@ from .runs import (
     prune_runs,
     prune_runs_report,
 )
+from .workspaces import (
+    QUEUE_TERMINAL_STATUSES,
+    WorkspaceRetentionReport,
+    is_terminal_reference,
+    should_retain_workspace,
+    sweep_workspaces,
+    sweep_workspaces_report,
+)
 from .worktrees import (
     WorkTreeRetentionReport,
     prune_worktrees,
@@ -49,6 +65,8 @@ from .worktrees import (
 
 __all__ = [
     "DEFAULT_CONFIG",
+    "DEFAULT_WORKSPACE_MAX_AGE_HOURS",
+    "DEFAULT_WORKSPACE_RETENTION_ENABLED",
     "DiskRetentionConfig",
     "RetainMode",
     "config_from_runtime",
@@ -59,10 +77,16 @@ __all__ = [
     "prune_runs_report",
     "prune_worktrees",
     "prune_worktrees_report",
+    "QUEUE_TERMINAL_STATUSES",
+    "is_terminal_reference",
+    "should_retain_workspace",
+    "sweep_workspaces",
+    "sweep_workspaces_report",
     "check_disk",
     "disk_skip_reason",
     "format_warning_event",
     "DiskState",
     "RunRetentionReport",
     "WorkTreeRetentionReport",
+    "WorkspaceRetentionReport",
 ]

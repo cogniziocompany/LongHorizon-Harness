@@ -965,6 +965,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Parent directories of parked work trees. The sweep removes idle trees under each.",
     )
     retention_parser.add_argument(
+        "--work-root",
+        default=None,
+        help=(
+            "Node work root whose direct children are run working clones. "
+            "The sweep lists (and, only with --apply AND "
+            "LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED=true, removes) clones whose runs are all terminal "
+            "and older than LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS. Skipped when unset."
+        ),
+    )
+    retention_parser.add_argument(
         "--npm-cache",
         default=os.environ.get("LH_HARNESS_NPM_CACHE_DIR"),
         help="Path to the npm cache directory (skipped when unset).",
@@ -2739,12 +2749,48 @@ def _build_env(spec: str, *, tmp_dir: str | None = None):
     raise ValueError(f"Unknown env: {spec}")
 
 
+def _workspace_retention_inputs(runs_root: Path) -> tuple[list[dict], list]:
+    """Gather the live run and queue references a workspace sweep needs.
+
+    Reuses the surfaces the service already uses: ``RunSupervisor`` over
+    the same ``runs_root`` for ``list_run_items`` (workspace, status and
+    ``finished_at`` per run) and the queue store for entries still
+    pending/launched/blocked.  Both are read-only.  A supervisor that
+    cannot be built (no project config, odd platform) yields an empty run
+    list, which makes the sweep keep everything as an orphan — the safe
+    direction.
+    """
+
+    from .supervisor.service import RunSupervisor
+
+    run_items: list[dict] = []
+    queue_entries: list = []
+    try:
+        supervisor = RunSupervisor(runs_root, workspace_root=None)
+        run_items = list(supervisor.list_run_items())
+    except Exception:  # noqa: BLE001 - listing is best-effort; the sweep keeps orphans
+        run_items = []
+    try:
+        from .queue import _select_queue_store
+
+        store = _select_queue_store(str(runs_root), None)
+        if store is not None:
+            queue_entries = list(store.list())
+    except Exception:  # noqa: BLE001 - a queue that cannot be read keeps everything
+        queue_entries = []
+    return run_items, queue_entries
+
+
 def _retention_command(args: argparse.Namespace) -> int:
     """`lh-harness retention`.  Dry-run by default; --apply to actually move/delete.
 
     The CLI is the operator entry point for the disk-retention sweeps
     (CT110-DISK).  The first real prune is documented in the PR as an
     operator step — never automated by a run.
+
+    The terminal-run workspace sweep (``--work-root``) has a second gate
+    on top of ``--apply``: ``LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED``
+    must be ``true`` in the settings DB before a clone is removed.
     """
 
     import json
@@ -2756,6 +2802,7 @@ def _retention_command(args: argparse.Namespace) -> int:
         prune_caches_report,
         prune_runs_report,
         prune_worktrees_report,
+        sweep_workspaces_report,
     )
     from .settings_store import active_runtime
 
@@ -2788,6 +2835,17 @@ def _retention_command(args: argparse.Namespace) -> int:
         config=cfg,
         mode=mode,
     )
+    work_root = getattr(args, "work_root", None)
+    workspaces_payload: dict | None = None
+    if work_root:
+        run_items, queue_entries = _workspace_retention_inputs(runs_root)
+        workspaces_payload = sweep_workspaces_report(
+            work_root,
+            run_items=run_items,
+            queue_entries=queue_entries,
+            config=cfg,
+            mode=mode,
+        )
 
     payload = {
         "schema_version": 1,
@@ -2800,11 +2858,15 @@ def _retention_command(args: argparse.Namespace) -> int:
             "warn_pct": cfg.warn_pct,
             "pause_pct": cfg.pause_pct,
             "resume_pct": cfg.resume_pct,
+            "workspace_retention_enabled": cfg.workspace_retention_enabled,
+            "workspace_max_age_hours": cfg.workspace_max_age_hours,
         },
         "runs": runs_payload,
         "worktrees": worktrees_payload,
         "caches": caches_payload,
     }
+    if workspaces_payload is not None:
+        payload["workspaces"] = workspaces_payload
     from .disk_retention.runs import write_report as _write_report
 
     _write_report(report_path, payload)
