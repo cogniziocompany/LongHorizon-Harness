@@ -140,6 +140,16 @@ class HarnessConfig:
     # record omits it.  'not-a-repo' is a legitimate non-git workspace: the
     # worker runs in place with no branch work at all.
     workspace_base_mode: str | None = None
+    # The *explicit* task/profile declaration that this run is a non-code
+    # task and therefore has no test suite to verify.  It is the ONLY
+    # source of no-test applicability for the workspace preflight: it is
+    # never inferred from the filesystem.  A missing ``.git`` or a
+    # ``not-a-repo`` launch is a fact about the directory's shape, and it
+    # is equally what a wrong working directory or an exported code tree
+    # looks like -- so those produce a readiness gap, not a skip.  Only
+    # this flag (or the repo's own ``declared_no_tests`` declaration) can
+    # establish that a workspace has no tests.
+    no_tests_applicable: bool = False
     auditor_output_chars: int = 24_000
     role_verified_context_chars: int = 60_000
     role_history_chars: int = 100_000

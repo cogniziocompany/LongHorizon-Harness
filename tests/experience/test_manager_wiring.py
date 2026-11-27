@@ -59,6 +59,12 @@ async def _two_round_run(
         config=HarnessConfig(
             max_total_episodes=2,
             workspace_path=str(workspace),
+            # The workspace here is a bare temp directory: it holds no test
+            # suite at all.  That is an explicit fact about the task, so it is
+            # declared explicitly -- the preflight never infers "no tests" from the
+            # shape of the filesystem (a missing .git, a not-a-repo workspace, a
+            # manifest-less directory).
+            no_tests_applicable=True,
             harness_dir=str(tmp_path / "harness"),
             log_dir=str(tmp_path / "logs"),
         ),
@@ -190,6 +196,12 @@ async def test_env_var_off_overrides_config_on(tmp_path: Path, monkeypatch) -> N
         config=HarnessConfig(
             max_total_episodes=2,
             workspace_path=str(workspace),
+            # The workspace here is a bare temp directory: it holds no test
+            # suite at all.  That is an explicit fact about the task, so it is
+            # declared explicitly -- the preflight never infers "no tests" from the
+            # shape of the filesystem (a missing .git, a not-a-repo workspace, a
+            # manifest-less directory).
+            no_tests_applicable=True,
             harness_dir=str(tmp_path / "harness"),
             log_dir=str(tmp_path / "logs"),
             experience=True,
@@ -213,6 +225,12 @@ async def test_config_flag_enables_without_the_env_var(tmp_path: Path, monkeypat
         config=HarnessConfig(
             max_total_episodes=2,
             workspace_path=str(workspace),
+            # The workspace here is a bare temp directory: it holds no test
+            # suite at all.  That is an explicit fact about the task, so it is
+            # declared explicitly -- the preflight never infers "no tests" from the
+            # shape of the filesystem (a missing .git, a not-a-repo workspace, a
+            # manifest-less directory).
+            no_tests_applicable=True,
             harness_dir=str(tmp_path / "harness"),
             log_dir=str(tmp_path / "logs"),
             experience=True,
