@@ -16,10 +16,13 @@ Six components, all configurable via the harness settings DB:
    ``RetainMode`` used by all four retention modules.
 6. ``workspaces.py`` — remove the working clone of a run once every run
    and queue entry naming it is TERMINAL and the clone has been so for
-   longer than ``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`` (default 72).
-   Opt-in: ``LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED`` (default
-   false) must be set explicitly before anything is deleted; until then
-   the sweep only lists candidates.
+   longer than ``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`` (default 336
+   = 14 days).  Opt-in: ``LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED``
+   (default false) must be set explicitly before anything is deleted;
+   until then the sweep only lists candidates.  A clone that cannot be
+   proved clean and pushed (dirty tree, untracked file, unpushed commit,
+   no upstream, git failure, not a repository) is kept with the reason
+   ``kept_uncommitted``.
 
 Limits: dry-run is the first mode an operator runs; no module here deletes
 or moves a real file unless ``dry_run=False`` is explicit.  See
@@ -50,8 +53,12 @@ from .runs import (
     prune_runs_report,
 )
 from .workspaces import (
+    GIT_PROBE_TIMEOUT_SECONDS,
     QUEUE_TERMINAL_STATUSES,
+    STATE_KEPT_UNCOMMITTED,
+    CloneGitState,
     WorkspaceRetentionReport,
+    inspect_clone_git_state,
     is_terminal_reference,
     should_retain_workspace,
     sweep_workspaces,
@@ -78,6 +85,10 @@ __all__ = [
     "prune_worktrees",
     "prune_worktrees_report",
     "QUEUE_TERMINAL_STATUSES",
+    "STATE_KEPT_UNCOMMITTED",
+    "GIT_PROBE_TIMEOUT_SECONDS",
+    "CloneGitState",
+    "inspect_clone_git_state",
     "is_terminal_reference",
     "should_retain_workspace",
     "sweep_workspaces",

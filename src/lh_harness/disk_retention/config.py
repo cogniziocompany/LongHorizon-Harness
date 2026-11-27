@@ -35,8 +35,8 @@ under the node work root:
   workspace: the dry-run listing is the only thing that runs.
 * ``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`` — how long a workspace must
   have belonged only to TERMINAL runs before it is eligible (default
-  ``72``).  ``0`` or a negative value disables the rule: no clone is ever
-  old enough, so the sweep lists and removes nothing.
+  ``336`` = 14 days).  ``0`` or a negative value disables the rule: no clone
+  is ever old enough, so the sweep lists and removes nothing.
 """
 
 from __future__ import annotations
@@ -85,9 +85,11 @@ DEFAULT_RESUME_PCT = 85
 # Terminal-run clone-workspace retention is opt-in: nothing is ever deleted
 # until an operator sets the enabled flag explicitly.  The age threshold is
 # in hours (not days) because a node's work root fills much faster than its
-# runs tree.
+# runs tree.  336 h = 14 days (easybutt0n-304; was 72 h): two weeks gives a
+# finished run's clone ample time to be re-opened, re-reviewed or pushed
+# before it is a candidate, and matches the run-folder age rule's horizon.
 DEFAULT_WORKSPACE_RETENTION_ENABLED = False
-DEFAULT_WORKSPACE_MAX_AGE_HOURS = 72
+DEFAULT_WORKSPACE_MAX_AGE_HOURS = 336
 
 _TRUTHY = frozenset({"1", "true", "yes", "on", "enabled"})
 _FALSY = frozenset({"0", "false", "no", "off", "disabled", ""})
