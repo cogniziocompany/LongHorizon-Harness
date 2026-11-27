@@ -8,7 +8,7 @@ edits.  It is not run evidence: the run's own records live under
 
 Once every run and queue entry that names a workspace has reached a
 TERMINAL state, and the workspace has stayed that way for longer than
-``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`` (default 72), the clone is a
+``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`` (default 336 = 14 days), the clone is a
 candidate for removal.  The decision is a pure predicate
 (:func:`should_retain_workspace`); everything that touches the
 filesystem — enumerating the work root, measuring sizes, computing an
@@ -30,7 +30,13 @@ Deny by default.  A workspace is kept when
   threshold itself is ``0`` or negative, which disables the rule entirely
   so no clone is ever old enough;
 * the explicit ``LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED`` flag is not
-  set — the sweep then only *lists* candidates.
+  set — the sweep then only *lists* candidates;
+* the clone is not *provably* clean and pushed (easybutt0n-304): it has
+  uncommitted changes (tracked or untracked), commits no remote branch
+  carries, a checked-out branch with no upstream, is not a git repository
+  at all, or any git probe into it fails or times out.  Such a clone is
+  kept with the reason ``kept_uncommitted`` — a failure to *prove* the
+  clone is disposable is never read as proof that it is.
 
 The sweep is dry-run by default like every other module here, and the
 flag above is a second, independent gate in front of ``rmtree``: with the
@@ -45,11 +51,13 @@ import logging
 import math
 import os
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from ..safe_subprocess import child_env, git_argv
 from ..supervisor.lifecycle import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
@@ -65,6 +73,16 @@ logger = logging.getLogger(__name__)
 HARNESS_OWNED_COMPONENT = ".lh-harness"
 
 SECONDS_PER_HOUR = 3600.0
+
+# Every git probe the dirty guard runs against a clone is read-only and
+# bounded.  ``--no-optional-locks`` keeps ``git status`` from writing the
+# index (it would otherwise refresh ``.git/index`` on a clean tree, which
+# is a write into the very clone we are deciding whether to remove);
+# ``git_argv`` additionally neutralises ``core.fsmonitor``/``core.hooksPath``
+# so a worker-planted fsmonitor or hook cannot run on our ``git status``.
+# The timeout is deliberately short: a hung git must read as "keep", never
+# stall a scheduling pass, and never read as clean.
+GIT_PROBE_TIMEOUT_SECONDS = 10.0
 
 
 # ------------------------------------------------------------ reference kinds
@@ -339,6 +357,9 @@ STATE_KEPT_HARNESS_OWNED = "kept_harness_owned"
 STATE_KEPT_NO_REFS = "kept_no_references"
 STATE_KEPT_ACTIVE = "kept_active_reference"
 STATE_KEPT_RECENT = "kept_recent"
+# Dirty guard (easybutt0n-304): the clone could not be PROVED clean and
+# pushed.  Also the exact reason token the dry-run listing carries.
+STATE_KEPT_UNCOMMITTED = "kept_uncommitted"
 STATE_SKIPPED = "skipped"
 STATE_ERROR = "error"
 
@@ -348,6 +369,7 @@ KEEP_STATES: frozenset[str] = frozenset(
         STATE_KEPT_NO_REFS,
         STATE_KEPT_ACTIVE,
         STATE_KEPT_RECENT,
+        STATE_KEPT_UNCOMMITTED,
         STATE_SKIPPED,
     }
 )
@@ -425,6 +447,174 @@ def _workspace_age(ref: WorkspaceRef | None, ws: Path, now: float) -> tuple[floa
     return max(0.0, now - mtime), "workspace_mtime"
 
 
+# ------------------------------------------------------------ dirty guard
+# A terminal-run clone is only safe to remove once it is PROVED that
+# nothing in it would be lost: no uncommitted change, no commit that lives
+# only here, and a checked-out branch that is tracked so "pushed" is a
+# fact git can confirm rather than an assumption.  Anything that cannot be
+# proved — a dirty tree, an untracked file, an unpushed commit, a branch
+# with no upstream (or a detached HEAD), a git command that fails or hangs,
+# or a directory that is not a repository at all — KEEPS the clone.  There
+# is no path from "could not tell" to "clean": the probe is deny-by-default
+# exactly like the predicate above it.
+#
+# Every probe is a read-only git invocation (``git_argv`` + ``--no-optional-locks``,
+# ``GIT_PROBE_TIMEOUT_SECONDS``); nothing here writes to the clone.
+
+
+@dataclass(frozen=True)
+class CloneGitState:
+    """Outcome of the dirty guard's read-only probes into one clone.
+
+    ``disposable`` is True only when every probe succeeded AND none of them
+    found a reason to keep: the tree is clean (no tracked change, no
+    untracked file, no ignored file, no ``.gitmodules``), HEAD has no commit
+    that is absent from every remote branch, and the checked-out branch has
+    an upstream.  ``detail`` is the human half of the ``reason``; ``detail``
+    is empty when the clone is disposable.
+    """
+
+    disposable: bool
+    detail: str = ""
+
+    @property
+    def kept(self) -> bool:
+        return not self.disposable
+
+
+def _run_git(ws: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """One read-only git probe in ``ws``: hardened argv, scrubbed env, bounded.
+
+    Raises ``subprocess.TimeoutExpired`` or ``OSError`` for the caller to
+    turn into a keep — this function never decides, it only runs.
+    """
+
+    return subprocess.run(
+        [*git_argv("--no-optional-locks", "-C", str(ws), *args)],
+        capture_output=True,
+        text=True,
+        env=child_env(),
+        timeout=GIT_PROBE_TIMEOUT_SECONDS,
+        check=False,
+    )
+
+
+def _classify_git_state(
+    *,
+    is_repo: bool,
+    status_porcelain: str | None,
+    unpushed_count: int | None,
+    has_upstream: bool,
+    failed: str | None,
+) -> CloneGitState:
+    """Pure: fold the probe results into a keep/proceed decision.
+
+    Every "unknown" input (``None``) and any ``failed`` message is a keep.
+    Only a repository whose status is empty, whose unpushed count is ``0``
+    and whose branch has an upstream — with no failure — is disposable.
+    The ignored-file and ``.gitmodules`` keeps are decided by the caller
+    (:func:`inspect_clone_git_state`) straight after the status probe.
+    """
+
+    if failed is not None:
+        return CloneGitState(False, f"git probe failed: {failed}")
+    if not is_repo:
+        return CloneGitState(False, "not a git repository")
+    if status_porcelain is None or status_porcelain.strip():
+        return CloneGitState(
+            False, "uncommitted changes (tracked or untracked)" if status_porcelain else "git status unavailable"
+        )
+    if unpushed_count is None or unpushed_count > 0:
+        return CloneGitState(
+            False,
+            f"{unpushed_count} commit(s) not on any remote branch"
+            if unpushed_count is not None
+            else "unpushed-commit count unavailable",
+        )
+    if not has_upstream:
+        return CloneGitState(False, "checked-out branch has no upstream (pushed cannot be proved)")
+    return CloneGitState(True, "")
+
+
+def inspect_clone_git_state(ws: Path) -> CloneGitState:
+    """Run the dirty-guard probes against ``ws`` and classify the result.
+
+    Order matters only for cost: the cheap repository check comes first so
+    a non-repo directory never spawns the three git probes.  The probes are
+    all read-only; a failure or timeout in any one of them is reported as
+    a keep (``failed``), never as clean.
+    """
+
+    try:
+        if not (ws / ".git").exists():
+            return _classify_git_state(is_repo=False, status_porcelain=None, unpushed_count=None, has_upstream=False, failed=None)
+    except OSError as exc:
+        return _classify_git_state(is_repo=False, status_porcelain=None, unpushed_count=None, has_upstream=False, failed=str(exc))
+
+    try:
+        has_gitmodules = (ws / ".gitmodules").exists()
+    except OSError as exc:
+        return _classify_git_state(is_repo=True, status_porcelain=None, unpushed_count=None, has_upstream=False, failed=str(exc))
+
+    try:
+        # ``--ignored=matching`` lists ignored paths as ``!!`` lines; tracked
+        # and untracked entries are unchanged.  A fresh clone lists none.
+        status = _run_git(ws, "status", "--porcelain", "--ignored=matching")
+        if status.returncode != 0:
+            return _classify_git_state(
+                is_repo=True, status_porcelain=None, unpushed_count=None, has_upstream=False,
+                failed=f"git status exited {status.returncode}: {status.stderr.strip()[:200]}",
+            )
+        ignored_lines = [line for line in status.stdout.splitlines() if line.startswith("!!")]
+        dirty_lines = [line for line in status.stdout.splitlines() if not line.startswith("!!")]
+        if dirty_lines:
+            # A tracked change or untracked file keeps its existing reason
+            # and its existing precedence over the two reasons below.
+            return _classify_git_state(
+                is_repo=True, status_porcelain="\n".join(dirty_lines), unpushed_count=None, has_upstream=False, failed=None
+            )
+        if ignored_lines:
+            # An ignored file is work too: plain ``--porcelain`` would read
+            # such a clone as clean and it would be removed.
+            return CloneGitState(False, "ignored files present")
+        if has_gitmodules:
+            # The submodules themselves are deliberately not probed; the
+            # file alone is enough to keep the clone.
+            return CloneGitState(False, "submodules present (not probed)")
+        porcelain = ""
+
+        unpushed = _run_git(ws, "rev-list", "--count", "HEAD", "--not", "--remotes")
+        if unpushed.returncode != 0:
+            return _classify_git_state(
+                is_repo=True, status_porcelain=porcelain, unpushed_count=None, has_upstream=False,
+                failed=f"git rev-list exited {unpushed.returncode}: {unpushed.stderr.strip()[:200]}",
+            )
+        try:
+            unpushed_count: int | None = int(unpushed.stdout.strip() or "0")
+        except ValueError:
+            return _classify_git_state(
+                is_repo=True, status_porcelain=porcelain, unpushed_count=None, has_upstream=False,
+                failed=f"git rev-list printed a non-integer count: {unpushed.stdout.strip()[:200]!r}",
+            )
+
+        upstream = _run_git(ws, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+        if upstream.returncode != 0:
+            # No upstream configured (or a detached HEAD): git itself fails
+            # to resolve the name.  That is the "cannot prove pushed" case,
+            # not a probe failure — the clone is kept either way.
+            return _classify_git_state(
+                is_repo=True, status_porcelain=porcelain, unpushed_count=unpushed_count, has_upstream=False, failed=None
+            )
+    except subprocess.TimeoutExpired as exc:
+        return _classify_git_state(is_repo=True, status_porcelain=None, unpushed_count=None, has_upstream=False, failed=f"timeout after {exc.timeout}s")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _classify_git_state(is_repo=True, status_porcelain=None, unpushed_count=None, has_upstream=False, failed=str(exc) or type(exc).__name__)
+
+    return _classify_git_state(
+        is_repo=True, status_porcelain=porcelain, unpushed_count=unpushed_count, has_upstream=True, failed=None
+    )
+
+
 def _sweep_one(
     ws: Path,
     *,
@@ -461,6 +651,21 @@ def _sweep_one(
             states=states,
         )
     if should_retain_workspace(ws, states, age, max_age):
+        # Dirty guard: terminal and old is necessary, not sufficient.  The
+        # clone must also be PROVED clean and pushed before it is a
+        # candidate; anything the guard cannot prove keeps it here, listed
+        # with the reason ``kept_uncommitted`` and never handed to
+        # ``_delete_workspace``.
+        git_state = inspect_clone_git_state(ws)
+        if git_state.kept:
+            return WorkspaceRetentionReport(
+                path=str(ws),
+                state=STATE_KEPT_UNCOMMITTED,
+                reason=f"{STATE_KEPT_UNCOMMITTED}: {git_state.detail}; kept",
+                age_seconds=age,
+                age_source=source,
+                states=states,
+            )
         size = _dir_size_bytes(ws)
         return WorkspaceRetentionReport(
             path=str(ws),
@@ -649,6 +854,7 @@ def write_report(path: str | Path, payload: Mapping[str, Any]) -> None:
 
 __all__ = [
     "ACTIVE_STATUSES",
+    "GIT_PROBE_TIMEOUT_SECONDS",
     "HARNESS_OWNED_COMPONENT",
     "KEEP_STATES",
     "QUEUE_TERMINAL_STATUSES",
@@ -660,14 +866,17 @@ __all__ = [
     "STATE_KEPT_HARNESS_OWNED",
     "STATE_KEPT_NO_REFS",
     "STATE_KEPT_RECENT",
+    "STATE_KEPT_UNCOMMITTED",
     "STATE_REMOVED",
     "STATE_SELECTABLE",
     "STATE_SKIPPED",
     "TERMINAL_STATUSES",
+    "CloneGitState",
     "WorkspaceRef",
     "WorkspaceRetentionReport",
     "collect_workspace_refs",
     "human_size",
+    "inspect_clone_git_state",
     "is_terminal_reference",
     "should_retain_workspace",
     "sweep_workspaces",

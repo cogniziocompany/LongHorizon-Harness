@@ -7,7 +7,7 @@ Pins the documented behaviour of ``lh_harness.disk_retention.workspaces``:
   the enforcement setting is;
 * enforcement is behind an explicit setting that defaults OFF, and OFF
   means no deletion path is reachable at all;
-* the age threshold defaults to 72 h and comes from the settings DB.
+* the age threshold defaults to 336 h (14 days) and comes from the settings DB.
 
 Every filesystem test builds its tree under ``tmp_path``; the real work
 root is never touched.  Synchronous, pytest + stdlib only.
@@ -19,6 +19,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -39,6 +40,7 @@ from lh_harness.disk_retention import (
 )
 from lh_harness.disk_retention import config as cfg_mod
 from lh_harness.disk_retention.workspaces import (
+    GIT_PROBE_TIMEOUT_SECONDS,
     KEEP_STATES,
     QUEUE_TERMINAL_STATUSES,
     STATE_ERROR,
@@ -46,15 +48,17 @@ from lh_harness.disk_retention.workspaces import (
     STATE_KEPT_HARNESS_OWNED,
     STATE_KEPT_NO_REFS,
     STATE_KEPT_RECENT,
+    STATE_KEPT_UNCOMMITTED,
     STATE_REMOVED,
     STATE_SELECTABLE,
     collect_workspace_refs,
     human_size,
+    inspect_clone_git_state,
     is_terminal_reference,
 )
 
 HOUR = 3600.0
-THRESHOLD = float(DEFAULT_WORKSPACE_MAX_AGE_HOURS) * HOUR  # 72 h
+THRESHOLD = float(DEFAULT_WORKSPACE_MAX_AGE_HOURS) * HOUR  # 336 h
 # A fixed wall-clock anchor (2026-11-27T00:00:00Z) used as ``now=`` for the sweep
 # calls that accept it.  The launcher wiring path uses the real clock, so the
 # anchor must sit in the past relative to it; the predicate itself never
@@ -63,7 +67,21 @@ NOW = 1_792_752_000.0
 
 
 # ------------------------------------------------------------------ helpers
-def _old(hours: float = 100.0) -> float:
+# "Old" means comfortably older than the DEFAULT threshold, whatever it is:
+# derived from ``THRESHOLD`` (336 h) so the default-age change (72 -> 336,
+# easybutt0n-304) did not silently turn every "old" fixture young.
+OLD_MARGIN_HOURS = 100.0
+
+
+def _old(hours: float | None = None) -> float:
+    """An age in seconds that is older than the default threshold.
+
+    With no argument: ``THRESHOLD + 100 h``.  With an argument, that many
+    hours (used by tests that need a fixed age regardless of the default).
+    """
+
+    if hours is None:
+        return THRESHOLD + OLD_MARGIN_HOURS * HOUR
     return hours * HOUR
 
 
@@ -97,6 +115,70 @@ def _snapshot(root: Path) -> set[str]:
 
 def _entry(workspace: str, status: str, run_id: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(workspace=workspace, status=status, run_id=run_id)
+
+
+# ------------------------------------------------------------ git fixtures
+# Dirty guard (easybutt0n-304): a terminal-and-old clone is a candidate only
+# when it is PROVED clean and pushed, so a fixture that models a removable
+# clone must be a real git repository with an upstream whose remote carries
+# HEAD.  Every helper here builds its repository under ``tmp_path`` (the
+# bare "origin" is a sibling directory of the clone, never a network URL),
+# and the mutating git they run touches only those fixture trees.
+_GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+
+
+def _git(cwd: Path, *args: str) -> str:
+    """Run git in ``cwd`` (a tmp_path fixture tree) and return stdout; fail loudly."""
+
+    import subprocess
+
+    proc = subprocess.run(["git", *_GIT_ID, "-C", str(cwd), *args], capture_output=True, text=True, check=True)
+    return proc.stdout
+
+
+def _make_clone(
+    root: Path,
+    name: str,
+    files: dict[str, bytes] | None = None,
+    *,
+    pushed: bool = True,
+) -> Path:
+    """A clean git clone at ``root/name`` with its own local bare origin.
+
+    With ``pushed=True`` the branch has an upstream and the remote carries
+    HEAD — the one shape the dirty guard lets through.  ``pushed=False``
+    adds the origin but never pushes: the branch then has no upstream and
+    the commit is on no remote branch.
+
+    The bare origin is kept OUTSIDE the work root (``<root>/../origins/``):
+    the sweep visits every direct child of the root, so an origin placed
+    beside the clone would show up as a second entry and pollute the
+    listing under test.
+    """
+
+    ws = root / name
+    origins = root.parent / "origins"
+    origins.mkdir(parents=True, exist_ok=True)
+    origin = origins / f"{name}.origin"
+    ws.mkdir(parents=True)
+    _git(root, "init", "-q", "--bare", str(origin))
+    _git(ws, "init", "-q", "-b", "main")
+    for rel, data in (files or {"src/main.py": b"print('hi')\n"}).items():
+        leaf = ws / rel
+        leaf.parent.mkdir(parents=True, exist_ok=True)
+        leaf.write_bytes(data)
+    _git(ws, "add", ".")
+    _git(ws, "commit", "-q", "-m", "init")
+    _git(ws, "remote", "add", "origin", str(origin))
+    if pushed:
+        _git(ws, "push", "-q", "-u", "origin", "main")
+    return ws
+
+
+def _commit(ws: Path, msg: str = "local") -> None:
+    """One more empty commit on the fixture clone's checked-out branch."""
+
+    _git(ws, "commit", "-q", "--allow-empty", "-m", msg)
 
 
 # =========================================================== predicate matrix
@@ -390,7 +472,7 @@ class TestSweepQueueOnlyReferences:
         self, tmp_path: Path, status: str
     ) -> None:
         root = tmp_path / "work"
-        ws = _tree(root, "ws-queue-done")
+        ws = _make_clone(root, "ws-queue-done")
         os.utime(ws, (NOW - _old(), NOW - _old()))
         reports = sweep_workspaces(
             root,
@@ -409,10 +491,16 @@ class TestSweepQueueOnlyReferences:
         """The mixed sweep: one candidate goes, every queue-parked sibling stays."""
 
         root = tmp_path / "work"
-        ws_old = _tree(root, "ws-old-terminal", {".git/HEAD": b"ref" * 100})
+        ws_old = _make_clone(root, "ws-old-terminal")
+        # The two queue-terminal clones (done/failed) are removal candidates, so
+        # each must be a real clean pushed clone the dirty guard lets through;
+        # the non-terminal/unknown ones are kept before the guard is reached.
+        for name in ("ws-done", "ws-failed"):
+            _make_clone(root, name)
         names = [f"ws-{s}" for s in QUEUE_STATUSES] + ["ws-queue-unknown"]
         for name in names:
-            _tree(root, name, {".git/HEAD": b"ref" * 100})
+            if not (root / name).exists():
+                _tree(root, name, {".git/HEAD": b"ref" * 100})
         ws_harness = _tree(root, ".lh-harness/runs/x", {"status.json": b"{}"})
         for ws in [root / n for n in names] + [ws_old]:
             os.utime(ws, (NOW - _old(), NOW - _old()))
@@ -459,7 +547,7 @@ class TestSweepQueueOnlyReferences:
     def test_dry_run_with_queue_only_blocked_lists_sizes_and_removes_nothing(self, tmp_path: Path) -> None:
         root = tmp_path / "work"
         ws_blocked = _tree(root, "ws-blocked", {".git/HEAD": b"b" * 4096})
-        ws_old = _tree(root, "ws-old", {".git/HEAD": b"o" * 4096})
+        ws_old = _make_clone(root, "ws-old", {"payload.bin": b"o" * 4096})
         for ws in (ws_blocked, ws_old):
             os.utime(ws, (NOW - _old(), NOW - _old()))
         before = _snapshot(root)
@@ -474,13 +562,15 @@ class TestSweepQueueOnlyReferences:
         by_name = {os.path.basename(e["path"]): e for e in payload["entries"]}
         assert payload["mode"] == "dry-run"
         assert by_name["ws-old"]["state"] == STATE_SELECTABLE
-        assert by_name["ws-old"]["size_bytes"] == 4096
-        assert by_name["ws-old"]["size_human"] == "4.0KiB"
+        # The committed payload is exactly the 4 KiB fixture file; ``.git`` is
+        # part of the clone's own size, so the candidate is at least that.
+        assert by_name["ws-old"]["size_bytes"] >= 4096
+        assert by_name["ws-old"]["size_human"].endswith(("B", "KiB", "MiB", "GiB"))
+        assert payload["totals"]["candidate_bytes"] == by_name["ws-old"]["size_bytes"]
         # The blocked one is listed with its tagged state, kept, and carries no candidate size.
         assert by_name["ws-blocked"]["state"] == STATE_KEPT_ACTIVE
         assert by_name["ws-blocked"]["states"] == ["queue:blocked"]
         assert payload["totals"]["candidates"] == 1
-        assert payload["totals"]["candidate_bytes"] == 4096
         assert _snapshot(root) == before
 
 
@@ -514,8 +604,13 @@ def work_tree(tmp_path: Path) -> dict[str, Any]:
     """
 
     root = tmp_path / "work"
+    # The one candidate is a real clean clone with an upstream whose remote
+    # carries HEAD: the dirty guard must let it through.  Its bare origin
+    # is a sibling under tmp_path.  Every other entry is kept for a reason
+    # that is checked before the guard (age, active reference, orphan,
+    # harness-owned), so a plain tree still models them.
+    _make_clone(root, "ws-old-terminal")
     for name in (
-        "ws-old-terminal",
         "ws-young-terminal",
         "ws-running",
         "ws-queued",
@@ -774,7 +869,7 @@ class TestEnforcement:
         self, tmp_path: Path
     ) -> None:
         root = tmp_path / "work"
-        ws = _tree(root, "ws-mtime")
+        ws = _make_clone(root, "ws-mtime")
         target = NOW - _old()
         os.utime(ws, (target, target))
         reports = sweep_workspaces(
@@ -790,7 +885,7 @@ class TestEnforcement:
     def test_age_uses_run_finished_at_not_dir_mtime(self, tmp_path: Path) -> None:
         """A clone re-created yesterday but finished a week ago is a week old."""
         root = tmp_path / "work"
-        ws = _tree(root, "ws")
+        ws = _make_clone(root, "ws")
         os.utime(ws, (NOW - _young(), NOW - _young()))  # dir looks young
         reports = sweep_workspaces(
             root,
@@ -836,11 +931,11 @@ class TestEnforcement:
 
     def test_threshold_from_config_is_honoured(self, tmp_path: Path) -> None:
         root = tmp_path / "work"
-        ws = _tree(root, "ws")
+        ws = _make_clone(root, "ws")
         run_items = [{"workspace": str(ws), "status": "completed", "finished_at": NOW - 2 * HOUR}]
         # 1 h threshold: 2 h old selects.
         assert sweep_workspaces(root, run_items=run_items, config=DiskRetentionConfig(workspace_max_age_hours=1), now=NOW)[0].state == STATE_SELECTABLE
-        # 72 h threshold: 2 h old is kept.
+        # Default threshold: 2 h old is kept.
         assert sweep_workspaces(root, run_items=run_items, config=DiskRetentionConfig(), now=NOW)[0].state == STATE_KEPT_RECENT
 
 
@@ -975,16 +1070,16 @@ class TestZeroOrNegativeThresholdDisables:
 
 # =================================================================== settings
 class TestSettings:
-    def test_defaults_are_off_and_72h(self) -> None:
+    def test_defaults_are_off_and_336h(self) -> None:
         assert DEFAULT_WORKSPACE_RETENTION_ENABLED is False
-        assert DEFAULT_WORKSPACE_MAX_AGE_HOURS == 72
+        assert DEFAULT_WORKSPACE_MAX_AGE_HOURS == 336
         assert DEFAULT_CONFIG.workspace_retention_enabled is False
-        assert DEFAULT_CONFIG.workspace_max_age_hours == 72
+        assert DEFAULT_CONFIG.workspace_max_age_hours == 336
 
     def test_config_from_values_without_settings_yields_defaults(self) -> None:
         cfg = config_from_values({})
         assert cfg.workspace_retention_enabled is False
-        assert cfg.workspace_max_age_hours == 72
+        assert cfg.workspace_max_age_hours == 336
         assert config_from_values(None).workspace_retention_enabled is False
 
     def test_settings_are_registered_in_catalog_like_neighbours(self) -> None:
@@ -1012,7 +1107,7 @@ class TestSettings:
         assert cfg.workspace_max_age_hours == 6
         # A mis-set value falls back to the default rather than 0 (which
         # would make everything selectable).
-        assert config_from_values({cfg_mod.SETTING_WORKSPACE_MAX_AGE_HOURS: "soon"}).workspace_max_age_hours == 72
+        assert config_from_values({cfg_mod.SETTING_WORKSPACE_MAX_AGE_HOURS: "soon"}).workspace_max_age_hours == 336
 
     def test_config_from_runtime_reads_store(self) -> None:
         runtime = SimpleNamespace(
@@ -1021,6 +1116,261 @@ class TestSettings:
         cfg = dr.config_from_runtime(runtime)
         assert cfg.workspace_retention_enabled is True
         assert cfg.workspace_max_age_hours == 12
+
+
+# ============================================================ dirty guard
+# easybutt0n-304: a terminal-and-old clone is a candidate only when it is
+# PROVED clean and pushed.  Every case below builds a REAL git repository
+# under ``tmp_path`` (bare origin included, never a network URL) and drives
+# the public sweep, so the probes under test are the real ``git`` calls.
+# Each kept case pins all three faces of the rule: the inspection says keep,
+# the dry-run listing carries the reason ``kept_uncommitted``, and an
+# enforcement sweep (flag on, live mode) leaves the clone in place with the
+# delete path never reached.
+ENFORCE = dict(config=DiskRetentionConfig(workspace_retention_enabled=True), mode=RetainMode.live())
+
+
+def _terminal_old_run(ws: Path) -> list[dict]:
+    """One ``completed`` run that finished ``_old()`` ago and names ``ws``."""
+
+    return [{"id": "r-old", "workspace": str(ws), "status": "completed", "finished_at": NOW - _old()}]
+
+
+def _assert_kept_uncommitted(tmp_path: Path, ws: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Assert the three faces of a ``kept_uncommitted`` clone and return its report."""
+
+    import lh_harness.disk_retention.workspaces as mod
+
+    called: list[str] = []
+    monkeypatch.setattr(mod, "_delete_workspace", lambda p: called.append(str(p)))
+    monkeypatch.setattr(mod.shutil, "rmtree", lambda *a, **k: called.append("rmtree"))
+
+    run_items = _terminal_old_run(ws)
+    # 1. The inspection itself says keep.
+    state = inspect_clone_git_state(ws)
+    assert state.kept is True and state.disposable is False
+    # 2. Dry-run lists it with the reason, and removes nothing.
+    before = _snapshot(tmp_path)
+    dry = sweep_workspaces(tmp_path / "work", run_items=run_items, config=DiskRetentionConfig(workspace_retention_enabled=True), mode=RetainMode.dry(), now=NOW)
+    assert [r.state for r in dry] == [STATE_KEPT_UNCOMMITTED]
+    assert dry[0].reason.startswith(f"{STATE_KEPT_UNCOMMITTED}: ")
+    assert STATE_KEPT_UNCOMMITTED in dry[0].reason
+    assert dry[0].size_bytes == 0  # never measured for removal
+    assert dry[0].age_source == "run_finished_at"
+    assert _snapshot(tmp_path) == before
+    # 3. Enforcement (flag on, live) still keeps it; the delete path is unreachable.
+    live = sweep_workspaces(tmp_path / "work", run_items=run_items, **ENFORCE, now=NOW)
+    assert [r.state for r in live] == [STATE_KEPT_UNCOMMITTED]
+    assert STATE_KEPT_UNCOMMITTED in live[0].reason
+    assert ws.is_dir()
+    assert _snapshot(tmp_path) == before
+    assert called == []
+    return live[0]
+
+
+class TestDirtyGuardKeepsUncommittedClones:
+    def test_uncommitted_tracked_change_is_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = tmp_path / "work"
+        ws = _make_clone(root, "ws-dirty")
+        (ws / "src" / "main.py").write_bytes(b"print('edited')\n")  # tracked, unstaged
+        report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
+        assert "uncommitted" in report.reason
+
+    def test_untracked_file_is_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = tmp_path / "work"
+        ws = _make_clone(root, "ws-untracked")
+        (ws / "notes.txt").write_text("scratch\n")  # never added
+        report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
+        assert "uncommitted" in report.reason
+
+    def test_unpushed_commit_is_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = tmp_path / "work"
+        ws = _make_clone(root, "ws-unpushed")  # pushed, then one more local commit
+        _commit(ws, "local only")
+        report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
+        assert "not on any remote branch" in report.reason
+
+    @pytest.mark.parametrize("shape", ["no_upstream", "detached_head"])
+    def test_branch_without_upstream_is_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str) -> None:
+        """``@{upstream}`` unresolvable — a branch never pushed -u, or a detached HEAD."""
+        root = tmp_path / "work"
+        if shape == "no_upstream":
+            ws = _make_clone(root, "ws-no-upstream", pushed=False)  # origin set, never -u pushed
+            # Push the commit through the back door so ONLY the upstream is missing:
+            # the branch itself carries no tracking config, so "pushed" cannot be proved.
+            _git(ws, "push", "-q", "origin", "main")
+            _git(ws, "fetch", "-q", "origin")
+            assert _git(ws, "rev-list", "--count", "HEAD", "--not", "--remotes").strip() == "0"
+        else:
+            ws = _make_clone(root, "ws-detached")  # fully pushed, then HEAD detached
+            _git(ws, "checkout", "-q", "--detach", "HEAD")
+        report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
+        assert "no upstream" in report.reason
+
+    @pytest.mark.parametrize("how", ["nonzero_exit", "timeout"])
+    def test_git_failure_is_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str) -> None:
+        """A git that ACTUALLY fails — non-zero exit, or hangs past the bounded timeout — reads as keep, never as clean."""
+        import subprocess
+
+        import lh_harness.disk_retention.workspaces as mod
+
+        root = tmp_path / "work"
+        ws = _make_clone(root, "ws-git-fails")
+        # A git shim first on PATH: ``git_argv`` resolves bare ``git`` and
+        # ``child_env()`` copies ``os.environ`` at call time, so it is honoured.
+        shim = tmp_path / "shim"
+        shim.mkdir()
+        if how == "nonzero_exit":
+            (shim / "git").write_text("#!/bin/sh\necho 'shim: git is broken' >&2\nexit 128\n")
+        else:
+            # Absolute sleep: with no PATH a bare ``sleep`` exits 127 instead
+            # of hanging, and the probe would report exit 127, not a timeout.
+            (shim / "git").write_text(f"#!/bin/sh\n{shutil.which('sleep') or '/bin/sleep'} 60\n")
+        (shim / "git").chmod(0o755)
+        # ``os.environ['PATH']`` is absent in some environments (the PR-gate
+        # runner runs without one); a keep-only guard must not depend on it.
+        monkeypatch.setenv("PATH", os.pathsep.join(p for p in (str(shim), os.environ.get("PATH", "")) if p))
+        if how == "timeout":
+            monkeypatch.setattr(mod, "GIT_PROBE_TIMEOUT_SECONDS", 0.5)
+        # The shim really is the git the probe runs, and it really fails.
+        if how == "nonzero_exit":
+            proc = subprocess.run(["git", "--version"], capture_output=True, text=True, env=dict(os.environ))
+            assert proc.returncode == 128 and "broken" in proc.stderr
+        run_items = _terminal_old_run(ws)
+        called: list[str] = []
+        monkeypatch.setattr(mod, "_delete_workspace", lambda p: called.append(str(p)))
+        monkeypatch.setattr(mod.shutil, "rmtree", lambda *a, **k: called.append("rmtree"))
+        before = _snapshot(tmp_path)
+        # Dry-run lists it with the reason; enforcement keeps it; delete is unreachable.
+        dry = sweep_workspaces(tmp_path / "work", run_items=run_items, config=DiskRetentionConfig(workspace_retention_enabled=True), mode=RetainMode.dry(), now=NOW)
+        live = sweep_workspaces(tmp_path / "work", run_items=run_items, **ENFORCE, now=NOW)
+        for report in (dry[0], live[0]):
+            assert report.state == STATE_KEPT_UNCOMMITTED
+            assert report.reason.startswith(f"{STATE_KEPT_UNCOMMITTED}: ")
+            assert "git probe failed" in report.reason
+        if how == "nonzero_exit":
+            assert "exited 128" in live[0].reason
+        else:
+            assert "timeout" in live[0].reason
+        assert ws.is_dir()
+        assert _snapshot(tmp_path) == before
+        assert called == []
+
+    def test_non_repo_directory_is_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = tmp_path / "work"
+        ws = _tree(root, "ws-not-a-repo")  # a plain directory: no ``.git`` at all
+        report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
+        assert "not a git repository" in report.reason
+
+    def test_ignored_file_is_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Plain ``git status --porcelain`` does not list ignored files: a clone
+        whose only work sits in an ignored path reads clean and would be removed.
+        Any ignored entry is a keep, reason ``ignored files present``."""
+        root = tmp_path / "work"
+        # The .gitignore is COMMITTED (part of the initial commit), so the only
+        # thing in the tree that is not pushed is the ignored file itself.
+        ws = _make_clone(root, "ws-ignored", files={"src/main.py": b"print('hi')\n", ".gitignore": b"*.log\n"})
+        (ws / "debug.log").write_text("ignored work\n")
+        # Isolation of the trigger: plain porcelain is empty (not dirty), and
+        # the file is listed only under --ignored.
+        assert _git(ws, "status", "--porcelain") == ""
+        assert _git(ws, "status", "--porcelain", "--ignored=matching").splitlines() == ["!! debug.log"]
+        assert _git(ws, "ls-files", "--others", "--ignored", "--exclude-standard").split() == ["debug.log"]
+        report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
+        assert report.reason == f"{STATE_KEPT_UNCOMMITTED}: ignored files present; kept"
+
+    def test_gitmodules_is_kept_without_probing_submodules(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``.gitmodules`` marks a repository with submodules; the guard does
+        not probe them, the file alone is a keep with reason
+        ``submodules present (not probed)``."""
+        import subprocess
+
+        root = tmp_path / "work"
+        # COMMITTED .gitmodules naming no network URL: the clone stays clean
+        # and fully pushed, so the file is the only reason to keep it.
+        ws = _make_clone(
+            root, "ws-gitmodules",
+            files={"src/main.py": b"print('hi')\n", ".gitmodules": b"[submodule \"vendor/x\"]\n\tpath = vendor/x\n\turl = ../x.git\n"},
+        )
+        assert (ws / ".gitmodules").exists()
+        assert _git(ws, "status", "--porcelain") == ""
+        assert _git(ws, "status", "--porcelain", "--ignored=matching") == ""
+        # No submodule is ever probed: no ``git submodule`` call is made.
+        real = subprocess.run
+        seen: list[list[str]] = []
+
+        def _spy(argv: Any, **kw: Any) -> Any:
+            seen.append(list(argv))
+            return real(argv, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _spy)
+        state = inspect_clone_git_state(ws)
+        monkeypatch.setattr(subprocess, "run", real)
+        assert state.kept is True and state.disposable is False
+        assert state.detail == "submodules present (not probed)"
+        assert not any("submodule" in argv for argv in seen)
+        report = _assert_kept_uncommitted(tmp_path, ws, monkeypatch)
+        assert report.reason == f"{STATE_KEPT_UNCOMMITTED}: submodules present (not probed); kept"
+
+    def test_clean_pushed_old_clone_is_still_removed_under_enforcement(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control: the one shape the guard lets through is removed exactly as before.
+
+        Also pins the shape of the probes that let it through: three read-only
+        git calls, each with ``--no-optional-locks`` and the hardened argv, each
+        bounded by ``GIT_PROBE_TIMEOUT_SECONDS`` (<= 10 s).
+        """
+        import subprocess
+
+        root = tmp_path / "work"
+        ws = _make_clone(root, "ws-clean-pushed")  # clean, upstream set, remote carries HEAD
+        assert GIT_PROBE_TIMEOUT_SECONDS <= 10.0
+        seen: list[tuple[list[str], float]] = []
+        real = subprocess.run
+
+        def _spy(argv: Any, **kw: Any) -> Any:
+            # Only the probe calls pass a timeout; the test's own ``_git``
+            # helper (no timeout) is passed straight through, unrecorded.
+            if kw.get("timeout") is not None:
+                seen.append((list(argv), float(kw["timeout"])))
+            return real(argv, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _spy)
+        assert inspect_clone_git_state(ws).disposable is True
+        assert len(seen) == 3
+        for argv, timeout in seen:
+            assert argv[0] == "git"
+            assert "--no-optional-locks" in argv
+            assert "-c" in argv and "core.fsmonitor=" in argv and "core.hooksPath=/dev/null" in argv
+            assert timeout == GIT_PROBE_TIMEOUT_SECONDS
+        assert [argv[argv.index("-C") + 2] for argv, _ in seen] == ["status", "rev-list", "rev-parse"]  # all read-only
+        monkeypatch.setattr(subprocess, "run", real)
+        run_items = _terminal_old_run(ws)
+        # Dry-run: still the one candidate, with a size.
+        dry = sweep_workspaces(root, run_items=run_items, config=DiskRetentionConfig(workspace_retention_enabled=True), mode=RetainMode.dry(), now=NOW)
+        assert [r.state for r in dry] == [STATE_SELECTABLE]
+        assert dry[0].size_bytes > 0
+        # Enforcement: removed.
+        reports = sweep_workspaces(root, run_items=run_items, **ENFORCE, now=NOW)
+        assert [r.state for r in reports] == [STATE_REMOVED]
+        assert not ws.exists()
+
+
+def test_workspace_max_age_default_is_336() -> None:
+    """``LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`` defaults to 336 (14 days), not 72."""
+    assert DEFAULT_WORKSPACE_MAX_AGE_HOURS == 336
+    assert DEFAULT_WORKSPACE_MAX_AGE_HOURS == 14 * 24
+    assert DEFAULT_CONFIG.workspace_max_age_hours == 336
+    assert config_from_values({}).workspace_max_age_hours == 336
+    assert config_from_values(None).workspace_max_age_hours == 336
+    # Unset in the store -> 336; the setting still overrides when present.
+    assert config_from_values({cfg_mod.SETTING_WORKSPACE_MAX_AGE_HOURS: None}).workspace_max_age_hours == 336
+    assert config_from_values({cfg_mod.SETTING_WORKSPACE_MAX_AGE_HOURS: "6"}).workspace_max_age_hours == 6
+    # The admin help string states the default and the 0/negative disable.
+    from lh_harness.settings_store import CATALOG_BY_NAME
+
+    spec = CATALOG_BY_NAME[cfg_mod.SETTING_WORKSPACE_MAX_AGE_HOURS]
+    assert "336" in spec.description and "14 days" in spec.description
+    assert "0 or a negative" in spec.description and "disables" in spec.description
 
 
 # =============================================================== wiring
@@ -1046,7 +1396,7 @@ class TestWiring:
         runs_root = tmp_path / "runs"
         runs_root.mkdir()
         root = tmp_path / "work"
-        ws = _tree(root, "ws-old")
+        ws = _make_clone(root, "ws-old")
         (root / ".lh-harness" / "runs").mkdir(parents=True)
         before = _snapshot(root)
         monkeypatch.setattr(cli_mod, "_workspace_retention_inputs", lambda r: ([{"workspace": str(ws), "status": "completed", "finished_at": NOW - _old()}], []))
@@ -1092,7 +1442,7 @@ class TestWiring:
         from lh_harness.launcher import Launcher
 
         root = tmp_path / "work"
-        ws = _tree(root, "ws-old")
+        ws = _make_clone(root, "ws-old")
         events: list[tuple[str, dict]] = []
         touched: list[str] = []
         run_items = [{"workspace": str(ws), "status": "completed", "finished_at": NOW - _old()}]

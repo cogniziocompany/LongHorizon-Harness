@@ -22,8 +22,8 @@ state when a node starts running low on disk:
    `cancelled`, `blocked` or `incomplete`; a queue entry only in `done` or
    `failed` (a queue `blocked`/`pending`/`launched` entry is still parked
    work and keeps the clone) — and the clone has stayed that way for more
-   than `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` (default 72 h; `0` or a
-   negative value disables this rule), the clone
+   than `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` (default 336 h = 14 days;
+   `0` or a negative value disables this rule), the clone
    is a removal candidate.  **Opt-in**: nothing is deleted unless
    `LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED` is `true` (default
    `false`).  See "Terminal-run clone workspaces" below.
@@ -66,7 +66,7 @@ state.
 | `LH_HARNESS_DISK_PAUSE_PCT` | 90 | Disk usage that pauses new launches |
 | `LH_HARNESS_DISK_RESUME_PCT` | 85 | Disk usage under which launches auto-resume |
 | `LH_HARNESS_DISK_WORKSPACE_RETENTION_ENABLED` | `false` | Explicit opt-in for terminal-run clone-workspace removal |
-| `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` | 72 | Age a terminal-run clone must exceed before it can be removed; `0` or negative disables the rule |
+| `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS` | 336 (14 d) | Age a terminal-run clone must exceed before it can be removed; `0` or negative disables the rule |
 
 For `LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS`, a setting of `0` (or any
 negative value) disables the rule: no clone is ever old enough, so the
@@ -133,10 +133,25 @@ lh-harness retention --runs-root <runs-root> --work-root /home/harness/work --ap
 
 Report states: `selectable` (candidate; would be / was removed),
 `removed`, `kept_harness_owned`, `kept_no_references`,
-`kept_active_reference`, `kept_recent`, `skipped`, `error`.
+`kept_active_reference`, `kept_recent`, `kept_uncommitted`, `skipped`,
+`error`.
 
-Installing or enabling this on a node is an operator (infraops1) action
-after reviewing the dry-run listing; a run never enables it.
+A terminal-and-old clone is a candidate only when it is *proved* clean and
+pushed (easybutt0n-304).  The sweep runs three read-only git probes into
+the clone (`git --no-optional-locks status --porcelain`, `git
+--no-optional-locks rev-list --count HEAD --not --remotes`, and `git
+--no-optional-locks rev-parse --abbrev-ref --symbolic-full-name
+@{upstream}`, each with a 10 s timeout) and keeps the clone with the
+reason `kept_uncommitted` — listed in the dry-run, never removed under
+enforcement — when *any* of these holds: the tree has uncommitted changes
+(tracked or untracked); HEAD has a commit no remote branch carries; the
+checked-out branch has no upstream (a detached HEAD included, since
+"pushed" cannot then be proved); any git probe fails or times out; or the
+directory is not a git repository.  A probe that cannot tell never reads
+as clean.
+
+Enabling this on a node is a tooled-seat action: overseer1 or
+overseer1-op enables it after review, dry-run first; a run never enables it.
 
 ## State machine
 

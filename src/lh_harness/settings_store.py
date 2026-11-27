@@ -240,7 +240,8 @@ CATALOG: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         "LH_HARNESS_DISK_WORKSPACE_MAX_AGE_HOURS",
-        "Age in hours a TERMINAL-run workspace must reach before it can be removed (default 72)",
+        "Age in hours a TERMINAL-run workspace must reach before it can be removed "
+        "(default 336 = 14 days; 0 or a negative value disables the rule)",
         False,
         restart=False,
     ),
