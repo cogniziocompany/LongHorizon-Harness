@@ -162,7 +162,12 @@ def test_instructions_invalidates_snapshot_cache(tmp_path: Path) -> None:
     queued = client.get("/api/runs/run-1/snapshot").json()
     assert queued["operator_messages"][0]["status"] == "queued"
 
-    state.drain_injections()
+    assert state.drain_injections() == ["go"]
+    # A claim alone does not apply the instruction: the worker may die before
+    # its live manager prompt, and the bus must then still offer the command.
+    claimed = client.get("/api/runs/run-1/snapshot").json()
+    assert claimed["operator_messages"][0]["status"] == "queued"
+    state.mark_instruction_applied("go")
     applied = client.get("/api/runs/run-1/snapshot").json()
     assert applied["operator_messages"][0]["status"] == "applied"
 

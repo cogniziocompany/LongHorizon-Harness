@@ -2315,6 +2315,13 @@ def _run_command(args: argparse.Namespace) -> int:
                     pending_instructions=(
                         gate_state.drain_injections if gate_state is not None else None
                     ),
+                    # 'applied' follows delivery, not the claim: an instruction
+                    # claimed by a worker that dies before its live manager
+                    # prompt stays pending on the bus and is delivered exactly
+                    # once by the next restore (LHH#215 review note 2).
+                    instruction_delivered=(
+                        gate_state.mark_instruction_applied if gate_state is not None else None
+                    ),
                     progress=_print_progress,
                     resume=bool(getattr(args, "resume", False)),
                     **role_agents,
