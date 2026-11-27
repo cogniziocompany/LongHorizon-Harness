@@ -38,7 +38,7 @@ jobs:
           github.event.comment.author_association == 'COLLABORATOR'
         )
       )
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lan-cognizioware]
     # Real wall-clock cap, at the JOB level - this is the mechanism that actually
     # works. The action input named timeout_minutes (removed above) never applied.
     # Matters because concurrency below sets cancel-in-progress: false, so a hung

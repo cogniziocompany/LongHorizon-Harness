@@ -12,8 +12,13 @@ name: PR Gate
 # v8.24.3, blocking).  The shared gate's classify/auto-merge jobs are not
 # carried over: they need write tokens, and nothing in this repo auto-merges.
 #
-# Every job runs on ubuntu-latest (GitHub-hosted), never on the LAN runner:
-# workflow code from a PR must not execute inside the LAN.
+# Every job runs on [self-hosted, lan-cognizioware] (Paxton's standing order
+# 2026-11-04: off GitHub-hosted cloud runners, local self-hosted only).
+# NOTE: this means code from a PR now executes inside the LAN.  That reverses
+# the earlier isolation stance ("workflow code from a PR must not execute
+# inside the LAN"); the trade-off is called out in the migration PR for
+# review, and fork-PR safeguards (no secrets on fork PRs, read-only
+# permissions above) still apply.
 
 on:
   pull_request:
@@ -29,7 +34,7 @@ concurrency:
 jobs:
   test:
     name: build + test (pytest)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lan-cognizioware]
     timeout-minutes: 40
     steps:
       - name: Checkout
@@ -74,7 +79,7 @@ jobs:
 
   secret-scan:
     name: secret-scan (gitleaks, blocking)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lan-cognizioware]
     timeout-minutes: 10
     steps:
       - name: Checkout (full history for a PR-scoped scan)
