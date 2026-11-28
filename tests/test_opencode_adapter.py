@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import shlex
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -278,6 +280,66 @@ def test_fetch_gateway_model_limits_reduces_to_min_and_skips_blocked() -> None:
     assert limits == {"kimi-k3.1-pro:pool": (262144, 65536)}
     assert captured["url"] == "https://gw.example.com/model/info"
     assert captured["auth"] == "Bearer sk-test"
+
+
+def test_fetch_gateway_model_limits_degrades_to_none_on_http_403() -> None:
+    # easybutt0n-211 F2: when the gateway answers /model/info with HTTP 403
+    # (the run key is not allowed on the admin route), the fetch must swallow
+    # the error and return None -- it never turns a denied route into a run
+    # failure.  The 403 is simulated purely in-process: urlopen is stubbed to
+    # raise the real HTTPError for a 403 response, so no network or gateway
+    # contact happens.
+    def _raising_urlopen(req: urllib.request.Request, timeout: float) -> "_Response":
+        raise urllib.error.HTTPError(
+            req.full_url, 403, "Forbidden", {}, io.BytesIO(b'{"detail":"run key not allowed"}')
+        )
+
+    saved = urllib.request.urlopen
+    urllib.request.urlopen = _raising_urlopen
+    try:
+        assert _fetch_gateway_model_limits("https://gw.example.com/v1", "sk-test") is None
+    finally:
+        urllib.request.urlopen = saved
+
+
+def test_opencode_adapter_degrades_on_gateway_403_no_models_key(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # easybutt0n-211 F2 end-to-end through the adapter: the gateway's
+    # /model/info answers HTTP 403 (run key not allowed on that route).  The
+    # limits fetch degrades to None, the run is never failed by it, and the
+    # written OpenCode config carries the base URL override but NO models key.
+    binary = str(tmp_path / "bin" / "opencode")
+    monkeypatch.setattr(opencode_adapter_module, "resolve_opencode_binary", lambda: binary)
+
+    def _raising_urlopen(req: urllib.request.Request, timeout: float):
+        raise urllib.error.HTTPError(
+            req.full_url, 403, "Forbidden", {}, io.BytesIO(b'{"detail":"run key not allowed"}')
+        )
+
+    monkeypatch.setattr(opencode_adapter_module.urllib.request, "urlopen", _raising_urlopen)
+
+    adapter = OpenCodeAdapter(
+        model="litellm/minimax-m3:minimax",
+        api_key="sk-test",
+        base_url="https://gw.example.com/v1",
+        prompt_dir=str(tmp_path / "prompts"),
+        role="cli_executor",
+    )
+
+    tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
+    env = dict(
+        item.split("=", 1) for item in tokens if "=" in item and item.split("=", 1)[0] == "OPENCODE_CONFIG"
+    )
+    config = json.loads(Path(env["OPENCODE_CONFIG"]).read_text(encoding="utf-8"))
+    provider = config["provider"]["litellm"]
+    # The endpoint override is still present...
+    assert provider["options"]["baseURL"] == "https://gw.example.com/v1"
+    # ...but the 403 degraded the limits to None, so no models key is pinned.
+    assert "models" not in provider
+    # The run command itself was built normally: the 403 did not fail it.
+    assert "OPENCODE_CONFIG" in adapter.command_template
 
 
 def test_opencode_jsonl_views() -> None:
