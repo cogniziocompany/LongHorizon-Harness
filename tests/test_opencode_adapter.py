@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+import urllib.request
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from lh_harness import agent_logs
 from lh_harness.adapters import opencode as opencode_adapter_module
-from lh_harness.adapters.opencode import OpenCodeAdapter
+from lh_harness.adapters.opencode import (
+    OpenCodeAdapter,
+    _fetch_gateway_model_limits,
+)
 from lh_harness.environment.local import LocalEnvironment
 from lh_harness.provider_errors import classify_agent_runtime_failure
 from lh_harness.types import DEFAULT_OPENCODE_MODEL, EpisodeBudget, EpisodeResult
@@ -157,6 +161,11 @@ def test_opencode_adapter_writes_endpoint_config_for_base_url(
 ) -> None:
     binary = str(tmp_path / "bin" / "opencode")
     monkeypatch.setattr(opencode_adapter_module, "resolve_opencode_binary", lambda: binary)
+    # No gateway behind the endpoint in this test: the limits fetch degrades
+    # to None and the config still carries the base URL override alone.
+    monkeypatch.setattr(
+        opencode_adapter_module, "_fetch_gateway_model_limits", lambda *a, **k: None
+    )
 
     adapter = OpenCodeAdapter(
         api_key="sk-test",
@@ -171,8 +180,178 @@ def test_opencode_adapter_writes_endpoint_config_for_base_url(
     config_path = env["OPENCODE_CONFIG"]
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     assert config["provider"]["opencode"]["options"]["baseURL"] == "https://api.example.com/v1"
+    assert "models" not in config["provider"]["opencode"]
     assert "OPENCODE_CONFIG" in adapter.command_template
     assert "OPENCODE_API_KEY" in adapter.command_template
+
+
+def test_opencode_adapter_pins_model_limits_from_gateway(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    binary = str(tmp_path / "bin" / "opencode")
+    monkeypatch.setattr(opencode_adapter_module, "resolve_opencode_binary", lambda: binary)
+    monkeypatch.setattr(
+        opencode_adapter_module,
+        "_fetch_gateway_model_limits",
+        lambda *a, **k: {"minimax-m3:minimax": (1000000, 131072)},
+    )
+
+    adapter = OpenCodeAdapter(
+        model="litellm/minimax-m3:minimax",
+        api_key="sk-test",
+        base_url="https://gw.example.com/v1",
+        prompt_dir=str(tmp_path / "prompts"),
+        role="cli_executor",
+    )
+
+    tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
+    env = dict(item.split("=", 1) for item in tokens if "=" in item and item.split("=", 1)[0] == "OPENCODE_CONFIG")
+    config = json.loads(Path(env["OPENCODE_CONFIG"]).read_text(encoding="utf-8"))
+    provider = config["provider"]["litellm"]
+    assert provider["options"]["baseURL"] == "https://gw.example.com/v1"
+    assert provider["models"]["minimax-m3:minimax"]["limit"] == {
+        "context": 1000000,
+        "output": 131072,
+    }
+
+
+def test_fetch_gateway_model_limits_reduces_to_min_and_skips_blocked() -> None:
+    payload = {
+        "data": [
+            {
+                "model_name": "kimi-k3.1-pro:pool",
+                "model_info": {
+                    "max_input_tokens": 1048576,
+                    "max_output_tokens": 131072,
+                },
+            },
+            {
+                "model_name": "kimi-k3.1-pro:pool",
+                "model_info": {
+                    "max_input_tokens": 262144,
+                    "max_output_tokens": 65536,
+                },
+            },
+            {
+                "model_name": "blocked-alias",
+                "model_info": {
+                    "max_input_tokens": 999,
+                    "max_output_tokens": 999,
+                    "blocked": True,
+                },
+            },
+            {
+                "model_name": "no-limits-alias",
+                "model_info": {"mode": "chat"},
+            },
+        ]
+    }
+
+    class _Response:
+        def __init__(self, body: str) -> None:
+            self._body = body.encode("utf-8")
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    captured: dict[str, str] = {}
+
+    def fake_urlopen(req: urllib.request.Request, timeout: float) -> _Response:
+        captured["url"] = req.full_url
+        captured["auth"] = req.headers.get("Authorization", "")
+        return _Response(json.dumps(payload))
+
+    monkeypatch_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        limits = _fetch_gateway_model_limits("https://gw.example.com/v1", "sk-test")
+    finally:
+        urllib.request.urlopen = monkeypatch_urlopen
+
+    assert limits == {"kimi-k3.1-pro:pool": (262144, 65536)}
+    assert captured["url"] == "https://gw.example.com/model/info"
+    assert captured["auth"] == "Bearer sk-test"
+
+
+def test_opencode_adapter_http_429_drops_gateway_model_limits(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # The gateway rate-limits the /model/info probe (HTTP 429): urlopen
+    # raises urllib.error.HTTPError, an OSError subclass. The limits
+    # fetch must degrade to None and the written config must carry the
+    # base URL override alone -- no "models" key -- while the run itself
+    # still starts.
+    binary = str(tmp_path / "bin" / "opencode")
+    monkeypatch.setattr(opencode_adapter_module, "resolve_opencode_binary", lambda: binary)
+
+    def fake_urlopen(req: urllib.request.Request, timeout: float):
+        raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
+
+    monkeypatch_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        adapter = OpenCodeAdapter(
+            model="opencode/gateway-model",
+            api_key="sk-test",
+            base_url="https://gw.example.com/v1",
+            prompt_dir=str(tmp_path / "prompts"),
+            role="cli_executor",
+        )
+        limits = _fetch_gateway_model_limits("https://gw.example.com/v1", "sk-test")
+    finally:
+        urllib.request.urlopen = monkeypatch_urlopen
+
+    assert limits is None
+    tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
+    env = dict(item.split("=", 1) for item in tokens if "=" in item and item.split("=", 1)[0] == "OPENCODE_CONFIG")
+    config = json.loads(Path(env["OPENCODE_CONFIG"]).read_text(encoding="utf-8"))
+    provider = config["provider"]["opencode"]
+    assert provider["options"]["baseURL"] == "https://gw.example.com/v1"
+    assert "models" not in provider
+
+
+def test_opencode_adapter_http_503_drops_gateway_model_limits(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # Same degradation for a 5xx server error (HTTP 503): the HTTPError
+    # from urlopen is swallowed, limits stay None, and the config is
+    # written without a "models" key.
+    binary = str(tmp_path / "bin" / "opencode")
+    monkeypatch.setattr(opencode_adapter_module, "resolve_opencode_binary", lambda: binary)
+
+    def fake_urlopen(req: urllib.request.Request, timeout: float):
+        raise urllib.error.HTTPError(req.full_url, 503, "Service Unavailable", {}, None)
+
+    monkeypatch_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        adapter = OpenCodeAdapter(
+            model="opencode/gateway-model",
+            api_key="sk-test",
+            base_url="https://gw.example.com/v1",
+            prompt_dir=str(tmp_path / "prompts"),
+            role="cli_executor",
+        )
+        limits = _fetch_gateway_model_limits("https://gw.example.com/v1", "sk-test")
+    finally:
+        urllib.request.urlopen = monkeypatch_urlopen
+
+    assert limits is None
+    tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
+    env = dict(item.split("=", 1) for item in tokens if "=" in item and item.split("=", 1)[0] == "OPENCODE_CONFIG")
+    config = json.loads(Path(env["OPENCODE_CONFIG"]).read_text(encoding="utf-8"))
+    provider = config["provider"]["opencode"]
+    assert provider["options"]["baseURL"] == "https://gw.example.com/v1"
+    assert "models" not in provider
 
 
 def test_opencode_jsonl_views() -> None:
